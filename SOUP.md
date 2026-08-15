@@ -44,6 +44,37 @@ Files: `src/semver_jsc/SemverObject.rs`, `src/semver/Version.rs` (exposes the co
 `packages/bun-types/bun.d.ts`, `docs/runtime/semver.mdx`, `test/cli/install/semver.test.ts`,
 `test/integration/bun-types/fixture/bun.ts`.
 
+### 2026-08-15: `wc` shell builtin
+
+The first example in the Bun Shell docs pipes into `wc`, but `wc` was not a builtin, so the
+example (and every `| wc -l` in a script) only worked where coreutils happened to be installed,
+which on Windows is usually nowhere. `wc` is now a builtin on every platform: `-l`, `-w`, `-c` and
+`-m` (UTF-8 characters), in any combination, reading stdin or any number of files, with a `total`
+line for more than one file. An unreadable operand is reported on stderr, sets the exit code to 1
+and does not stop the others from being counted, like wc(1).
+
+```ts
+await $`cat access.log | wc -l`.text(); // "1042\n"
+await $`wc -l src/*.ts`.text();
+//  12 src/a.ts
+// 240 src/b.ts
+// 252 total
+```
+
+Columns are padded to the widest count being printed, so a single count is a bare number and
+multi-file output lines up; GNU and BSD wc pad to different fixed widths here, and scripts split on
+whitespace anyway. `-L` is rejected as unsupported rather than silently ignored.
+
+Reading files needed one fix underneath: the shell's `IOReader` always registered its fd with
+epoll/kqueue, which fails with `EPERM` for regular files and `/dev/null`. Non-pollable fds are now
+read on the next event-loop turn through `bun_io`'s existing unpolled read loop, so the builtin sees
+the same chunk/EOF callbacks either way. This also makes the (experimental on POSIX) builtin `cat`
+work on `cat file`, `cat < file` and a `/dev/null` stdin.
+
+Files: `src/runtime/shell/builtin/wc.rs`, `src/runtime/shell/Builtin.rs`, `src/runtime/shell/mod.rs`,
+`src/runtime/shell/IOReader.rs`, `src/runtime/shell/interpreter.rs` (exposes `is_pollable`),
+`docs/runtime/shell.mdx`, `test/js/bun/shell/commands/wc.test.ts`, `test/js/bun/shell/exec.test.ts`.
+
 ## Dropped
 
 Nothing yet.

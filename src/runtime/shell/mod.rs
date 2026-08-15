@@ -109,6 +109,8 @@ pub mod builtins {
     pub mod touch;
     #[path = "true_.rs"]
     pub(crate) mod true_;
+    #[path = "wc.rs"]
+    pub mod wc;
     #[path = "which.rs"]
     pub mod which;
     #[path = "yes.rs"]
