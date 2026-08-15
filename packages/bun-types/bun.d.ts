@@ -5355,6 +5355,54 @@ declare module "bun" {
      * Throws an error if either version is invalid.
      */
     function order(v1: StringLike, v2: StringLike): -1 | 0 | 1;
+
+    /**
+     * The components of a version, as returned by {@link parse}.
+     */
+    interface Version {
+      major: number;
+      minor: number;
+      patch: number;
+      /**
+       * The dot-separated prerelease identifiers, or `[]` when there are none.
+       * Numeric identifiers are numbers, like in `node-semver`.
+       *
+       * `"1.0.0-beta.2"` → `["beta", 2]`
+       */
+      prerelease: (string | number)[];
+      /**
+       * The dot-separated build metadata identifiers, or `[]` when there are none.
+       *
+       * `"1.0.0+sha.e0f1"` → `["sha", "e0f1"]`
+       */
+      build: string[];
+      /**
+       * The normalized `major.minor.patch[-prerelease]` string, without any `v` prefix,
+       * surrounding whitespace, or build metadata (which does not take part in ordering).
+       *
+       * `"v1.2.3-rc.1+5"` → `"1.2.3-rc.1"`
+       */
+      version: string;
+    }
+
+    /**
+     * Parses a single version into its components.
+     *
+     * Returns `null` if `version` is not a complete `major.minor.patch` version, so this also
+     * doubles as a validity check. Ranges (`^1.2.3`), partial versions (`1.2`), and wildcards
+     * (`1.x`) are not versions. A leading `v` or `=` and surrounding whitespace are ignored,
+     * as in {@link order} and {@link satisfies}.
+     *
+     * @example
+     * ```ts
+     * Bun.semver.parse("v1.2.3-beta.1+build.5");
+     * // { major: 1, minor: 2, patch: 3, prerelease: ["beta", 1], build: ["build", "5"], version: "1.2.3-beta.1" }
+     *
+     * Bun.semver.parse("^1.2.3"); // null
+     * Bun.semver.parse("1.2"); // null
+     * ```
+     */
+    function parse(version: StringLike | null | undefined): Version | null;
   }
 
   namespace unsafe {
