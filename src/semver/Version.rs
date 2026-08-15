@@ -1265,7 +1265,7 @@ pub struct ParseResult<T: VersionInt> {
     pub(crate) overflow: bool,
     pub version: Partial<T>,
     /// Where parsing stopped; shorter than the input when trailing bytes are not part of the version.
-    pub(crate) len: u32,
+    pub len: u32,
 }
 
 impl<T: VersionInt> Default for ParseResult<T> {
