@@ -16,7 +16,7 @@
 
 import { bunEnv, bunExe } from "harness";
 import { unsortedPrereleases } from "./semver-fixture.js";
-const { satisfies, order } = Bun.semver;
+const { satisfies, order, parse } = Bun.semver;
 
 function testSatisfiesExact(left: any, right: any, expected: boolean) {
   expect(satisfies(left, right)).toBe(expected);
@@ -808,6 +808,126 @@ describe("Bun.semver.satisfies()", () => {
 
   test("pre-release snapshot", () => {
     expect(unsortedPrereleases.sort(Bun.semver.order)).toMatchSnapshot();
+  });
+});
+
+describe("Bun.semver.parse()", () => {
+  test("release version", () => {
+    expect(parse("1.2.3")).toEqual({
+      major: 1,
+      minor: 2,
+      patch: 3,
+      prerelease: [],
+      build: [],
+      version: "1.2.3",
+    });
+    expect(parse("0.0.0")).toEqual({ major: 0, minor: 0, patch: 0, prerelease: [], build: [], version: "0.0.0" });
+    expect(parse("2024.12.31")).toEqual({
+      major: 2024,
+      minor: 12,
+      patch: 31,
+      prerelease: [],
+      build: [],
+      version: "2024.12.31",
+    });
+  });
+
+  test("prerelease and build metadata", () => {
+    expect(parse("v1.2.3-beta.1+build.5")).toEqual({
+      major: 1,
+      minor: 2,
+      patch: 3,
+      prerelease: ["beta", 1],
+      build: ["build", "5"],
+      version: "1.2.3-beta.1",
+    });
+    expect(parse("1.0.0-beta+exp.sha.5114f85")).toEqual({
+      major: 1,
+      minor: 0,
+      patch: 0,
+      prerelease: ["beta"],
+      build: ["exp", "sha", "5114f85"],
+      version: "1.0.0-beta",
+    });
+    expect(parse("1.0.0+20130313144700")).toEqual({
+      major: 1,
+      minor: 0,
+      patch: 0,
+      prerelease: [],
+      build: ["20130313144700"],
+      version: "1.0.0",
+    });
+  });
+
+  test("prerelease identifiers", () => {
+    expect(parse("1.0.0-alpha")!.prerelease).toEqual(["alpha"]);
+    expect(parse("1.0.0-alpha.1")!.prerelease).toEqual(["alpha", 1]);
+    expect(parse("1.0.0-0.3.7")!.prerelease).toEqual([0, 3, 7]);
+    expect(parse("1.0.0-x.7.z.92")!.prerelease).toEqual(["x", 7, "z", 92]);
+    expect(parse("1.0.0-alpha-2.b-3")!.prerelease).toEqual(["alpha-2", "b-3"]);
+    expect(parse("1.0.0-rc.9007199254740991")!.prerelease).toEqual(["rc", Number.MAX_SAFE_INTEGER]);
+    // Too big to be an exact number, so it stays a string instead of losing digits.
+    expect(parse("1.0.0-rc.9007199254740992")!.prerelease).toEqual(["rc", "9007199254740992"]);
+    expect(parse("1.0.0-rc.99999999999999999999999")!.prerelease).toEqual(["rc", "99999999999999999999999"]);
+    // Build identifiers are never converted.
+    expect(parse("1.0.0+1.2")!.build).toEqual(["1", "2"]);
+  });
+
+  test("ignores the same prefixes and whitespace as order() and satisfies()", () => {
+    const expected = parse("1.2.3-rc.1");
+    expect(expected).not.toBeNull();
+    for (const input of ["v1.2.3-rc.1", "=1.2.3-rc.1", " 1.2.3-rc.1", "1.2.3-rc.1\n", "\t v1.2.3-rc.1 \r\n"]) {
+      expect(parse(input)).toEqual(expected!);
+    }
+  });
+
+  test("stringifies non-string input", () => {
+    expect(parse(Buffer.from("1.2.3"))).toEqual(parse("1.2.3")!);
+    expect(parse({ toString: () => "4.5.6" })).toEqual(parse("4.5.6")!);
+    expect(() => parse(Symbol.for("1.2.3") as any)).toThrow("Cannot convert a symbol to a string");
+  });
+
+  test("returns null for anything that is not a complete version", () => {
+    const invalid = [
+      "",
+      " ",
+      "v",
+      "1",
+      "1.2",
+      "1.2.",
+      "1.2.3.4",
+      "x",
+      "*",
+      "1.x",
+      "1.2.x",
+      "1.2.*",
+      "^1.2.3",
+      "~1.2.3",
+      ">=1.2.3",
+      "1.2.3 || 2.0.0",
+      "1.2.3 - 2.0.0",
+      "1.2.3 trailing",
+      "-beta",
+      "nope",
+      "1.2.3-\u00df",
+    ];
+    for (const input of invalid) {
+      expect(parse(input)).toBeNull();
+    }
+    expect(parse(undefined)).toBeNull();
+    expect(parse(null)).toBeNull();
+    // @ts-expect-error
+    expect(parse()).toBeNull();
+  });
+
+  test("round-trips through order()", () => {
+    const mismatches = unsortedPrereleases.filter(input => {
+      const parsed = parse(input);
+      if (parsed === null || order(parsed.version, input) !== 0) return true;
+      // `version` drops build metadata, everything else survives the round trip.
+      return !Bun.deepEquals(parse(parsed.version), { ...parsed, build: [] }, true);
+    });
+    expect(mismatches).toEqual([]);
   });
 });
 
