@@ -60,6 +60,7 @@ describe("bun exec", () => {
       ["false",  1, "", ""],
       // ["yes",    1, "", ""],
       ["seq",    1, "seq: invalid argument\n", ""],
+      ["wc",     1, "wc: illegal option -- -\n", ""],
     ] as const;
     for (const [item, exitCode, stderr, stdout] of programs) {
       TestBuilder.command`${BUN} exec ${`${item} --help`}`
