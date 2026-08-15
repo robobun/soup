@@ -14,4 +14,11 @@ export const semver = b.namespace({
     capability: "heap",
     throws: true,
   },
+  parse: {
+    args: { version: b.string.loose.utf8.nullable },
+    returns: b.any,
+    capability: "js",
+    throws: true,
+    length: 1,
+  },
 });
