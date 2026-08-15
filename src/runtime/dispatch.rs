@@ -524,6 +524,7 @@ pub(crate) fn run_task(
         | task_tag::ShellRmTask
         | task_tag::ShellRmDirTask
         | task_tag::ShellGlobTask
+        | task_tag::ShellIOReaderUnpolledRead
         | task_tag::ShellYesTask => run_task_cold(&task),
 
         // ── fetch / S3 ───────────────────────────────────────────────────
@@ -818,6 +819,14 @@ fn run_task_cold(task: &Task) {
             ShellRmDirTask::run_from_main_thread(t);
         }
         task_tag::ShellGlobTask => shell_dispatch!(PoolTask<ShellGlobTask>),
+        task_tag::ShellIOReaderUnpolledRead => {
+            #[cfg(not(windows))]
+            crate::shell::io_reader::IOReader::run_unpolled_read(cast_ptr!(
+                crate::shell::io_reader::UnpolledReadTask
+            ));
+            #[cfg(windows)]
+            unreachable!("posix-only tag");
+        }
         task_tag::ShellYesTask => {
             // SAFETY: §Dispatch — tag identifies pointee; enqueued by `YesTask::enqueue`.
             unsafe { ShellYesTask::run_from_main_thread(cast_ptr!(ShellYesTask)) };
@@ -832,7 +841,7 @@ fn run_task_cold(task: &Task) {
 /// `release_task_unrun` track `bun_event_loop::task_tag::COUNT`. Bump when
 /// adding a variant — and give it an arm in both.
 const _: () = assert!(
-    task_tag::COUNT == 82,
+    task_tag::COUNT == 83,
     "dispatch::run_task / release_task_unrun arm count out of sync with bun_event_loop::task_tag",
 );
 
@@ -1752,6 +1761,12 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
         task_tag::ShellCondExprStatTask => release_in!([Shell], PoolTask<ShellCondExprStatTask>),
         task_tag::ShellCpTask => release_in!([Shell], ShellCpTask),
         task_tag::ShellGlobTask => release_in!([Shell], PoolTask<ShellGlobTask>),
+        task_tag::ShellIOReaderUnpolledRead => {
+            #[cfg(not(windows))]
+            release_in!([Shell], crate::shell::io_reader::UnpolledReadTask);
+            #[cfg(windows)]
+            unreachable!("posix-only tag");
+        }
         task_tag::ShellLsTask => release_in!([Shell], PoolTask<ShellLsTask>),
         task_tag::ShellMkdirTask => release_in!([Shell], PoolTask<ShellMkdirTask>),
         task_tag::ShellMvBatchedTask => release_in!([Shell], PoolTask<ShellMvBatchedTask>),

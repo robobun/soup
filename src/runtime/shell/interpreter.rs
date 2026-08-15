@@ -1921,7 +1921,7 @@ fn open_null_device() -> bun_sys::Result<File> {
 }
 
 /// `false` (synchronous writes) if `fstat` fails, as on Windows.
-fn is_pollable(fd: Fd) -> bool {
+pub(crate) fn is_pollable(fd: Fd) -> bool {
     #[cfg(windows)]
     {
         let _ = fd;

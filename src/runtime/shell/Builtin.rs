@@ -13,8 +13,8 @@ use crate::shell::ExitCode;
 use crate::shell::ast;
 use crate::shell::builtins::batch::Batch;
 use crate::shell::builtins::{
-    basename, cat, cd, cp, dirname, echo, exit, export, ls, mkdir, mv, pwd, rm, seq, touch, which,
-    yes,
+    basename, cat, cd, cp, dirname, echo, exit, export, ls, mkdir, mv, pwd, rm, seq, touch, wc,
+    which, yes,
 };
 use crate::shell::interpreter::{Interpreter, NodeId, is_pollable_from_mode, shell_openat};
 use crate::shell::io::{InKind, OutFd, OutKind};
@@ -49,6 +49,7 @@ pub(crate) enum State {
     Batch(Batch),
     Cat(cat::Cat),
     Mv(mv::Mv),
+    Wc(Box<wc::Wc>),
     Which {
         next: usize,
         missing: bool,
@@ -102,6 +103,7 @@ shell_builtins! {
     Cp       "cp"       cp::start,
     Seq      "seq"      seq::start,
     Yes      "yes"      yes::start,
+    Wc       "wc"       wc::start,
 }
 
 impl Kind {
@@ -733,6 +735,7 @@ impl Builtin {
         match (&me.state, failed) {
             (State::Batch(_), _) => Batch::on_write(interp, cmd),
             (State::Cat(_), _) => cat::Cat::on_write(interp, cmd, failed),
+            (State::Wc(_), _) => wc::Wc::on_write(interp, cmd, failed),
             (State::Exiting(_) | State::Which { .. } | State::Yes(_), Some(code))
             | (&State::Exiting(code), None) => Self::done(interp, cmd, code),
             (&State::Which { next, missing }, None) => which::print(interp, cmd, next, missing),
