@@ -103,3 +103,9 @@ tsd.expectType(Bun.mmap("./data.bin", { size: 1024 })).is<Uint8Array<ArrayBuffer
 declare const webview: Bun.WebView;
 tsd.expectType(webview.goBack()).is<Promise<void>>();
 tsd.expectType(webview.goForward()).is<Promise<void>>();
+
+tsd.expectType(Bun.semver.parse("1.2.3")).is<Bun.semver.Version | null>();
+tsd.expectType(Bun.semver.parse(undefined)).is<Bun.semver.Version | null>();
+tsd.expectType(Bun.semver.parse("1.2.3")!.prerelease).is<(string | number)[]>();
+tsd.expectType(Bun.semver.parse("1.2.3")!.build).is<string[]>();
+tsd.expectType(Bun.semver.parse("1.2.3")!.version).is<string>();
