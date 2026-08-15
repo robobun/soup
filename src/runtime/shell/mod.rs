@@ -105,6 +105,8 @@ pub(crate) mod builtins {
     pub(crate) mod seq;
     #[path = "touch.rs"]
     pub(crate) mod touch;
+    #[path = "wc.rs"]
+    pub(crate) mod wc;
     #[path = "which.rs"]
     pub(crate) mod which;
     #[path = "yes.rs"]
