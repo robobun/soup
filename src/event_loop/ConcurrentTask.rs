@@ -125,6 +125,7 @@ pub mod task_tag {
         ShellCondExprStatTask,
         ShellCpTask,
         ShellGlobTask,
+        ShellIOReaderUnpolledRead,
         ShellLsTask,
         ShellMkdirTask,
         ShellMvBatchedTask,
