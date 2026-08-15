@@ -8,6 +8,8 @@ use core::ffi::c_void;
 
 use bun_sys::{self as sys, Fd};
 
+#[cfg(not(windows))]
+use crate::shell::interpreter::is_pollable;
 use crate::shell::interpreter::{EventLoopHandle, Interpreter, NodeId};
 use crate::shell::yield_::Yield;
 
@@ -28,6 +30,7 @@ pub(crate) struct ChildPtr {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ReaderTag {
     Cat,
+    Wc,
 }
 
 // PERF: an inline small-vec may be worth it — profile if hot.
@@ -55,6 +58,16 @@ struct State {
     /// True after EOF. The Windows reader closes its source and the fd at EOF, so later listeners can't read.
     #[cfg(windows)]
     reached_eof: bool,
+    /// A [`run_unpolled_read`](IOReader::run_unpolled_read) task is queued on
+    /// the event loop; `start()` must not queue a second one.
+    #[cfg(not(windows))]
+    unpolled_read_queued: bool,
+    /// What the last read failed with. The reader does not read an fd again
+    /// after a read of it failed (`PosixFlags::READ_FAILED`), so
+    /// [`run_unpolled_read`](IOReader::run_unpolled_read) tells a listener
+    /// that starts later of the same failure.
+    #[cfg(not(windows))]
+    read_error: Option<sys::Error>,
     /// Weak self-ref so `keepalive()` can bump the strong count from `&self`
     /// without unsafe Arc-pointer reconstruction. Set via `Arc::new_cyclic` in
     /// `init()` (the sole constructor).
@@ -150,6 +163,10 @@ impl IOReader {
                 is_reading: false,
                 #[cfg(windows)]
                 reached_eof: false,
+                #[cfg(not(windows))]
+                unpolled_read_queued: false,
+                #[cfg(not(windows))]
+                read_error: None,
                 self_weak: std::sync::Weak::clone(w),
                 read_guards: Vec::new(),
                 interp: None,
@@ -237,12 +254,26 @@ impl IOReader {
     fn start_impl(&self) -> sys::Result<()> {
         let r = self.reader();
         r.unpause();
+        let fd = self.state().fd;
+        if !is_pollable(fd) {
+            // epoll/kqueue refuse regular files (and bun treats /dev/null
+            // and other character devices the same way), so the fd is
+            // handed over unpolled and read on the next event-loop turn.
+            // The chunks and completion then reach the builtin through the
+            // same callbacks, from the same stack depth, as a polled read.
+            // `ReaderImpl::start` is only run once per reader: rerunning it
+            // with a handle already holding the fd would close the fd.
+            if matches!(r.handle, bun_io::pipes::PollOrFd::Closed) {
+                r.start(fd, false)?;
+            }
+            self.queue_unpolled_read();
+            return Ok(());
+        }
         // After a read finishes, the one-shot poll has fired but is still registered,
         // so checking `is_registered()` would skip the read a later listener needs.
         if r.has_pending_read() {
             return Ok(());
         }
-        let fd = self.state().fd;
         r.start(fd, true)
     }
 
@@ -268,6 +299,60 @@ impl IOReader {
     fn nobody_ready(&self) -> bool {
         let s = self.state();
         !s.readers.is_empty() && s.readers.iter().all(|r| awaits_write(*r, s.interp))
+    }
+
+    /// Queue [`run_unpolled_read`](Self::run_unpolled_read). The task owns an
+    /// `Arc` so the reader outlives the hop even if every listener drops it
+    /// in the meantime.
+    #[cfg(not(windows))]
+    fn queue_unpolled_read(&self) {
+        let evtloop = {
+            let s = self.state();
+            if s.unpolled_read_queued {
+                return;
+            }
+            s.unpolled_read_queued = true;
+            s.evtloop
+        };
+        let task: *mut UnpolledReadTask =
+            bun_core::heap::into_raw(Box::new(UnpolledReadTask(self.keepalive())));
+        match evtloop {
+            EventLoopHandle::Js { owner } => owner.enqueue_task(bun_jsc::Task::init(task)),
+            EventLoopHandle::Mini(mut mini) => {
+                let any = bun_jsc::AnyTaskWithExtraContext::AnyTaskWithExtraContext::from_callback_auto_deinit(
+                    task,
+                    Self::unpolled_read_task_mini,
+                );
+                // SAFETY: the shell's own mini loop, on its thread (see
+                // `Async::enqueue_self`).
+                unsafe { mini.get_mut() }
+                    .enqueue_task_concurrent(core::ptr::NonNull::new(any).expect("heap task"));
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn unpolled_read_task_mini(task: *mut UnpolledReadTask, _: *mut c_void) {
+        Self::run_unpolled_read(task);
+    }
+
+    /// Reads a non-pollable fd (regular file, `/dev/null`, ...) to EOF in one
+    /// go. `ReaderImpl::read` delivers every chunk and then EOF or the error
+    /// through the same `BufferedReaderParent` hooks the polled path uses.
+    #[cfg(not(windows))]
+    pub(crate) fn run_unpolled_read(task: *mut UnpolledReadTask) {
+        // SAFETY: `task` is the box `queue_unpolled_read` allocated for this
+        // one run of the task.
+        let this = unsafe { bun_core::heap::take(task) }.0;
+        this.state().unpolled_read_queued = false;
+        if let Some(err) = this.state().read_error.clone() {
+            this.on_reader_error(&err);
+            return;
+        }
+        // SAFETY: this is a fresh event-loop turn, so no `&mut ReaderImpl`
+        // from a read loop is live (the aliasing contract on `reader()`), and
+        // `this` keeps the reader alive across the hooks `read` dispatches.
+        unsafe { ReaderImpl::read(this.reader.get()) };
     }
 
     /// Only adds if not already present.
@@ -332,6 +417,10 @@ impl IOReader {
         // alive across the loop.
         let _keepalive = self.keepalive();
         self.set_reading(false);
+        #[cfg(not(windows))]
+        {
+            self.state().read_error = Some(err.clone());
+        }
         if self.state().starting {
             self.state().start_err = Some(err.clone());
             return;
@@ -397,6 +486,23 @@ impl IOReader {
         // `ParentRef: Deref<Target=Interpreter>` — the interpreter owns the IO
         // struct holding this Arc and outlives every IOReader. Single-threaded.
         y.run(&interp);
+    }
+}
+
+/// The hop [`IOReader::queue_unpolled_read`] queues: the keep-alive `Arc`, boxed.
+#[cfg(not(windows))]
+pub(crate) struct UnpolledReadTask(std::sync::Arc<IOReader>);
+
+#[cfg(not(windows))]
+impl bun_event_loop::Taskable for UnpolledReadTask {
+    const TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::ShellIOReaderUnpolledRead;
+    unsafe fn release_unrun(this: *mut Self) {
+        // SAFETY: fn contract — boxed in `queue_unpolled_read`.
+        drop(unsafe { bun_core::heap::take(this) });
+    }
+    /// See [`ShellTaskCtx`](crate::shell::interpreter::ShellTaskCtx): a step of a shell script always runs.
+    unsafe fn context(_: *const Self) -> bun_event_loop::ContextId {
+        bun_event_loop::ContextId::NONE
     }
 }
 
@@ -475,6 +581,9 @@ fn dispatch_read_chunk(
         ReaderTag::Cat => {
             crate::shell::builtins::cat::Cat::on_io_reader_chunk(interp, child.node, chunk, remove)
         }
+        ReaderTag::Wc => {
+            crate::shell::builtins::wc::Wc::on_io_reader_chunk(interp, child.node, chunk, remove)
+        }
     }
 }
 
@@ -484,6 +593,7 @@ fn awaits_write(child: ChildPtr, interp: Option<bun_ptr::ParentRef<Interpreter>>
     };
     match child.tag {
         ReaderTag::Cat => crate::shell::builtins::cat::Cat::awaits_write(interp.get(), child.node),
+        ReaderTag::Wc => false,
     }
 }
 
@@ -500,5 +610,6 @@ fn dispatch_reader_done(
         ReaderTag::Cat => {
             crate::shell::builtins::cat::Cat::on_io_reader_done(interp, child.node, err)
         }
+        ReaderTag::Wc => crate::shell::builtins::wc::Wc::on_io_reader_done(interp, child.node, err),
     }
 }
