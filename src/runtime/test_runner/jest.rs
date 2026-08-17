@@ -118,6 +118,8 @@ pub(crate) struct TestRunner {
     pub(crate) coverage_skips_test_files: bool,
     /// Also true in a `--parallel` worker, whose records the coordinator replays into its own `JunitReporter`.
     pub(crate) reports_to_junit: bool,
+    /// `--dry-run`: the tests that would run are reported, and no test or hook runs.
+    pub(crate) dry_run: bool,
 
     pub(crate) snapshots: RefCell<Snapshots>,
 
@@ -236,12 +238,14 @@ pub(crate) struct Summary {
     pub(crate) skipped_because_label: u32,
     /// Files reordered by `describe.shuffle`. The seed is printed if there are any.
     pub(crate) shuffled: u32,
+    /// Tests reported without being run. Only `--dry-run` produces these.
+    pub(crate) pending: u32,
 }
 
 impl Summary {
     pub(crate) fn did_label_filter_out_all_tests(&self) -> bool {
         self.skipped_because_label > 0
-            && (self.pass + self.skip + self.todo + self.fail + self.expectations) == 0
+            && (self.pass + self.pending + self.skip + self.todo + self.fail + self.expectations) == 0
     }
 }
 

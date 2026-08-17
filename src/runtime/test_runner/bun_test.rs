@@ -1147,10 +1147,17 @@ impl BunTest {
     fn advance_inner(&self) -> JsResult<Advance> {
         match self.phase.get() {
             Phase::Collection => {
-                self.phase.set(Phase::Execution);
                 debug::dump_describe(self, self.scope(ScopeId::ROOT))?;
 
                 let jest = &self.reporter.jest;
+
+                if jest.dry_run {
+                    self.report_dry_run();
+                    self.phase.set(Phase::Done);
+                    return Ok(Advance::Exit);
+                }
+                self.phase.set(Phase::Execution);
+
                 // Derive a per-file shuffle seed from (seed, file_path) so a
                 // file's test order depends only on the path and the printed
                 // seed — not on which worker ran it or what files preceded it
@@ -1208,6 +1215,41 @@ impl BunTest {
                 Ok(Advance::Exit)
             }
             Phase::Done => Ok(Advance::Exit),
+        }
+    }
+
+    /// `--dry-run`: report the tests the execution phase would have scheduled
+    /// instead of building the order, so no test or hook callback runs. A test
+    /// that would run is reported as `Pending`; the rest get the result
+    /// execution would have given them without running anything.
+    fn report_dry_run(&self) {
+        let _g = group_begin!();
+        let mut tests: Vec<EntryId> = Vec::new();
+        collect_dry_run_tests(self, ScopeId::ROOT, &mut tests);
+
+        for test in tests {
+            let entry = self.entry(test);
+            let sequence_entry = self.push_sequence_entry(test);
+            let sequence = Execution::ExecutionSequence::init(
+                Some(sequence_entry),
+                Some(sequence_entry),
+                entry.retry_count,
+                entry.repeat_count,
+            );
+            sequence.result.set(if entry.callback.is_some() {
+                Execution::Result::Pending
+            } else {
+                // Mirrors the callback-less branch of `Execution::run_one`.
+                match entry.base.mode {
+                    ScopeMode::Skip => Execution::Result::Skip,
+                    ScopeMode::Todo => Execution::Result::Todo,
+                    ScopeMode::FilteredOut => Execution::Result::SkippedBecauseLabel,
+                    ScopeMode::Normal | ScopeMode::Failing | ScopeMode::Fails => {
+                        Execution::Result::Pending
+                    }
+                }
+            });
+            CommandLineReporter::handle_test_completed(self, &sequence, entry, 0);
         }
     }
 
@@ -1717,6 +1759,32 @@ impl Default for StepResult {
 enum Advance {
     Cont,
     Exit,
+}
+
+/// The tests `Order::generate_order_describe` would schedule, in declaration order:
+/// a failed describe contributes nothing, and inside a scope that contains `.only`
+/// entries only those are scheduled.
+fn collect_dry_run_tests(buntest: &BunTest, scope: ScopeId, out: &mut Vec<EntryId>) {
+    let scope = buntest.scope(scope);
+    if scope.failed.get() {
+        return;
+    }
+    let scope_only = scope.base.only.get();
+    scope.entries.with_taken(|entries| {
+        for &entry in entries.iter() {
+            let base = match entry {
+                TestScheduleEntry::Describe(describe) => &buntest.scope(describe).base,
+                TestScheduleEntry::TestCallback(test) => &buntest.entry(test).base,
+            };
+            if scope_only == Only::Contains && base.only.get() == Only::No {
+                continue;
+            }
+            match entry {
+                TestScheduleEntry::Describe(describe) => collect_dry_run_tests(buntest, describe, out),
+                TestScheduleEntry::TestCallback(test) => out.push(test),
+            }
+        }
+    });
 }
 
 pub(crate) use super::collection::Collection;

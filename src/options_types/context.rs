@@ -517,6 +517,9 @@ pub struct TestOptions {
     pub globals: Option<TestGlobals>,
     /// `--react-compiler` or `[test] reactCompiler`.
     pub react_compiler: Option<ReactCompilerScope>,
+    /// `bun test --dry-run`: load the test files and report every test that
+    /// would run, without running any test or hook.
+    pub dry_run: bool,
 
     pub reporters: Reporters,
     pub reporter_outfile: Option<Box<[u8]>>,
@@ -660,6 +663,7 @@ impl Default for TestOptions {
             environment: None,
             globals: None,
             react_compiler: None,
+            dry_run: false,
             reporters: Reporters::default(),
             reporter_outfile: None,
         }
