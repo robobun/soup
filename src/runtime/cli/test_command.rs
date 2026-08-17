@@ -1645,6 +1645,19 @@ impl JunitReporter {
                 self.contents.extend_from_slice(indent);
                 self.contents.extend_from_slice(b"</testcase>\n");
             }
+            // Only reported by --dry-run: the test would have run.
+            R::Pending => {
+                if !self.suite_stack.is_empty() {
+                    let last = self.suite_stack.len() - 1;
+                    self.suite_stack[last].metrics.skipped += 1;
+                }
+                self.contents.extend_from_slice(b">\n");
+                self.contents.extend_from_slice(indent);
+                self.contents
+                    .extend_from_slice(b"  <skipped message=\"dry run\" />\n");
+                self.contents.extend_from_slice(indent);
+                self.contents.extend_from_slice(b"</testcase>\n");
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -2254,7 +2267,7 @@ impl CommandLineReporter {
 
         use bun_test::Execution::Result as R;
         match sequence.result {
-            R::Pending => {}
+            R::Pending => this.summary().pending += 1,
             R::Pass => this.summary().pass += 1,
             R::Skip => this.summary().skip += 1,
             R::Todo => this.summary().todo += 1,
@@ -2284,12 +2297,19 @@ impl CommandLineReporter {
     }
 
     pub(crate) fn print_summary(&mut self) {
+        let verb = if self.jest.test_options.dry_run {
+            "Found"
+        } else {
+            "Ran"
+        };
         let summary_ = self.summary();
-        let tests = summary_.fail + summary_.pass + summary_.skip + summary_.todo;
+        let tests =
+            summary_.fail + summary_.pass + summary_.pending + summary_.skip + summary_.todo;
         let files = summary_.files;
 
         pretty_error!(
-            "Ran {} test{} across {} file{}. ",
+            "{} {} test{} across {} file{}. ",
+            verb,
             tests,
             if tests == 1 { "" } else { "s" },
             files,
@@ -2694,6 +2714,17 @@ impl TestCommand {
             core::sync::atomic::Ordering::Relaxed,
         );
 
+        let dry_run = ctx.test_options.dry_run;
+        if dry_run {
+            // Nothing executes: a coverage report would be empty, recorded
+            // timings would be wrong, and loading the files once in this
+            // process is all a listing needs.
+            ctx.test_options.coverage.enabled = false;
+            ctx.test_options.update_timings = false;
+            ctx.test_options.repeat_count = 0;
+            ctx.test_options.parallel = 0;
+        }
+
         if !ctx.test_options.test_worker && !run_compiled::is_second_process() {
             // print the version so you know its doing stuff if it takes a sec
             let w = Output::writer();
@@ -2721,6 +2752,13 @@ impl TestCommand {
                 } else {
                     let _ = write!(w, " {}x PARALLEL", ctx.test_options.parallel);
                 }
+            }
+            if dry_run {
+                let _ = w.write_all(if colors {
+                    b" \x1b[1;2mDRY RUN\x1b[0m" as &[u8]
+                } else {
+                    b" DRY RUN"
+                });
             }
             let _ = w.write_all(b"\n");
             Output::flush();
@@ -3513,11 +3551,15 @@ impl TestCommand {
                     pretty_error!("{}<r>--seed={}<r>\n", &indenter, seed);
                 }
 
-                if summary.pass > 0 {
-                    pretty_error!("<r><green>");
-                }
+                if dry_run {
+                    pretty_error!("{}<r>{:5>} pending<r>\n", &indenter, summary.pending);
+                } else {
+                    if summary.pass > 0 {
+                        pretty_error!("<r><green>");
+                    }
 
-                pretty_error!("{}{:5>} pass<r>\n", &indenter, summary.pass);
+                    pretty_error!("{}{:5>} pass<r>\n", &indenter, summary.pass);
+                }
 
                 if summary.skip > 0 {
                     pretty_error!("{}<r><yellow>{:5>} skip<r>\n", &indenter, summary.skip);
@@ -3534,12 +3576,10 @@ impl TestCommand {
                 }
 
                 if summary.fail > 0 {
-                    pretty_error!("<r><red>");
-                } else {
-                    pretty_error!("<r><d>");
+                    pretty_error!("<r><red>{}{:5>} fail<r>\n", &indenter, summary.fail);
+                } else if !dry_run {
+                    pretty_error!("<r><d>{}{:5>} fail<r>\n", &indenter, summary.fail);
                 }
-
-                pretty_error!("{}{:5>} fail<r>\n", &indenter, summary.fail);
                 if reporter.jest.unhandled_errors_between_tests > 0 {
                     pretty_error!(
                         "{}<r><red>{:5>} error{}<r>\n",
