@@ -1012,15 +1012,24 @@ impl BunTest {
 
         match self.phase {
             Phase::Collection => {
-                self.phase = Phase::Execution;
                 debug::dump_describe(&self.collection.root_scope)?;
 
-                let has_filter = if let Some(reporter) = self.reporter {
+                let (has_filter, dry_run) = if let Some(reporter) = self.reporter {
                     // SAFETY: reporter outlives every BunTest (see field doc).
-                    unsafe { reporter.as_ref() }.jest.filter_regex.is_some()
+                    let jest = &unsafe { reporter.as_ref() }.jest;
+                    (jest.filter_regex.is_some(), jest.test_options.dry_run)
                 } else {
-                    false
+                    (false, false)
                 };
+
+                if dry_run {
+                    self.report_dry_run();
+                    self.in_run_loop = false;
+                    self.phase = Phase::Done;
+                    return Ok(Advance::Exit);
+                }
+                self.phase = Phase::Execution;
+
                 // Derive a per-file shuffle PRNG from (seed, file_path) so a
                 // file's test order depends only on the path and the printed
                 // seed — not on which worker ran it or what files preceded it
@@ -1096,6 +1105,44 @@ impl BunTest {
                 Ok(Advance::Exit)
             }
             Phase::Done => Ok(Advance::Exit),
+        }
+    }
+
+    /// `--dry-run`: report the tests the execution phase would have scheduled
+    /// instead of building the order, so no test or hook callback runs. A test
+    /// that would run is reported as `Pending`; the rest get the result
+    /// execution would have given them without running anything.
+    fn report_dry_run(&mut self) {
+        let _g = group_begin!();
+        let mut tests: Vec<NonNull<ExecutionEntry>> = Vec::new();
+        collect_dry_run_tests(&mut self.collection.root_scope, &mut tests);
+
+        let this: *mut BunTest = self;
+        for test in tests {
+            // SAFETY: each entry is Box-owned by `collection.root_scope`, which lives as
+            // long as this `BunTest`; `handle_test_completed` reads `reporter`, `file_id`
+            // and `bun_test_root` and never touches `collection`, so the two `&mut`s are
+            // disjoint (same shape as `Execution::on_sequence_completed`).
+            let entry = unsafe { &mut *test.as_ptr() };
+            let mut sequence = Execution::ExecutionSequence::init(
+                Some(test),
+                Some(test),
+                entry.retry_count,
+                entry.repeat_count,
+            );
+            sequence.result = if entry.callback.is_some() {
+                Execution::Result::Pending
+            } else {
+                // Mirrors the callback-less branch of `Execution::run_one`.
+                match entry.base.mode {
+                    ScopeMode::Skip => Execution::Result::Skip,
+                    ScopeMode::Todo => Execution::Result::Todo,
+                    ScopeMode::FilteredOut => Execution::Result::SkippedBecauseLabel,
+                    ScopeMode::Normal | ScopeMode::Failing => Execution::Result::Pending,
+                }
+            };
+            // SAFETY: see above.
+            CommandLineReporter::handle_test_completed(unsafe { &mut *this }, &mut sequence, entry, 0);
         }
     }
 
@@ -1578,6 +1625,25 @@ impl Default for StepResult {
 enum Advance {
     Cont,
     Exit,
+}
+
+/// The tests `Order::generate_order_describe` would schedule, in declaration order:
+/// a failed describe contributes nothing, and inside a scope that contains `.only`
+/// entries only those are scheduled.
+fn collect_dry_run_tests(scope: &mut DescribeScope, out: &mut Vec<NonNull<ExecutionEntry>>) {
+    if scope.failed {
+        return;
+    }
+    let scope_only = scope.base.only;
+    for entry in scope.entries.iter_mut() {
+        if scope_only == Only::Contains && entry.base().only == Only::No {
+            continue;
+        }
+        match entry {
+            TestScheduleEntry::Describe(describe) => collect_dry_run_tests(describe, out),
+            TestScheduleEntry::TestCallback(test) => out.push(NonNull::from(&mut **test)),
+        }
+    }
 }
 
 pub use super::collection::Collection;
