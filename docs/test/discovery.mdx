@@ -82,6 +82,36 @@ By default, Bun looks for test files starting from the current working directory
 root = "src"  # Only scan for tests in the src directory
 ```
 
+## Listing tests without running them
+
+To see what a given `bun test` command line would run, add `--dry-run`. Every other flag keeps its meaning, so this is the quickest way to check a `-t` pattern, a `--changed` or `--shard` selection, or which tests a stray `.only` leaves behind:
+
+```sh terminal icon="terminal"
+bun test --dry-run -t "math"
+bun test --dry-run --shard=2/4
+```
+
+```txt
+bun test v1.4.0 DRY RUN
+
+math.test.ts:
+… math > adds
+» math > subtracts
+✎ math > multiplies
+… math > divides
+
+ 2 pending
+ 1 skip
+ 1 todo
+Found 4 tests across 1 file. [12.00ms]
+```
+
+Tests that would run are listed as `pending` (`…`, or `(pending)` when colors are off). Skipped and todo tests keep their usual markers, and tests excluded by `-t` or by `.only` are left out, exactly as in a real run.
+
+The test files are still loaded, so their imports and `describe()` bodies execute. That is what makes the list exact: it includes `test.each()` entries and tests registered conditionally. Test callbacks and `beforeAll`/`beforeEach`/`afterEach`/`afterAll` hooks, including those from `--preload` scripts, do not run. The exit code is `0` unless something a real run would also fail on happens: no test files are found, a file fails to load, or the `-t` pattern matches nothing.
+
+`--dry-run` works with `--reporter=junit` too: each test that would run is written as a `<skipped message="dry run" />` test case, which gives you the full inventory of a test suite as a file. Coverage, `--rerun-each`, `--update-timings` and `--parallel` are ignored, since nothing executes.
+
 ## Execution Order
 
 Tests run in the following order:
