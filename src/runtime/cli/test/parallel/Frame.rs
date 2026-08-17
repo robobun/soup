@@ -56,6 +56,8 @@ pub(crate) fn counters(summary: &mut Summary) -> [&mut u32; 8] {
         skipped_because_label: skipped,
         files,
         shuffled,
+        // Only a `--dry-run` counts these, and it has no workers.
+        pending: _,
     } = summary;
     [
         pass,
