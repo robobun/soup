@@ -462,6 +462,9 @@ pub struct TestOptions {
     pub timings_files: Vec<Box<[u8]>>,
     /// `bun test --update-timings`: merge this run's measured per-file durations into `timings_file`.
     pub update_timings: bool,
+    /// `bun test --dry-run`: load the test files and report every test that
+    /// would run, without running any test or hook.
+    pub dry_run: bool,
 
     pub reporters: Reporters,
     pub reporter_outfile: Option<Box<[u8]>>,
@@ -528,6 +531,7 @@ impl Default for TestOptions {
             shard: None,
             timings_files: Vec::new(),
             update_timings: false,
+            dry_run: false,
             reporters: Reporters::default(),
             reporter_outfile: None,
         }
