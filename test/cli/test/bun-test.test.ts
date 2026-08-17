@@ -1,6 +1,15 @@
 import { spawnSync } from "bun";
 import { beforeAll, describe, expect, it, test } from "bun:test";
-import { bunEnv, bunExe, isLinux, isWindows, tempDir, tempDirWithFiles, tmpdirSync } from "harness";
+import {
+  bunEnv,
+  bunExe,
+  isLinux,
+  isWindows,
+  normalizeBunSnapshot,
+  tempDir,
+  tempDirWithFiles,
+  tmpdirSync,
+} from "harness";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 
@@ -293,6 +302,181 @@ describe("bun test", () => {
       expect(stderr).toContain("reachable");
       expect(stderr).not.toContain("unreachable");
       expect(stderr.match(/reachable/g)).toHaveLength(3);
+    });
+  });
+  describe.concurrent("--dry-run", () => {
+    // Every callback logs "RAN ..." to stdout, so stdout doubles as proof that nothing executed.
+    const files = {
+      "a.test.ts": `
+        import { test, describe, beforeAll, beforeEach, afterEach, afterAll } from "bun:test";
+        beforeAll(() => console.log("RAN beforeAll"));
+        beforeEach(() => console.log("RAN beforeEach"));
+        afterEach(() => console.log("RAN afterEach"));
+        afterAll(() => console.log("RAN afterAll"));
+        describe("math", () => {
+          test("adds", () => console.log("RAN adds"));
+          test.skip("subtracts", () => console.log("RAN subtracts"));
+          test.todo("multiplies");
+          test.todo("divides", () => console.log("RAN divides"));
+          test.failing("throws", () => console.log("RAN throws"));
+          test.each([1, 2])("squares %i", () => console.log("RAN squares"));
+        });
+        test("top level", () => console.log("RAN top level"));
+      `,
+      "b.test.ts": `
+        import { test, describe } from "bun:test";
+        describe.skip("disabled", () => {
+          test("inside", () => console.log("RAN inside"));
+        });
+        test("b works", () => console.log("RAN b works"));
+      `,
+      "only.test.ts": `
+        import { test, describe } from "bun:test";
+        test("a", () => console.log("RAN a"));
+        test.only("b", () => console.log("RAN b"));
+        describe("d", () => {
+          test("c", () => console.log("RAN c"));
+          test.only("e", () => console.log("RAN e"));
+        });
+      `,
+      "broken.test.ts": `
+        import { test } from "bun:test";
+        test("never listed", () => console.log("RAN never listed"));
+        throw new Error("boom at load time");
+      `,
+      "preload.ts": `
+        import { beforeAll, afterAll } from "bun:test";
+        beforeAll(() => console.log("RAN preload beforeAll"));
+        afterAll(() => console.log("RAN preload afterAll"));
+      `,
+    };
+
+    async function dryRun(args: string[], env: Record<string, string> = {}) {
+      using dir = tempDir("bun-test-dry-run", files);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "--dry-run", ...args],
+        env: { ...bunEnv, ...env },
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return {
+        stdout: normalizeBunSnapshot(stdout, String(dir)),
+        stderr: normalizeBunSnapshot(stderr, String(dir)),
+        exitCode,
+      };
+    }
+
+    test("lists every test with the result it would get, without running tests or hooks", async () => {
+      const { stdout, stderr, exitCode } = await dryRun(["--preload", "./preload.ts", "./a.test.ts", "./b.test.ts"]);
+      expect(stdout).toBe("bun test <version> (<revision>) DRY RUN");
+      expect(stderr).toMatchInlineSnapshot(`
+        "a.test.ts:
+        (pending) math > adds
+        (skip) math > subtracts
+        (todo) math > multiplies
+        (todo) math > divides
+        (pending) math > throws
+        (pending) math > squares 1
+        (pending) math > squares 2
+        (pending) top level
+
+        b.test.ts:
+        (skip) disabled > inside
+        (pending) b works
+
+         6 pending
+         2 skip
+         2 todo
+        Found 10 tests across 2 files."
+      `);
+      expect(exitCode).toBe(0);
+    });
+
+    test("--todo makes todo tests with a callback pending", async () => {
+      const { stdout, stderr, exitCode } = await dryRun(["--todo", "./a.test.ts"]);
+      expect(stdout).not.toContain("RAN");
+      expect(stderr).toContain("(pending) math > divides");
+      expect(stderr).toContain("(todo) math > multiplies");
+      expect(stderr).toContain(" 6 pending");
+      expect(stderr).toContain(" 1 todo");
+      expect(exitCode).toBe(0);
+    });
+
+    test("applies -t like a real run", async () => {
+      const { stdout, stderr, exitCode } = await dryRun(["-t", "adds", "./a.test.ts", "./b.test.ts"]);
+      expect(stdout).not.toContain("RAN");
+      expect(stderr).toMatchInlineSnapshot(`
+        "a.test.ts:
+        (pending) math > adds
+
+        b.test.ts:
+        (skip) disabled > inside
+
+         1 pending
+         1 skip
+        Found 2 tests across 2 files."
+      `);
+      expect(exitCode).toBe(0);
+    });
+
+    test("still fails when -t matches nothing", async () => {
+      const { stdout, stderr, exitCode } = await dryRun(["-t", "no such test", "./a.test.ts"]);
+      expect(stdout).toBe("bun test <version> (<revision>) DRY RUN");
+      expect(stderr).toContain('regex "no such test" matched 0 tests');
+      expect(exitCode).toBe(1);
+    });
+
+    test("honors .only", async () => {
+      const { stdout, stderr, exitCode } = await dryRun(["./only.test.ts"], { CI: "false" });
+      expect(stdout).not.toContain("RAN");
+      expect(stderr).toMatchInlineSnapshot(`
+        "only.test.ts:
+        (pending) b
+        (pending) d > e
+
+         2 pending
+        Found 2 tests across 1 file."
+      `);
+      expect(exitCode).toBe(0);
+    });
+
+    test("a file that fails to load is reported and fails the run", async () => {
+      const { stderr, exitCode } = await dryRun(["./broken.test.ts", "./b.test.ts"]);
+      expect(stderr).toContain("boom at load time");
+      expect(stderr).not.toContain("(pending) never listed");
+      expect(stderr).toContain("(pending) b works");
+      expect(stderr).toContain(" 1 fail");
+      expect(exitCode).toBe(1);
+    });
+
+    test("lists each file once, in this process, even with --rerun-each and --parallel", async () => {
+      const { stdout, stderr, exitCode } = await dryRun(["--rerun-each=3", "--parallel=2", "./b.test.ts"]);
+      expect(stdout).toBe("bun test <version> (<revision>) DRY RUN");
+      expect(stderr.match(/b\.test\.ts:/g)).toHaveLength(1);
+      expect(stderr).toContain("Found 2 tests across 1 file.");
+      expect(exitCode).toBe(0);
+    });
+
+    test("writes pending tests to the junit report as skipped", async () => {
+      using dir = tempDir("bun-test-dry-run-junit", files);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "--dry-run", "--reporter=junit", "--reporter-outfile=report.xml", "./b.test.ts"],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+      expect(stderr).toContain("Found 2 tests across 1 file.");
+      expect(exitCode).toBe(0);
+      const report = await Bun.file(join(String(dir), "report.xml")).text();
+      expect(report).toContain(
+        '<testsuite name="b.test.ts" file="b.test.ts" tests="2" assertions="0" failures="0" skipped="2"',
+      );
+      expect(report).toMatch(/<testcase name="b works"[^>]*>\s*<skipped message="dry run" \/>/);
+      expect(report).toMatch(/<testcase name="inside"[^>]*>\s*<skipped \/>/);
     });
   });
   describe("--bail", () => {

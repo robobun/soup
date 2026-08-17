@@ -634,6 +634,9 @@ pub(crate) const TEST_ONLY_PARAMS: &[ParamType] = &[
         "--shard <STR>                    Run a subset of test files, e.g. '--shard=1/3' runs the first of three shards. Useful for splitting tests across multiple CI jobs."
     ),
     parse_param!(
+        "--dry-run                        Load the test files and list the tests that would run, without running any test or hook."
+    ),
+    parse_param!(
         "--timings <STR>...               JSON file(s) of per-file durations (ms); several are merged, e.g. one per CI shard. Balances --shard by total time and makes --parallel start the slowest files first."
     ),
     parse_param!(
@@ -1955,6 +1958,7 @@ fn parse_test_command_options(args: &clap::Args<clap::Help>, ctx: Context<'_>) {
         );
         Global::exit(1);
     }
+    ctx.test_options.dry_run = args.flag(b"--dry-run");
     ctx.test_options.update_snapshots = args.flag(b"--update-snapshots");
     ctx.test_options.run_todo = args.flag(b"--todo");
     ctx.test_options.only = args.flag(b"--only");

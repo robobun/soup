@@ -267,12 +267,14 @@ pub struct Summary {
     pub(crate) fail: u32,
     pub(crate) files: u32,
     pub(crate) skipped_because_label: u32,
+    /// Tests reported without being run. Only `--dry-run` produces these.
+    pub(crate) pending: u32,
 }
 
 impl Summary {
     pub(crate) fn did_label_filter_out_all_tests(&self) -> bool {
         self.skipped_because_label > 0
-            && (self.pass + self.skip + self.todo + self.fail + self.expectations) == 0
+            && (self.pass + self.pending + self.skip + self.todo + self.fail + self.expectations) == 0
     }
 }
 
