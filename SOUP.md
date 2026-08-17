@@ -75,6 +75,48 @@ Files: `src/runtime/shell/builtin/wc.rs`, `src/runtime/shell/Builtin.rs`, `src/r
 `src/runtime/shell/IOReader.rs`, `src/runtime/shell/interpreter.rs` (exposes `is_pollable`),
 `docs/runtime/shell.mdx`, `test/js/bun/shell/commands/wc.test.ts`, `test/js/bun/shell/exec.test.ts`.
 
+### 2026-08-17: `bun test --dry-run`
+
+There was no way to ask `bun test` what it was about to run. Checking a `-t` pattern, a
+`--changed` or `--shard` selection, or what a leftover `.only` still covers meant running the suite
+and reading the results. `--dry-run` loads the test files exactly like a real run and prints every
+test with the result it would get without executing anything: tests that would run are `pending`
+(`…`, or `(pending)` without colors), skip/todo tests keep their markers, and tests dropped by `-t`
+or `.only` are left out, as usual. No test callback or hook runs, including hooks from `--preload`
+scripts. The summary says `Found N tests across M files`; the exit code is 0 unless no files are
+found, a file fails to load or the `-t` pattern matches nothing, which a real run would fail on as
+well.
+
+```sh
+bun test --dry-run -t "math"
+# math.test.ts:
+# (pending) math > adds
+# (skip) math > subtracts
+# (todo) math > multiplies
+#
+#  1 pending
+#  1 skip
+#  1 todo
+# Found 3 tests across 1 file. [12.00ms]
+```
+
+The runner already had a `Pending` result that the reporter knew how to print but that never
+reached it, because every sequence gets a real result before it is reported. The dry run hooks in
+at the collection-to-execution hand-off: instead of building the execution order it walks the
+collected describe tree with the same pruning rules and hands each test to the reporter with
+`Pending`, or with the skip/todo/filtered-out result that execution would have assigned to it
+without running it. Because it goes through the normal reporter, `--dots`, `--only-failures`,
+`--reporter=junit` (pending tests become `<skipped message="dry run" />`, so a dry run doubles as
+a test inventory export) and the `-t ... matched 0 tests` error all work unchanged. Coverage,
+`--rerun-each`, `--update-timings` and `--parallel` are switched off under `--dry-run`, since
+nothing executes; the header reads `bun test vX.Y.Z DRY RUN` so the output cannot be mistaken for
+a passing run.
+
+Files: `src/runtime/test_runner/bun_test.rs` (dry-run walk), `src/runtime/test_runner/jest.rs`
+(`Summary.pending`), `src/runtime/cli/test_command.rs` (summary, header, junit, flag interactions),
+`src/runtime/cli/Arguments.rs`, `src/options_types/context.rs`, `completions/bun.zsh`,
+`docs/test/discovery.mdx`, `docs/snippets/cli/test.mdx`, `test/cli/test/bun-test.test.ts`.
+
 ## Dropped
 
 Nothing yet.
