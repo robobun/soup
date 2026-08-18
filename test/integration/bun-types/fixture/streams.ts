@@ -85,3 +85,12 @@ expectType(new Blob([]).bytes()).is<Promise<Uint8Array<ArrayBuffer>>>();
 expectType(new Blob([]).json()).is<Promise<any>>();
 expectType(new Blob([]).formData()).is<Promise<FormData>>();
 expectType(new Blob([]).stream()).is<ReadableStream<Uint8Array<ArrayBuffer>>>();
+expectType(new Blob([]).lines()).is<AsyncIterableIterator<string>>();
+expectType(Bun.file("./foo.csv").lines()).is<AsyncIterableIterator<string>>();
+expectType(Bun.stdin.lines()).is<AsyncIterableIterator<string>>();
+expectType(node_stream.lines()).is<AsyncIterableIterator<string>>();
+expectType(stream.lines()).is<AsyncIterableIterator<string>>();
+
+for await (const line of Bun.file("./foo.csv").lines()) {
+  expectType(line).is<string>();
+}
