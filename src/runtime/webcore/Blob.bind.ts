@@ -26,6 +26,8 @@ export const Blob = b.class({
     image: { ...method, args: { options: b.any }, passThis: true, length: 0 },
     json: method,
     lastModified: { getter: b.f64 },
+    /** `this.stream().lines()`, in `src/js/builtins/Blob.ts` */
+    lines: { builtin: true, length: 0 },
     name: { getter: b.any, setter: true, cache: true, passThis: true, ...js },
     size: { getter: b.f64 },
     slice: { ...method, args: { start: b.any, end: b.any, contentType: b.any }, length: 2 },
