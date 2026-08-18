@@ -29,6 +29,8 @@ export const Blob = b.class({
     image: { ...js, args: { options: b.any }, returns: b.any.returning("Image"), passThis: true, length: 0 },
     json: { ...method, typedResultForm: { form: "ParsedBody", source: "this" } },
     lastModified: { getter: b.f64 },
+    /** `this.stream().lines()`, in `src/js/builtins/Blob.ts` */
+    lines: { builtin: true, length: 0 },
     /** `file.name = new String("a")` keeps the object. */
     name: {
       getter: b.any.returning("string", "String", "undefined", "null"),
