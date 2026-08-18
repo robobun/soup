@@ -977,6 +977,11 @@ describe("@types/bun integration test", () => {
           message: "Argument of type '\"zstd\"' is not assignable to parameter of type 'CompressionFormat'.",
         },
         {
+          code: 2339,
+          line: "streams.ts:92:19",
+          message: "Property 'lines' does not exist on type 'ReadableStream<Uint8Array<ArrayBufferLike>>'.",
+        },
+        {
           code: 2353,
           line: "websocket.ts:25:5",
           message:
