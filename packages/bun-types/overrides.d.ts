@@ -23,6 +23,32 @@ interface BunConsumerConvenienceMethods {
    * Consume as JSON
    */
   json(): Promise<any>;
+
+  /**
+   * Consume as lines of text, one at a time, without loading everything into
+   * memory first.
+   *
+   * Bytes are decoded as UTF-8. A line ends at `\n`, and a `\r` right before
+   * it is removed, so both `\n` and `\r\n` line endings work. The yielded
+   * lines do not include the line ending. Text after the last newline is
+   * yielded as the final line; a trailing newline does not produce an extra
+   * empty line.
+   *
+   * Calling `lines()` locks the stream. Exiting the loop early (with `break`,
+   * `return` or a thrown error) cancels it.
+   *
+   * @example
+   * ```ts
+   * for await (const line of Bun.file("access.log").lines()) {
+   *   if (line.includes(" 500 ")) console.log(line);
+   * }
+   *
+   * for await (const line of Bun.stdin.lines()) {
+   *   console.log(line.toUpperCase());
+   * }
+   * ```
+   */
+  lines(): AsyncIterableIterator<string>;
 }
 
 declare module "stream/web" {

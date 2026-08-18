@@ -40,7 +40,7 @@ BigInt64Array.prototype : BYTES_PER_ELEMENT/- constructor/wc
 BigUint64Array : BYTES_PER_ELEMENT/- length/? name/? prototype/-
 BigUint64Array.prototype : BYTES_PER_ELEMENT/- constructor/wc
 Blob : length/c name/c prototype/-
-Blob.prototype : @@toStringTag/c arrayBuffer/w bytes/w constructor/wc delete/w exists/w formData/w image/w json/w lastModified/a name/a size/a slice/w stat/w stream/w text/w type/a unlink/w write/w writer/w
+Blob.prototype : @@toStringTag/c arrayBuffer/w bytes/w constructor/wc delete/w exists/w formData/w image/w json/w lastModified/a lines/wc name/a size/a slice/w stat/w stream/w text/w type/a unlink/w write/w writer/w
 Boolean : length/? name/? prototype/-
 Boolean.prototype : constructor/wc toString/wc valueOf/wc
 Buffer : alloc/wc allocUnsafe/wc allocUnsafeSlow/wc byteLength/wc compare/wc concat/wc copyBytesFrom/wc from/wc isBuffer/wc isEncoding/wc length/? name/? poolSize/wc prototype/-
