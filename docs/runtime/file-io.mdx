@@ -31,6 +31,7 @@ const foo = Bun.file("foo.txt");
 await foo.text(); // contents as a string
 await foo.json(); // contents as a JSON object
 foo.stream(); // contents as ReadableStream
+foo.lines(); // contents as an async iterator of lines
 await foo.arrayBuffer(); // contents as ArrayBuffer
 await foo.bytes(); // contents as Uint8Array
 ```
@@ -65,6 +66,28 @@ Bun.stdin; // readonly
 Bun.stdout;
 Bun.stderr;
 ```
+
+### Reading files line by line (`file.lines()`)
+
+`.lines()` reads the file as UTF-8 text and yields it one line at a time. The file is read incrementally, so this works for files that are too large to hold in memory. Lines are split on `\n`; a `\r` before the `\n` is removed, so files with Windows line endings work too. The yielded lines do not include the line ending, and a trailing newline at the end of the file does not produce an empty last line.
+
+```ts
+for await (const line of Bun.file("access.log").lines()) {
+  if (line.includes(" 500 ")) console.log(line);
+}
+```
+
+Leaving the loop early, with `break` or `return`, closes the file.
+
+Since `Bun.stdin` is a `BunFile`, the same works for reading standard input line by line.
+
+```ts
+for await (const line of Bun.stdin.lines()) {
+  console.log(line.toUpperCase());
+}
+```
+
+`.lines()` is also available on any other `Blob`, and on [`ReadableStream`](/runtime/streams#reading-lines) for data that does not come from a file, such as a `fetch()` response body.
 
 ### Deleting files (`file.delete()`)
 
