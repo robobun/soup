@@ -314,6 +314,7 @@ const calledFunctionsByPath: Readonly<Record<b.BuiltinPath, readonly b.CalledFun
   "Bun.peek": [heldAs(b.functionIn("builtins/Peek", "peek"), "Bun.peek"), b.functionIn("builtins/Peek", "peekStatus")],
   "Bun.plugin": bundlerPluginFunctions,
   "Bun.serve": pluginFunctionsOfServer,
+  ReadableStream: functionsIn("builtins/ReadableStream", "lines"),
   "WebAssembly.compileStreaming": streamedModuleFunctions,
   "WebAssembly.instantiateStreaming": streamedModuleFunctions,
   "bun:test": fakeTimerFunctions,
