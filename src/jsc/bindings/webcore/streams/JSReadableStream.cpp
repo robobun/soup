@@ -16,6 +16,7 @@
 #include "JSReadableStreamBYOBReader.h"
 #include "JSReadableStreamDefaultReader.h"
 #include "JSWritableStream.h"
+#include "WebCoreJSBuiltins.h"
 #include "WebCoreJSClientData.h"
 #include "WebStreamsHeapAnalyzer.h"
 #include "WebStreamsInspectCustom.h"
@@ -372,6 +373,7 @@ static const HashTableValue JSReadableStreamPrototypeTableValues[] = {
     { "bytes"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsReadableStreamPrototypeFunction_bytes, 0 } },
     { "json"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsReadableStreamPrototypeFunction_json, 0 } },
     { "text"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsReadableStreamPrototypeFunction_text, 0 } },
+    { "lines"_s, static_cast<unsigned>(JSC::PropertyAttribute::Builtin), NoIntrinsic, { HashTableValue::BuiltinGeneratorType, readableStreamLinesCodeGenerator, 0 } },
 };
 
 const ClassInfo JSReadableStreamPrototype::s_info = { "ReadableStream"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSReadableStreamPrototype) };

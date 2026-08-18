@@ -825,3 +825,45 @@ test.each([
   const blob = new Blob(["abc"], { type });
   expect(blob.slice(0, 1).type).toBe(expected);
 });
+
+describe("Blob.prototype.lines", () => {
+  test("yields the lines of the blob", async () => {
+    expect(await Array.fromAsync(new Blob(["one\ntwo\r\n", "three\nfo", "ur"]).lines())).toEqual([
+      "one",
+      "two",
+      "three",
+      "four",
+    ]);
+  });
+
+  test("yields nothing for an empty blob", async () => {
+    expect(await Array.fromAsync(new Blob([]).lines())).toEqual([]);
+  });
+
+  test("decodes the bytes as UTF-8", async () => {
+    const bytes = new TextEncoder().encode("日本語\n🙂\n");
+    expect(await Array.fromAsync(new Blob([bytes]).lines())).toEqual(["日本語", "🙂"]);
+  });
+
+  test("works on a File and on a slice", async () => {
+    const file = new File(["skip\nkeep\nalso\n"], "lines.txt");
+    expect(await Array.fromAsync(file.lines())).toEqual(["skip", "keep", "also"]);
+    expect(await Array.fromAsync(file.slice(5).lines())).toEqual(["keep", "also"]);
+  });
+
+  test("is the same as .stream().lines()", async () => {
+    const blob = new Blob(["a\nb"]);
+    expect(await Array.fromAsync(blob.lines())).toEqual(await Array.fromAsync(blob.stream().lines()));
+  });
+
+  test("can be called more than once", async () => {
+    const blob = new Blob(["a\nb\n"]);
+    expect(await Array.fromAsync(blob.lines())).toEqual(["a", "b"]);
+    expect(await Array.fromAsync(blob.lines())).toEqual(["a", "b"]);
+  });
+
+  test("throws for a non-Blob receiver", () => {
+    expect(() => Blob.prototype.lines.call({})).toThrow(TypeError);
+    expect(() => Blob.prototype.lines.call({})).toThrow('Value of "this" must be of type Blob');
+  });
+});

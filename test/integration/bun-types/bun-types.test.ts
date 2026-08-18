@@ -864,7 +864,7 @@ describe("@types/bun integration test", () => {
           code: 2322,
           line: "24154.ts:11:3",
           message:
-            "Type 'Blob' is not assignable to type 'import(\"node:buffer\").Blob'.\nThe types returned by 'stream()' are incompatible between these types.\nType 'ReadableStream<Uint8Array<ArrayBuffer>>' is missing the following properties from type 'ReadableStream<NonSharedUint8Array>': blob, text, bytes, json",
+            "Type 'Blob' is not assignable to type 'import(\"node:buffer\").Blob'.\nThe types returned by 'stream()' are incompatible between these types.\nType 'ReadableStream<Uint8Array<ArrayBuffer>>' is missing the following properties from type 'ReadableStream<NonSharedUint8Array>': blob, text, bytes, json, lines",
         },
         {
           code: 2769,
@@ -973,6 +973,11 @@ describe("@types/bun integration test", () => {
           code: 2345,
           line: "streams.ts:64:111",
           message: "Argument of type '\"zstd\"' is not assignable to parameter of type 'CompressionFormat'.",
+        },
+        {
+          code: 2339,
+          line: "streams.ts:92:19",
+          message: "Property 'lines' does not exist on type 'ReadableStream<Uint8Array<ArrayBufferLike>>'.",
         },
         {
           code: 2353,

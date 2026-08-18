@@ -38,6 +38,27 @@ for await (const chunk of stream) {
 // world
 ```
 
+To read the whole stream at once, Bun adds `.text()`, `.json()`, `.bytes()` and `.blob()` to `ReadableStream`.
+
+```ts
+const proc = Bun.spawn(["git", "status", "--porcelain"]);
+const text = await proc.stdout.text();
+```
+
+### Reading lines
+
+Chunks are split wherever the source happened to produce them, not at line boundaries. `.lines()` decodes the stream as UTF-8 and yields it one line at a time, no matter how the chunks are split. It works on any `ReadableStream` of bytes or strings, and on any `Blob` (including [`Bun.file()`](/runtime/file-io#reading-files-line-by-line-file-lines)), where it is the same as `.stream().lines()`.
+
+```ts
+const response = await fetch("https://example.com/events.ndjson");
+
+for await (const line of response.body!.lines()) {
+  console.log(JSON.parse(line));
+}
+```
+
+A line ends at `\n`; a `\r` before it is removed, so `\r\n` line endings work too. The yielded lines do not include the line ending. Text after the last newline is yielded as the final line, and a trailing newline does not produce an extra empty line. Calling `.lines()` locks the stream, and leaving the loop early (with `break`, `return` or an error) cancels it.
+
 ---
 
 ## Direct `ReadableStream`

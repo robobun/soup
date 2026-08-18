@@ -1535,6 +1535,24 @@ interface Blob {
    * Returns a readable stream of the blob's contents
    */
   stream(): ReadableStream<Uint8Array<ArrayBuffer>>;
+
+  /**
+   * Read the blob as UTF-8 text, one line at a time, without loading all of
+   * it into memory first. Same as `blob.stream().lines()`.
+   *
+   * A line ends at `\n`, and a `\r` right before it is removed. The yielded
+   * lines do not include the line ending. A trailing newline does not produce
+   * an extra empty line.
+   *
+   * This is a non-standard addition to the `Blob` API.
+   *
+   * ```ts
+   * for await (const line of Bun.file("access.log").lines()) {
+   *   console.log(line);
+   * }
+   * ```
+   */
+  lines(): AsyncIterableIterator<string>;
 }
 
 declare var Blob: Bun.__internal.UseLibDomIfAvailable<

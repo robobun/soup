@@ -425,6 +425,181 @@ it("ReadableStream.prototype.values", async () => {
   expect(chunks.join("")).toBe("helloworld");
 });
 
+describe("ReadableStream.prototype.lines", () => {
+  function streamOf(...chunks) {
+    return new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+  }
+
+  function byteStreamOf(text, chunkSize) {
+    const bytes = new TextEncoder().encode(text);
+    const chunks = [];
+    for (let i = 0; i < bytes.length; i += chunkSize) chunks.push(bytes.subarray(i, i + chunkSize));
+    return streamOf(...chunks);
+  }
+
+  it.each([
+    ["a\nb\nc\n", ["a", "b", "c"]],
+    ["a\nb\nc", ["a", "b", "c"]],
+    ["a\r\nb\r\nc\r\n", ["a", "b", "c"]],
+    ["a\r\nb\r\nc\r", ["a", "b", "c"]],
+    ["a\n\nb\n", ["a", "", "b"]],
+    ["\n", [""]],
+    ["\r\n", [""]],
+    ["\n\n", ["", ""]],
+    ["a", ["a"]],
+    ["", []],
+    ["a\rb\n", ["a\rb"]],
+  ])("%j", async (text, expected) => {
+    expect(await Array.fromAsync(streamOf(text).lines())).toEqual(expected);
+    expect(await Array.fromAsync(streamOf(new TextEncoder().encode(text)).lines())).toEqual(expected);
+  });
+
+  it("joins lines that span chunks", async () => {
+    const stream = streamOf("fir", "st\nsec", "", "ond\n", "th", "ird");
+    expect(await Array.fromAsync(stream.lines())).toEqual(["first", "second", "third"]);
+  });
+
+  it("handles \\r\\n split between chunks", async () => {
+    expect(await Array.fromAsync(streamOf("a\r", "\nb\r", "\n").lines())).toEqual(["a", "b"]);
+  });
+
+  it("handles several lines in one chunk and one line over many chunks", async () => {
+    const long = Buffer.alloc(1000, "x").toString();
+    const text = `1\n2\n3\n${long}\n4`;
+    const expected = ["1", "2", "3", long, "4"];
+    expect(await Array.fromAsync(byteStreamOf(text, 7).lines())).toEqual(expected);
+    expect(await Array.fromAsync(byteStreamOf(text, 100000).lines())).toEqual(expected);
+  });
+
+  it("decodes UTF-8 sequences split between chunks", async () => {
+    const text = "héllo\nwörld\n日本語\n🙂\n";
+    for (const chunkSize of [1, 2, 3, 5]) {
+      expect(await Array.fromAsync(byteStreamOf(text, chunkSize).lines())).toEqual(["héllo", "wörld", "日本語", "🙂"]);
+    }
+  });
+
+  it("replaces a UTF-8 sequence cut off by the end of the stream, like text()", async () => {
+    const bytes = new Uint8Array([0x61, 0x0a, 0xe2, 0x82]);
+    expect(await Array.fromAsync(streamOf(bytes).lines())).toEqual(["a", "\uFFFD"]);
+    expect(await streamOf(bytes).text()).toBe("a\n\uFFFD");
+  });
+
+  it("accepts a mix of string and byte chunks", async () => {
+    const stream = streamOf("a\nb", new TextEncoder().encode("c\nd"), "\n");
+    expect(await Array.fromAsync(stream.lines())).toEqual(["a", "bc", "d"]);
+  });
+
+  it("rejects chunks that are neither strings nor bytes", async () => {
+    await expect(Array.fromAsync(streamOf(123).lines())).rejects.toBeInstanceOf(TypeError);
+  });
+
+  it("locks the stream", () => {
+    const stream = streamOf("a\n");
+    expect(stream.locked).toBe(false);
+    stream.lines();
+    expect(stream.locked).toBe(true);
+  });
+
+  it("throws if the stream is already locked", () => {
+    const stream = streamOf("a\n");
+    stream.getReader();
+    expect(() => stream.lines()).toThrow("ReadableStream is locked");
+  });
+
+  it("cancels the stream when the loop exits early", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream({
+      pull(controller) {
+        controller.enqueue("a\nb\n");
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const lines = [];
+    for await (const line of stream.lines()) {
+      lines.push(line);
+      break;
+    }
+
+    expect(lines).toEqual(["a"]);
+    expect(cancelled).toBe(true);
+    expect(stream.locked).toBe(false);
+  });
+
+  it("cancels the stream when return() is called", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream({
+      pull(controller) {
+        controller.enqueue("a\nb\n");
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const iterator = stream.lines();
+    expect(await iterator.next()).toEqual({ value: "a", done: false });
+    expect(await iterator.return()).toEqual({ value: undefined, done: true });
+    expect(await iterator.next()).toEqual({ value: undefined, done: true });
+    expect(cancelled).toBe(true);
+    expect(stream.locked).toBe(false);
+  });
+
+  it("rejects with the stream's error after yielding the complete lines before it", async () => {
+    let pulls = 0;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (pulls++ === 0) {
+          controller.enqueue("first\nsecond");
+        } else {
+          controller.error(new Error("boom"));
+        }
+      },
+    });
+
+    const lines = [];
+    const error = await (async () => {
+      try {
+        for await (const line of stream.lines()) lines.push(line);
+      } catch (e) {
+        return e;
+      }
+    })();
+
+    expect(lines).toEqual(["first"]);
+    expect(error.message).toBe("boom");
+  });
+
+  it("works on a direct stream", async () => {
+    const stream = new ReadableStream({
+      type: "direct",
+      pull(controller) {
+        controller.write("hello\nwo");
+        controller.write("rld\n");
+        controller.close();
+      },
+    });
+    expect(await Array.fromAsync(stream.lines())).toEqual(["hello", "world"]);
+  });
+
+  it("works on a Response body", async () => {
+    const response = new Response("status: ok\r\ncount: 2\r\n");
+    expect(await Array.fromAsync(response.body.lines())).toEqual(["status: ok", "count: 2"]);
+  });
+
+  it("throws the same error as text() for a non-stream receiver", () => {
+    expect(() => ReadableStream.prototype.lines.call({})).toThrow(TypeError);
+    expect(() => ReadableStream.prototype.lines.call({})).toThrow('Value of "this" must be of type ReadableStream');
+  });
+});
+
 it.todoIf(isWindows || isMacOS)("Bun.file() read text from pipe", async () => {
   const fifoPath = join(tmpdirSync(), "bun-streams-test-fifo");
   try {

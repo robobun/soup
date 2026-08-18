@@ -117,6 +117,49 @@ Files: `src/runtime/test_runner/bun_test.rs` (dry-run walk), `src/runtime/test_r
 `src/runtime/cli/Arguments.rs`, `src/options_types/context.rs`, `completions/bun.zsh`,
 `docs/test/discovery.mdx`, `docs/snippets/cli/test.mdx`, `test/cli/test/bun-test.test.ts`.
 
+### 2026-08-18: `.lines()` on `ReadableStream` and `Blob`
+
+Reading something line by line is the most common thing a script does with a file, a subprocess or
+stdin, and bun had no direct way to do it: `ReadableStream` has `.text()`, `.json()`, `.bytes()` and
+`.blob()`, which all read everything at once, and splitting chunks into lines by hand means
+handling a line or a UTF-8 sequence cut in half by a chunk boundary. `Bun.file(path).lines()` is
+also an API people already assume exists (oven-sh/bun#6692 is a report that it does not). `lines()`
+now exists on `ReadableStream` and on `Blob`, so it works on `Bun.file()`, `Bun.stdin`, S3 files,
+`response.body`, `proc.stdout` and in-memory blobs alike. It returns an async iterator of strings:
+the stream is decoded as UTF-8 (string chunks are taken as they are), a line ends at `\n`, a `\r`
+before it is dropped, the line ending is not part of the line, text after the last newline is the
+final line and a trailing newline does not produce an empty extra line.
+
+```ts
+for await (const line of Bun.file("access.log").lines()) {
+  if (line.includes(" 500 ")) console.log(line);
+}
+
+for await (const line of (await fetch(url)).body!.lines()) {
+  handle(JSON.parse(line)); // NDJSON
+}
+
+await Array.fromAsync(Bun.stdin.lines());
+```
+
+`stream.lines()` is `for await (const chunk of stream)` plus line splitting, and keeps its
+semantics: calling it locks the stream immediately, leaving the loop early cancels the stream (so a
+file is closed), and an error from the source (such as `ENOENT`) surfaces where `stream.values()`
+would surface it. `blob.lines()` is `blob.stream().lines()`, so a file is read incrementally and a
+`slice()` is honoured. Both are small JS builtins attached to the native prototypes, the same way
+`Glob.prototype.scan` is; a line that spans chunks is collected in an array and joined once, so a
+huge line does not get re-copied per chunk. `.name` of the new functions is empty, which is a
+pre-existing property of every builtin-backed method in bun (`Buffer.prototype.readInt8.name` is
+empty too) and was reported separately.
+
+Files: `src/js/builtins/ReadableStream.ts`, `src/js/builtins/Blob.ts`,
+`src/jsc/bindings/webcore/streams/JSReadableStream.cpp`, `src/runtime/webcore/response.classes.ts`,
+`packages/bun-types/overrides.d.ts`, `packages/bun-types/globals.d.ts`, `docs/runtime/streams.mdx`,
+`docs/runtime/file-io.mdx`, `test/js/web/streams/streams.test.js`, `test/js/web/fetch/blob.test.ts`,
+`test/js/bun/util/bun-file-read.test.ts`, `test/integration/bun-types/fixture/streams.ts`,
+`test/integration/bun-types/bun-types.test.ts` (the global `ReadableStream` under `lib.dom` lacks the
+bun methods, `lines` included, which that test records).
+
 ## Dropped
 
 Nothing yet.

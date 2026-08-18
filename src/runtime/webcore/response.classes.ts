@@ -169,6 +169,9 @@ export default [
       // Non-standard, but consistent!
       bytes: { fn: "getBytes", async: true },
 
+      // Non-standard. `.stream().lines()`, implemented in js/builtins/Blob.ts.
+      lines: { builtin: "blobLinesCodeGenerator", length: 0 },
+
       // `new Bun.Image(this, opts)` — synchronous (the read happens lazily
       // when an Image terminal is awaited), so this is just a constructor
       // call with the receiver as input. Covers BunFile/S3File.
