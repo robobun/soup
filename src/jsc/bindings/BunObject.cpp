@@ -41,6 +41,7 @@
 #include "GeneratedCsrfJsc.h"
 #include "GeneratedDns.h"
 #include "GeneratedHashObject.h"
+#include "GeneratedINIObject.h"
 #include "GeneratedJSON5Object.h"
 #include "GeneratedJSONCObject.h"
 #include "GeneratedPasswordObject.h"
@@ -937,6 +938,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     SHA384                                         BunObject_lazyPropCb_wrap_SHA384                                    DontDelete|PropertyCallback
     SHA512                                         BunObject_lazyPropCb_wrap_SHA512                                    DontDelete|PropertyCallback
     SHA512_256                                     BunObject_lazyPropCb_wrap_SHA512_256                                DontDelete|PropertyCallback
+    INI                                            Bun::Bindgen::Generated::INIObject::createINI                       DontDelete|PropertyCallback
     JSONC                                          Bun::Bindgen::Generated::JSONCObject::createJSONC                   DontDelete|PropertyCallback
     JSON5                                          Bun::Bindgen::Generated::JSON5Object::createJSON5                   DontDelete|PropertyCallback
     JSONL                                          constructJSONLObject                                                ReadOnly|DontDelete|PropertyCallback
