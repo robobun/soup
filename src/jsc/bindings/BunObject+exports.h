@@ -11,6 +11,7 @@
     macro(FileSystemRouter) \
     macro(Glob) \
     macro(Image) \
+    macro(INI) \
     macro(JSON5) \
     macro(JSONC) \
     macro(MD4) \
