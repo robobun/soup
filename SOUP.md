@@ -160,6 +160,50 @@ Files: `src/js/builtins/ReadableStream.ts`, `src/js/builtins/Blob.ts`,
 `test/integration/bun-types/bun-types.test.ts` (the global `ReadableStream` under `lib.dom` lacks the
 bun methods, `lines` included, which that test records).
 
+### 2026-08-19: `Bun.INI.parse()`
+
+Bun ships parsers for JSON5, JSONC, TOML, YAML, XML and markdown as `Bun.*` objects, and it has had
+an INI parser for years, because `bun install` reads `.npmrc` with it, but there was no way to call
+that parser from JavaScript. INI is still what `.npmrc`, `.gitconfig`, `php.ini`, systemd units and
+a lot of application config files are written in, so scripts end up pulling in the npm `ini` package
+for a format bun can already read. `Bun.INI.parse()` (also `import { INI } from "bun"`) now exposes
+it. It takes a string, UTF-8 bytes or a `Blob` like `Bun.TOML.parse()` and returns a plain object.
+
+```ts
+Bun.INI.parse(`
+name = my-app
+debug
+
+[database]
+host = localhost
+port = 5432
+
+[database.replicas]
+host[] = db-1
+host[] = db-2
+`);
+// { name: "my-app", debug: true,
+//   database: { host: "localhost", port: "5432", replicas: { host: ["db-1", "db-2"] } } }
+```
+
+The dialect is the npm `ini` package's, which the existing parser already implements (its test
+fixture is npm/ini's), so `Bun.INI.parse` is a drop-in for `ini.parse`: `;`/`#` comments, a bare key
+is `true`, `true`/`false`/`null` convert and everything else unquoted is a string, a quoted value is
+read as JSON, `key[]` builds arrays, `[a.b]` nests and `[a\.b]` does not, `__proto__` keys are
+dropped. Two things differ from the `.npmrc` use of the parser: `${VAR}` is left as written instead
+of being expanded from the environment (an npm config feature that has no business in a general
+parser, and a surprise in any file that contains a literal `$`), which is done by making the parser's
+environment optional, and a leading UTF-8 BOM is skipped, as `Bun.TOML.parse` and `Bun.YAML.parse`
+do. The parser has no syntax errors, so the function only throws when given `undefined`/`null`. The
+types give it a closed value type (`INI.Value`, `INI.Section`) in the style of `Bun.XML`, rather than
+`object`. `stringify` is left for another day.
+
+Files: `src/runtime/api/INIObject.rs`, `src/runtime/api.rs`, `src/runtime/api/BunObject.rs`,
+`src/runtime/Cargo.toml`, `Cargo.lock`, `src/ini/lib.rs` (optional env, BOM),
+`src/install_jsc/ini_jsc.rs`, `src/jsc/bindings/BunObject.cpp`, `src/jsc/bindings/BunObject+exports.h`,
+`packages/bun-types/bun.d.ts`, `docs/runtime/ini.mdx`, `docs/docs.json`, `docs/runtime/bun-apis.mdx`,
+`test/js/bun/ini/ini.test.ts`, `test/integration/bun-types/fixture/ini.ts`.
+
 ## Dropped
 
 Nothing yet.

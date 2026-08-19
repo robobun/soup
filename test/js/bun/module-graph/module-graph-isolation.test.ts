@@ -3877,6 +3877,7 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
         "CookieMap",
         "CryptoHasher",
         "FileSystemRouter",
+        "INI",
         "JSON5",
         "JSONC",
         "JSONL",
