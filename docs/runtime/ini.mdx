@@ -1,0 +1,77 @@
+---
+title: INI
+description: Parse INI files with Bun's built-in parser, the one bun install reads .npmrc with
+---
+
+Bun has built-in support for parsing [INI](https://en.wikipedia.org/wiki/INI_file) files, the format of `.npmrc`, `.gitconfig`, `php.ini` and many other configuration files. It is the parser `bun install` reads `.npmrc` with, exposed as `Bun.INI.parse`.
+
+```ts
+import { INI } from "bun";
+
+const config = INI.parse(await Bun.file("app.ini").text());
+```
+
+---
+
+## `Bun.INI.parse()`
+
+Parse an INI document into a plain object. The input can be a string, UTF-8 bytes (`Uint8Array`, `Buffer`, `ArrayBuffer`) or a `Blob`. A UTF-8 byte order mark at the start is skipped.
+
+```ts
+const config = Bun.INI.parse(`
+; comments start with ; or #
+name = my-app
+debug
+
+[database]
+host = localhost
+port = 5432
+
+[database.replicas]
+host[] = db-1
+host[] = db-2
+`);
+
+console.log(config);
+// {
+//   name: "my-app",
+//   debug: true,
+//   database: {
+//     host: "localhost",
+//     port: "5432",
+//     replicas: { host: ["db-1", "db-2"] },
+//   },
+// }
+```
+
+### The format
+
+INI has no specification. Bun reads the dialect of the npm [`ini`](https://www.npmjs.com/package/ini) package, which is also what `.npmrc` uses, so `Bun.INI.parse` returns the same object `ini.parse` does:
+
+- `;` and `#` start a comment. Escape them as `\;` and `\#` inside a value.
+- A `key` without `=` is `true`.
+- `true`, `false` and `null` convert to the JavaScript values. Every other unquoted value is a string, numbers included: `port = 5432` is `{ port: "5432" }`.
+- A value in double or single quotes is read as JSON: `"  a  "` keeps its spaces, `'["a", 1]'` is an array. If the quoted text is not valid JSON, it is a string.
+- `name[] = x` collects the values for `name` into an array. Once `name` is an array, a plain `name = y` appends to it.
+- Otherwise, if a key is set more than once, the last value wins.
+- `[section]` puts the keys that follow it into a nested object. A dot in a section name nests further: `[a.b]` is `b` inside `a`. Escape it as `[a\.b]` to keep the dot in the name. Dots in keys are never split.
+- A `__proto__` key is ignored. A `[__proto__]` section becomes an own property of the result, like in `JSON.parse`, and never touches the prototype.
+
+Unlike `.npmrc`, `${VAR}` is not replaced with the environment variable. The value is returned as written.
+
+There are no syntax errors: every line means something, so malformed input does not throw. `Bun.INI.parse` throws only when the argument is missing (`undefined` or `null`). An empty document is `{}`.
+
+### Types
+
+Every parsed value is an `INI.Value`, and the document and each section are an `INI.Section`:
+
+```ts
+import type { INI } from "bun";
+
+type Value = string | number | boolean | null | Value[] | Section;
+interface Section {
+  [key: string]: Value;
+}
+```
+
+Numbers, and objects inside a value, only come from quoted JSON values. Check the type of a value before you use it, or validate the document with a schema library.
