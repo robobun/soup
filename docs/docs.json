@@ -154,6 +154,7 @@
               "/runtime/markdown",
               "/runtime/json5",
               "/runtime/xml",
+              "/runtime/ini",
               "/runtime/jsonl",
               "/runtime/html-rewriter",
               "/runtime/image",

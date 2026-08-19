@@ -49,6 +49,8 @@ pub mod glob;
 pub mod hash_object;
 #[path = "api/html_rewriter.rs"]
 pub mod html_rewriter;
+#[path = "api/INIObject.rs"]
+pub mod ini_object;
 #[path = "api/js_bundle_completion_task.rs"]
 pub mod js_bundle_completion_task;
 #[path = "api/JSBundler.rs"]
@@ -151,9 +153,9 @@ pub use crate::api::unsafe_object as UnsafeObject;
 pub use crate::api::xml_object as XMLObject;
 pub use crate::api::yaml_object as YAMLObject;
 
-// ─── shared scaffold for Bun.{TOML,JSONC,JSON5,YAML}.parse ───────────────────
+// ─── shared scaffold for Bun.{TOML,JSONC,JSON5,YAML,XML,INI}.parse ───────────
 //
-// All four host fns repeat: Arena + ASTMemoryAllocator scope + Log +
+// All of these host fns repeat: Arena + ASTMemoryAllocator scope + Log +
 // frame.argument(0) → bytes → Source::init_path_string. They diverge on
 // (a) whether nullish input throws, (b) whether Blob/Buffer is accepted, and
 // (c) parse-error class + Expr→JS tail — so this helper owns ONLY the scaffold

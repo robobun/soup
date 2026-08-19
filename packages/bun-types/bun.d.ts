@@ -1378,6 +1378,70 @@ declare module "bun" {
   }
 
   /**
+   * INI related APIs
+   */
+  namespace INI {
+    /**
+     * A value in a parsed INI document. Plain values are strings; bare
+     * `true`, `false` and `null` convert; a key written as `name[]` collects
+     * an array; a `[section]` is a nested {@link Section}; a quoted value is
+     * read as JSON, so it can also be a number, an array or an object.
+     */
+    type Value = string | number | boolean | null | Value[] | Section;
+
+    /**
+     * The top-level document and every `[section]` in it have this shape.
+     */
+    interface Section {
+      [key: string]: Value;
+    }
+
+    /**
+     * Parse an INI document into a plain object.
+     *
+     * This is the parser `bun install` reads `.npmrc` with, and it follows
+     * the dialect of the npm `ini` package: `;` and `#` start a comment, a
+     * key without `=` is `true`, `[a.b]` nests `b` inside `a` (escape the dot
+     * as `\.` to keep it in the name), `name[] = x` collects an array, bare
+     * `true`, `false` and `null` convert, every other unquoted value is a
+     * string (numbers included), and a quoted value is read as JSON. Unlike
+     * `.npmrc`, `${VAR}` is not expanded. There are no syntax errors: every
+     * line means something.
+     *
+     * @category Utilities
+     *
+     * @param input The INI document to parse, as a string or UTF-8 bytes
+     * @returns The top-level {@link Section}
+     *
+     * @example
+     * ```ts
+     * import { INI } from "bun";
+     *
+     * INI.parse(`
+     * name = my-app
+     * debug
+     *
+     * [database]
+     * host = localhost
+     * port = 5432
+     *
+     * [database.replicas]
+     * host[] = db-1
+     * host[] = db-2
+     * `);
+     * // {
+     * //   name: "my-app",
+     * //   debug: true,
+     * //   database: { host: "localhost", port: "5432", replicas: { host: ["db-1", "db-2"] } },
+     * // }
+     * ```
+     */
+    export function parse(
+      input: string | NodeJS.TypedArray | DataView<ArrayBufferLike> | ArrayBufferLike | Blob,
+    ): Section;
+  }
+
+  /**
    * JSONL (JSON Lines) related APIs.
    *
    * Each line of the input is a JSON value.

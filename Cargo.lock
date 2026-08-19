@@ -1279,6 +1279,7 @@ dependencies = [
  "bun_http",
  "bun_http_jsc",
  "bun_http_types",
+ "bun_ini",
  "bun_install",
  "bun_install_jsc",
  "bun_install_types",
