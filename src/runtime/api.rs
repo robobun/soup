@@ -44,6 +44,8 @@ pub(crate) mod glob;
 pub(crate) mod hash_object;
 #[path = "api/html_rewriter.rs"]
 pub(crate) mod html_rewriter;
+#[path = "api/INIObject.rs"]
+pub(crate) mod ini_object;
 #[path = "api/js_bundle_completion_task.rs"]
 pub(crate) mod js_bundle_completion_task;
 #[path = "api/JSBundler.rs"]
@@ -136,9 +138,9 @@ pub(crate) use crate::api::bun::ssl_context_cache as SSLContextCache;
 pub(crate) use crate::api::js_bundler::BuildArtifact;
 pub(crate) use crate::api::js_bundler::JSBundler;
 
-// ─── shared scaffold for Bun.{TOML,JSONC,JSON5,YAML,XML}.parse ───────────────
+// ─── shared scaffold for Bun.{TOML,JSONC,JSON5,YAML,XML,INI}.parse ───────────
 //
-// All five repeat: Arena + ASTMemoryAllocator scope + Log + Source::init_path_string. They diverge on the parse-error
+// All six repeat: Arena + ASTMemoryAllocator scope + Log + Source::init_path_string. They diverge on the parse-error
 // class and the Expr→JS tail, so this helper owns ONLY the scaffold and hands `(&arena, &mut log, &source)` to a
 // per-format closure that does the format-specific parse, error match (StackOverflow / OOM / SyntaxError vs
 // log.to_js), and tail conversion.
