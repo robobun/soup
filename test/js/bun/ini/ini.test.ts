@@ -1,5 +1,6 @@
 const { iniInternals } = require("bun:internal-for-testing");
 const { parse } = iniInternals;
+import { INI } from "bun";
 import { describe, expect, it, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
 
@@ -572,6 +573,106 @@ brr = 3
       const ini = Buffer.concat([Buffer.from("key = \\"), Buffer.from([0x80])]).toString("latin1");
       expect(() => parse(ini)).not.toThrow();
     });
+  });
+});
+
+describe("Bun.INI.parse", () => {
+  test("is exported from 'bun'", () => {
+    expect(INI).toBe(Bun.INI);
+    expect(typeof INI.parse).toBe("function");
+  });
+
+  test("parses the npm/ini dialect", () => {
+    const result = INI.parse(/* ini */ `
+; a comment
+# also a comment
+name = my-app
+port = 5432
+debug
+enabled = true
+disabled = false
+nothing = null
+quoted = "  spaces kept; not a comment  "
+list = '["a", 1]'
+semicolon = a\\;b
+host[] = db-1
+host[] = db-2
+
+[database]
+user = app
+[database.pool]
+max = 10
+
+[x\\.y]
+a.b = keys never nest
+`);
+
+    expect(result).toEqual({
+      "name": "my-app",
+      "port": "5432",
+      "debug": true,
+      "enabled": true,
+      "disabled": false,
+      "nothing": null,
+      "quoted": "  spaces kept; not a comment  ",
+      "list": ["a", 1],
+      "semicolon": "a;b",
+      "host": ["db-1", "db-2"],
+      "database": { user: "app", pool: { max: "10" } },
+      "x.y": { "a.b": "keys never nest" },
+    });
+  });
+
+  test("accepts CRLF line endings, a BOM, bytes and blobs", () => {
+    const text = "a = 1\r\n[s]\r\nb = 2\r\n";
+    const expected = { a: "1", s: { b: "2" } };
+    expect(INI.parse(text)).toEqual(expected);
+    expect(INI.parse("\uFEFF" + text)).toEqual(expected);
+    expect(INI.parse(Buffer.from(text))).toEqual(expected);
+    expect(INI.parse(Buffer.from("\uFEFF" + text))).toEqual(expected);
+    expect(INI.parse(new TextEncoder().encode(text).buffer)).toEqual(expected);
+    expect(INI.parse(new Blob([text]))).toEqual(expected);
+  });
+
+  test("an empty document is an empty object", () => {
+    expect(INI.parse("")).toEqual({});
+    expect(INI.parse("\n; nothing here\n\n")).toEqual({});
+  });
+
+  test("rejects a missing document", () => {
+    expect(() => (INI.parse as any)()).toThrow("Expected a string to parse");
+    expect(() => INI.parse(null as any)).toThrow("Expected a string to parse");
+    expect(() => INI.parse(undefined as any)).toThrow("Expected a string to parse");
+  });
+
+  test("__proto__ cannot reach the prototype", () => {
+    expect(INI.parse("__proto__ = polluted\nok = 1")).toEqual({ ok: "1" });
+
+    const result = INI.parse("[__proto__]\npolluted = 1");
+    expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+    expect(Object.hasOwn(result, "__proto__")).toBe(true);
+    expect(({} as any).polluted).toBeUndefined();
+  });
+
+  test("leaves ${VAR} as written, unlike .npmrc", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const { iniInternals } = require("bun:internal-for-testing");
+         const text = "plain = \${INI_TEST_VALUE}\\nquoted = '\${INI_TEST_VALUE}'";
+         console.log(JSON.stringify({ npmrc: iniInternals.parse(text), ini: Bun.INI.parse(text) }));`,
+      ],
+      env: { ...bunEnv, INI_TEST_VALUE: "expanded" },
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({
+      npmrc: { plain: "expanded", quoted: "expanded" },
+      ini: { plain: "${INI_TEST_VALUE}", quoted: "${INI_TEST_VALUE}" },
+    });
+    expect(exitCode).toBe(0);
   });
 });
 
