@@ -163,7 +163,9 @@ mod draft {
         pub(crate) source: &'a Source,
         pub(crate) src: &'a [u8],
         pub out: Expr,
-        pub(crate) env: &'a DotEnvLoader,
+        /// Expands `${VAR}` in values the way npm does for `.npmrc`. `None`
+        /// (`Bun.INI.parse`) keeps `${VAR}` as written.
+        pub(crate) env: Option<&'a DotEnvLoader>,
     }
 
     // The result type depends on the usage (`.section -> *Rope`, `.key ->
@@ -194,7 +196,7 @@ mod draft {
     }
 
     impl<'a> Parser<'a> {
-        pub fn init(source: &'a Source, env: &'a DotEnvLoader) -> Parser<'a> {
+        pub fn init(source: &'a Source, env: Option<&'a DotEnvLoader>) -> Parser<'a> {
             Parser {
                 src: source.contents.as_ref(),
                 out: Expr::init(E::Object::default(), Loc::EMPTY),
@@ -209,7 +211,10 @@ mod draft {
             let src = self.src;
             let env = self.env;
             let source_path = self.source.path.text;
-            let mut iter = bun_core::strings::split(src, b"\n");
+            // A subslice of `src`, so the `Loc`s below (offsets from `src`) still
+            // point into the source.
+            let mut iter =
+                bun_core::strings::split(bun_core::strings::without_utf8_bom(src), b"\n");
             // `StoreRef` is the arena-backed handle `ExprData` already stores;
             // it is `Copy`, so keeping the root and the current-section head as
             // separate values is a split borrow, not an alias.
@@ -417,7 +422,7 @@ mod draft {
         }
 
         fn prepare_str(
-            env: &DotEnvLoader,
+            env: Option<&DotEnvLoader>,
             source_path: &[u8],
             usage: Usage,
             bump: &'a Arena,
@@ -618,6 +623,9 @@ mod draft {
                                     if usage != Usage::Value {
                                         break 'not_env_substitution;
                                     }
+                                    let Some(env) = env else {
+                                        break 'not_env_substitution;
+                                    };
 
                                     if let Some(new_i) =
                                         Self::parse_env_substitution(env, val, i, i, 0, &mut unesc)?
@@ -748,7 +756,14 @@ mod draft {
         /// - ${VAR} - if VAR is undefined, leave as "${VAR}" (no expansion)
         /// - ${VAR?} - if VAR is undefined, expand to empty string
         /// - Backslash escaping is already handled by JSON parsing
-        fn expand_env_vars(env: &DotEnvLoader, bump: &'a Arena, val: &'a [u8]) -> OOM<&'a [u8]> {
+        fn expand_env_vars(
+            env: Option<&DotEnvLoader>,
+            bump: &'a Arena,
+            val: &'a [u8],
+        ) -> OOM<&'a [u8]> {
+            let Some(env) = env else {
+                return Ok(val);
+            };
             // Quick check if there are any env vars to expand
             if bun_core::index_of(val, b"${").is_none() {
                 // Nothing to expand: return the borrow directly.
@@ -1332,7 +1347,7 @@ mod draft {
     ) -> OOM<()> {
         let arena = Arena::new();
         let bump = &arena;
-        let mut parser = Parser::init(source, env);
+        let mut parser = Parser::init(source, Some(env));
         parser.parse(bump)?;
         // Need to be very, very careful here with strings.
         // They are allocated in the Parser's arena, which of course gets
