@@ -53,6 +53,7 @@
 #include "GeneratedFilesystemRouter.h"
 #include "GeneratedGlob.h"
 #include "GeneratedHashObject.h"
+#include "GeneratedINIObject.h"
 #include "GeneratedImage.h"
 #include "GeneratedInterpreter.h"
 #include "GeneratedJSBundler.h"
@@ -1011,6 +1012,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     SHA384                                         Bun::Bindgen::Generated::CryptoHasher::getSHA384Constructor         DontDelete|PropertyCallback
     SHA512                                         Bun::Bindgen::Generated::CryptoHasher::getSHA512Constructor         DontDelete|PropertyCallback
     SHA512_256                                     Bun::Bindgen::Generated::CryptoHasher::getSHA512_256Constructor     DontDelete|PropertyCallback
+    INI                                            Bun::Bindgen::Generated::INIObject::createINI                       DontDelete|PropertyCallback
     JSONC                                          Bun::Bindgen::Generated::JSONCObject::createJSONC                   DontDelete|PropertyCallback
     JSON5                                          Bun::Bindgen::Generated::JSON5Object::createJSON5                   DontDelete|PropertyCallback
     JSONL                                          constructJSONLObject                                                ReadOnly|DontDelete|PropertyCallback
