@@ -204,6 +204,49 @@ Files: `src/runtime/api/INIObject.rs`, `src/runtime/api.rs`, `src/runtime/api/Bu
 `packages/bun-types/bun.d.ts`, `docs/runtime/ini.mdx`, `docs/docs.json`, `docs/runtime/bun-apis.mdx`,
 `test/js/bun/ini/ini.test.ts`, `test/integration/bun-types/fixture/ini.ts`.
 
+### 2026-08-20: the rest of the common `[[ ... ]]` tests
+
+The shell's `[[ ... ]]` knew seven tests: `-f`, `-d`, `-c`, `-z`, `-n`, `==` and `!=`. Everything else
+that bash scripts reach for was a parse error ("Conditional expression operation: -e, is not
+supported right now"), which is the first thing a script ported to `$` trips over: `[[ -e $f ]]`,
+`[[ $COUNT -gt 0 ]]`, `[[ $a = $b ]]`, `[[ out.js -nt in.ts ]]`. The parser already had the whole
+operator table and the interpreter already did its `stat` on the thread pool, so this adds the
+missing evaluations rather than new machinery:
+
+- file tests `-e`, `-s`, `-b`, `-p`, `-S`, and `-L`/`-h`, which `lstat` so a dangling link still counts;
+- `-nt`, `-ot` and `-ef` on two files, comparing mtimes to the nanosecond, with bash's answers when one
+  side is missing (`a -nt missing` holds, `missing -nt a` does not);
+- integer comparisons `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge` on 64-bit decimal integers. As in bash's
+  `[[ ]]`, an empty operand (an unset variable) is 0; anything else that is not an integer prints
+  `[[: x: integer expression expected` and fails the test with exit 1, the way bash reports it;
+- `=` as a spelling of `==`, and a negative number as the first operand (`[[ -1 -lt 0 ]]`), which the
+  parser used to reject as an unknown operator.
+
+```ts
+await $`[[ dist/index.js -nt src/index.ts ]] || bun build ./src/index.ts --outdir dist`;
+await $`[[ -s ${logFile} ]] && cat ${logFile}`;
+if ((await $`[[ ${retries} -gt 0 ]]`.nothrow()).exitCode === 0) {
+  /* ... */
+}
+```
+
+The stat task now carries both operands and stats each one in the same thread-pool hop; an empty
+operand is reported as missing there too, so Windows' `stat("")` (which returns the cwd) cannot make
+`[[ "" -ot x ]]` lie. Still missing after today: `-r`/`-w`/`-x` (want `access(2)` plus a decision
+about what executable means on Windows), `<`/`>` string ordering (the lexer reads them as
+redirections inside `[[ ]]`), and `&&`/`||`/`!` inside a single `[[ ]]`, which remain parse errors as
+before. The shell docs had no section on `[[ ]]` at all, so one was added with the full table. The
+tests were run on Linux; the Windows and macOS builds were only type-checked (`bun run rust:check-all`),
+and the Windows path reuses the existing `shell_get_path` rewriting plus `bun_sys::lstat`.
+
+While running clippy over the stack, the day-1 `wc` builtin had one `needless_pass_by_value` hit in
+its `on_io_writer_chunk`; that commit was amended to consume the error the way the other builtins do.
+
+Files: `src/shell_parser/parse.rs` (supported table, `=`, negative operands),
+`src/runtime/shell/states/CondExpr.rs`, `src/runtime/shell/dispatch_tasks.rs` (two-operand stat task),
+`src/runtime/shell/interpreter.rs` (`shell_lstatat`), `src/bun_core/util.rs` (`S::ISBLK`),
+`docs/runtime/shell.mdx`, `test/js/bun/shell/bunshell.test.ts`.
+
 ## Dropped
 
 Nothing yet.
