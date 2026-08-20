@@ -29,8 +29,12 @@ pub(crate) struct ShellCondExprStatTask {
 pub(crate) struct CondExprStatInner {
     pub task: ShellTask,
     pub cond: NodeId,
-    pub stat: bun_sys::Result<bun_sys::Stat>,
-    pub path: Vec<u8>,
+    /// One operand for the unary file tests, two for `-nt`, `-ot` and `-ef`.
+    /// Each path is NUL-terminated; `stats[i]` is filled in for `paths[i]`.
+    pub paths: [Vec<u8>; 2],
+    pub stats: [bun_sys::Result<bun_sys::Stat>; 2],
+    /// `[[ -L ]]` / `[[ -h ]]` test the link itself, so they `lstat`.
+    pub no_follow: bool,
     /// The shell env's cwd fd, captured at schedule time so
     /// `run_from_thread_pool` can
     /// `statat` without touching the interpreter off-thread.
@@ -50,8 +54,7 @@ impl ShellCondExprStatTask {
         crate::shell::states::cond_expr::CondExpr::on_stat_task_done(
             interp,
             owned.task.cond,
-            &owned.task.stat,
-            &owned.task.path,
+            &owned.task.stats,
         );
     }
 }

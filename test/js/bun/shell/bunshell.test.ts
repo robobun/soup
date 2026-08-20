@@ -6,7 +6,7 @@
  */
 import { $ } from "bun";
 import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
-import { chmodSync, mkdirSync } from "fs";
+import { chmodSync, linkSync, mkdirSync, symlinkSync, utimesSync } from "fs";
 import { mkdir, rm, stat } from "fs/promises";
 import { bunExe, isPosix, isWindows, rss, runWithErrorPromise, tempDir, tempDirWithFiles, tmpdirSync } from "harness";
 import { join, sep } from "path";
@@ -2567,6 +2567,207 @@ describe("condexprs", () => {
 
   TestBuilder.command`LOL=; [[ $LOl == $LOL ]] && echo yes!`.stdout("yes!\n").runAsTest("== empty");
   TestBuilder.command`LOL=; [[ $LOl != $LOL ]] && echo yes!`.exitCode(1).runAsTest("!= empty");
+
+  TestBuilder.command`[[ foo = foo ]] && echo yes!`.stdout("yes!\n").runAsTest("= is the same as ==");
+  TestBuilder.command`[[ foo = bar ]] && echo yes!`.exitCode(1).runAsTest("= fail");
+
+  TestBuilder.command`[[ -e package.json ]] && echo yes!`
+    .file("package.json", "hi")
+    .stdout("yes!\n")
+    .runAsTest("-e file");
+  TestBuilder.command`[[ -e mydir ]] && echo yes!`.directory("mydir").stdout("yes!\n").runAsTest("-e directory");
+  TestBuilder.command`[[ -e /dev/null ]] && echo yes!`.stdout("yes!\n").runAsTest("-e character device");
+  TestBuilder.command`[[ -e mumbo.jumbo ]] && echo yes!`.exitCode(1).runAsTest("-e non-existent");
+  TestBuilder.command`[[ -e "" ]] && echo yes!`.exitCode(1).runAsTest("-e empty string");
+
+  TestBuilder.command`[[ -s package.json ]] && echo yes!`.file("package.json", "hi").stdout("yes!\n").runAsTest("-s");
+  TestBuilder.command`[[ -s empty.txt ]] && echo yes!`.file("empty.txt", "").exitCode(1).runAsTest("-s empty file");
+  TestBuilder.command`[[ -s mumbo.jumbo ]] && echo yes!`.exitCode(1).runAsTest("-s non-existent");
+
+  TestBuilder.command`[[ -b /dev/null ]] && echo yes!`.exitCode(1).runAsTest("-b character device");
+  TestBuilder.command`[[ -b mumbo.jumbo ]] && echo yes!`.exitCode(1).runAsTest("-b non-existent");
+  TestBuilder.command`[[ -p package.json ]] && echo yes!`
+    .file("package.json", "hi")
+    .exitCode(1)
+    .runAsTest("-p regular file");
+  TestBuilder.command`[[ -S package.json ]] && echo yes!`
+    .file("package.json", "hi")
+    .exitCode(1)
+    .runAsTest("-S regular file");
+  TestBuilder.command`[[ -L package.json ]] && echo yes!`
+    .file("package.json", "hi")
+    .exitCode(1)
+    .runAsTest("-L regular file");
+  TestBuilder.command`[[ -L mumbo.jumbo ]] && echo yes!`.exitCode(1).runAsTest("-L non-existent");
+
+  TestBuilder.command`if [[ -e package.json ]]; then echo exists; else echo missing; fi`
+    .file("package.json", "hi")
+    .stdout("exists\n")
+    .runAsTest("-e inside if");
+
+  test("-L and -h test the link itself, everything else follows it", async () => {
+    using dir = tempDir("condexpr-symlink", { "target.txt": "hi" });
+    const cwd = String(dir);
+    symlinkSync("target.txt", join(cwd, "link"));
+    symlinkSync("does-not-exist", join(cwd, "dangling"));
+
+    const results = {
+      "-L link": (await $`[[ -L link ]]`.cwd(cwd)).exitCode,
+      "-h link": (await $`[[ -h link ]]`.cwd(cwd)).exitCode,
+      "-L dangling": (await $`[[ -L dangling ]]`.cwd(cwd)).exitCode,
+      "-h dangling": (await $`[[ -h dangling ]]`.cwd(cwd)).exitCode,
+      "-L target.txt": (await $`[[ -L target.txt ]]`.cwd(cwd)).exitCode,
+      "-e link": (await $`[[ -e link ]]`.cwd(cwd)).exitCode,
+      "-f link": (await $`[[ -f link ]]`.cwd(cwd)).exitCode,
+      "-e dangling": (await $`[[ -e dangling ]]`.cwd(cwd)).exitCode,
+      "link -ef target.txt": (await $`[[ link -ef target.txt ]]`.cwd(cwd)).exitCode,
+    };
+
+    expect(results).toEqual({
+      "-L link": 0,
+      "-h link": 0,
+      "-L dangling": 0,
+      "-h dangling": 0,
+      "-L target.txt": 1,
+      "-e link": 0,
+      "-f link": 0,
+      "-e dangling": 1,
+      "link -ef target.txt": 0,
+    });
+  });
+
+  test("-nt and -ot compare modification times", async () => {
+    using dir = tempDir("condexpr-mtime", { "old.txt": "", "new.txt": "" });
+    const cwd = String(dir);
+    utimesSync(join(cwd, "old.txt"), 1_000_000, 1_000_000);
+    utimesSync(join(cwd, "new.txt"), 2_000_000, 2_000_000);
+
+    const results = {
+      "new -nt old": (await $`[[ new.txt -nt old.txt ]]`.cwd(cwd)).exitCode,
+      "old -nt new": (await $`[[ old.txt -nt new.txt ]]`.cwd(cwd)).exitCode,
+      "new -nt new": (await $`[[ new.txt -nt new.txt ]]`.cwd(cwd)).exitCode,
+      "new -nt missing": (await $`[[ new.txt -nt missing.txt ]]`.cwd(cwd)).exitCode,
+      "missing -nt new": (await $`[[ missing.txt -nt new.txt ]]`.cwd(cwd)).exitCode,
+      "missing -nt missing": (await $`[[ missing.txt -nt also-missing.txt ]]`.cwd(cwd)).exitCode,
+      "old -ot new": (await $`[[ old.txt -ot new.txt ]]`.cwd(cwd)).exitCode,
+      "new -ot old": (await $`[[ new.txt -ot old.txt ]]`.cwd(cwd)).exitCode,
+      "old -ot old": (await $`[[ old.txt -ot old.txt ]]`.cwd(cwd)).exitCode,
+      "missing -ot old": (await $`[[ missing.txt -ot old.txt ]]`.cwd(cwd)).exitCode,
+      "old -ot missing": (await $`[[ old.txt -ot missing.txt ]]`.cwd(cwd)).exitCode,
+      "empty -ot old": (await $`[[ "" -ot old.txt ]]`.cwd(cwd)).exitCode,
+    };
+
+    expect(results).toEqual({
+      "new -nt old": 0,
+      "old -nt new": 1,
+      "new -nt new": 1,
+      "new -nt missing": 0,
+      "missing -nt new": 1,
+      "missing -nt missing": 1,
+      "old -ot new": 0,
+      "new -ot old": 1,
+      "old -ot old": 1,
+      "missing -ot old": 0,
+      "old -ot missing": 1,
+      "empty -ot old": 0,
+    });
+  });
+
+  test("-ef is true when both names refer to the same file", async () => {
+    using dir = tempDir("condexpr-ef", { "a.txt": "a", "b.txt": "b" });
+    const cwd = String(dir);
+    linkSync(join(cwd, "a.txt"), join(cwd, "hardlink.txt"));
+
+    const results = {
+      "a -ef ./a": (await $`[[ a.txt -ef ./a.txt ]]`.cwd(cwd)).exitCode,
+      "a -ef hardlink": (await $`[[ a.txt -ef hardlink.txt ]]`.cwd(cwd)).exitCode,
+      "a -ef b": (await $`[[ a.txt -ef b.txt ]]`.cwd(cwd)).exitCode,
+      "a -ef missing": (await $`[[ a.txt -ef missing.txt ]]`.cwd(cwd)).exitCode,
+      "missing -ef missing": (await $`[[ missing.txt -ef missing.txt ]]`.cwd(cwd)).exitCode,
+    };
+
+    expect(results).toEqual({
+      "a -ef ./a": 0,
+      "a -ef hardlink": 0,
+      "a -ef b": 1,
+      "a -ef missing": 1,
+      "missing -ef missing": 1,
+    });
+  });
+
+  test.skipIf(isWindows)("-p matches a named pipe and -S a socket", async () => {
+    using dir = tempDir("condexpr", { "regular.txt": "" });
+    const cwd = String(dir);
+    expect((await $`mkfifo fifo`.cwd(cwd)).exitCode).toBe(0);
+    using listener = Bun.listen({ unix: join(cwd, "sock"), socket: { data() {} } });
+
+    const results = {
+      "-p fifo": (await $`[[ -p fifo ]]`.cwd(cwd)).exitCode,
+      "-e fifo": (await $`[[ -e fifo ]]`.cwd(cwd)).exitCode,
+      "-f fifo": (await $`[[ -f fifo ]]`.cwd(cwd)).exitCode,
+      "-S sock": (await $`[[ -S sock ]]`.cwd(cwd)).exitCode,
+      "-e sock": (await $`[[ -e sock ]]`.cwd(cwd)).exitCode,
+      "-p sock": (await $`[[ -p sock ]]`.cwd(cwd)).exitCode,
+      "-S regular.txt": (await $`[[ -S regular.txt ]]`.cwd(cwd)).exitCode,
+    };
+
+    expect(results).toEqual({
+      "-p fifo": 0,
+      "-e fifo": 0,
+      "-f fifo": 1,
+      "-S sock": 0,
+      "-e sock": 0,
+      "-p sock": 1,
+      "-S regular.txt": 1,
+    });
+  });
+
+  TestBuilder.command`[[ 1 -eq 1 ]] && echo yes!`.stdout("yes!\n").runAsTest("-eq");
+  TestBuilder.command`[[ 1 -eq 2 ]] && echo yes!`.exitCode(1).runAsTest("-eq fail");
+  TestBuilder.command`[[ 1 -ne 2 ]] && echo yes!`.stdout("yes!\n").runAsTest("-ne");
+  TestBuilder.command`[[ 2 -ne 2 ]] && echo yes!`.exitCode(1).runAsTest("-ne fail");
+  TestBuilder.command`[[ 9 -lt 10 ]] && echo yes!`.stdout("yes!\n").runAsTest("-lt compares numbers, not strings");
+  TestBuilder.command`[[ 10 -lt 9 ]] && echo yes!`.exitCode(1).runAsTest("-lt fail");
+  TestBuilder.command`[[ 10 -le 10 ]] && echo yes!`.stdout("yes!\n").runAsTest("-le");
+  TestBuilder.command`[[ 11 -le 10 ]] && echo yes!`.exitCode(1).runAsTest("-le fail");
+  TestBuilder.command`[[ 10 -gt 9 ]] && echo yes!`.stdout("yes!\n").runAsTest("-gt");
+  TestBuilder.command`[[ 9 -gt 10 ]] && echo yes!`.exitCode(1).runAsTest("-gt fail");
+  TestBuilder.command`[[ 10 -ge 10 ]] && echo yes!`.stdout("yes!\n").runAsTest("-ge");
+  TestBuilder.command`[[ 9 -ge 10 ]] && echo yes!`.exitCode(1).runAsTest("-ge fail");
+  TestBuilder.command`[[ -1 -lt 0 ]] && echo yes!`.stdout("yes!\n").runAsTest("negative number as the first operand");
+  TestBuilder.command`[[ 0 -gt -1 ]] && echo yes!`.stdout("yes!\n").runAsTest("negative number as the second operand");
+  TestBuilder.command`[[ +7 -eq 7 ]] && echo yes!`.stdout("yes!\n").runAsTest("explicit plus sign");
+  TestBuilder.command`[[ " 7 " -eq 7 ]] && echo yes!`
+    .stdout("yes!\n")
+    .runAsTest("whitespace around a number is ignored");
+  TestBuilder.command`[[ 007 -eq 7 ]] && echo yes!`.stdout("yes!\n").runAsTest("leading zeros are decimal");
+  TestBuilder.command`[[ $CONDEXPR_UNSET -eq 0 ]] && echo yes!`.stdout("yes!\n").runAsTest("empty operand counts as 0");
+  TestBuilder.command`N=3; [[ $N -gt 2 ]] && echo yes!`.stdout("yes!\n").runAsTest("operands are expanded");
+  TestBuilder.command`[[ ${5} -gt ${4} ]] && echo yes!`.stdout("yes!\n").runAsTest("interpolated JavaScript numbers");
+  TestBuilder.command`[[ $(echo 3) -eq 3 ]] && echo yes!`.stdout("yes!\n").runAsTest("command substitution operand");
+  TestBuilder.command`[[ 9223372036854775807 -gt 9223372036854775806 ]] && echo yes!`
+    .stdout("yes!\n")
+    .runAsTest("64-bit operands");
+  TestBuilder.command`[[ abc -eq 1 ]] && echo yes!`
+    .stderr("[[: abc: integer expression expected\n")
+    .exitCode(1)
+    .runAsTest("non-integer first operand");
+  TestBuilder.command`[[ 1 -eq 1x ]] && echo yes!`
+    .stderr("[[: 1x: integer expression expected\n")
+    .exitCode(1)
+    .runAsTest("non-integer second operand");
+  TestBuilder.command`[[ 1 -eq - ]] && echo yes!`
+    .stderr("[[: -: integer expression expected\n")
+    .exitCode(1)
+    .runAsTest("sign without digits");
+  TestBuilder.command`[[ 99999999999999999999 -eq 1 ]] && echo yes!`
+    .stderr("[[: 99999999999999999999: integer expression expected\n")
+    .exitCode(1)
+    .runAsTest("operand too large for 64 bits");
+  TestBuilder.command`[[ 1 -eq a ]] || echo fell through`
+    .stderr("[[: a: integer expression expected\n")
+    .stdout("fell through\n")
+    .runAsTest("a bad operand fails the test without aborting the script");
 
   describe.todo("ported from GNU bash", () => {
     TestBuilder.command`
