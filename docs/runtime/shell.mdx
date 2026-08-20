@@ -297,6 +297,51 @@ Use the `$(...)` syntax instead.
 
 ---
 
+## Conditional expressions (`[[ ... ]]`)
+
+`[[ ... ]]` tests a condition and exits with `0` when it holds and `1` when it does not, so it works with `&&`, `||` and `if`:
+
+```js
+import { $ } from "bun";
+
+// Rebuild when the bundle is missing or older than its source
+await $`[[ dist/index.js -nt src/index.ts ]] || bun build ./src/index.ts --outdir dist`;
+
+const { exitCode } = await $`bun test`.nothrow();
+await $`
+  if [[ ${exitCode} -eq 0 ]]; then
+    echo "tests passed"
+  else
+    echo "tests failed with exit code ${exitCode}"
+  fi
+`;
+```
+
+Each `[[ ... ]]` holds a single test; combine several with `&&` and `||` between them. Operands are expanded like command arguments (variables, command substitution and interpolated JavaScript values all work), but the operator itself has to be written literally. The supported tests are:
+
+| Test                                         | Holds when                                                                               |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `-e file`                                    | `file` exists                                                                            |
+| `-f file`                                    | `file` exists and is a regular file                                                      |
+| `-d file`                                    | `file` exists and is a directory                                                         |
+| `-s file`                                    | `file` exists and is not empty                                                           |
+| `-L file`, `-h file`                         | `file` is a symbolic link (the link itself is tested, every other test follows it)       |
+| `-p file`                                    | `file` is a named pipe                                                                   |
+| `-S file`                                    | `file` is a socket                                                                       |
+| `-b file`, `-c file`                         | `file` is a block or character device                                                    |
+| `a -nt b`                                    | `a` was modified more recently than `b`, or `a` exists and `b` does not                  |
+| `a -ot b`                                    | `a` was modified less recently than `b`, or `b` exists and `a` does not                  |
+| `a -ef b`                                    | `a` and `b` are the same file (the same device and inode, also through hard links)       |
+| `-z string`, `-n string`                     | `string` is empty, or is not empty                                                       |
+| `a == b`, `a = b`, `a != b`                  | the strings are equal, or are not equal                                                  |
+| `a -eq b`, `-ne`, `-lt`, `-le`, `-gt`, `-ge` | the integers compare equal, not equal, less, less or equal, greater, or greater or equal |
+
+File tests are relative to the shell's current directory and an empty operand never names a file, so `[[ -e $MAYBE_UNSET ]]` is simply false.
+
+The integer tests take optionally signed decimal integers, with whitespace around them ignored. Like in bash, an empty operand counts as `0`, so an unset variable compares as zero. Any other operand that is not an integer prints `[[: <operand>: integer expression expected` to stderr and the test fails with exit code `1`.
+
+---
+
 ## Environment variables
 
 Set environment variables like in bash:
