@@ -225,7 +225,7 @@ pub mod ast {
         /// -n string
         #[strum(serialize = "-n")]
         DashN,
-        /// string1 == string2
+        /// string1 == string2 (also spelled `string1 = string2`)
         #[strum(serialize = "==")]
         EqEq,
         /// string1 != string2
@@ -253,13 +253,29 @@ pub mod ast {
 
     impl CondExprOp {
         pub(crate) const SUPPORTED: &'static [CondExprOp] = &[
+            CondExprOp::DashB,
+            CondExprOp::DashC,
+            CondExprOp::DashD,
+            CondExprOp::DashE,
             CondExprOp::DashF,
+            CondExprOp::DashH,
+            CondExprOp::DashCapL,
+            CondExprOp::DashP,
+            CondExprOp::DashS,
+            CondExprOp::DashCapS,
             CondExprOp::DashZ,
             CondExprOp::DashN,
-            CondExprOp::DashD,
-            CondExprOp::DashC,
+            CondExprOp::DashEf,
+            CondExprOp::DashNt,
+            CondExprOp::DashOt,
             CondExprOp::EqEq,
             CondExprOp::NotEq,
+            CondExprOp::DashEq,
+            CondExprOp::DashNe,
+            CondExprOp::DashLt,
+            CondExprOp::DashLe,
+            CondExprOp::DashGt,
+            CondExprOp::DashGe,
         ];
 
         pub fn is_supported(op: CondExprOp) -> bool {
@@ -307,6 +323,7 @@ pub mod ast {
             ("-nt", CondExprOp::DashNt),
             ("-ot", CondExprOp::DashOt),
             ("==", CondExprOp::EqEq),
+            ("=", CondExprOp::EqEq),
             ("!=", CondExprOp::NotEq),
             ("<", CondExprOp::Lt),
             (">", CondExprOp::Gt),
@@ -1029,10 +1046,11 @@ impl<'bump> Parser<'bump> {
         // Operators are not allowed to be expanded (i.e. `FOO=-f; [[ $FOO package.json ]]` won't work)
         // So it must be a .Text token
         // Also, all single operand operators start with "-", so check it starts with "-".
+        // A negative number (`[[ -1 -lt 0 ]]`) is an operand of a binary operator, not an operator.
         if let Token::Text(range) = self.peek() {
             let txt = self.text(range);
 
-            if txt[0] == b'-' {
+            if txt[0] == b'-' && !txt.get(1).is_some_and(u8::is_ascii_digit) {
                 // Is a potential single arg op
                 for &(name, op) in ast::CondExprOp::SINGLE_ARG_OPS {
                     if txt == name.as_bytes() {
