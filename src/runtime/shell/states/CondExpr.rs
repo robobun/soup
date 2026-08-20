@@ -81,30 +81,72 @@ impl CondExpr {
         use ast::CondExprOp as Op;
         let parent = interp.as_condexpr(this).base.parent;
         match op {
-            Op::DashC | Op::DashD | Op::DashF => {
+            Op::DashB
+            | Op::DashC
+            | Op::DashD
+            | Op::DashE
+            | Op::DashF
+            | Op::DashH
+            | Op::DashCapL
+            | Op::DashP
+            | Op::DashS
+            | Op::DashCapS => {
                 // Empty expansion or empty path → exit 1 (bash always
                 // gives 1; Windows `stat("")` can succeed and return cwd's
                 // stat, so the empty-path check must be explicit).
-                let path_empty = {
-                    let me = interp.as_condexpr(this);
-                    me.args.is_empty() || me.args[0].is_empty()
-                };
-                if path_empty {
+                let path = interp.as_condexpr(this).args.first().cloned();
+                let Some(path) = path.filter(|path| !path.is_empty()) else {
                     return interp.child_done(parent, this, 1);
-                }
-                // Post a
-                // `ShellCondExprStatTask` to the thread pool; the result comes
-                // back on the main thread via `on_stat_task_done`.
-                let (cwd_fd, mut path) = {
-                    let me = interp.as_condexpr(this);
-                    let cwd_fd = me.base.shell().cwd_fd;
-                    (cwd_fd, me.args[0].clone())
                 };
-                if path.last() != Some(&0) {
-                    path.push(0);
-                }
-                interp.as_condexpr_mut(this).state = CondExprState::WaitingStat;
-                Self::do_stat(interp, this, cwd_fd, path)
+                let no_follow = matches!(op, Op::DashH | Op::DashCapL);
+                Self::do_stat(interp, this, [path, Vec::new()], no_follow)
+            }
+            Op::DashEf | Op::DashNt | Op::DashOt => {
+                // A missing or empty operand is a file that does not exist;
+                // `run_from_thread_pool` reports it as such, so `-nt`/`-ot`
+                // keep bash's "exists vs. does not exist" answers.
+                let paths = {
+                    let me = interp.as_condexpr(this);
+                    [
+                        me.args.first().cloned().unwrap_or_default(),
+                        me.args.get(1).cloned().unwrap_or_default(),
+                    ]
+                };
+                Self::do_stat(interp, this, paths, false)
+            }
+            Op::DashEq | Op::DashNe | Op::DashLt | Op::DashLe | Op::DashGt | Op::DashGe => {
+                let parsed = {
+                    let me = interp.as_condexpr(this);
+                    let lhs = me.args.first().map_or(&[][..], Vec::as_slice);
+                    let rhs = me.args.get(1).map_or(&[][..], Vec::as_slice);
+                    match (parse_integer_operand(lhs), parse_integer_operand(rhs)) {
+                        (Some(lhs), Some(rhs)) => Ok((lhs, rhs)),
+                        (None, _) => Err(lhs.to_vec()),
+                        (_, None) => Err(rhs.to_vec()),
+                    }
+                };
+                let (lhs, rhs) = match parsed {
+                    Ok(operands) => operands,
+                    Err(bad) => {
+                        return Self::write_failing_error(
+                            interp,
+                            this,
+                            format_args!(
+                                "[[: {}: integer expression expected\n",
+                                bstr::BStr::new(&bad)
+                            ),
+                        );
+                    }
+                };
+                let holds = match op {
+                    Op::DashEq => lhs == rhs,
+                    Op::DashNe => lhs != rhs,
+                    Op::DashLt => lhs < rhs,
+                    Op::DashLe => lhs <= rhs,
+                    Op::DashGt => lhs > rhs,
+                    _ => lhs >= rhs,
+                };
+                interp.child_done(parent, this, if holds { 0 } else { 1 })
             }
             Op::DashZ => {
                 let exit = {
@@ -183,38 +225,65 @@ impl CondExpr {
         )
     }
 
-    /// Main-thread re-entry for the
-    /// off-thread `stat`/`lstat` posted by a unary file-test operator.
+    /// Main-thread re-entry for the off-thread `stat`/`lstat` posted by a
+    /// file-test operator. `stats[1]` is only filled in for the binary
+    /// operators (`-nt`, `-ot`, `-ef`).
     pub(crate) fn on_stat_task_done(
         interp: &Interpreter,
         this: NodeId,
-        stat: &bun_sys::Result<bun_sys::Stat>,
-        path: &[u8],
+        stats: &[bun_sys::Result<bun_sys::Stat>; 2],
     ) {
-        // Evaluate `op` against the stat result.
-        let _ = path;
+        use ast::CondExprOp as Op;
         debug_assert!(matches!(
             interp.as_condexpr(this).state,
             CondExprState::WaitingStat
         ));
         let op = interp.as_condexpr(this).node.op;
-        let exit = match stat {
-            Err(_) => 1,
-            Ok(st) => {
-                let mode = st.st_mode as _;
-                let ok = match op {
-                    ast::CondExprOp::DashF => bun_sys::S::ISREG(mode),
-                    ast::CondExprOp::DashD => bun_sys::S::ISDIR(mode),
-                    ast::CondExprOp::DashC => bun_sys::S::ISCHR(mode),
-                    _ => {
-                        unreachable!("CondExprOp does not need stat(); this indicates a bug in Bun")
+        let [first, second] = stats;
+        let holds = match op {
+            Op::DashNt => match (first, second) {
+                (Ok(a), Ok(b)) => bun_sys::stat_mtime(a)
+                    .order(&bun_sys::stat_mtime(b))
+                    .is_gt(),
+                (Ok(_), Err(_)) => true,
+                (Err(_), _) => false,
+            },
+            Op::DashOt => match (first, second) {
+                (Ok(a), Ok(b)) => bun_sys::stat_mtime(a)
+                    .order(&bun_sys::stat_mtime(b))
+                    .is_lt(),
+                (Err(_), Ok(_)) => true,
+                (_, Err(_)) => false,
+            },
+            Op::DashEf => match (first, second) {
+                (Ok(a), Ok(b)) => a.st_dev == b.st_dev && a.st_ino == b.st_ino,
+                _ => false,
+            },
+            _ => match first {
+                Err(_) => false,
+                Ok(st) => {
+                    let mode = st.st_mode as _;
+                    match op {
+                        Op::DashE => true,
+                        Op::DashS => st.st_size > 0,
+                        Op::DashF => bun_sys::S::ISREG(mode),
+                        Op::DashD => bun_sys::S::ISDIR(mode),
+                        Op::DashC => bun_sys::S::ISCHR(mode),
+                        Op::DashB => bun_sys::S::ISBLK(mode),
+                        Op::DashP => bun_sys::S::ISFIFO(mode),
+                        Op::DashCapS => bun_sys::S::ISSOCK(mode),
+                        Op::DashH | Op::DashCapL => bun_sys::S::ISLNK(mode),
+                        _ => unreachable!(
+                            "CondExprOp does not need stat(); this indicates a bug in Bun"
+                        ),
                     }
-                };
-                if ok { 0 } else { 1 }
-            }
+                }
+            },
         };
         let parent = interp.as_condexpr(this).base.parent;
-        interp.child_done(parent, this, exit).run(interp);
+        interp
+            .child_done(parent, this, if holds { 0 } else { 1 })
+            .run(interp);
     }
 
     pub(crate) fn child_done(
@@ -253,23 +322,34 @@ impl CondExpr {
 
     /// Heap-allocate a `ShellCondExprStatTask`
     /// and hand it to the work pool; `run_from_thread_pool` performs the
-    /// `statat`, then the main thread resumes via
+    /// `statat` of every operand, then the main thread resumes via
     /// `ShellCondExprStatTask::run_from_main_thread` → `on_stat_task_done`.
-    /// `path` is NUL-terminated by the caller.
-    fn do_stat(interp: &Interpreter, this: NodeId, cwd_fd: bun_sys::Fd, path: Vec<u8>) -> Yield {
+    fn do_stat(
+        interp: &Interpreter,
+        this: NodeId,
+        mut paths: [Vec<u8>; 2],
+        no_follow: bool,
+    ) -> Yield {
         use crate::shell::dispatch_tasks::{CondExprStatInner, ShellCondExprStatTask};
         use crate::shell::interpreter::ShellTask;
-        debug_assert!(path.last() == Some(&0));
+        for path in &mut paths {
+            if path.last() != Some(&0) {
+                path.push(0);
+            }
+        }
+        let cwd_fd = interp.as_condexpr(this).base.shell().cwd_fd;
+        interp.as_condexpr_mut(this).state = CondExprState::WaitingStat;
         let mut task = ShellTask::new(interp.event_loop);
         task.interp = interp.as_ctx_ptr();
         let stat_task = bun_core::heap::alloc(ShellCondExprStatTask {
             task: CondExprStatInner {
                 task,
                 cond: this,
-                // Placeholder — always overwritten by `run_from_thread_pool`
-                // before the main thread reads it.
-                stat: Err(Default::default()),
-                path,
+                paths,
+                // Placeholders — overwritten by `run_from_thread_pool` before
+                // the main thread reads them.
+                stats: [Err(Default::default()), Err(Default::default())],
+                no_follow,
                 cwd_fd,
             },
         });
@@ -330,6 +410,36 @@ impl CondExpr {
     }
 }
 
+/// Operand of `-eq`, `-ne`, `-lt`, `-le`, `-gt` or `-ge`: an optionally signed
+/// decimal integer with optional surrounding whitespace. As in bash's `[[ ]]`,
+/// an empty operand (usually an unset variable) counts as 0.
+fn parse_integer_operand(arg: &[u8]) -> Option<i64> {
+    let arg = arg.trim_ascii();
+    let (negative, digits) = match arg.split_first() {
+        None => return Some(0),
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        Some(_) => (false, arg),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        let digit = i64::from(byte - b'0');
+        value = value.checked_mul(10)?;
+        value = if negative {
+            value.checked_sub(digit)?
+        } else {
+            value.checked_add(digit)?
+        };
+    }
+    Some(value)
+}
+
 // `runtime::dispatch::run_task`'s `task_tag::ShellCondExprStatTask` arm casts
 // the enqueued pointer back to `ShellCondExprStatTask`; both sides MUST agree.
 impl bun_event_loop::Taskable for crate::shell::dispatch_tasks::ShellCondExprStatTask {
@@ -355,10 +465,26 @@ impl crate::shell::interpreter::ShellTaskCtx
             + core::mem::offset_of!(crate::shell::dispatch_tasks::CondExprStatInner, task);
 
     fn run_from_thread_pool(this: &mut Self) {
+        use crate::shell::interpreter::{shell_lstatat, shell_statat};
         let inner = &mut this.task;
-        debug_assert!(inner.path.last() == Some(&0));
-        let z = bun_core::ZStr::from_buf(&inner.path, inner.path.len() - 1);
-        inner.stat = crate::shell::interpreter::shell_statat(inner.cwd_fd, z);
+        for (path, stat) in inner.paths.iter().zip(inner.stats.iter_mut()) {
+            debug_assert!(path.last() == Some(&0));
+            // An empty operand names no file. Windows `stat("")` would report
+            // the cwd instead of failing.
+            if path.len() <= 1 {
+                *stat = Err(bun_sys::Error::new(
+                    bun_sys::E::ENOENT,
+                    bun_sys::Tag::fstatat,
+                ));
+                continue;
+            }
+            let z = bun_core::ZStr::from_buf(path, path.len() - 1);
+            *stat = if inner.no_follow {
+                shell_lstatat(inner.cwd_fd, z)
+            } else {
+                shell_statat(inner.cwd_fd, z)
+            };
+        }
     }
 
     fn run_from_main_thread(this: *mut Self, interp: &Interpreter) {
