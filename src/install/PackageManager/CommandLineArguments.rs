@@ -602,7 +602,7 @@ static PATCH_COMMIT_PARAMS: ParamTable = &[
 static OUTDATED_PARAMS: ParamTable = &[
     SHARED_PARAMS,
     &[
-        // clap::param!("--json                                 Output outdated information in JSON format"),
+        clap::param!("--json                                 Output in JSON format"),
         clap::param!(
             "-F, --filter <STR>...                  Display outdated dependencies for each matching workspace"
         ),
@@ -1214,6 +1214,9 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/unlink<r>.
   <b><green>bun outdated<r> <blue>"is-*"<r>
   <b><green>bun outdated<r> <blue>"!is-even"<r>
 
+  <d>Print the outdated dependencies as JSON.<r>
+  <b><green>bun outdated<r> <cyan>--json<r>
+
 Full documentation is available at <magenta>https://bun.com/docs/cli/outdated<r>.
 "#,
             ),
@@ -1674,7 +1677,6 @@ Full documentation is available at <magenta>https://bun.com/docs/pm/cli/prune<r>
             // fake --dry-run, we don't actually resolve+clean the lockfile
             cli.dry_run = true;
             cli.recursive = args.flag(b"--recursive");
-            // cli.json_output = args.flag(b"--json");
         }
 
         if matches!(subcommand, Subcommand::Dedupe | Subcommand::Prune) && args.flag(b"--check") {
