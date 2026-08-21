@@ -247,6 +247,60 @@ Files: `src/shell_parser/parse.rs` (supported table, `=`, negative operands),
 `src/runtime/shell/interpreter.rs` (`shell_lstatat`), `src/bun_core/util.rs` (`S::ISBLK`),
 `docs/runtime/shell.mdx`, `test/js/bun/shell/bunshell.test.ts`.
 
+### 2026-08-21: `bun outdated --json`
+
+`bun outdated` only produced a table, so anything that wanted the information (a CI check, a
+dependency dashboard, an update bot, an editor) had to scrape box-drawing characters, or run
+`npm outdated --json` against a project npm did not install. `bun audit`, `bun info` and the
+`bun pm` commands already take `--json`, and `bun outdated` had the flag stubbed out in two comments
+since the command was written (oven-sh/bun#39534, filed this week, lists JSON output as the biggest
+gap against npm and pnpm). `--json` now prints an array with one object per row of the table and
+nothing else on stdout, so `bun outdated --json | jq` works; the `bun outdated v1.x` header is not
+printed, and errors and the manifest download progress go to stderr as before.
+
+```sh
+bun outdated --json
+# [
+#   {
+#     "name": "eslint",
+#     "current": "8.57.1",
+#     "update": "8.57.1",
+#     "latest": "9.20.0",
+#     "type": "devDependencies",
+#     "workspace": "my-app",
+#     "catalog": null
+#   }
+# ]
+
+# fail CI when something can be updated without changing package.json
+bun outdated --json -r | jq -e 'map(select(.current != .update)) == []'
+```
+
+`name` is the name in package.json (what `bun update <name>` and the positional filters use), `type`
+is the package.json section, `workspace` is always present (the table only shows the column when it
+is filtered), and `catalog` is `null`, `"default"` or the catalog name, the encoding `bun audit fix
+--json` already uses. Catalog rows are not folded into one `catalog (a, b)` row as in the table:
+each workspace gets its own object, since a consumer can group and a folded string cannot be
+ungrouped. Objects come out in the table's order (dependencies, dev, peer, optional); nothing
+outdated prints `[]`, as do the early exits for an unknown root package and a dependency pattern
+that cannot match. The minimum-release-age `*` marker has no JSON counterpart: the versions are the
+ones the table prints, which are also the ones `bun update` would install.
+
+The implementation keeps the three version strings the first pass already formats to size the
+columns, instead of computing them a third time; that pass formatted the _current_ version with the
+manifest's string buffer in the "no version satisfies the range" fallback, although the current
+version comes from the lockfile, so the JSON would have carried a wrong prerelease tag there. The
+fallback now uses the lockfile buffer; upstream oven-sh/bun#38649 (open) changes the same two lines,
+so that part of this patch disappears when it lands. The
+header moved after argument parsing so it can be skipped, which also makes `bun outdated --help`
+start with `Usage:` like every other command instead of a version line. The JSON tests run against
+the test registry and pin the exact documents, including a row where current, update and latest all
+differ (install `no-deps@1.0.0`, then widen the range to `^1.0.0`; the lockfile keeps 1.0.0).
+
+Files: `src/runtime/cli/outdated_command.rs`, `src/install/PackageManager.rs` (`supports_json_output`),
+`src/install/PackageManager/CommandLineArguments.rs` (flag, help), `completions/bun.zsh`,
+`docs/pm/cli/outdated.mdx`, `docs/snippets/cli/outdated.mdx`, `test/cli/install/bun-install-registry.test.ts`.
+
 ## Dropped
 
 Nothing yet.

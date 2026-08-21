@@ -1,14 +1,20 @@
+use std::io::Write as _;
+
+use bstr::BStr;
+
 use bun_core::fmt::{Table, TableSymbols, count, escape_control_chars};
 use bun_core::strings;
 use bun_core::{Global, Output};
 use bun_glob as glob;
 use bun_install::dependency::{self, Behavior};
+use bun_install::lockfile::Lockfile;
 use bun_install::lockfile::package::PackageColumns as _;
 use bun_install::package_manager::workspace_manifests::{
     BrokenMember, DeclaredDependencies, DeclaredDependency, is_outdated,
 };
 use bun_install::package_manager::{Subcommand, WorkspaceFilter, populate_manifest_cache};
 use bun_install::{CommandLineArguments, PackageID, PackageManager};
+use bun_install_types::DependencyGroup;
 use bun_wyhash::hash;
 
 use crate::Command;
@@ -18,6 +24,14 @@ pub(crate) struct OutdatedCommand;
 struct GroupedOutdatedInfo {
     dep: DeclaredDependency,
     grouped_workspace_names: Option<Box<[u8]>>,
+}
+
+/// One object of the `--json` array, with the version columns as text.
+struct OutdatedJsonRow {
+    dep: DeclaredDependency,
+    current: String,
+    update: String,
+    latest: String,
 }
 
 /// Between the two names of an aliased dependency: `"my-alias": "npm:dep@1.0.0"` is listed as `my-alias@npm:dep`.
@@ -50,6 +64,8 @@ static COLUMN_NAMES: [&[u8]; 5] = [b"Package", b"Current", b"Update", b"Latest",
 struct OutdatedTable {
     declared: DeclaredDependencies,
     rows: Vec<GroupedOutdatedInfo>,
+    /// Empty without `--json`.
+    json_rows: Vec<OutdatedJsonRow>,
     /// One per `COLUMN_NAMES`.
     column_inside_lengths: [usize; 5],
     show_workspace_column: bool,
@@ -95,13 +111,14 @@ fn package_patterns_select(
 
 impl OutdatedCommand {
     pub(crate) fn exec(ctx: Command::Context) -> crate::Result<()> {
-        bun_core::prettyln!(
-            "<r><b>bun outdated <r><d>v{}<r>",
-            Global::package_json_version_with_sha,
-        );
-        Output::flush();
-
         let cli = CommandLineArguments::parse(Subcommand::Outdated)?;
+        if !cli.json_output {
+            bun_core::prettyln!(
+                "<r><b>bun outdated <r><d>v{}<r>",
+                Global::package_json_version_with_sha,
+            );
+            Output::flush();
+        }
 
         let (manager, original_cwd) =
             match PackageManager::init(&mut *ctx, &cli, Subcommand::Outdated) {
@@ -135,6 +152,9 @@ impl OutdatedCommand {
                     .root_package_id
                     .get(&manager.lockfile, manager.workspace_name_hash);
                 if root_pkg_id == bun_install::INVALID_PACKAGE_ID {
+                    if manager.options.json_output {
+                        print_json(&manager.lockfile, None);
+                    }
                     return Ok(());
                 }
                 (vec![root_pkg_id], false)
@@ -144,7 +164,10 @@ impl OutdatedCommand {
             populate_manifest_cache::Packages::Ids(&workspace_pkg_ids),
         )?;
         // The table covers what could be checked; what could not follows it.
-        if let Some(table) = Self::collect_outdated(manager, &workspace_pkg_ids, was_filtered) {
+        let table = Self::collect_outdated(manager, &workspace_pkg_ids, was_filtered);
+        if manager.options.json_output {
+            print_json(&manager.lockfile, table.as_ref());
+        } else if let Some(table) = table {
             if Output::enable_ansi_colors_stdout() {
                 Self::print_outdated_info_table::<true>(manager, &table);
             } else {
@@ -270,9 +293,12 @@ impl OutdatedCommand {
         let needs_extended = min_age_ms.is_some();
         let excludes = manager.options.minimum_release_age_excludes;
 
+        let json_output = manager.options.json_output;
+
         let declared =
             DeclaredDependencies::load(manager, workspace_pkg_ids, BrokenMember::LeftOut);
         let mut outdated_ids: Vec<DeclaredDependency> = Vec::new();
+        let mut json_rows: Vec<OutdatedJsonRow> = Vec::new();
 
         for row in declared.rows() {
             let string_buf = manager.lockfile.buffers.string_bytes.as_slice();
@@ -336,13 +362,32 @@ impl OutdatedCommand {
             let current_len = count(format_args!("{}", current_version.fmt(string_buf)));
             fit(1, current_len);
 
+            let mut json_row = json_output.then(|| {
+                let current = current_version.fmt(string_buf).to_string();
+                OutdatedJsonRow {
+                    dep: *row,
+                    update: current.clone(),
+                    latest: current.clone(),
+                    current,
+                }
+            });
+
             for (column, found) in [(2, update_version), (3, latest)] {
                 let filtered = found.latest_is_filtered();
                 has_filtered_versions |= filtered;
-                let version_len = found.unwrap().map_or(current_len, |found| {
+                let found = found.unwrap();
+                let version_len = found.map_or(current_len, |found| {
                     count(format_args!("{}", found.version.fmt(&manifest.string_buf)))
                 });
                 fit(column, version_len + if filtered { " *".len() } else { 0 });
+                if let (Some(json_row), Some(found)) = (&mut json_row, found) {
+                    let version = found.version.fmt(&manifest.string_buf).to_string();
+                    if column == 2 {
+                        json_row.update = version;
+                    } else {
+                        json_row.latest = version;
+                    }
+                }
             }
 
             let workspace_name = manager.lockfile.packages.items_name()
@@ -351,6 +396,7 @@ impl OutdatedCommand {
             fit(4, printed_width(&printed(workspace_name)));
 
             outdated_ids.push(*row);
+            json_rows.extend(json_row);
         }
 
         if outdated_ids.is_empty() {
@@ -371,6 +417,7 @@ impl OutdatedCommand {
         Some(OutdatedTable {
             declared,
             rows,
+            json_rows,
             column_inside_lengths,
             show_workspace_column: was_filtered || has_catalog_deps,
             has_filtered_versions,
@@ -525,4 +572,72 @@ impl OutdatedCommand {
             );
         }
     }
+}
+
+/// `--json`: an array with one object per outdated dependency, in the order of
+/// the table. Catalog entries are not grouped: every workspace that uses one
+/// gets its own object, and `catalog` names the catalog (`"default"` for the
+/// unnamed one, as in `bun audit fix --json`), or is `null`.
+fn print_json(lockfile: &Lockfile, outdated: Option<&OutdatedTable>) {
+    fn js(s: &[u8]) -> bun_core::fmt::JSONFormatterUTF8<'_> {
+        bun_core::fmt::format_json_string_utf8(s, Default::default())
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    out.push(b'[');
+    let mut written: usize = 0;
+    if let Some(outdated) = outdated {
+        let declared = &outdated.declared;
+        let declared_buf = declared.string_bytes();
+        let string_buf = lockfile.buffers.string_bytes.as_slice();
+        let pkg_names = lockfile.packages.items_name();
+        for group in [
+            DependencyGroup::DEPENDENCIES,
+            DependencyGroup::DEV,
+            DependencyGroup::PEER,
+            DependencyGroup::OPTIONAL,
+        ] {
+            for item in &outdated.json_rows {
+                let dep = declared.dependency(&item.dep);
+                if DependencyGroup::prop_for_behavior(dep.behavior) != group.prop {
+                    continue;
+                }
+                if written > 0 {
+                    out.push(b',');
+                }
+                written += 1;
+
+                let workspace = pkg_names[item.dep.workspace_pkg_id as usize].slice(string_buf);
+                let _ = write!(
+                    out,
+                    "\n  {{\n    \"name\": {},",
+                    js(dep.name.slice(declared_buf))
+                );
+                let _ = write!(out, "\n    \"current\": {},", js(item.current.as_bytes()));
+                let _ = write!(out, "\n    \"update\": {},", js(item.update.as_bytes()));
+                let _ = write!(out, "\n    \"latest\": {},", js(item.latest.as_bytes()));
+                let _ = write!(out, "\n    \"type\": \"{}\",", BStr::new(group.prop));
+                let _ = write!(out, "\n    \"workspace\": {},", js(workspace));
+                out.extend_from_slice(b"\n    \"catalog\": ");
+                if dep.version.tag == dependency::Tag::Catalog {
+                    match dep.version.catalog().slice(declared_buf) {
+                        b"" => out.extend_from_slice(b"\"default\""),
+                        name => {
+                            let _ = write!(out, "{}", js(name));
+                        }
+                    }
+                } else {
+                    out.extend_from_slice(b"null");
+                }
+                out.extend_from_slice(b"\n  }");
+            }
+        }
+    }
+    if written > 0 {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"]\n");
+
+    let _ = Output::writer().write_all(&out);
+    Output::flush();
 }
