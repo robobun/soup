@@ -1,5 +1,10 @@
 import * as b from "../../codegen/bindgen-lib.ts";
 
+export const GlobScanIgnore = b.union({
+  pattern: b.string.utf8,
+  patterns: b.array(b.string.utf8.owned),
+});
+
 export const GlobScanOptions = b.dictionary(
   {
     onlyFiles: b.bool.loose.nullable.default(true),
@@ -8,6 +13,7 @@ export const GlobScanOptions = b.dictionary(
     absolute: b.bool.loose.nullable.default(false),
     cwd: b.string.utf8.nullable,
     dot: b.bool.loose.nullable.default(false),
+    ignore: GlobScanIgnore.falsyAsNull,
   },
   { allowArray: true },
 );
