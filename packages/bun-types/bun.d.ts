@@ -8965,6 +8965,25 @@ declare module "bun" {
      * @default true
      */
     onlyFiles?: boolean;
+
+    /**
+     * Glob patterns for paths to leave out. A pattern is matched against the
+     * path relative to `cwd`, the same string `scan` returns without
+     * `absolute`. A directory that matches, with or without a trailing slash,
+     * is not entered, so `"node_modules/**"` skips that tree instead of
+     * walking it.
+     *
+     * @example
+     * ```ts
+     * const glob = new Glob("**" + "/*.ts");
+     * for await (const file of glob.scan({ ignore: ["node_modules/**", "dist/**"] })) {
+     *   console.log(file);
+     * }
+     * ```
+     *
+     * @default []
+     */
+    ignore?: string | string[];
   }
 
   /**

@@ -28,9 +28,41 @@ struct ScanOpts {
     only_files: bool,
     follow_symlinks: bool,
     error_on_broken_symlinks: bool,
+    ignore: Vec<Box<[u8]>>,
 }
 
 impl ScanOpts {
+    /// `ignore`: one pattern or an array of patterns.
+    fn parse_ignore(
+        global_this: &JSGlobalObject,
+        value: JSValue,
+        fn_name: &'static str,
+    ) -> JsResult<Vec<Box<[u8]>>> {
+        if value.is_string() {
+            let pattern = value.to_utf8(global_this)?;
+            return Ok(vec![Box::from(pattern.slice())]);
+        }
+        let invalid = || {
+            global_this.throw(format_args!(
+                "{}: invalid `ignore`, expected a string or an array of strings",
+                fn_name
+            ))
+        };
+        if !value.is_array() {
+            return Err(invalid());
+        }
+        let mut patterns: Vec<Box<[u8]>> = Vec::new();
+        let mut iter = value.array_iterator(global_this)?;
+        while let Some(item) = iter.next()? {
+            if !item.is_string() {
+                return Err(invalid());
+            }
+            let pattern = item.to_utf8(global_this)?;
+            patterns.push(Box::from(pattern.slice()));
+        }
+        Ok(patterns)
+    }
+
     fn parse_cwd(
         global_this: &JSGlobalObject,
         _arena: &Arena,
@@ -110,6 +142,7 @@ impl ScanOpts {
             follow_symlinks: false,
             error_on_broken_symlinks: false,
             only_files: true,
+            ignore: Vec::new(),
         };
         if opts_obj.is_undefined_or_null() {
             return Ok(Some(out));
@@ -186,6 +219,10 @@ impl ScanOpts {
             } else {
                 false
             };
+        }
+
+        if let Some(ignore) = opts_obj.get_truthy(global_this, "ignore")? {
+            out.ignore = Self::parse_ignore(global_this, ignore, fn_name)?;
         }
 
         Ok(Some(out))
@@ -474,7 +511,7 @@ impl Glob {
         fn init_walker<A: walk::Accessor>(
             global_this: &JSGlobalObject,
             pattern: &[u8],
-            opts: &ScanOpts,
+            opts: ScanOpts,
         ) -> JsResult<Box<walk::GlobWalker<A, false>>> {
             let result = match &opts.cwd {
                 Some(cwd) => walk::GlobWalker::<A, false>::init_with_cwd(
@@ -499,7 +536,10 @@ impl Glob {
             };
             match result.map_err(crate::Error::from)? {
                 bun_sys::Result::Err(err) => Err(global_this.throw_value(err.to_js(global_this))),
-                bun_sys::Result::Ok(gw) => Ok(Box::new(gw)),
+                bun_sys::Result::Ok(mut gw) => {
+                    gw.set_ignore_patterns(opts.ignore);
+                    Ok(Box::new(gw))
+                }
             }
         }
 
@@ -524,11 +564,11 @@ impl Glob {
             >(
                 global_this,
                 &self.pattern,
-                &match_opts,
+                match_opts,
             )?)));
         }
         Ok(Some(AnyGlobWalker::Fs(
-            init_walker::<walk::SyscallAccessor>(global_this, &self.pattern, &match_opts)?,
+            init_walker::<walk::SyscallAccessor>(global_this, &self.pattern, match_opts)?,
         )))
     }
 
