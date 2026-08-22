@@ -1180,3 +1180,173 @@ describe.skipIf(!isWindows)("glob scan descends read-only directories", () => {
     },
   );
 });
+
+describe("ignore option", () => {
+  const norm = (a: string[]) => a.map(p => p.replaceAll("\\", "/")).sort();
+  const tree = {
+    "package.json": "{}",
+    "src/index.ts": "",
+    "src/index.test.ts": "",
+    "src/util/helpers.ts": "",
+    "src/util/helpers.test.ts": "",
+    "dist/index.js": "",
+    "dist/chunks/a.js": "",
+    "node_modules/dep/index.ts": "",
+    "node_modules/dep/dist/index.js": "",
+    "packages/app/package.json": "{}",
+    "packages/app/src/main.ts": "",
+    "packages/app/dist/main.js": "",
+    "packages/app/node_modules/dep/index.ts": "",
+  };
+  const scanSync = (pattern: string, opts: GlobScanOptions) => norm(Array.from(new Glob(pattern).scanSync(opts)));
+  const scan = async (pattern: string, opts: GlobScanOptions) =>
+    norm(await Array.fromAsync(new Glob(pattern).scan(opts)));
+
+  test("leaves out matching files and does not enter matching directories", async () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    const ignore = ["**/node_modules/**", "dist/**"];
+    const expected = [
+      "package.json",
+      "packages/app/dist/main.js",
+      "packages/app/package.json",
+      "packages/app/src/main.ts",
+      "src/index.test.ts",
+      "src/index.ts",
+      "src/util/helpers.test.ts",
+      "src/util/helpers.ts",
+    ];
+    expect(scanSync("**/*", { cwd, ignore })).toEqual(expected);
+    expect(await scan("**/*", { cwd, ignore })).toEqual(expected);
+  });
+
+  test("accepts a single pattern", () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    expect(scanSync("src/**/*.ts", { cwd, ignore: "**/*.test.ts" })).toEqual(["src/index.ts", "src/util/helpers.ts"]);
+  });
+
+  test("a directory name without a trailing slash still skips its subtree", () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    // `dist` only covers the root `dist`; `**/node_modules` covers every one.
+    expect(scanSync("**/*", { cwd, ignore: ["dist", "**/node_modules"] })).toEqual([
+      "package.json",
+      "packages/app/dist/main.js",
+      "packages/app/package.json",
+      "packages/app/src/main.ts",
+      "src/index.test.ts",
+      "src/index.ts",
+      "src/util/helpers.test.ts",
+      "src/util/helpers.ts",
+    ]);
+  });
+
+  test("ignored directories are not listed with onlyFiles: false", () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    expect(scanSync("**", { cwd, onlyFiles: false, ignore: ["**/node_modules/**", "**/dist", "src/util/**"] })).toEqual(
+      [
+        "package.json",
+        "packages",
+        "packages/app",
+        "packages/app/package.json",
+        "packages/app/src",
+        "packages/app/src/main.ts",
+        "src",
+        "src/index.test.ts",
+        "src/index.ts",
+      ],
+    );
+  });
+
+  test("patterns are relative to cwd when absolute: true", async () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    const expected = norm([path.join(cwd, "src/index.ts"), path.join(cwd, "src/util/helpers.ts")]);
+    const ignore = ["node_modules/**", "packages/**", "**/*.test.ts"];
+    expect(scanSync("**/*.ts", { cwd, absolute: true, ignore })).toEqual(expected);
+    expect(await scan("**/*.ts", { cwd, absolute: true, ignore })).toEqual(expected);
+    // A cwd that `scan` normalizes before it joins paths onto it.
+    expect(scanSync("**/*.ts", { cwd: cwd + path.sep, absolute: true, ignore })).toEqual(expected);
+    expect(scanSync("**/*.ts", { cwd: cwd + path.sep + ".", absolute: true, ignore })).toEqual(expected);
+  });
+
+  test("an absolute pattern is matched against the full path", () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    // Ignore patterns use `/` as the separator, like `Glob.match()`; it also matches `\` on Windows.
+    const ignore = [`${cwd.replaceAll("\\", "/")}/**/node_modules/**`, "**/*.test.ts", "**/packages/**"];
+    expect(scanSync(path.join(cwd, "**", "*.ts"), { cwd, ignore })).toEqual(
+      norm([path.join(cwd, "src/index.ts"), path.join(cwd, "src/util/helpers.ts")]),
+    );
+  });
+
+  // A broken symlink inside the ignored tree makes the walk throw if it is entered.
+  test.skipIf(isWindows)("an ignored directory is not entered", async () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    fs.symlinkSync("missing", path.join(cwd, "node_modules", "broken"));
+    const opts = { cwd, followSymlinks: true, throwErrorOnBrokenSymlink: true } satisfies GlobScanOptions;
+
+    let err: any;
+    try {
+      scanSync("**/*", opts);
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("ENOENT");
+
+    const expected = ["package.json", "packages/app/package.json", "packages/app/src/main.ts", "src/index.ts"];
+    const ignore = ["**/node_modules/**", "**/dist", "**/*.test.ts", "src/util/**"];
+    expect(scanSync("**/*", { ...opts, ignore })).toEqual(expected);
+    expect(await scan("**/*", { ...opts, ignore })).toEqual(expected);
+  });
+
+  test.skipIf(!canCreateDirSymlink)("a symlinked directory that matches is not entered", () => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    fs.symlinkSync("src", path.join(cwd, "linked"), "dir");
+    const opts = { cwd, followSymlinks: true, ignore: ["**/node_modules/**", "**/*.test.ts"] };
+    expect(scanSync("**/*.ts", opts)).toEqual([
+      "linked/index.ts",
+      "linked/util/helpers.ts",
+      "packages/app/src/main.ts",
+      "src/index.ts",
+      "src/util/helpers.ts",
+    ]);
+    expect(scanSync("**/*.ts", { ...opts, ignore: [...opts.ignore, "linked/**"] })).toEqual([
+      "packages/app/src/main.ts",
+      "src/index.ts",
+      "src/util/helpers.ts",
+    ]);
+  });
+
+  test.each([
+    ["**/*", ["**/node_modules/**"]],
+    ["**/*", ["dist/**", "**/*.test.ts"]],
+    ["**/*.ts", ["**/*.test.ts", "node_modules"]],
+    ["**/*", ["packages/*/dist/**", "{dist,node_modules}/**"]],
+    ["**/*.js", ["dist/**"]],
+    ["src/**", ["src/util/**"]],
+  ])("agrees with fast-glob: %s ignoring %j", (pattern, ignore) => {
+    using dir = tempDir("glob-ignore", tree);
+    const cwd = String(dir);
+    const expected = fg.globSync(pattern, { cwd, ignore }).sort();
+    expect(expected.length).toBeGreaterThan(0);
+    expect(scanSync(pattern, { cwd, ignore })).toEqual(expected);
+  });
+
+  test("rejects values that are not patterns", () => {
+    using dir = tempDir("glob-ignore", { "a.ts": "" });
+    const cwd = String(dir);
+    for (const ignore of [123, true, {}, [1], ["a", null]]) {
+      // @ts-expect-error
+      expect(() => new Glob("*").scanSync({ cwd, ignore })).toThrow("invalid `ignore`");
+      // @ts-expect-error
+      expect(() => new Glob("*").scan({ cwd, ignore })).toThrow("invalid `ignore`");
+    }
+    expect(scanSync("*", { cwd, ignore: [] })).toEqual(["a.ts"]);
+    expect(scanSync("*", { cwd, ignore: undefined })).toEqual(["a.ts"]);
+  });
+});

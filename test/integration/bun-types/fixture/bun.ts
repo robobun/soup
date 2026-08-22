@@ -99,3 +99,8 @@ tsd.expectType(Bun.semver.parse(undefined)).is<Bun.semver.Version | null>();
 tsd.expectType(Bun.semver.parse("1.2.3")!.prerelease).is<(string | number)[]>();
 tsd.expectType(Bun.semver.parse("1.2.3")!.build).is<string[]>();
 tsd.expectType(Bun.semver.parse("1.2.3")!.version).is<string>();
+
+new Bun.Glob("**/*.ts").scan({ ignore: "node_modules/**" }) satisfies AsyncIterableIterator<string>;
+new Bun.Glob("**/*.ts").scanSync({ ignore: ["node_modules/**", "dist/**"] }) satisfies IterableIterator<string>;
+// @ts-expect-error ignore takes glob pattern strings
+new Bun.Glob("**/*.ts").scanSync({ ignore: /node_modules/ });
