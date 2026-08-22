@@ -21,6 +21,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use crate::IgnoreList;
 use crate::matcher::{Dots, Shape};
 use bun_alloc::AllocError;
 use bun_collections::AutoBitSet;
@@ -231,6 +235,15 @@ pub struct GlobWalker<A: Accessor, const SENTINEL: bool> {
     followed_links: Vec<FollowedLink>,
 
     is_ignored: IgnoreFilterFn,
+
+    /// What the scan leaves out, see [`GlobWalker::set_ignore`].
+    ignore: Option<Arc<IgnoreList>>,
+    /// `cwd` as [`GlobWalker::join`] normalizes it, when `absolute` is set and the pattern
+    /// is relative. Matched paths start with it; the ignore patterns see the rest.
+    ignore_root: Box<[u8]>,
+    /// Without `absolute` a matched path is as the pattern spells it, and the pattern spells
+    /// what a normalized path does not have, see [`spells_dots`].
+    ignore_normalizes: bool,
 
     _accessor: core::marker::PhantomData<A>,
 }
@@ -504,10 +517,11 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                     || S::ISREG(mode)
                     || !self.walker.only_files;
                 if matches {
-                    if let Some(path) = self
-                        .walker
-                        .prepare_matched_path(pathz.as_bytes(), dir_path.as_bytes())?
-                    {
+                    if let Some(path) = self.walker.prepare_matched_path(
+                        pathz.as_bytes(),
+                        dir_path.as_bytes(),
+                        S::ISDIR(mode),
+                    )? {
                         self.iter_state = IterState::Matched(path);
                     } else {
                         self.iter_state = IterState::GetNext;
@@ -691,6 +705,7 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                         {
                                             match self.walker.prepare_matched_path_symlink(
                                                 symlink_full_path_z.as_bytes(),
+                                                false,
                                             )? {
                                                 Some(p) => return Ok(Ok(Some(p))),
                                                 None => continue 'outer,
@@ -706,6 +721,7 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                 if self.walker.eval_file(&active, entry_name) {
                                     match self.walker.prepare_matched_path_symlink(
                                         symlink_full_path_z.as_bytes(),
+                                        false,
                                     )? {
                                         Some(p) => return Ok(Ok(Some(p))),
                                         None => continue,
@@ -713,6 +729,13 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                 }
                                 continue;
                             };
+
+                            if self
+                                .walker
+                                .is_ignored_path(symlink_full_path_z.as_bytes(), true)
+                            {
+                                continue;
+                            }
 
                             let mut add_dir: bool = false;
                             let child = self.walker.eval_dir(&active, entry_name, &mut add_dir);
@@ -757,10 +780,10 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                             }
 
                             if add_dir && !self.walker.only_files {
-                                match self
-                                    .walker
-                                    .prepare_matched_path_symlink(symlink_full_path_z.as_bytes())?
-                                {
+                                match self.walker.prepare_matched_path_symlink(
+                                    symlink_full_path_z.as_bytes(),
+                                    true,
+                                )? {
                                     Some(p) => return Ok(Ok(Some(p))),
                                     None => continue,
                                 }
@@ -796,7 +819,11 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                     match entry.kind {
                         bun_sys::FileKind::File => {
                             if self.walker.eval_file(&active, entry_name) {
-                                match self.walker.prepare_matched_path(entry_name, dir_path())? {
+                                match self.walker.prepare_matched_path(
+                                    entry_name,
+                                    dir_path(),
+                                    false,
+                                )? {
                                     Some(prepared) => return Ok(Ok(Some(prepared))),
                                     None => continue,
                                 }
@@ -814,6 +841,9 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                 ) {
                                     let subdir_entry_name =
                                         self.walker.join(dir_path(), entry_name);
+                                    if self.walker.is_ignored_path(&subdir_entry_name, true) {
+                                        continue;
+                                    }
                                     self.walker.push_work_item(
                                         WorkItem::new(
                                             subdir_entry_name,
@@ -825,7 +855,11 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                 }
                             }
                             if add_dir && !self.walker.only_files {
-                                match self.walker.prepare_matched_path(entry_name, dir_path())? {
+                                match self.walker.prepare_matched_path(
+                                    entry_name,
+                                    dir_path(),
+                                    true,
+                                )? {
                                     Some(prepared_path) => {
                                         return Ok(Ok(Some(prepared_path)));
                                     }
@@ -863,7 +897,11 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                             }
 
                             if self.walker.eval_file(&active, entry_name) {
-                                match self.walker.prepare_matched_path(entry_name, dir_path())? {
+                                match self.walker.prepare_matched_path(
+                                    entry_name,
+                                    dir_path(),
+                                    false,
+                                )? {
                                     Some(prepared_path) => {
                                         return Ok(Ok(Some(prepared_path)));
                                     }
@@ -888,10 +926,11 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                             match real_kind {
                                 bun_sys::FileKind::File => {
                                     if self.walker.eval_file(&active, entry_name) {
-                                        match self
-                                            .walker
-                                            .prepare_matched_path(entry_name, dir_path())?
-                                        {
+                                        match self.walker.prepare_matched_path(
+                                            entry_name,
+                                            dir_path(),
+                                            false,
+                                        )? {
                                             Some(prepared) => {
                                                 return Ok(Ok(Some(prepared)));
                                             }
@@ -908,6 +947,9 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                     if child.count() != 0 {
                                         let subdir_entry_name =
                                             self.walker.join(dir_path(), entry_name);
+                                        if self.walker.is_ignored_path(&subdir_entry_name, true) {
+                                            continue;
+                                        }
                                         self.walker.push_work_item(
                                             WorkItem::new(
                                                 subdir_entry_name,
@@ -918,10 +960,11 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                         );
                                     }
                                     if add_dir && !self.walker.only_files {
-                                        match self
-                                            .walker
-                                            .prepare_matched_path(entry_name, dir_path())?
-                                        {
+                                        match self.walker.prepare_matched_path(
+                                            entry_name,
+                                            dir_path(),
+                                            true,
+                                        )? {
                                             Some(prepared_path) => {
                                                 return Ok(Ok(Some(prepared_path)));
                                             }
@@ -947,10 +990,11 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
                                         )?;
                                     } else if !self.walker.only_files {
                                         if self.walker.eval_file(&active, entry_name) {
-                                            match self
-                                                .walker
-                                                .prepare_matched_path(entry_name, dir_path())?
-                                            {
+                                            match self.walker.prepare_matched_path(
+                                                entry_name,
+                                                dir_path(),
+                                                false,
+                                            )? {
                                                 Some(prepared_path) => {
                                                     return Ok(Ok(Some(prepared_path)));
                                                 }
@@ -1205,6 +1249,9 @@ impl<A: Accessor, const SENTINEL: bool> GlobWalker<A, SENTINEL> {
             follow_matched_symlinks: false,
             followed_links: Vec::new(),
             is_ignored: ignore_filter_fn.unwrap_or(dummy_filter_false),
+            ignore: None,
+            ignore_root: Box::default(),
+            ignore_normalizes: false,
             _accessor: core::marker::PhantomData,
         };
 
@@ -1227,6 +1274,67 @@ impl<A: Accessor, const SENTINEL: bool> GlobWalker<A, SENTINEL> {
         }
 
         Ok(Ok(this))
+    }
+
+    /// The `ignore` option of a scan. A path that `ignore` leaves out is not reported, and a
+    /// directory that it leaves out is not entered. Walkers can share a list.
+    ///
+    /// A pattern of the list is asked about the normalized path, with `absolute` and without
+    /// it: the path from `cwd` if the pattern of the walk is relative, and the full path if it
+    /// is absolute.
+    pub fn set_ignore(&mut self, ignore: Arc<IgnoreList>) {
+        let asks = !ignore.is_empty();
+        self.ignore_root = if asks && self.absolute && !bun_paths::is_absolute(&self.pattern) {
+            // `join` normalizes every matched path; do the same to `cwd` so the
+            // prefix compares equal even when `cwd` has a trailing separator or `.`.
+            Box::from(Path::join(&[&self.cwd[..]]).as_bytes())
+        } else {
+            Box::default()
+        };
+        self.ignore_normalizes = asks && !self.absolute && spells_dots(&self.pattern);
+        self.ignore = asks.then_some(ignore);
+    }
+
+    fn ignore_subject<'p>(&self, path: &'p [u8]) -> Cow<'p, [u8]> {
+        if self.ignore_normalizes {
+            let cwd: &[u8] = &self.cwd;
+            return Cow::Owned(match bun_paths::is_absolute(&self.pattern) {
+                true => Path::join(&[path]).as_bytes().to_vec(),
+                false => Path::relative(cwd, &Path::join(&[cwd, path]))
+                    .as_bytes()
+                    .to_vec(),
+            });
+        }
+        let root: &[u8] = &self.ignore_root;
+        if root.is_empty() {
+            return Cow::Borrowed(path);
+        }
+        // A pattern with a `..` finds paths that are not below `cwd`.
+        let from_root = || Cow::Owned(Path::relative(root, path).as_bytes().to_vec());
+        if !path.starts_with(root) {
+            return from_root();
+        }
+        let rest = &path[root.len()..];
+        if root.last().is_some_and(|&c| bun_paths::is_sep(c)) {
+            // A filesystem root (`/`, `C:\`) already ends with the separator.
+            return Cow::Borrowed(rest);
+        }
+        match rest.first() {
+            None => Cow::Borrowed(rest),
+            Some(&c) if bun_paths::is_sep(c) => Cow::Borrowed(&rest[1..]),
+            // `/a/b` is not the root of `/a/bc/d`.
+            Some(_) => from_root(),
+        }
+    }
+
+    /// Whether the scan leaves out `path` (a joined matched path, as [`GlobWalker::join`]
+    /// builds it, with or without the `SENTINEL` NUL).
+    fn is_ignored_path(&self, path: &[u8], is_dir: bool) -> bool {
+        let Some(ignore) = &self.ignore else {
+            return false;
+        };
+        let subject = self.ignore_subject(work_item_logical_path(path));
+        ignore.ignores(&subject, is_dir)
     }
 
     pub fn walk(&mut self) -> Result<Maybe<()>, Error> {
@@ -1601,7 +1709,11 @@ impl<A: Accessor, const SENTINEL: bool> GlobWalker<A, SENTINEL> {
     fn prepare_matched_path_symlink(
         &mut self,
         symlink_full_path: &[u8],
+        is_dir: bool,
     ) -> Result<Option<MatchedPath>, AllocError> {
+        if self.is_ignored_path(symlink_full_path, is_dir) {
+            return Ok(None);
+        }
         // PERF: two lookups here (contains_key + insert); profile if hot.
         if self.matched_paths.contains_key(symlink_full_path) {
             log!(
@@ -1624,8 +1736,12 @@ impl<A: Accessor, const SENTINEL: bool> GlobWalker<A, SENTINEL> {
         &mut self,
         entry_name: &[u8],
         dir_name: &[u8],
+        is_dir: bool,
     ) -> Result<Option<MatchedPath>, AllocError> {
         let name_matched_path = self.join(dir_name, entry_name);
+        if self.is_ignored_path(&name_matched_path, is_dir) {
+            return Ok(None);
+        }
         // PERF: two lookups here (contains_key + insert); profile if hot.
         if self.matched_paths.contains_key(&name_matched_path) {
             log!(
@@ -1962,6 +2078,25 @@ fn matched_as_slice<const SENTINEL: bool>(p: &[u8]) -> &[u8] {
     } else {
         p
     }
+}
+
+/// Whether a path that is joined as `pattern` spells it can differ from the normalized one,
+/// by more than a `./` in front: the pattern has a `..`, or behind a name a `.` or a second
+/// `/` in a row. A `..` in front can lead back into `cwd`.
+fn spells_dots(pattern: &[u8]) -> bool {
+    let mut components = strings::split(pattern, b"/").peekable();
+    let mut has_name = false;
+    while let Some(component) = components.next() {
+        match component {
+            b".." => return true,
+            // The `/` at the end of a pattern names a directory.
+            b"" if components.peek().is_none() => {}
+            b"" | b"." if has_name => return true,
+            b"" | b"." => {}
+            _ => has_name = true,
+        }
+    }
+    false
 }
 
 /// The logical path stored in a [`WorkItem`], excluding any trailing NUL.

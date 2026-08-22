@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use bun_glob::BunGlobWalker as GlobWalker;
+use bun_glob::IgnoreList;
 use bun_glob::walk;
 use bun_jsc::bindgen::{self, IntoError, JsHeap, JsLocal, JsScope};
 use bun_jsc::bun_string_jsc;
@@ -8,7 +11,7 @@ use bun_jsc::{
 use bun_paths::MAX_PATH_BYTES;
 use bun_sys as syscall;
 
-use crate::generated_bindgen::glob::{GlobScanArgument, GlobScanOptions};
+use crate::generated_bindgen::glob::{GlobScanArgument, GlobScanIgnore, GlobScanOptions};
 
 /// `Bun.Glob`, declared in `Glob.bind.ts`.
 pub(crate) struct Glob {
@@ -52,6 +55,7 @@ struct ScanOpts {
     only_files: bool,
     follow_symlinks: bool,
     error_on_broken_symlinks: bool,
+    ignore: Option<Arc<IgnoreList>>,
 }
 
 impl ScanOpts {
@@ -110,6 +114,14 @@ impl ScanOpts {
             only_files: options.only_files,
             follow_symlinks: options.follow_symlinks,
             error_on_broken_symlinks: options.throw_error_on_broken_symlink,
+            ignore: match &options.ignore {
+                Some(GlobScanIgnore::Pattern(pattern)) => Some(IgnoreList::new([*pattern])),
+                Some(GlobScanIgnore::Patterns(patterns)) if !patterns.is_empty() => Some(
+                    IgnoreList::new(patterns.iter().map(|pattern| pattern.slice())),
+                ),
+                _ => None,
+            }
+            .map(Arc::new),
         })
     }
 }
@@ -334,7 +346,7 @@ impl Glob {
 
         fn init_walker<'a, A: walk::Accessor>(
             pattern: &[u8],
-            opts: &ScanOpts,
+            opts: ScanOpts,
         ) -> Result<Box<walk::GlobWalker<A, false>>, ScanError<'a>> {
             let result = match &opts.cwd {
                 Some(cwd) => walk::GlobWalker::<A, false>::init_with_cwd(
@@ -357,10 +369,13 @@ impl Glob {
                     None,
                 ),
             };
-            result
+            let mut walker = result
                 .map_err(|err| ScanError::Runtime(err.into()))?
-                .map(Box::new)
-                .map_err(ScanError::Sys)
+                .map_err(ScanError::Sys)?;
+            if let Some(ignore) = opts.ignore {
+                walker.set_ignore(ignore);
+            }
+            Ok(Box::new(walker))
         }
 
         // Match the walker's root choice (`Iterator::init`): an absolute
@@ -390,12 +405,12 @@ impl Glob {
 
         if in_standalone_graph {
             return Ok(AnyGlobWalker::Standalone(
-                init_walker::<StandaloneAccessor>(self.pattern.slice(), &match_opts)?,
+                init_walker::<StandaloneAccessor>(self.pattern.slice(), match_opts)?,
             ));
         }
         Ok(AnyGlobWalker::Fs(init_walker::<walk::SyscallAccessor>(
             self.pattern.slice(),
-            &match_opts,
+            match_opts,
         )?))
     }
 }

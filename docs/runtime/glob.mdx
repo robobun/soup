@@ -81,8 +81,37 @@ interface ScanOptions {
    * @default true
    */
   onlyFiles?: boolean;
+
+  /**
+   * Glob patterns for paths to leave out. A directory that matches is not entered.
+   *
+   * @default []
+   */
+  ignore?: string | string[];
 }
 ```
+
+## Ignoring paths
+
+Pass `ignore` to leave paths out of the scan. It takes one glob pattern or an array of them, with the same syntax as the main pattern:
+
+```ts
+import { Glob } from "bun";
+
+const glob = new Glob("**/*.ts");
+
+for await (const file of glob.scan({
+  ignore: ["**/node_modules/**", "dist/**", "**/*.test.ts"],
+})) {
+  console.log(file); // never a test file, and nothing under node_modules or dist
+}
+```
+
+Bun matches a pattern against the normalized path relative to `cwd`, with `absolute` and without it. So `dist/**` only covers the `dist` directory at the root of the scan and `**/dist/**` covers every `dist` directory. If the scanned pattern is absolute, Bun matches against the full path.
+
+A scan does not enter a directory that a pattern matches. `dist/**` and `dist/` match the directory `dist` too. `"**/node_modules/**"` therefore skips each `node_modules` tree instead of walking it and filtering its files afterwards, which is the part that makes a scan of a project directory slow. A pattern that ends with `/*`, such as `dist/*`, leaves out what is in `dist` and keeps `dist` itself.
+
+A `./` in front of the scanned pattern or of an ignore pattern makes no difference. `new Glob("./**/*.ts")` returns `./src/index.ts`, and both `ignore: ["src/**"]` and `ignore: ["./src/**"]` leave it out.
 
 ## Supported Glob Patterns
 

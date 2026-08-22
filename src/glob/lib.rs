@@ -1,12 +1,14 @@
 #![warn(unused_must_use)]
 #[path = "GlobWalker.rs"]
 pub mod glob_walker;
+mod ignore;
 pub mod matcher;
 pub mod pattern;
 pub mod scan;
 
 // `match` is a Rust keyword; re-export with raw identifier.
 pub use crate::glob_walker as walk;
+pub use crate::ignore::IgnoreList;
 pub use crate::matcher::{Dots, MatchResult, r#match};
 pub use crate::pattern::{Candidate, Pattern};
 pub use walk::GlobWalker;

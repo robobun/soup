@@ -301,6 +301,65 @@ Files: `src/runtime/cli/outdated_command.rs`, `src/install/PackageManager.rs` (`
 `src/install/PackageManager/CommandLineArguments.rs` (flag, help), `completions/bun.zsh`,
 `docs/pm/cli/outdated.mdx`, `docs/snippets/cli/outdated.mdx`, `test/cli/install/bun-install-registry.test.ts`.
 
+### 2026-08-22: `ignore` option for `Bun.Glob` scans
+
+`Bun.Glob` could only say what to include. Leaving things out meant filtering the results afterwards,
+which still walks every `node_modules` and `dist` directory first, and that walk is what makes a scan
+of a project slow. It is also the first option people moving from `fast-glob`, `globby` or
+`node:fs.glob` look for (oven-sh/bun#8182, open since early 2024). `scan()` and `scanSync()` now take
+`ignore`: one glob pattern or an array of them, in the same syntax as the main pattern. A path that
+matches an ignore pattern is left out, and a directory that matches is not entered at all, so an
+ignored tree costs one `readdir` entry instead of a traversal.
+
+```ts
+const glob = new Glob("**/*.ts");
+
+for await (const file of glob.scan({
+  ignore: ["**/node_modules/**", "dist/**", "**/*.test.ts"],
+})) {
+  // never a test file, nothing under any node_modules or under the root dist
+}
+```
+
+Patterns are matched against the normalized path relative to `cwd`, with `absolute` and without it,
+so `dist/**` covers only the root `dist` and `**/dist/**` every one. With `absolute: true` the cwd
+prefix is stripped before matching (cwd is normalized the way the walker normalizes the paths it
+joins, so a trailing slash or `/.` in `cwd` does not break it). Without it, a path that the pattern
+spells with a `..` or a `.` is normalized first. An absolute glob pattern is matched against the full
+path. Directory pruning tests the directory path as is. It tests it with a trailing `/` too for a
+pattern that has a `**`, or a `/` at its end or at the end of an alternative, because the matcher
+does not let `dist/**` match `dist` but does let it match `dist/`. `dist/*` is not asked that way: its
+`*` matches nothing as well, and `dist` would go with what is in it. Node's `fs.glob` `exclude`
+decides the same way, and it gives gitignore semantics (a bare `dist` skips the whole tree) where
+fast-glob only filters. For the patterns people actually write (`**/node_modules/**`,
+`dist/**`, `**/*.test.ts`, a bare directory name, a brace group) the results are identical to
+fast-glob's, which the tests check against the real package. Separators in ignore patterns are `/`, as
+in `Glob.match()`; on Windows that matches `\` in paths as well. An `ignore` value that is not a
+string or an array of strings throws. A `./` in front of the scanned pattern or of an
+ignore pattern does not count: `./**/*.ts` reports `./src/a.ts`, and `src/**` and `./src/**` both
+leave it out. (Until 2026-11-26 neither did, and `./**/*.ts` with `ignore: ["node_modules"]` gave
+the files of `node_modules`. Three more repairs are of that day. `absolute` changed what a pattern was
+asked about when the scanned pattern had a `..` or a `.` in it, so `../other/*.ts` with
+`ignore: "../other/*.test.ts"` left the test files out only without `absolute`. `dist/*` left out the
+directory `dist` too. And `.//src` was read as `/src`, and `./!x` as a negation.)
+
+The check lives in the walker, at the two points every result funnels through
+(`prepare_matched_path` and its symlink twin) and before a directory work item is pushed, including a
+followed symlink to a directory. The patterns and the question about a path are
+`bun_glob::IgnoreList` (`src/glob/ignore.rs`), which the walker holds through an `Arc`. With no
+patterns it is one test of an `Option` per entry. The shell's
+`BunGlobWalkerZ`, the `bun install` workspace globs and `--filter` share the walker and never set
+patterns, so they are unchanged. The test that proves a directory is skipped rather than filtered puts
+a broken symlink inside `node_modules` and scans with `throwErrorOnBrokenSymlink`: without `ignore`
+the scan throws `ENOENT`, with `"**/node_modules/**"` it does not. A pre-existing bug turned up on the
+way and was reported separately rather than fixed here: an absolute pattern with no glob syntax
+(`new Glob("/abs/file").scanSync()`) yields nothing, because that early-exit path never records the
+match.
+
+Files: `src/glob/GlobWalker.rs`, `src/glob/ignore.rs`, `src/glob/lib.rs`, `src/runtime/api/glob.rs`,
+`packages/bun-types/bun.d.ts`, `docs/runtime/glob.mdx`, `test/js/bun/glob/scan.test.ts`,
+`test/integration/bun-types/fixture/bun.ts`.
+
 ## Dropped
 
 Nothing yet.
