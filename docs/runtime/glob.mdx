@@ -79,8 +79,33 @@ interface ScanOptions {
    * @default true
    */
   onlyFiles?: boolean;
+
+  /**
+   * Glob patterns for paths to leave out. A directory that matches is not entered.
+   *
+   * @default []
+   */
+  ignore?: string | string[];
 }
 ```
+
+## Ignoring paths
+
+Pass `ignore` to leave paths out of the scan. It takes one glob pattern or an array of them, with the same syntax as the main pattern:
+
+```ts
+import { Glob } from "bun";
+
+const glob = new Glob("**/*.ts");
+
+for await (const file of glob.scan({
+  ignore: ["**/node_modules/**", "dist/**", "**/*.test.ts"],
+})) {
+  console.log(file); // never a test file, and nothing under node_modules or dist
+}
+```
+
+A pattern is matched against the path relative to `cwd`, the same string `scan` returns when `absolute` is off, so `dist/**` only covers the `dist` directory at the root of the scan and `**/dist/**` covers every `dist` directory. A directory that matches a pattern, with or without a trailing slash, is not entered at all. `"**/node_modules/**"` therefore skips each `node_modules` tree instead of walking it and filtering its files afterwards, which is the part that makes a scan of a project directory slow.
 
 ## Supported Glob Patterns
 
