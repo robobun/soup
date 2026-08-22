@@ -9,7 +9,9 @@ use bun_paths::resolve_path::join_string_buf;
 use bun_paths::{self as resolve_path, MAX_PATH_BYTES, platform};
 use bun_sys as syscall;
 
-use crate::generated_bindgen::glob::{GlobClass, GlobScanArgument, GlobScanOptions};
+use crate::generated_bindgen::glob::{
+    GlobClass, GlobScanArgument, GlobScanIgnore, GlobScanOptions,
+};
 
 /// `Bun.Glob`, declared in `Glob.bind.ts`.
 pub(crate) struct Glob {
@@ -45,6 +47,7 @@ struct ScanOpts {
     only_files: bool,
     follow_symlinks: bool,
     error_on_broken_symlinks: bool,
+    ignore: Vec<Box<[u8]>>,
 }
 
 impl ScanOpts {
@@ -103,6 +106,14 @@ impl ScanOpts {
             only_files: options.only_files,
             follow_symlinks: options.follow_symlinks,
             error_on_broken_symlinks: options.throw_error_on_broken_symlink,
+            ignore: match options.ignore {
+                Some(GlobScanIgnore::Pattern(pattern)) => vec![Box::from(pattern)],
+                Some(GlobScanIgnore::Patterns(patterns)) => patterns
+                    .iter()
+                    .map(|pattern| Box::from(pattern.slice()))
+                    .collect(),
+                None => Vec::new(),
+            },
         })
     }
 }
@@ -350,7 +361,7 @@ impl Glob {
 
         fn init_walker<'a, A: walk::Accessor>(
             pattern: &[u8],
-            opts: &ScanOpts,
+            opts: ScanOpts,
         ) -> Result<Box<walk::GlobWalker<A, false>>, ScanError<'a>> {
             let result = match &opts.cwd {
                 Some(cwd) => walk::GlobWalker::<A, false>::init_with_cwd(
@@ -373,10 +384,11 @@ impl Glob {
                     None,
                 ),
             };
-            result
+            let mut walker = result
                 .map_err(|err| ScanError::Runtime(err.into()))?
-                .map(Box::new)
-                .map_err(ScanError::Sys)
+                .map_err(ScanError::Sys)?;
+            walker.set_ignore_patterns(opts.ignore);
+            Ok(Box::new(walker))
         }
 
         // Match the walker's root choice (`Iterator::init`): an absolute
@@ -396,12 +408,12 @@ impl Glob {
 
         if in_standalone_graph {
             return Ok(AnyGlobWalker::Standalone(
-                init_walker::<StandaloneAccessor>(self.pattern.slice(), &match_opts)?,
+                init_walker::<StandaloneAccessor>(self.pattern.slice(), match_opts)?,
             ));
         }
         Ok(AnyGlobWalker::Fs(init_walker::<walk::SyscallAccessor>(
             self.pattern.slice(),
-            &match_opts,
+            match_opts,
         )?))
     }
 }
