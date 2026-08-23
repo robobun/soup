@@ -1537,6 +1537,7 @@ impl Run<'_> {
             }
             _ => {}
         }
+        vm.add_env_files_to_watcher_if_needed();
 
         if entry == Some(b".".as_slice()) {
             // SAFETY: `vm.transpiler.fs` is the process-static `FileSystem`
