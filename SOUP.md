@@ -348,6 +348,39 @@ match.
 Files: `src/glob/GlobWalker.rs`, `src/runtime/api/glob.rs`, `packages/bun-types/bun.d.ts`,
 `docs/runtime/glob.mdx`, `test/js/bun/glob/scan.test.ts`, `test/integration/bun-types/fixture/bun.ts`.
 
+### 2026-08-23: `.env` changes restart `--watch` and `--hot`
+
+`bun --watch` restarts the process when any imported file changes, but not when a `.env` file does,
+although bun is the one that loaded it. Edit `PORT` or a database URL in `.env` while `bun --watch
+server.ts` runs and nothing happens until the next source edit, which then silently picks the new
+values up (oven-sh/bun#2521, open since 2023). Node's `--watch` already restarts on a change to its
+`--env-file` files. Bun now watches every `.env` file it loaded at startup: the default set
+(`.env`, `.env.local`, `.env.development`, ... as selected by `NODE_ENV`) and each `--env-file`, whether
+relative or absolute. A change to one of them restarts the process exactly like a source change,
+for `bun run --watch`, `bun test --watch` and the `--hot` variants.
+
+```sh
+bun --watch server.ts
+# edit .env: the process restarts and process.env reflects the file
+```
+
+Under `--hot` the restart is deliberate rather than a soft reload: environment variables are read
+once at startup, by user code but also by bun itself (`NODE_ENV`, `TZ`, proxy and TLS settings), and
+`process.env` is a snapshot that user code may have written to, so re-applying a file in place would
+be wrong in several ways a restart is not. The files are registered with the existing watcher right
+after it starts, by the same path-only route the entry point uses, so a missing-then-created `.env`
+is not picked up until the next restart. On the watcher thread a `--hot` event on one of these hashes
+takes the same restart path `--watch` uses; under `--watch` nothing special is needed, the file is
+just another watched file, including the `--watch-kill-signal` handling. On Windows `--hot` does not
+register them, because a restart there goes through the `--watch` manager process that `--hot` does
+not have. The dotenv loader now exposes the list of files it read, in the order its `[0.05ms] ".env"`
+line prints them.
+
+Files: `src/dotenv/env_loader.rs` (`Loader::loaded_files`), `src/jsc/VirtualMachine.rs`
+(`add_env_files_to_watcher_if_needed`), `src/jsc/hot_reloader.rs`, `src/runtime/cli/run_command.rs`,
+`src/runtime/cli/test_command.rs`, `docs/runtime/watch-mode.mdx`, `docs/runtime/environment-variables.mdx`,
+`test/cli/watch/watch.test.ts`, `test/cli/hot/hot.test.ts`.
+
 ## Dropped
 
 Nothing yet.
