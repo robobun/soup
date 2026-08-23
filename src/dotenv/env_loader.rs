@@ -769,6 +769,21 @@ impl Loader {
         Ok(())
     }
 
+    /// The `.env` files `load` read, in the order `print_loaded` lists them:
+    /// the default files by basename (relative to the directory `load` was
+    /// given), then the `--env-file` paths as written on the command line.
+    pub fn loaded_files<'a>(&'a self) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.default_files_loaded
+            .iter()
+            .map(|file| -> &'a [u8] { file.name() })
+            .chain(
+                self.custom_files_loaded
+                    .keys()
+                    .iter()
+                    .map(|k| -> &'a [u8] { k }),
+            )
+    }
+
     pub(crate) fn print_loaded(&self, start: i128) {
         let count = self.loaded_count();
 

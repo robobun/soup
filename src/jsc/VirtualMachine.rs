@@ -3925,6 +3925,43 @@ impl VirtualMachine {
         }
     }
 
+    /// Adds the `.env` files the env loader read to the file watcher when watch
+    /// mode is enabled. Environment variables are read once at startup, so a
+    /// change to one of these files restarts the process, under `--hot` too
+    /// (see `hot_reloader::set_watched_env_file_hashes`).
+    pub fn add_env_files_to_watcher_if_needed(&mut self) {
+        if !self.is_watcher_enabled() {
+            return;
+        }
+        // On Windows a restart goes through the `--watch` manager process
+        // (`become_watcher_manager`), which `--hot` does not have.
+        if cfg!(windows) && self.hot_reload == HotReload::Hot {
+            return;
+        }
+        let watcher = self.bun_watcher_ptr();
+        if watcher.is_null() {
+            return;
+        }
+        let top_level_dir = self.top_level_dir();
+        let mut buf = bun_paths::path_buffer_pool::get();
+        let mut hashes: Vec<bun_watcher::HashType> = Vec::new();
+        for file in self.env_loader().loaded_files() {
+            // Default files are basenames in the top-level directory; an
+            // `--env-file` path is relative to the cwd or absolute.
+            let path = bun_paths::resolve_path::join_abs_string_buf::<
+                bun_paths::resolve_path::platform::Auto,
+            >(top_level_dir, &mut **buf, &[file]);
+            // SAFETY: see `add_main_to_watcher_if_needed`; the same
+            // mutex-guarded call on the same live `ImportWatcher`.
+            if unsafe { (*watcher).add_file_by_path_slow(path) } {
+                hashes.push(bun_watcher::Watcher::get_hash(path));
+            }
+        }
+        if !hashes.is_empty() {
+            crate::hot_reloader::set_watched_env_file_hashes(hashes.into_boxed_slice());
+        }
+    }
+
     /// `bun_resolver` holds the manager as an opaque forward-decl (it cannot
     /// depend on `bun_install`). `bun_jsc` *can*, so cast the opaque back to
     /// the concrete `bun_install::PackageManager` here — the resolver's

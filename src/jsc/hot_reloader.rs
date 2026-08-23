@@ -368,6 +368,23 @@ fn flush_changed_paths_for_reload() {
     }
 }
 
+/// Watch-list hashes of the `.env` files the process loaded at startup
+/// (`VirtualMachine::add_env_files_to_watcher_if_needed`). Set once from the
+/// JS thread after the watcher starts, read by the watcher thread; `OnceLock`
+/// carries the publish.
+static WATCHED_ENV_FILE_HASHES: std::sync::OnceLock<Box<[bun_watcher::HashType]>> =
+    std::sync::OnceLock::new();
+
+pub fn set_watched_env_file_hashes(hashes: Box<[bun_watcher::HashType]>) {
+    let _ = WATCHED_ENV_FILE_HASHES.set(hashes);
+}
+
+fn is_watched_env_file(hash: bun_watcher::HashType) -> bool {
+    WATCHED_ENV_FILE_HASHES
+        .get()
+        .is_some_and(|hashes| hashes.contains(&hash))
+}
+
 unsafe extern "C" {
     safe fn BunDebugger__willHotReload();
 }
@@ -919,6 +936,21 @@ where
                         .intersects(WatchOp::WRITE | WatchOp::DELETE | WatchOp::RENAME)
                     {
                         record_changed_path(file_path);
+
+                        // Environment variables are read once at startup, so
+                        // a changed `.env` file cannot be hot reloaded: restart
+                        // the process the way `--watch` does for every file.
+                        if !RELOAD_IMMEDIATELY && is_watched_env_file(current_hash) {
+                            crate::node_compile_cache::persist_now();
+                            Output::flush();
+                            flush_changed_paths_for_reload();
+                            bun_core::reload_process(
+                                CLEAR_SCREEN.load(core::sync::atomic::Ordering::Relaxed),
+                                false,
+                            );
+                            unreachable!();
+                        }
+
                         if IS_KQUEUE {
                             if event.op.contains(WatchOp::RENAME) {
                                 // Special case for entrypoint: defer reload until we get
