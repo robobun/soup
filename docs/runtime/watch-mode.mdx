@@ -28,6 +28,8 @@ bun --watch test
 
 In `--watch` mode, Bun keeps track of all imported files and watches them for changes. When a file changes, Bun restarts the process with the same CLI arguments and environment variables as the initial run. If Bun crashes, `--watch` attempts to restart the process.
 
+Bun also watches the [`.env` files](/runtime/environment-variables) it loaded at startup, such as `.env`, `.env.local` and any file passed with `--env-file`. Editing one of them restarts the process too, so the new values take effect without a manual restart.
+
 <Note>
 
 **⚡️ Reloads are fast.** The filesystem watchers you're probably used to have several layers of libraries wrapping the native APIs or, worse, rely on polling.
@@ -100,6 +102,8 @@ bun --hot server.ts
 ```
 
 Starting from the entrypoint (`server.ts` in this example), Bun builds a registry of all imported source files (excluding those in `node_modules`) and watches them for changes. When a file changes, Bun performs a "soft reload". Bun re-evaluates all files, but global state (notably, the `globalThis` object) persists.
+
+Environment variables are read once at startup, so a soft reload cannot apply a changed `.env` file. When one of the `.env` files Bun loaded changes, `--hot` restarts the process instead, like `--watch` does. (On Windows, `--hot` does not watch `.env` files.)
 
 ```ts title="server.ts" icon="/icons/typescript.svg"
 // make TypeScript happy

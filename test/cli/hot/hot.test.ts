@@ -928,3 +928,50 @@ it.each([
     stderr: [],
   });
 });
+
+// Environment variables are read once at startup, so a soft reload cannot
+// apply a changed .env file. Editing one restarts the process (global state
+// starts over), while editing a module still soft reloads.
+it("--hot restarts the process when a loaded .env file changes", async () => {
+  using dir = tempDir("hot-dotenv", {
+    ".env": "GREETING=hello\n",
+    "app.js": `globalThis.runs = (globalThis.runs ?? 0) + 1;
+console.log(process.env.GREETING + " " + globalThis.runs);
+setInterval(() => {}, 1000);
+`,
+  });
+  await using runner = spawn({
+    cmd: [bunExe(), "--hot", "app.js"],
+    cwd: String(dir),
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "inherit",
+    stdin: "ignore",
+  });
+
+  const reader = runner.stdout.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  const waitFor = async (needle: string) => {
+    while (!output.includes(needle)) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`stream closed, output so far: ${JSON.stringify(output)}`);
+      output += decoder.decode(value, { stream: true });
+    }
+  };
+
+  await waitFor("hello 1\n");
+
+  // A module edit soft reloads: globalThis survives, so the counter advances.
+  const app = join(String(dir), "app.js");
+  writeFileSync(app, readFileSync(app, "utf-8") + "// edited\n");
+  await waitFor("hello 2\n");
+
+  // A .env edit restarts the process: the counter starts over with the new value.
+  writeFileSync(join(String(dir), ".env"), "GREETING=bye\n");
+  await waitFor("bye 1\n");
+
+  reader.releaseLock();
+  runner.kill("SIGKILL");
+  await runner.exited;
+});
