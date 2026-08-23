@@ -1564,6 +1564,7 @@ impl Run<'_> {
             }
             _ => {}
         }
+        vm.add_env_files_to_watcher_if_needed();
 
         if entry == Some(b".".as_slice()) {
             let tld = vm.top_level_dir();
