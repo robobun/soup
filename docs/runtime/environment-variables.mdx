@@ -100,6 +100,8 @@ env = false
 
 Files passed with `--env-file` still load even when default loading is disabled.
 
+Under [`bun --watch` and `bun --hot`](/runtime/watch-mode), Bun watches the `.env` files it loaded, including those passed with `--env-file`, and restarts the process when one of them changes.
+
 When invoked as `node` (for example via `bun --bun`, `bunx --bun`, or a `node` symlink pointing at Bun), Bun disables automatic `.env` loading to match Node.js. This lets tools with their own mode-aware `.env` resolution, such as Vite's `loadEnv`, pick the correct `.env.{mode}` file instead of seeing Bun's pre-populated values as shell-set overrides. Bun still honors explicit `--env-file` arguments.
 
 ---
