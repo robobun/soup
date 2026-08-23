@@ -3150,6 +3150,7 @@ impl TestCommand {
                 }
                 _ => {}
             }
+            vm.add_env_files_to_watcher_if_needed();
         }
 
         if run_compiled::is_requested(ctx) && !test_files.is_empty() {
