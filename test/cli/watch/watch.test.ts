@@ -186,6 +186,64 @@ for (;;) spawnThreadsForTesting(1000, fd, 2);
   30000,
 );
 
+// Environment variables are read once at startup, so the .env files bun loaded
+// are watched too: editing one restarts the process like editing a module.
+it("--watch restarts when a loaded .env file changes", async () => {
+  using dir = tempDir("watch-dotenv", {
+    ".env": "GREETING=hello\n",
+    ".env.local": "TARGET=world\n",
+    "app.js": `console.log(process.env.GREETING + " " + process.env.TARGET); setInterval(() => {}, 1000);`,
+  });
+
+  watchee = spawn({
+    cmd: [bunExe(), "--watch", "app.js"],
+    cwd: String(dir),
+    // `bun test` runs with NODE_ENV=test, under which .env.local is not loaded.
+    env: { ...bunEnv, NODE_ENV: "development" },
+    stdout: "pipe",
+    stderr: "inherit",
+    stdin: "ignore",
+  });
+
+  const { waitFor, release } = stdoutWaiter(watchee);
+
+  await waitFor("hello world");
+  await Bun.write(join(String(dir), ".env"), "GREETING=bye\n");
+  await waitFor("bye world");
+  await Bun.write(join(String(dir), ".env.local"), "TARGET=moon\n");
+  await waitFor("bye moon");
+
+  release();
+  watchee.kill("SIGKILL");
+  await watchee.exited;
+});
+
+it("--watch restarts when an --env-file file changes", async () => {
+  using dir = tempDir("watch-env-file-flag", {
+    "config/app.env": "GREETING=hello\n",
+    "app.js": `console.log(process.env.GREETING); setInterval(() => {}, 1000);`,
+  });
+
+  watchee = spawn({
+    cmd: [bunExe(), "--watch", "--env-file=config/app.env", "app.js"],
+    cwd: String(dir),
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "inherit",
+    stdin: "ignore",
+  });
+
+  const { waitFor, release } = stdoutWaiter(watchee);
+
+  await waitFor("hello");
+  await Bun.write(join(String(dir), "config/app.env"), "GREETING=bye\n");
+  await waitFor("bye");
+
+  release();
+  watchee.kill("SIGKILL");
+  await watchee.exited;
+});
+
 // Watcher::start() must propagate a failed thread spawn as an Err through its
 // Result return instead of aborting inside start() with `.expect()`. An
 // LD_PRELOAD shim arms on inotify_init1 (which Watcher::init() calls on Linux
