@@ -4698,6 +4698,7 @@ impl TestCommand {
                 }
                 _ => {}
             }
+            vm.add_env_files_to_watcher_if_needed();
         }
 
         let splits_files = run_compiled::is_requested(ctx)
