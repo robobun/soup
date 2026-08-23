@@ -2356,6 +2356,7 @@ impl TestCommand {
                 }
                 _ => {}
             }
+            vm.add_env_files_to_watcher_if_needed();
         }
 
         // After the file watcher is enabled: see `watching`.
