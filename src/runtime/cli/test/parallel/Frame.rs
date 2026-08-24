@@ -13,11 +13,13 @@ pub enum Kind {
     /// u32 file_idx, str formatted_line (ANSI included; printed verbatim);
     /// then, only when the worker runs with `--reporter`, the structured
     /// result (`runner::encode_test_case`): u32 status, u32 assertions,
-    /// u64 elapsed_ns, u32 line, str name, u32 n × {str scope_name,
+    /// u64 elapsed_ns, u32 line, u32 column, str name, u32 n × {str scope_name,
     /// u32 scope_line}, u32 has_failure [, str name, str message, str body]
     TestDone,
     /// 9 × u32: file_idx, pass, fail, skip, todo, expectations, skipped_label,
-    /// files, unhandled; u64 elapsed_ns
+    /// files, unhandled; u64 elapsed_ns; then, only with `--reporter`, the
+    /// error the file threw outside of any test (`runner::encode_failure`):
+    /// u32 has_failure [, str name, str message, str body]
     FileDone,
     /// 3 × str: failures, skips, todos (verbatim repeat-buffer bytes)
     RepeatBufs,
