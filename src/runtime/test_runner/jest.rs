@@ -811,11 +811,23 @@ pub(crate) fn format_label(
     Ok(list.into_boxed_slice())
 }
 
-pub(crate) fn capture_test_line_number(global_this: &JSGlobalObject) -> u32 {
+/// The 1-based `(line, column)` of the `test()`/`describe()` call, or zeros.
+/// Walking the stack costs something per registered test, so only the
+/// reporters that write positions (junit, json) pay for it.
+pub(crate) fn capture_test_location(global_this: &JSGlobalObject) -> (u32, u32) {
     if let Some(runner) = Jest::runner() {
-        if runner.test_options.reporters.junit {
-            return bun_jsc::cpp::JSC__JSGlobalObject__getCallerLineNumber(global_this);
+        if runner.test_options.reporters.junit || runner.test_options.reporters.json {
+            let mut column: u32 = 0;
+            // SAFETY: `global_this` is a live reference and `column` is a live local for the
+            // duration of the call.
+            let line = unsafe {
+                bun_jsc::cpp::JSC__JSGlobalObject__getCallerLineAndColumn(
+                    core::ptr::from_ref(global_this).cast_mut(),
+                    &raw mut column,
+                )
+            };
+            return (line, column);
         }
     }
-    0
+    (0, 0)
 }

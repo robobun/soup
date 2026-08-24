@@ -6684,11 +6684,14 @@ CPP_DECL [[ZIG_EXPORT(check_slow)]] void Bun__JSValue__setPrototypeDirect(JSC::E
     return;
 }
 
-CPP_DECL [[ZIG_EXPORT(nothrow)]] unsigned int JSC__JSGlobalObject__getCallerLineNumber(JSC::JSGlobalObject* globalObject)
+// The 1-based line and column of the nearest user-code frame, remapped through
+// the source map. 0 when unknown.
+CPP_DECL [[ZIG_EXPORT(nothrow)]] unsigned int JSC__JSGlobalObject__getCallerLineAndColumn(JSC::JSGlobalObject* globalObject, [[ZIG_NONNULL]] unsigned int* columnOut)
 {
     auto& vm = JSC::getVM(globalObject);
     JSC::LineColumn lineColumn;
     String sourceURL;
+    *columnOut = 0;
 
     JSC::StackVisitor::visit(vm.topCallFrame, vm, [&](JSC::StackVisitor& visitor) -> WTF::IterationStatus {
         if (Zig::isImplementationVisibilityPrivate(visitor))
@@ -6710,14 +6713,17 @@ CPP_DECL [[ZIG_EXPORT(nothrow)]] unsigned int JSC__JSGlobalObject__getCallerLine
         Bun::OwnedZigStackFrames remappedFrames(1);
         ZigStackFrame& remappedFrame = remappedFrames[0];
         remappedFrame.position.line_zero_based = lineColumn.line - 1;
-        remappedFrame.position.column_zero_based = lineColumn.column;
+        remappedFrame.position.column_zero_based = WTF::OrdinalNumber::fromOneBasedInt(lineColumn.column).zeroBasedInt();
         remappedFrame.source_url = Bun::toStringRef(sourceURL);
 
         remappedFrames.remap(Bun::vm(globalObject));
 
+        if (remappedFrame.position.column_zero_based >= 0)
+            *columnOut = remappedFrame.position.column_zero_based + 1;
         return remappedFrame.position.line_zero_based + 1;
     }
 
+    *columnOut = lineColumn.column;
     return lineColumn.line;
 }
 
