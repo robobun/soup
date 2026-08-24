@@ -3,6 +3,7 @@ use bun_io::Write as _;
 use crate::cli::Command;
 use crate::cli::run_compiled;
 use crate::cli::test::changed_files_filter as ChangedFilesFilter;
+use crate::cli::test::json_reporter::JsonReporter;
 use crate::cli::test::parallel_runner as ParallelRunner;
 use crate::cli::test::scanner::{self, Scanner};
 use crate::cli::test::timings::Timings;
@@ -182,7 +183,9 @@ pub(crate) struct TestCaseReport<'a> {
     pub status: bun_test::Execution::Result,
     pub assertions: u32,
     pub elapsed_ns: u64,
+    /// 1-based position of the `test()` call, zeros when unknown.
     pub line_number: u32,
+    pub column_number: u32,
     pub failure: Option<TestFailure>,
 }
 
@@ -969,9 +972,14 @@ pub(crate) struct CommandLineReporter {
     /// the terminal.
     pub(crate) worker_ipc_file_idx: Option<u32>,
     /// Errors thrown by the test now running, captured while a reporter
-    /// that attaches them to the test case (JUnit) is on. Taken by
+    /// that attaches them to the test case (JUnit, JSON) is on. Taken by
     /// `handle_test_completed`.
     pub(crate) test_failure: Option<TestFailure>,
+    /// Errors the file now running threw outside of any test (while it loads,
+    /// in a describe body, between tests), captured while the JSON reporter is
+    /// on. Taken when the file ends: the serial runner hands it to the
+    /// reporter, a `--parallel` worker puts it on its `FileDone` frame.
+    pub(crate) file_failure: Option<TestFailure>,
 
     pub(crate) failures_to_repeat_buf: Vec<u8>,
     pub(crate) skips_to_repeat_buf: Vec<u8>,
@@ -988,6 +996,7 @@ pub(crate) struct ReportersConfig {
     pub(crate) dots: bool,
     pub(crate) only_failures: bool,
     pub(crate) junit: Option<Box<JunitReporter>>,
+    pub(crate) json: Option<Box<JsonReporter>>,
 }
 
 impl CommandLineReporter {
@@ -1253,6 +1262,7 @@ impl CommandLineReporter {
             assertions: sequence.expect_call_count,
             elapsed_ns,
             line_number: test_entry.base.line_no,
+            column_number: test_entry.base.column_no,
             failure,
         }
     }
@@ -1356,8 +1366,9 @@ impl CommandLineReporter {
         let this: &mut CommandLineReporter = unsafe { &mut *this.as_ptr() };
 
         // Under `--parallel` the flag is forwarded to workers, whose records
-        // the coordinator replays into its own `JunitReporter`.
-        let report = this.jest.test_options.reporters.junit.then(|| {
+        // the coordinator replays into its own reporter.
+        let reporters = &this.jest.test_options.reporters;
+        let report = (reporters.junit || reporters.json).then(|| {
             let failure = this.test_failure.take();
             Self::test_case_report(result, buntest, sequence, test_entry, elapsed_ns, failure)
         });
@@ -1365,8 +1376,13 @@ impl CommandLineReporter {
             ParallelRunner::worker_emit_test_done(idx, formatted_line, report.as_ref());
         } else {
             let _ = Output::error_writer().write_all(formatted_line);
-            if let (Some(junit), Some(report)) = (this.reporters.junit.as_mut(), &report) {
-                junit.record_test_case(report).expect("oom");
+            if let Some(report) = &report {
+                if let Some(junit) = this.reporters.junit.as_mut() {
+                    junit.record_test_case(report).expect("oom");
+                }
+                if let Some(json) = this.reporters.json.as_mut() {
+                    json.record_test_case(report);
+                }
             }
         }
 
@@ -1447,7 +1463,7 @@ impl CommandLineReporter {
             if self.jest.bail == 1 { "" } else { "s" }
         );
         Output::flush();
-        self.write_junit_report_if_needed();
+        self.write_reports_if_needed();
         self.write_timings_if_needed();
 
         vm.exit_handler.exit_code = 1;
@@ -1475,14 +1491,20 @@ impl CommandLineReporter {
         }
     }
 
-    /// Writes the JUnit reporter output file if a JUnit reporter is active and
-    /// an outfile path was configured. This must be called before any early exit
-    /// (e.g. bail) so that the report is not lost.
-    pub(crate) fn write_junit_report_if_needed(&mut self) {
+    /// Writes the JUnit report if a JUnit reporter is active and an outfile path
+    /// was configured, and the JSON report if a JSON reporter is active (to the
+    /// outfile, or stdout). This must be called before any early exit (e.g.
+    /// bail) so that the report is not lost. A `--parallel` worker has neither
+    /// reporter: the coordinator assembles the report from the workers' records.
+    pub(crate) fn write_reports_if_needed(&mut self) {
+        let outfile = self.jest.test_options.reporter_outfile.as_deref();
         if let Some(junit) = self.reporters.junit.as_mut() {
-            if let Some(outfile) = self.jest.test_options.reporter_outfile.as_deref() {
+            if let Some(outfile) = outfile {
                 let _ = junit.write_to_file(outfile);
             }
+        }
+        if let Some(json) = self.reporters.json.as_mut() {
+            json.write(outfile);
         }
     }
 
@@ -1792,7 +1814,13 @@ impl TestCommand {
             ctx.test_options.parallel = 0;
         }
 
-        if !ctx.test_options.test_worker && !run_compiled::is_second_process() {
+        // The JSON report goes to stdout when it has no outfile, so nothing else may.
+        let json_report_on_stdout =
+            ctx.test_options.reporters.json && ctx.test_options.reporter_outfile.is_none();
+        if !ctx.test_options.test_worker
+            && !run_compiled::is_second_process()
+            && !json_report_on_stdout
+        {
             // print the version so you know its doing stuff if it takes a sec
             let w = Output::writer();
             let colors = Output::enable_ansi_colors_stdout();
@@ -1911,6 +1939,7 @@ impl TestCommand {
             last_printed_dot: core::cell::Cell::new(false),
             worker_ipc_file_idx: None,
             test_failure: None,
+            file_failure: None,
             failures_to_repeat_buf: Vec::new(),
             skips_to_repeat_buf: Vec::new(),
             todos_to_repeat_buf: Vec::new(),
@@ -1934,6 +1963,9 @@ impl TestCommand {
 
         if ctx.test_options.reporters.junit && !ctx.test_options.test_worker {
             reporter.reporters.junit = Some(JunitReporter::init());
+        }
+        if ctx.test_options.reporters.json && !ctx.test_options.test_worker {
+            reporter.reporters.json = Some(JsonReporter::init());
         }
         if ctx.test_options.reporters.dots {
             reporter.reporters.dots = true;
@@ -2693,7 +2725,7 @@ impl TestCommand {
         }
         Output::flush();
 
-        reporter.write_junit_report_if_needed();
+        reporter.write_reports_if_needed();
         if !test_files.is_empty() || ctx.test_options.shard.is_some() {
             reporter.write_timings_if_needed();
         }
@@ -2897,6 +2929,10 @@ impl TestCommand {
         vm.on_unhandled_rejection_ctx = None;
         vm.on_unhandled_rejection = jest::on_unhandled_rejection::on_unhandled_rejection;
 
+        if let Some(json) = reporter.reporters.json.as_mut() {
+            json.begin_file(file_path);
+        }
+
         while repeat_index < repeat_count {
             // Clear the module cache before re-running (except for the first run)
             if repeat_index > 0 {
@@ -2972,6 +3008,9 @@ impl TestCommand {
                         Output::flush();
                     }
                     reporter.summary().fail += 1;
+                    if let Some(json) = reporter.reporters.json.as_mut() {
+                        json.end_file(reporter.file_failure.take().as_ref(), None);
+                    }
 
                     if reporter.jest.bail == reporter.summary().fail {
                         // This never returns, so the `exit_file()` defer above doesn't run.
@@ -3062,6 +3101,9 @@ impl TestCommand {
         }
         if let Some(junit) = reporter.reporters.junit.as_mut() {
             let _ = junit.end_file(None);
+        }
+        if let Some(json) = reporter.reporters.json.as_mut() {
+            json.end_file(reporter.file_failure.take().as_ref(), None);
         }
         Ok(())
     }

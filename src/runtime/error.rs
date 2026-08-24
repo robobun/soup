@@ -86,6 +86,8 @@ pub enum Error {
     ProcessWatchFailed,
     #[error("JUnitReportFailed")]
     JUnitReportFailed,
+    #[error("JSONReportFailed")]
+    JSONReportFailed,
     #[error("HTTP404")]
     HTTP404,
     #[error("GitHubIsDown")]
@@ -380,6 +382,7 @@ impl Error {
             Self::ChannelAdoptFailed => "ChannelAdoptFailed",
             Self::ProcessWatchFailed => "ProcessWatchFailed",
             Self::JUnitReportFailed => "JUnitReportFailed",
+            Self::JSONReportFailed => "JSONReportFailed",
             Self::HTTP404 => "HTTP404",
             Self::GitHubIsDown => "GitHubIsDown",
             Self::UpgradeFailedMissingExecutable => "UpgradeFailedMissingExecutable",
