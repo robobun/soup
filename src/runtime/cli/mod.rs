@@ -281,6 +281,10 @@ pub(crate) mod test {
     #[path = "Timings.rs"]
     pub(crate) mod timings;
 
+    /// `bun test --reporter=json`: the Jest-compatible results document.
+    #[path = "JsonReporter.rs"]
+    pub(crate) mod json_reporter;
+
     /// `bun test --parallel`: process-pool coordinator/worker entry points.
     /// Thin façade re-exporting from `parallel::runner`.
     #[path = "ParallelRunner.rs"]
