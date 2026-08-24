@@ -390,6 +390,15 @@ junit = "test-results.xml"
 
 CI systems and other tools can consume the report.
 
+#### `test.reporter.json`
+
+Enable the JSON reporter, which writes the results in Jest's `--json` format, and specify the output file path.
+
+```toml title="bunfig.toml" icon="settings"
+[test.reporter]
+json = "test-results.json"
+```
+
 ## Package manager
 
 The `[install]` section configures the behavior of `bun install`.
