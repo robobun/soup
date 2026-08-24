@@ -92,6 +92,89 @@ The JUnit reporter does not include:
 - `stdout` and `stderr` output from individual tests
 - Precise timestamp fields per test case
 
+### JSON Reporter
+
+`--reporter=json` writes the results as a JSON document in the format of Jest's `--json` output, which is also the format Vitest's JSON reporter produces. Tools that read either (CI dashboards, editor integrations, scripts with `jq`) can read Bun's output without changes.
+
+```sh terminal icon="terminal"
+# write the document to a file; console output is unchanged
+bun test --reporter=json --reporter-outfile=./results.json
+
+# or print it to stdout once the run is over
+bun test --reporter=json > results.json
+```
+
+`bun test` prints its console output to stderr, so with no `--reporter-outfile` the document is the only thing on stdout, unless a test writes there itself (`console.log`). The document is written at the end of the run, including when the run stops early because of `--bail`. With `--parallel`, each worker reports the files it ran and the document covers every file.
+
+```json
+{
+  "numTotalTestSuites": 1,
+  "numPassedTestSuites": 0,
+  "numFailedTestSuites": 1,
+  "numPendingTestSuites": 0,
+  "numRuntimeErrorTestSuites": 0,
+  "numTotalTests": 3,
+  "numPassedTests": 1,
+  "numFailedTests": 1,
+  "numPendingTests": 1,
+  "numTodoTests": 0,
+  "startTime": 1724500000000,
+  "success": false,
+  "testResults": [
+    {
+      "name": "/home/me/app/math.test.ts",
+      "status": "failed",
+      "startTime": 1724500000012,
+      "endTime": 1724500000031,
+      "message": "",
+      "assertionResults": [
+        {
+          "ancestorTitles": ["math"],
+          "fullName": "math adds",
+          "title": "adds",
+          "status": "passed",
+          "duration": 0.42,
+          "failureMessages": [],
+          "location": { "line": 4, "column": 3 }
+        },
+        {
+          "ancestorTitles": ["math"],
+          "fullName": "math subtracts",
+          "title": "subtracts",
+          "status": "failed",
+          "duration": 1.08,
+          "failureMessages": [
+            "AssertionError: expect(received).toBe(expected)\n\nExpected: 1\nReceived: 2\n\n      at math.test.ts:8:19\n"
+          ],
+          "location": { "line": 7, "column": 3 }
+        },
+        {
+          "ancestorTitles": ["math"],
+          "fullName": "math divides",
+          "title": "divides",
+          "status": "pending",
+          "duration": 0,
+          "failureMessages": [],
+          "location": { "line": 10, "column": 3 }
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `testResults` has one entry per test file, `name` is the absolute path, and `assertionResults` has one entry per test in the order the tests finished. Tests that `.only` or `-t` leave out are not listed, as in the console output.
+- A test's `status` is `passed`, `failed`, `pending` (`test.skip`, or every test under `--dry-run`) or `todo`. A file's `status` is `failed` when a test failed or when the file threw outside of a test (while loading, in a `describe` body, or between tests), in which case `message` holds the error and `numRuntimeErrorTestSuites` counts the file. A file whose tests are all skipped or todo is `skipped`.
+- `failureMessages` holds the error name, message and stack of a failed test. `duration` is in milliseconds. `location` is the position of the `test()` call in the source file.
+- `success` is `true` when no test failed and no file threw, which is when the exit code is 0.
+
+The reporter can also be enabled in `bunfig.toml`:
+
+```toml title="bunfig.toml" icon="settings"
+[test.reporter]
+json = "path/to/results.json"
+```
+
 ### GitHub Actions reporter
 
 `bun test` detects when it's running inside GitHub Actions and emits GitHub Actions annotations to the console directly. No configuration is needed beyond installing Bun and running `bun test`.
