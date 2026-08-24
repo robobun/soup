@@ -1492,7 +1492,8 @@ impl BunTest {
             return; // the exception should not be visible (eg m_terminationException)
         };
 
-        let recording_target = if !self.reporter.jest.reports_to_junit {
+        let jest = &self.reporter.jest;
+        let recording_target = if !(jest.reports_to_junit || jest.reports_to_json) {
             None
         } else if handle_status == HandleUncaughtExceptionResult::ShowHandledError {
             Some(RecordingTarget::Sequence(*user_data))
@@ -1845,6 +1846,7 @@ pub(crate) struct BaseScopeCfg {
     pub(crate) self_shuffle: bool,
     pub(crate) test_id_for_debugger: i32,
     pub(crate) line_no: u32,
+    pub(crate) column_no: u32,
 }
 impl BaseScopeCfg {
     /// returns None if the other already has the value
@@ -1927,8 +1929,10 @@ pub(crate) struct BaseScope {
     pub(crate) has_callback: Cell<bool>,
     /// this value is 0 unless the debugger is active and the scope has a debugger id
     pub(crate) test_id_for_debugger: Cell<i32>,
-    /// only available if using junit reporter, otherwise 0
+    /// 1-based position of the `test()`/`describe()` call. Only captured for
+    /// the junit and json reporters, otherwise 0.
     pub(crate) line_no: u32,
+    pub(crate) column_no: u32,
 }
 impl BaseScope {
     fn init(
@@ -1954,6 +1958,7 @@ impl BaseScope {
             has_callback: Cell::new(has_callback),
             test_id_for_debugger: Cell::new(cfg.test_id_for_debugger),
             line_no: cfg.line_no,
+            column_no: cfg.column_no,
             parent: parent.map(|p| p.id),
         }
     }

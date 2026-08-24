@@ -461,6 +461,15 @@ junitSuites = "flat"
 
 Equivalent to the `--reporter-junit-suites` flag.
 
+#### `test.reporter.json`
+
+Enable the JSON reporter, which writes the results in Jest's `--json` format, and specify the output file path.
+
+```toml title="bunfig.toml" icon="settings"
+[test.reporter]
+json = "test-results.json"
+```
+
 ## Linter
 
 The `[lint]` section configures [`bun lint`](/lint). Run `bun lint --init` to add it.

@@ -799,7 +799,8 @@ impl Execution {
 
     /// Saves a failed attempt's failure before a retry, so it's reported with the test's final result.
     fn save_attempt_failure(buntest: &BunTest, sequence: &ExecutionSequence) {
-        if !buntest.reporter.jest.reports_to_junit {
+        let runner = &buntest.reporter.jest;
+        if !(runner.reports_to_junit || runner.reports_to_json) {
             return;
         }
         let failure = sequence

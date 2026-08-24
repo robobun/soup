@@ -85,6 +85,10 @@ pub(crate) mod test {
     #[path = "ShardsByReach.rs"]
     pub(crate) mod shards_by_reach;
 
+    /// `bun test --reporter=json`: the Jest-compatible results document.
+    #[path = "JsonReporter.rs"]
+    pub(crate) mod json_reporter;
+
     /// `bun test --parallel`: a coordinator hands test files to worker processes. `runner` has the entry points.
     pub(crate) mod parallel {
         #[path = "aggregate.rs"]

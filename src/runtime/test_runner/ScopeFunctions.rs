@@ -328,7 +328,7 @@ pub(crate) fn call_as_function<'a>(
     let Some(this) = this_value.as_class_ref::<ScopeFunctions>() else {
         return Err(global.throw(format_args!("Expected callee to be ScopeFunctions")));
     };
-    let line_no = jest::capture_test_line_number(global);
+    let location = jest::capture_test_location(global);
 
     let buntest = bun_test::js_fns::clone_active_strong(global, Signature::ScopeFunctions(&this))?;
 
@@ -437,7 +437,7 @@ pub(crate) fn call_as_function<'a>(
                         Calling::Jest { done: callback_length > args_list.len() }
                     },
                     parameter.as_ref(),
-                    line_no,
+                    location,
                 )
             })?;
 
@@ -452,7 +452,7 @@ pub(crate) fn call_as_function<'a>(
             &args.options,
             if is_vitest { Calling::Vitest { context: true } } else { Calling::Jest { done: callback_length >= 1 } },
             parameter.as_ref(),
-            line_no,
+            location,
         )?;
     }
 
@@ -511,7 +511,7 @@ impl ScopeFunctions {
         options: &ParseArgumentsOptions,
         calling: Calling,
         parameter: Option<&SharedContextParameter>,
-        line_no: u32,
+        location: (u32, u32),
     ) -> JsResult<()> {
         let _g = group_log::begin();
 
@@ -562,7 +562,7 @@ impl ScopeFunctions {
         if callback.is_none() && matches!(base.self_mode, SelfMode::Normal | SelfMode::Failing | SelfMode::Fails) {
             base.self_mode = SelfMode::Todo;
         }
-        base.line_no = line_no;
+        (base.line_no, base.column_no) = location;
         base.test_id_for_debugger = test_id_for_debugger;
         // Use the file's default concurrent setting (determined once when entering the file)
         // or the global concurrent flag from the runner
