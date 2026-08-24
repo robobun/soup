@@ -42,9 +42,9 @@ pub(crate) struct Coordinator<'a> {
     pub(crate) envps: Vec<bun_dotenv::NullDelimitedEnvMap>,
 
     pub(crate) workers: &'a mut [Worker],
-    /// Per file index, when a structured reporter (JUnit) is configured: the
-    /// `TestDone` records received for it, replayed in file order at the end
-    /// so the document matches a serial run. Empty otherwise.
+    /// Per file index, when a structured reporter (JUnit, JSON) is configured:
+    /// the `TestDone` records received for it, replayed in file order at the
+    /// end so the document matches a serial run. Empty otherwise.
     pub(crate) test_records: Vec<FileTestRecords>,
     /// Per source path: coverage folded across every worker that loaded it.
     pub(crate) coverage_files:

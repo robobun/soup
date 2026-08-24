@@ -554,6 +554,7 @@ impl BunTestRoot {
             has_callback: false,
             test_id_for_debugger: 0,
             line_no: 0,
+            column_no: 0,
         });
         BunTestRoot {
             active_file: None,
@@ -577,6 +578,7 @@ impl BunTestRoot {
             has_callback: false,
             test_id_for_debugger: 0,
             line_no: 0,
+            column_no: 0,
         });
     }
 
@@ -1658,7 +1660,8 @@ impl BunTest {
             // SAFETY: `BunTest.reporter` carries write provenance from `enter_file`'s
             // `&mut`; single-threaded test runner, no other borrow live here.
             let reporter = unsafe { &mut *reporter.as_ptr() };
-            if !reporter.jest.test_options.reporters.junit {
+            let reporters = &reporter.jest.test_options.reporters;
+            if !(reporters.junit || reporters.json) {
                 core::ptr::null_mut()
             } else if handle_status == HandleUncaughtExceptionResult::ShowHandledError {
                 match self
@@ -2062,6 +2065,7 @@ pub(crate) struct BaseScopeCfg {
     pub(crate) self_shuffle: bool,
     pub(crate) test_id_for_debugger: i32,
     pub(crate) line_no: u32,
+    pub(crate) column_no: u32,
 }
 impl BaseScopeCfg {
     /// returns None if the other already has the value
@@ -2144,8 +2148,10 @@ pub(crate) struct BaseScope {
     pub(crate) has_callback: bool,
     /// this value is 0 unless the debugger is active and the scope has a debugger id
     pub(crate) test_id_for_debugger: i32,
-    /// only available if using junit reporter, otherwise 0
+    /// 1-based position of the `test()`/`describe()` call. Only captured for
+    /// the junit and json reporters, otherwise 0.
     pub(crate) line_no: u32,
+    pub(crate) column_no: u32,
 }
 impl BaseScope {
     pub(crate) fn init(
@@ -2171,6 +2177,7 @@ impl BaseScope {
             has_callback,
             test_id_for_debugger: cfg.test_id_for_debugger,
             line_no: cfg.line_no,
+            column_no: cfg.column_no,
             parent: parent.map(std::ptr::from_mut),
         }
     }

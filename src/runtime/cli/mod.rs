@@ -85,6 +85,10 @@ pub(crate) mod test {
     #[path = "ShardsByReach.rs"]
     pub(crate) mod shards_by_reach;
 
+    /// `bun test --reporter=json`: the Jest-compatible results document.
+    #[path = "JsonReporter.rs"]
+    pub(crate) mod json_reporter;
+
     /// `bun test --parallel`: process-pool coordinator/worker entry points.
     /// Thin façade re-exporting from `parallel::runner`.
     #[path = "ParallelRunner.rs"]
