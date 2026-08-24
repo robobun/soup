@@ -381,6 +381,99 @@ Files: `src/dotenv/env_loader.rs` (`Loader::loaded_files`), `src/jsc/VirtualMach
 `src/runtime/cli/test_command.rs`, `docs/runtime/watch-mode.mdx`, `docs/runtime/environment-variables.mdx`,
 `test/cli/watch/watch.test.ts`, `test/cli/hot/hot.test.ts`.
 
+### 2026-08-24: `bun test --reporter=json`
+
+`bun test` could report to the console, as dots, or as JUnit XML. Anything that wanted the results as
+data (a CI dashboard, an editor integration, a script deciding what to rerun, `jq`) had to parse the
+XML or scrape the console output, and the format the JavaScript ecosystem actually speaks is Jest's
+`--json` document, which Vitest's JSON reporter emits too, so tools already exist for it
+(oven-sh/bun#2984, the reporters issue, asks for a JSON reporter specifically). `--reporter=json` now
+writes that document: to `--reporter-outfile` when given, otherwise to stdout once the run is over.
+`bun test` prints its console output to stderr, so stdout holds only the document (the `bun test vX`
+header is skipped in that mode), and the console reporter is unchanged either way.
+
+```sh
+bun test --reporter=json --reporter-outfile=results.json
+bun test --reporter=json 2>/dev/null | jq '.testResults[] | select(.status == "failed") | .name'
+```
+
+```json
+{
+  "numTotalTestSuites": 2,
+  "numPassedTestSuites": 1,
+  "numFailedTestSuites": 1,
+  "numPendingTestSuites": 0,
+  "numRuntimeErrorTestSuites": 0,
+  "numTotalTests": 3,
+  "numPassedTests": 2,
+  "numFailedTests": 1,
+  "numPendingTests": 0,
+  "numTodoTests": 0,
+  "startTime": 1724500000000,
+  "success": false,
+  "testResults": [
+    {
+      "name": "/app/math.test.ts",
+      "status": "failed",
+      "startTime": 1724500000012,
+      "endTime": 1724500000031,
+      "message": "",
+      "assertionResults": [
+        {
+          "ancestorTitles": ["math"],
+          "fullName": "math subtracts",
+          "title": "subtracts",
+          "status": "failed",
+          "duration": 1.08,
+          "failureMessages": [
+            "AssertionError: expect(received).toBe(expected)\n\nExpected: 1\nReceived: 2\n\n      at math.test.ts:8:19\n"
+          ],
+          "location": { "line": 7, "column": 3 }
+        }
+      ]
+    }
+  ]
+}
+```
+
+The shape is Jest's, field for field, with the same status vocabulary (`test.skip` is `pending`,
+`test.todo` is `todo`; a file is `failed`, `passed`, or `skipped` when every test in it is skipped). Two
+things Jest leaves empty by default are filled in. `location` is the `test()` call's position: the
+runner already captured the line for JUnit, and the C++ stack walk now also returns the column (and
+feeds the source map a zero-based column, which it had been given a one-based one), so the field is
+complete rather than `null`. `message` on a file entry carries errors thrown outside of any test: a
+file that fails to load, a throwing `describe` body, an unhandled error between tests. Such a file is
+`failed` and counted in `numRuntimeErrorTestSuites`, and as in Jest it is not a failed _test_, which is
+the one place the document and the console summary count differently (the console folds a load
+failure into `fail`). `failureMessages` holds the error name, message and stack the way the JUnit
+`<failure>` body does; timeouts, `.failing` tests that pass and `expect.assertions` misses get fixed
+messages. Tests `-t` or `.only` leave out are not listed, matching the console, and a `--dry-run`
+lists every test as `pending`. The document is also written when `--bail` stops the run, and
+`[test.reporter] json = "path"` in bunfig.toml configures it like `junit`.
+
+The reporter consumes the same `TestCaseReport` record the JUnit reporter does (upstream introduced
+it in oven-sh/bun#40678, and this patch was re-ported onto it on 2026-08-28): the serial runner hands
+each finished test to both reporters, and under `--parallel` the coordinator forwards
+`--reporter=json` to the workers, whose `TestDone` frames carry the record; the coordinator replays
+them in the run's file order into its own `JsonReporter`, closing a crashed worker's file with a
+failed entry. The record gained the column of the `test()` call, and the `FileDone` frame gained the
+error a file threw outside of any test, so the parallel document matches the serial one. The error
+capture is `TestFailure`, recorded through the `on_print_error_zig_exception` hook into
+`CommandLineReporter.test_failure` for an error the runner attributes to a test, or into the new
+`file_failure` slot for one it does not. While testing it, a pre-existing quirk showed up:
+`bunfig.toml` is applied after the `bun test` flags are parsed, so a `junit = ...` (or `json = ...`)
+path in the config wins over `--reporter-outfile` on the command line.
+
+Files: `src/runtime/cli/test/JsonReporter.rs`, `src/runtime/cli/test_command.rs` (`TestCaseReport`,
+`CommandLineReporter::file_failure`, `write_reports_if_needed`),
+`src/runtime/cli/test/parallel/{Frame,Coordinator,runner,aggregate}.rs`, `src/runtime/cli/mod.rs`,
+`src/runtime/cli/Arguments.rs`, `src/runtime/error.rs`, `src/options_types/context.rs`,
+`src/bunfig/bunfig.rs`, `src/runtime/test_runner/{bun_test,Execution,jest,ScopeFunctions,Collection}.rs`
+(`column_no`, `capture_test_location`), `src/jsc/bindings/bindings.cpp` (`Bun__CallFrame__getLineAndColumn`),
+`completions/bun.zsh`, `completions/bun-cli.json`, `docs/test/reporters.mdx`, `docs/test/configuration.mdx`,
+`docs/runtime/bunfig.mdx`, `docs/snippets/cli/test.mdx`, `test/cli/test/bun-test.test.ts`,
+`test/cli/test/parallel.test.ts`.
+
 ## Dropped
 
 Nothing yet.

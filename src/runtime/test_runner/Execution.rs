@@ -856,7 +856,8 @@ impl Execution {
         if let Some(reporter) = unsafe { (*buntest.as_ptr()).reporter } {
             // SAFETY: the reporter outlives every BunTest; single-threaded, no `&mut` to it is live.
             let reporter = unsafe { reporter.as_ref() };
-            if !reporter.jest.test_options.reporters.junit {
+            let reporters = &reporter.jest.test_options.reporters;
+            if !(reporters.junit || reporters.json) {
                 return;
             }
             let failure = sequence

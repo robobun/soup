@@ -13,7 +13,7 @@ pub(crate) enum Kind {
     /// u32 file_idx, str formatted_line (ANSI included; printed verbatim);
     /// then, only when the worker runs with `--reporter`, the structured
     /// result (`runner::encode_test_case`): u32 status, u32 assertions,
-    /// u64 elapsed_ns, u32 line, str name, u32 n × {str scope_name,
+    /// u64 elapsed_ns, u32 line, u32 column, u32 unhandled, str name, u32 n × {str scope_name,
     /// u32 scope_line}, u32 has_failure [, str name, str message, str body, u32 uncaught]
     TestDone,
     /// 10 × u32: file_idx, pass, fail, skip, todo, expectations, skipped_label,

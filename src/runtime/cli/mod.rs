@@ -85,6 +85,10 @@ pub(crate) mod test {
     #[path = "MemoryOfJob.rs"]
     pub(crate) mod memory_of_job;
 
+    /// `bun test --reporter=json`: the Jest-compatible results document.
+    #[path = "JsonReporter.rs"]
+    pub(crate) mod json_reporter;
+
     /// `bun test --parallel`: process-pool coordinator/worker entry points.
     /// Thin façade re-exporting from `parallel::runner`.
     #[path = "ParallelRunner.rs"]

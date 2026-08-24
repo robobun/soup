@@ -587,6 +587,8 @@ pub struct Reporters {
     pub only_failures: bool,
     pub junit: bool,
     pub junit_suites: Option<JunitSuites>,
+    /// `--reporter=json`: written to `reporter_outfile`, or to stdout.
+    pub json: bool,
 }
 
 #[derive(Copy, Clone, Default, Eq, PartialEq)]
