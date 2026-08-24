@@ -448,6 +448,16 @@ impl<'a> Parser<'a> {
                             }
                         }
                     }
+                    if let Some(json_expr) = expr.get(b"json") {
+                        self.expect_string(&json_expr)?;
+                        if let ExprData::EString(s) = &json_expr.data {
+                            if s.len() > 0 {
+                                self.ctx.test_options.reporters.json = true;
+                                self.ctx.test_options.reporter_outfile =
+                                    Some(estring_to_owned(s, self.bump));
+                            }
+                        }
+                    }
                     if let Some(dots_expr) = expr.get(b"dots").or_else(|| expr.get(b"dot")) {
                         self.expect(&dots_expr, ExprTag::EBoolean)?;
                         self.ctx.test_options.reporters.dots =

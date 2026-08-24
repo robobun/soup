@@ -437,6 +437,7 @@ impl BunTestRoot {
             has_callback: false,
             test_id_for_debugger: 0,
             line_no: 0,
+            column_no: 0,
         });
         BunTestRoot {
             active_file: None,
@@ -460,6 +461,7 @@ impl BunTestRoot {
             has_callback: false,
             test_id_for_debugger: 0,
             line_no: 0,
+            column_no: 0,
         });
     }
 
@@ -1341,21 +1343,33 @@ impl BunTest {
             return; // the exception should not be visible (eg m_terminationException)
         };
 
+        // Where a structured reporter (junit, json) wants the error recorded
+        // while `run_error_handler` formats it: the failing test's slot for an
+        // error the runner attributes to a test, the file's slot for one it
+        // does not (only the json reporter writes those).
         let failure_ctx: *mut core::ffi::c_void = 'ctx: {
-            if handle_status != HandleUncaughtExceptionResult::ShowHandledError {
-                break 'ctx core::ptr::null_mut();
-            }
             let Some(reporter) = self.reporter else {
                 break 'ctx core::ptr::null_mut();
             };
             // SAFETY: `BunTest.reporter` carries write provenance from `enter_file`'s
             // `&mut`; single-threaded test runner, no other borrow live here.
             let reporter = unsafe { &mut *reporter.as_ptr() };
-            if reporter.jest.test_options.reporters.junit {
-                core::ptr::from_mut(&mut reporter.test_failure).cast()
-            } else {
-                core::ptr::null_mut()
-            }
+            let reporters = &reporter.jest.test_options.reporters;
+            let slot = match handle_status {
+                HandleUncaughtExceptionResult::ShowHandledError
+                    if reporters.junit || reporters.json =>
+                {
+                    &mut reporter.test_failure
+                }
+                HandleUncaughtExceptionResult::ShowUnhandledErrorBetweenTests
+                | HandleUncaughtExceptionResult::ShowUnhandledErrorInDescribe
+                    if reporters.json =>
+                {
+                    &mut reporter.file_failure
+                }
+                _ => break 'ctx core::ptr::null_mut(),
+            };
+            core::ptr::from_mut(slot).cast()
         };
 
         self.bun_test_root.on_before_print();
@@ -1663,6 +1677,7 @@ pub struct BaseScopeCfg {
     pub(crate) self_only: bool,
     pub(crate) test_id_for_debugger: i32,
     pub(crate) line_no: u32,
+    pub(crate) column_no: u32,
 }
 impl BaseScopeCfg {
     /// returns None if the other already has the value
@@ -1740,8 +1755,10 @@ pub struct BaseScope {
     pub(crate) has_callback: bool,
     /// this value is 0 unless the debugger is active and the scope has a debugger id
     pub(crate) test_id_for_debugger: i32,
-    /// only available if using junit reporter, otherwise 0
+    /// 1-based position of the `test()`/`describe()` call. Only captured for
+    /// the junit and json reporters, otherwise 0.
     pub(crate) line_no: u32,
+    pub(crate) column_no: u32,
 }
 impl BaseScope {
     pub(crate) fn init(
@@ -1770,6 +1787,7 @@ impl BaseScope {
             has_callback,
             test_id_for_debugger: cfg.test_id_for_debugger,
             line_no: cfg.line_no,
+            column_no: cfg.column_no,
         }
     }
 

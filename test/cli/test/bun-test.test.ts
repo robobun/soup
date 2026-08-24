@@ -10,7 +10,7 @@ import {
   tempDirWithFiles,
   tmpdirSync,
 } from "harness";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 
 describe("bun test", () => {
@@ -477,6 +477,277 @@ describe("bun test", () => {
       );
       expect(report).toMatch(/<testcase name="b works"[^>]*>\s*<skipped message="dry run" \/>/);
       expect(report).toMatch(/<testcase name="inside"[^>]*>\s*<skipped \/>/);
+    });
+  });
+  describe.concurrent("--reporter=json", () => {
+    const files = {
+      "a.test.ts": `
+        import { test, describe, expect } from "bun:test";
+        describe("math", () => {
+          test("adds", () => {
+            expect(1 + 1).toBe(2);
+          });
+          test("subtracts", () => {
+            expect(2 - 1).toBe(2);
+          });
+          describe("nested", () => {
+            test.skip("skipped", () => {});
+            test.todo("todo");
+          });
+        });
+        test("top level", () => {});
+        test("times out", async () => {
+          await new Promise(() => {});
+        }, { timeout: 10 });
+        test.failing("failing passes", () => {});
+      `,
+      "b.test.ts": `
+        import { test } from "bun:test";
+        test.skip("only skipped", () => {});
+      `,
+      "broken.test.ts": `
+        import { test } from "bun:test";
+        test("never listed", () => {});
+        throw new Error("boom at load time");
+      `,
+    };
+
+    type Report = {
+      numTotalTestSuites: number;
+      numPassedTestSuites: number;
+      numFailedTestSuites: number;
+      numPendingTestSuites: number;
+      numRuntimeErrorTestSuites: number;
+      numTotalTests: number;
+      numPassedTests: number;
+      numFailedTests: number;
+      numPendingTests: number;
+      numTodoTests: number;
+      startTime: number;
+      success: boolean;
+      testResults: {
+        name: string;
+        status: string;
+        startTime: number;
+        endTime: number;
+        message: string;
+        assertionResults: {
+          ancestorTitles: string[];
+          fullName: string;
+          title: string;
+          status: string;
+          duration: number;
+          failureMessages: string[];
+          location: { line: number; column: number } | null;
+        }[];
+      }[];
+    };
+
+    async function run(args: string[], outfile?: string, extraFiles: Record<string, string> = {}) {
+      using dir = tempDir("bun-test-json-reporter", { ...files, ...extraFiles });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", ...args],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      const report: Report = JSON.parse(outfile ? await Bun.file(join(String(dir), outfile)).text() : stdout);
+      return { stdout, stderr, exitCode, report, dir: realpathSync(String(dir)) };
+    }
+
+    test("writes a Jest-compatible document with every test and the errors", async () => {
+      const { stderr, exitCode, report, dir } = await run(
+        ["--reporter=json", "--reporter-outfile=report.json", "./a.test.ts", "./b.test.ts", "./broken.test.ts"],
+        "report.json",
+      );
+      // The console reporter is unchanged.
+      expect(stderr).toContain("(fail) math > subtracts");
+      expect(stderr).toContain("Ran 9 tests across 3 files.");
+      expect(exitCode).toBe(1);
+
+      const { testResults, startTime, ...counts } = report;
+      expect(counts).toEqual({
+        numTotalTestSuites: 3,
+        numPassedTestSuites: 0,
+        numFailedTestSuites: 2,
+        numPendingTestSuites: 1,
+        numRuntimeErrorTestSuites: 1,
+        numTotalTests: 8,
+        numPassedTests: 2,
+        numFailedTests: 3,
+        numPendingTests: 2,
+        numTodoTests: 1,
+        success: false,
+      });
+      expect(startTime).toBeGreaterThan(1_600_000_000_000);
+
+      expect(testResults.map(f => [basename(f.name), f.status])).toEqual([
+        ["a.test.ts", "failed"],
+        ["b.test.ts", "skipped"],
+        ["broken.test.ts", "failed"],
+      ]);
+      for (const file of testResults) {
+        expect(file.name).toBe(join(dir, basename(file.name)));
+        expect(file.endTime).toBeGreaterThanOrEqual(file.startTime);
+        expect(file.startTime).toBeGreaterThanOrEqual(startTime);
+      }
+
+      const [a, b, broken] = testResults;
+      expect(a.message).toBe("");
+      expect(a.assertionResults.map(t => ({ ...t, duration: typeof t.duration }))).toEqual([
+        {
+          ancestorTitles: ["math"],
+          fullName: "math adds",
+          title: "adds",
+          status: "passed",
+          duration: "number",
+          failureMessages: [],
+          location: { line: 4, column: 11 },
+        },
+        {
+          ancestorTitles: ["math"],
+          fullName: "math subtracts",
+          title: "subtracts",
+          status: "failed",
+          duration: "number",
+          failureMessages: [
+            expect.stringMatching(
+              /^AssertionError: expect\(received\)\.toBe\(expected\)\n\nExpected: 2\nReceived: 1\n\n\s+at .*a\.test\.ts:8:27\n$/,
+            ),
+          ],
+          location: { line: 7, column: 11 },
+        },
+        {
+          ancestorTitles: ["math", "nested"],
+          fullName: "math nested skipped",
+          title: "skipped",
+          status: "pending",
+          duration: "number",
+          failureMessages: [],
+          location: { line: 11, column: 18 },
+        },
+        {
+          ancestorTitles: ["math", "nested"],
+          fullName: "math nested todo",
+          title: "todo",
+          status: "todo",
+          duration: "number",
+          failureMessages: [],
+          location: { line: 12, column: 18 },
+        },
+        {
+          ancestorTitles: [],
+          fullName: "top level",
+          title: "top level",
+          status: "passed",
+          duration: "number",
+          failureMessages: [],
+          location: { line: 15, column: 9 },
+        },
+        {
+          ancestorTitles: [],
+          fullName: "times out",
+          title: "times out",
+          status: "failed",
+          duration: "number",
+          failureMessages: ["TimeoutError: test timed out"],
+          location: { line: 16, column: 9 },
+        },
+        {
+          ancestorTitles: [],
+          fullName: "failing passes",
+          title: "failing passes",
+          status: "failed",
+          duration: "number",
+          failureMessages: ["AssertionError: test marked with .failing() did not throw"],
+          location: { line: 19, column: 14 },
+        },
+      ]);
+      expect(a.assertionResults[5].duration).toBeGreaterThan(0);
+
+      expect(b.assertionResults).toEqual([
+        {
+          ancestorTitles: [],
+          fullName: "only skipped",
+          title: "only skipped",
+          status: "pending",
+          duration: 0,
+          failureMessages: [],
+          location: { line: 3, column: 14 },
+        },
+      ]);
+
+      // A file that throws while loading has no tests; the error is its message.
+      expect(broken.assertionResults).toEqual([]);
+      expect(broken.message).toMatch(/^Error: boom at load time\n\s+at .*broken\.test\.ts:4:19\n$/);
+    });
+
+    test("prints the document to stdout when there is no outfile, with nothing else", async () => {
+      const { stdout, stderr, exitCode, report } = await run(["--reporter=json", "./b.test.ts"]);
+      expect(stdout).toStartWith("{\n");
+      expect(stdout).toEndWith("}\n");
+      expect(stderr).toContain("(skip) only skipped");
+      expect(report.success).toBe(true);
+      expect(report.numTotalTests).toBe(1);
+      expect(report.testResults.map(f => f.status)).toEqual(["skipped"]);
+      expect(exitCode).toBe(0);
+    });
+
+    test("reads the outfile from bunfig.toml", async () => {
+      const { stdout, exitCode, report } = await run(["./b.test.ts"], "from-bunfig.json", {
+        "bunfig.toml": `
+          [test.reporter]
+          json = "from-bunfig.json"
+        `,
+      });
+      expect(stdout).toStartWith("bun test v");
+      expect(report.numPendingTests).toBe(1);
+      expect(exitCode).toBe(0);
+    });
+
+    test("is written when --bail stops the run", async () => {
+      const { exitCode, report } = await run(["--bail", "--reporter=json", "./a.test.ts"]);
+      expect(report.success).toBe(false);
+      expect(report.numTotalTests).toBe(2);
+      expect(report.testResults[0].assertionResults.map(t => t.status)).toEqual(["passed", "failed"]);
+      expect(exitCode).toBe(1);
+    });
+
+    test("leaves out the tests -t filters out, and lists --dry-run tests as pending", async () => {
+      const filtered = await run(["--reporter=json", "-t", "adds", "./a.test.ts"]);
+      expect(filtered.report.numTotalTests).toBe(1);
+      expect(filtered.report.testResults[0].assertionResults.map(t => t.fullName)).toEqual(["math adds"]);
+      expect(filtered.exitCode).toBe(0);
+
+      const dry = await run(["--reporter=json", "--dry-run", "./a.test.ts"]);
+      expect(dry.report.success).toBe(true);
+      expect(dry.report.testResults[0].assertionResults.map(t => t.status)).toEqual([
+        "pending",
+        "pending",
+        "pending",
+        "todo",
+        "pending",
+        "pending",
+        "pending",
+      ]);
+      expect(dry.exitCode).toBe(0);
+    });
+
+    test("rejects an unknown reporter", async () => {
+      using dir = tempDir("bun-test-json-reporter-unknown", files);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "--reporter=yaml", "./b.test.ts"],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+      expect(stderr).toContain("unsupported reporter format 'yaml'");
+      expect(stderr).toContain("'json'");
+      expect(exitCode).toBe(1);
     });
   });
   describe("--bail", () => {

@@ -476,6 +476,8 @@ pub struct Reporters {
     pub dots: bool,
     pub only_failures: bool,
     pub junit: bool,
+    /// `--reporter=json`: written to `reporter_outfile`, or to stdout.
+    pub json: bool,
 }
 
 impl TestOptions {

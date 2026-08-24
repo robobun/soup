@@ -597,10 +597,10 @@ pub(crate) const TEST_ONLY_PARAMS: &[ParamType] = &[
         "-t, --test-name-pattern/--grep <STR>    Run only tests with a name that matches the given regex."
     ),
     parse_param!(
-        "--reporter <STR>                 Test output reporter format. Available: 'junit' (requires --reporter-outfile), 'dots'. Default: console output."
+        "--reporter <STR>                 Test output reporter format. Available: 'junit' (requires --reporter-outfile), 'json' (Jest-compatible, to --reporter-outfile or stdout), 'dots'. Default: console output."
     ),
     parse_param!(
-        "--reporter-outfile <STR>         Output file path for the reporter format (required with --reporter)."
+        "--reporter-outfile <STR>         Output file path for the reporter format (required with --reporter=junit)."
     ),
     parse_param!(
         "--dots                           Enable dots reporter. Shorthand for --reporter=dots."
@@ -1790,11 +1790,13 @@ fn parse_test_command_options(args: &clap::Args<clap::Help>, ctx: Context<'_>) {
                 Global::crash();
             }
             ctx.test_options.reporters.junit = true;
+        } else if reporter == b"json" {
+            ctx.test_options.reporters.json = true;
         } else if reporter == b"dots" || reporter == b"dot" {
             ctx.test_options.reporters.dots = true;
         } else {
             Output::err_generic(
-                "unsupported reporter format '{}'. Available options: 'junit' (for XML test results), 'dots'",
+                "unsupported reporter format '{}'. Available options: 'junit' (for XML test results), 'json' (for Jest-compatible JSON test results), 'dots'",
                 format_args!("{}", BStr::new(reporter)),
             );
             Global::crash();

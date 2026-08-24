@@ -73,6 +73,7 @@ impl Collection {
             has_callback: false,
             test_id_for_debugger: 0,
             line_no: 0,
+            column_no: 0,
         });
 
         let active_scope = NonNull::from(&mut *root_scope);

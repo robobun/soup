@@ -613,6 +613,85 @@ test("--parallel --reporter=junit carries a large per-file report intact over IP
   expect(exitCode).toBe(0);
 });
 
+test("--parallel --reporter=json produces one document covering all files, in file order", async () => {
+  using dir = tempDir("parallel-json", {
+    "a.test.js": `import {test,expect,describe} from "bun:test"; describe("d", () => { test("ta",()=>expect(1).toBe(1)); });`,
+    "b.test.js": `import {test,expect} from "bun:test"; test.skip("tb",()=>expect(1).toBe(1));`,
+    "c.test.js": `import {test,expect} from "bun:test"; test("tc",()=>expect(1).toBe(2));`,
+    "d.test.js": `import {test} from "bun:test"; throw new Error("d cannot load");`,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", "--parallel=2", "--reporter=json"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  // The document is the only thing on stdout; the console output stays on stderr.
+  expect(stderr).toContain("(pass) d > ta");
+  const report = JSON.parse(stdout);
+  const { testResults, startTime, ...counts } = report;
+  expect(counts).toEqual({
+    numTotalTestSuites: 4,
+    numPassedTestSuites: 1,
+    numFailedTestSuites: 2,
+    numPendingTestSuites: 1,
+    numRuntimeErrorTestSuites: 1,
+    numTotalTests: 3,
+    numPassedTests: 1,
+    numFailedTests: 1,
+    numPendingTests: 1,
+    numTodoTests: 0,
+    success: false,
+  });
+  expect(testResults.map((f: any) => [f.name.split(/[\\/]/).pop(), f.status])).toEqual([
+    ["a.test.js", "passed"],
+    ["b.test.js", "skipped"],
+    ["c.test.js", "failed"],
+    ["d.test.js", "failed"],
+  ]);
+  expect(testResults[0].assertionResults).toEqual([
+    {
+      ancestorTitles: ["d"],
+      fullName: "d ta",
+      title: "ta",
+      status: "passed",
+      duration: expect.any(Number),
+      failureMessages: [],
+      location: { line: 1, column: 70 },
+    },
+  ]);
+  expect(testResults[2].assertionResults[0].failureMessages).toEqual([
+    expect.stringContaining("expect(received).toBe(expected)"),
+  ]);
+  expect(testResults[3].message).toContain("d cannot load");
+  expect(exitCode).toBe(1);
+});
+
+test("--parallel --reporter=json reports a file whose worker crashed as failed", async () => {
+  using dir = tempDir("parallel-json-crash", {
+    "pass.test.js": `import {test,expect} from "bun:test"; test("fine", () => expect(1).toBe(1));`,
+    "zcrash.test.js": `import {test} from "bun:test"; test("boom", () => process.exit(7));`,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", "--parallel=2", "--reporter=json", "--reporter-outfile=out.json"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  const [, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const report = JSON.parse(await Bun.file(String(dir) + "/out.json").text());
+  expect(report.success).toBe(false);
+  expect(report.numRuntimeErrorTestSuites).toBe(1);
+  expect(report.testResults.map((f: any) => [f.name.split(/[\\/]/).pop(), f.status, f.message])).toEqual([
+    ["pass.test.js", "passed", ""],
+    ["zcrash.test.js", "failed", "worker process crashed before reporting results"],
+  ]);
+  expect(exitCode).toBe(1);
+});
+
 test("--parallel --coverage merges LCOV across workers", async () => {
   using dir = tempDir("parallel-coverage-lcov", {
     "shared.js": `export function hit() { return 1; }\nexport function miss() { return 2; }\n`,

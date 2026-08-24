@@ -17,7 +17,7 @@ use bun_ptr::Interned;
 
 use super::frame::{self, Frame};
 use super::worker::{Worker, WorkerPipe};
-use crate::test_command::CommandLineReporter;
+use crate::test_command::{CommandLineReporter, TestFailure};
 
 // `Status` lives in `crate::api::bun::process`
 // (not the lower-tier `bun_spawn` crate). Worker.exit_status is this type.
@@ -41,9 +41,9 @@ pub struct Coordinator<'a> {
     pub(crate) envps: Vec<bun_dotenv::NullDelimitedEnvMap>,
 
     pub(crate) workers: &'a mut [Worker],
-    /// Per file index, when a structured reporter (JUnit) is configured: the
-    /// `TestDone` records received for it, replayed in file order at the end
-    /// so the document matches a serial run. Empty otherwise.
+    /// Per file index, when a structured reporter (JUnit, JSON) is configured:
+    /// the `TestDone` records received for it, replayed in file order at the
+    /// end so the document matches a serial run. Empty otherwise.
     pub(crate) test_records: Vec<FileTestRecords>,
     /// Per source path: coverage folded across every worker that loaded it.
     pub(crate) coverage_files:
@@ -75,6 +75,8 @@ pub(crate) struct FileTestRecords {
     /// `TestDone` payloads past the formatted line; see `runner::decode_test_case`.
     pub(crate) tests: Vec<Box<[u8]>>,
     pub(crate) elapsed_ns: u64,
+    /// The error the file threw outside of any test, from its `FileDone` frame.
+    pub(crate) file_failure: Option<TestFailure>,
 }
 
 /// Consecutive pre-`.ready` exits a worker slot tolerates before the slot
@@ -474,6 +476,7 @@ impl<'a> Coordinator<'a> {
                 ] = nums;
                 if let Some(file) = self.test_records.get_mut(idx as usize) {
                     file.elapsed_ns = rd.u64();
+                    file.file_failure = super::runner::decode_failure(rd);
                 }
 
                 self.flush_captured(w);

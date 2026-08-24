@@ -156,6 +156,20 @@ This complements the `--reporter=junit` and `--reporter-outfile` CLI flags:
 bun test --reporter=junit --reporter-outfile=./junit.xml
 ```
 
+### JSON Reporter
+
+The JSON reporter writes the results in Jest's `--json` format. Configure its output file path the same way:
+
+```toml title="bunfig.toml" icon="settings"
+[test.reporter]
+json = "path/to/results.json"  # Output path for the JSON report
+```
+
+```bash terminal icon="terminal"
+# Equivalent command line usage
+bun test --reporter=json --reporter-outfile=./results.json
+```
+
 #### Multiple Reporters
 
 You can use multiple reporters simultaneously:

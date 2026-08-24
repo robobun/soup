@@ -829,6 +829,8 @@ _bun_test_completion() {
         '--bail[Exit the test suite after <NUMBER> failures. If you do not specify a number, it defaults to 1.]:bail' \
         '--shard[Run a subset of test files, e.g. 1/3. Useful for splitting tests across CI jobs.]:shard' \
         '--dry-run[Load the test files and list the tests that would run, without running any test or hook]' \
+        '--reporter[Test output reporter format: junit (requires --reporter-outfile), json, dots]:reporter:(junit json dots)' \
+        '--reporter-outfile[Output file path for the reporter format]:outfile:_files' \
         '--test-name-pattern[Run only tests with a name that matches the given regex]:pattern' \
         '-t[Run only tests with a name that matches the given regex]:pattern' &&
         ret=0

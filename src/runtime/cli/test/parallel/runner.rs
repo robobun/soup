@@ -173,7 +173,7 @@ pub(crate) fn run_as_coordinator(
         },
         bail: ctx.test_options.bail,
         dots: ctx.test_options.reporters.dots,
-        test_records: if ctx.test_options.reporters.junit {
+        test_records: if ctx.test_options.reporters.junit || ctx.test_options.reporters.json {
             (0..n).map(|_| Default::default()).collect()
         } else {
             Vec::new()
@@ -221,7 +221,7 @@ pub(crate) fn run_as_coordinator(
         aggregate::write_coverage_report(&mut coord, coverage_opts);
     }
     if let Some(code) = coord.aborted {
-        coord.reporter.write_junit_report_if_needed();
+        coord.reporter.write_reports_if_needed();
         coord.reporter.write_timings_if_needed();
         Output::flush();
         Global::exit(code);
@@ -232,9 +232,9 @@ pub(crate) fn run_as_coordinator(
 /// Build the argv used for every worker (re)spawn. Forwards every `bun test`
 /// flag that affects how tests *execute inside* a worker, plus `--dots` and
 /// `--only-failures` since the worker formats result lines and the coordinator
-/// prints them verbatim. `--reporter=junit` is forwarded (without the outfile)
-/// so workers attach the per-test detail the coordinator's JunitReporter
-/// needs. Coordinator-only concerns — file discovery
+/// prints them verbatim. `--reporter=junit` and `--reporter=json` are forwarded
+/// (without the outfile) so workers attach the per-test detail the
+/// coordinator's reporter needs. Coordinator-only concerns — file discovery
 /// (`--path-ignore-patterns`, `--changed`), `--reporter-outfile`,
 /// `--pass-with-no-tests`, `--parallel` itself — are intentionally not
 /// forwarded.
@@ -285,6 +285,9 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Box<[bun_spawn
     }
     if opts.reporters.junit {
         argv.push(lit(b"--reporter=junit\0"));
+    }
+    if opts.reporters.json {
+        argv.push(lit(b"--reporter=json\0"));
     }
     if opts.update_snapshots {
         argv.push(lit(b"--update-snapshots\0"));
@@ -615,6 +618,7 @@ impl<'a> WorkerLoop<'a> {
                 wf.u32(v);
             }
             wf.u64(elapsed_ns);
+            encode_failure(wf, self.reporter.file_failure.take().as_ref());
             self.cmds.send(wf.finish());
         }
     }
@@ -769,13 +773,19 @@ fn encode_test_case(wf: &mut Frame, t: &test_command::TestCaseReport<'_>) {
     wf.u32(t.assertions);
     wf.u64(t.elapsed_ns);
     wf.u32(t.line_number);
+    wf.u32(t.column_number);
     wf.str(t.name);
     wf.u32(u32::try_from(t.scopes.len()).expect("int cast"));
     for &(name, line) in &t.scopes {
         wf.str(name);
         wf.u32(line);
     }
-    match &t.failure {
+    encode_failure(wf, t.failure.as_ref());
+}
+
+/// `u32 has_failure [, str name, str message, str body]`.
+pub(crate) fn encode_failure(wf: &mut Frame, failure: Option<&test_command::TestFailure>) {
+    match failure {
         None => wf.u32(0),
         Some(f) => {
             wf.u32(1);
@@ -784,6 +794,16 @@ fn encode_test_case(wf: &mut Frame, t: &test_command::TestCaseReport<'_>) {
             wf.str(&f.body);
         }
     }
+}
+
+/// Inverse of `encode_failure`. A frame without the trailer (a worker that runs
+/// with no `--reporter`) reads as no failure.
+pub(crate) fn decode_failure(rd: &mut frame::Reader<'_>) -> Option<test_command::TestFailure> {
+    (rd.u32() != 0).then(|| test_command::TestFailure {
+        name: rd.str().to_vec(),
+        message: rd.str().to_vec(),
+        body: rd.str().to_vec(),
+    })
 }
 
 /// Inverse of `encode_test_case`; strings borrow the frame payload. The file
@@ -798,6 +818,7 @@ pub(crate) fn decode_test_case<'a>(
     let assertions = rd.u32();
     let elapsed_ns = rd.u64();
     let line_number = rd.u32();
+    let column_number = rd.u32();
     let name = rd.str();
     let n = rd.u32() as usize;
     if n > 64 {
@@ -807,11 +828,7 @@ pub(crate) fn decode_test_case<'a>(
     for _ in 0..n {
         scopes.push((rd.str(), rd.u32()));
     }
-    let failure = (rd.u32() != 0).then(|| test_command::TestFailure {
-        name: rd.str().to_vec(),
-        message: rd.str().to_vec(),
-        body: rd.str().to_vec(),
-    });
+    let failure = decode_failure(rd);
     Some(test_command::TestCaseReport {
         file,
         scopes,
@@ -820,6 +837,7 @@ pub(crate) fn decode_test_case<'a>(
         assertions,
         elapsed_ns,
         line_number,
+        column_number,
         failure,
     })
 }
