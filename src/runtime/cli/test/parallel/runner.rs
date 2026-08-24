@@ -150,7 +150,7 @@ pub(crate) fn run_as_coordinator(
         } else {
             DEFAULT_SCALE_UP_AFTER_MS
         },
-        test_records: if ctx.test_options.reporters.junit {
+        test_records: if ctx.test_options.reporters.junit || ctx.test_options.reporters.json {
             (0..n).map(|_| Default::default()).collect()
         } else {
             Vec::new()
@@ -184,7 +184,7 @@ pub(crate) fn run_as_coordinator(
         aggregate::write_coverage_report(&mut coord, coverage_opts);
     }
     if let Some(code) = coord.aborted {
-        coord.reporter.write_junit_report_if_needed();
+        coord.reporter.write_reports_if_needed();
         coord.reporter.write_timings_if_needed();
         Output::flush();
         Global::exit(code);
@@ -276,9 +276,9 @@ impl Argv {
 /// Build the argv used for every worker (re)spawn. Forwards every `bun test`
 /// flag that affects how tests *execute inside* a worker, plus `--dots` and
 /// `--only-failures` since the worker formats result lines and the coordinator
-/// prints them verbatim. `--reporter=junit` is forwarded (without the outfile)
-/// so workers attach the per-test detail the coordinator's JunitReporter
-/// needs. Coordinator-only concerns — file discovery
+/// prints them verbatim. `--reporter=junit` and `--reporter=json` are forwarded
+/// (without the outfile) so workers attach the per-test detail the
+/// coordinator's reporter needs. Coordinator-only concerns — file discovery
 /// (`--path-ignore-patterns`, `--changed`), `--reporter-outfile`,
 /// `--pass-with-no-tests`, `--parallel` itself — are intentionally not
 /// forwarded.
@@ -308,6 +308,7 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Argv> {
     argv.flag("--dots", opts.reporters.dots);
     argv.flag("--only-failures", opts.reporters.only_failures);
     argv.flag("--reporter=junit", opts.reporters.junit);
+    argv.flag("--reporter=json", opts.reporters.json);
     argv.flag("--update-snapshots", opts.update_snapshots);
     argv.flag("--concurrent", opts.concurrent);
     argv.flag("--randomize", opts.randomize);
@@ -820,6 +821,8 @@ fn encode_test_case(wf: &mut Frame, t: &test_command::TestCaseReport<'_>) {
     wf.u32(t.assertions);
     wf.u64(t.elapsed_ns);
     wf.u32(t.line_number);
+    wf.u32(t.column_number);
+    wf.u32(u32::from(t.unhandled));
     wf.str(t.name);
     wf.u32(u32::try_from(t.scopes.len()).expect("int cast"));
     for &(name, line) in &t.scopes {
@@ -849,6 +852,8 @@ pub(crate) fn decode_test_case<'a>(
     let assertions = rd.u32();
     let elapsed_ns = rd.u64();
     let line_number = rd.u32();
+    let column_number = rd.u32();
+    let unhandled = rd.u32() != 0;
     let name = rd.str();
     let n = rd.u32() as usize;
     if n > 64 {
@@ -876,6 +881,8 @@ pub(crate) fn decode_test_case<'a>(
         assertions,
         elapsed_ns,
         line_number,
+        column_number,
+        unhandled,
         failure,
         earlier_failures,
     })
