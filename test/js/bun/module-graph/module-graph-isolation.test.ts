@@ -3921,6 +3921,7 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
       [
         "ArrayBufferSink",
         "CSRF",
+        "CSV",
         "Cookie",
         "CookieMap",
         "CryptoHasher",
