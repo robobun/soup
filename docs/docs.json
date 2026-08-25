@@ -162,6 +162,7 @@
               "/runtime/json5",
               "/runtime/xml",
               "/runtime/ini",
+              "/runtime/csv",
               "/runtime/jsonl",
               "/runtime/html-rewriter",
               "/runtime/image",
