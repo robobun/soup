@@ -474,6 +474,67 @@ Files: `src/runtime/cli/test/JsonReporter.rs`, `src/runtime/cli/test_command.rs`
 `docs/runtime/bunfig.mdx`, `docs/snippets/cli/test.mdx`, `test/cli/test/bun-test.test.ts`,
 `test/cli/test/parallel.test.ts`.
 
+### 2026-08-25: `Bun.CSV`
+
+Bun parses JSON, JSONC, JSON5, TOML, YAML, XML, INI and markdown out of the box, and nothing for
+CSV, which is still how spreadsheets, databases and most data exports hand tabular data around.
+Scripts pull in papaparse or csv-parse for a format that fits in a few hundred lines; oven-sh/bun#6722
+asked for CSV support in 2023 and the zig-era oven-sh/bun#19167 never landed. `Bun.CSV.parse()` and
+`Bun.CSV.stringify()` (also `import { CSV } from "bun"`) now exist next to the other parsers. `parse`
+takes a string, UTF-8 bytes or a `Blob` like `Bun.TOML.parse` and returns records; `stringify` writes
+them back.
+
+```ts
+import { CSV } from "bun";
+
+CSV.parse("name,age\nAda,36\nGrace,45\n");
+// [{ name: "Ada", age: "36" }, { name: "Grace", age: "45" }]
+
+CSV.parse("name,age\nAda,36\n", { header: false });
+// [["name", "age"], ["Ada", "36"]]
+
+CSV.parse("Ada\t36\n", { header: ["name", "age"], delimiter: "\t" });
+// [{ name: "Ada", age: "36" }]   (typed Record<"name" | "age", string>[])
+
+CSV.stringify([{ name: "Ada", note: 'says "hi"' }]);
+// 'name,note\nAda,"says ""hi"""\n'
+```
+
+The format is RFC 4180 plus what every reader accepts in practice: `\n`, `\r\n` and a lone `\r` end a
+record, a quoted field may span lines and doubles its quote to escape it, a quote inside an unquoted
+field is literal, a leading byte order mark is skipped. Fields are strings, always; CSV has no types
+and guessing them (`007`, `1e5`, `TRUE`) is how data gets corrupted, so no `dynamicTyping`. Options:
+`header` (`true` by default: the first record names the columns and records are objects; `false` for
+arrays; an array of names for a file without a header row, which also types the result), `delimiter`
+and `quote` (any single character, so TSV and `;` files work), `trim` (strip spaces and tabs around
+fields, and recognize a quote after them, as Python's `skipinitialspace` does), and `skipEmptyLines`
+(on by default). With named columns a short record leaves the missing columns `""` and extra fields
+are dropped, as d3-dsv does. An unterminated quote, or text between a closing quote and the next
+delimiter, is a `SyntaxError` that names the line; silently swallowing the rest of the file into one
+field, which the lenient parsers do, is worse than an error that points at the row. `stringify` takes
+all-array or all-object rows, writes a header from `columns` or the first row's keys, ends every
+record with `\n` so outputs concatenate, quotes only what needs it (delimiter, quote, line break, or a
+leading/trailing space or tab so `trim` round-trips), and converts values the way `JSON.stringify` and
+csv-stringify do: `null`/`undefined` empty, `Date` as ISO, nested objects as JSON, functions and
+symbols empty.
+
+The parser scans the UTF-8 bytes with the SIMD `index_of_any` for the next delimiter or line break,
+so an unquoted field costs one scan and one string allocation, and a quoted field is handed to the
+string constructor straight from the input unless it has `""` inside, which is the only case that
+copies into a scratch buffer first. It goes through the same input scaffold as the other
+`Bun.*.parse` functions. Column names are atomized once per parse, so the per-row property puts hit
+the atom table instead of hashing the name each time. Left for later: a cached `Structure` with
+`putDirectOffset` for object rows (what `Bun.sql` does for its rows), a streaming parser for files
+that do not fit in memory, and `import x from "./data.csv"`.
+
+While rebasing, upstream oven-sh/bun#40374 had renamed `JSValue::to_slice` to `to_utf8`, which the
+2026-08-22 glob patch used; that commit was amended.
+
+Files: `src/runtime/api/CSVObject.rs`, `src/runtime/api.rs`, `src/runtime/api/BunObject.rs`,
+`src/jsc/bindings/BunObject.cpp`, `src/jsc/bindings/BunObject+exports.h`, `packages/bun-types/bun.d.ts`,
+`docs/runtime/csv.mdx`, `docs/docs.json`, `docs/runtime/bun-apis.mdx`, `test/js/bun/csv/csv.test.ts`,
+`test/integration/bun-types/fixture/csv.ts`.
+
 ## Dropped
 
 Nothing yet.

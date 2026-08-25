@@ -1,0 +1,158 @@
+---
+title: CSV
+description: Parse and write CSV with Bun's built-in parser
+---
+
+Bun has built-in support for [CSV](https://www.rfc-editor.org/rfc/rfc4180) (and TSV, or any other single-character delimiter). `Bun.CSV.parse` turns CSV text into records, and `Bun.CSV.stringify` writes records back out.
+
+```ts
+import { CSV } from "bun";
+
+const rows = CSV.parse(await Bun.file("users.csv").text());
+// [{ name: "Ada", email: "ada@example.com" }, ...]
+
+await Bun.write("users.csv", CSV.stringify(rows));
+```
+
+---
+
+## `Bun.CSV.parse()`
+
+Parse CSV text into records. The input can be a string, UTF-8 bytes (`Uint8Array`, `Buffer`, `ArrayBuffer`) or a `Blob`. A UTF-8 byte order mark at the start is skipped.
+
+By default the first record names the columns and every other record becomes an object keyed by them:
+
+```ts
+Bun.CSV.parse(`name,age
+Ada,36
+Grace,45
+`);
+// [
+//   { name: "Ada", age: "36" },
+//   { name: "Grace", age: "45" },
+// ]
+```
+
+Every field is a string. CSV has no types, so `36` stays `"36"` and an empty field is `""`; convert what you know to be a number yourself.
+
+With `header: false`, every record, the first one included, is an array of strings:
+
+```ts
+Bun.CSV.parse("name,age\nAda,36\n", { header: false });
+// [["name", "age"], ["Ada", "36"]]
+```
+
+For a file without a header row, pass the column names as `header`. Every record is then data, and TypeScript types the records by those names:
+
+```ts
+const rows = Bun.CSV.parse("Ada\t36\nGrace\t45\n", {
+  header: ["name", "age"],
+  delimiter: "\t",
+});
+rows[0].name; // "Ada"
+```
+
+### The format
+
+- A record ends at `\n`, `\r\n` or a lone `\r`. The final line break does not produce an extra record.
+- A field that starts with the quote character (`"` by default) runs to the matching quote. Inside it, the delimiter and line breaks are ordinary characters, and `""` is one `"`. A CRLF inside a quoted field is kept as written.
+- A quote inside an unquoted field is an ordinary character: `5" floppy` is the field `5" floppy`.
+- Spaces are part of a field unless you pass `trim: true`.
+- Blank lines are skipped unless you pass `skipEmptyLines: false`.
+
+When the columns are named, a record with fewer fields leaves its missing columns as `""`, and fields past the last column are dropped. If two columns have the same name, the last one wins. Column names are plain own properties, so a column called `__proto__` or `0` is just a key.
+
+`Bun.CSV.parse` throws a `SyntaxError` for a quoted field that never closes, and for text between a closing quote and the next delimiter (`"a"b,c`). The message names the line. Everything else is accepted: unquoted quotes, ragged records, and any mix of line endings.
+
+### Options
+
+```ts
+Bun.CSV.parse(input, {
+  // true: the first record names the columns (default)
+  // false: records are arrays
+  // string[]: the column names; every record is data
+  header: true,
+
+  // the character between fields, exactly one character
+  delimiter: ",",
+
+  // the character that encloses a field, exactly one character
+  quote: '"',
+
+  // strip spaces and tabs around fields, and allow them around quoted fields
+  trim: false,
+
+  // skip lines with no content (with trim, lines of only spaces and tabs too)
+  skipEmptyLines: true,
+});
+```
+
+A delimiter or quote that is not exactly one character, is a line break, or is the same character as the other one throws a `TypeError`.
+
+---
+
+## `Bun.CSV.stringify()`
+
+Write rows as CSV text. Rows are either all arrays or all objects.
+
+Object rows get a header record from the keys of the first row, and each row is written column by column. A property a later row does not have is an empty field, and a property the first row did not have is not written:
+
+```ts
+Bun.CSV.stringify([{ name: "Ada", note: 'says "hi"' }, { name: "Grace" }]);
+// 'name,note\nAda,"says ""hi"""\nGrace,\n'
+```
+
+Array rows are written as they are:
+
+```ts
+Bun.CSV.stringify([
+  ["a", "b"],
+  [1, 2],
+]);
+// "a,b\n1,2\n"
+```
+
+Every record ends with `\n`, so the output is a complete text file and two outputs can be concatenated. A field is quoted only when it needs to be: when it contains the delimiter, the quote character or a line break, or when it starts or ends with a space or a tab (so that a reader with `trim` gives it back unchanged). Values convert like this:
+
+| Value                     | Written as                             |
+| ------------------------- | -------------------------------------- |
+| string                    | as is                                  |
+| number, boolean, `BigInt` | `String(value)`                        |
+| `null`, `undefined`       | an empty field                         |
+| `Date`                    | `date.toISOString()`                   |
+| object, array             | `JSON.stringify(value)`                |
+| function, symbol          | an empty field, as in `JSON.stringify` |
+
+### Options
+
+```ts
+Bun.CSV.stringify(rows, {
+  // write the header record (default true)
+  header: true,
+
+  // the columns to write, in order; for object rows this selects the
+  // properties, for array rows it only provides the header
+  columns: ["name", "note"],
+
+  // the character between fields, exactly one character
+  delimiter: ",",
+
+  // the character that encloses a field, exactly one character
+  quote: '"',
+});
+```
+
+With `columns`, a header is written for array rows too. With no rows at all, the output is the header when `columns` is given and an empty string otherwise.
+
+---
+
+## TSV and friends
+
+Both functions take any single character as the delimiter, so tab-separated values are one option away:
+
+```ts
+const rows = Bun.CSV.parse(tsv, { delimiter: "\t" });
+const out = Bun.CSV.stringify(rows, { delimiter: "\t" });
+```
+
+The same goes for `;`, which spreadsheets produce in locales where `,` is the decimal separator, and for `|`.
