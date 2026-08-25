@@ -1378,6 +1378,170 @@ declare module "bun" {
   }
 
   /**
+   * CSV related APIs
+   */
+  namespace CSV {
+    /**
+     * Options for {@link CSV.parse}.
+     */
+    interface ParseOptions {
+      /**
+       * How records are shaped.
+       *
+       * - `true` (the default): the first record names the columns and every
+       *   other record becomes an object keyed by them.
+       * - `false`: every record, the first one included, is an array of strings.
+       * - an array of names: the columns, for an input without a header row;
+       *   every record is data.
+       *
+       * With column names, a record with fewer fields leaves the missing
+       * columns as `""`, and fields past the last column are dropped.
+       */
+      header?: boolean | readonly string[];
+      /**
+       * The character between fields. Exactly one character.
+       *
+       * @default ","
+       */
+      delimiter?: string;
+      /**
+       * The character that encloses a field containing the delimiter, a line
+       * break or the quote character itself, which is written twice inside
+       * the field. Exactly one character.
+       *
+       * @default '"'
+       */
+      quote?: string;
+      /**
+       * Strip spaces and tabs around unquoted fields, and allow them around
+       * quoted ones.
+       *
+       * @default false
+       */
+      trim?: boolean;
+      /**
+       * Skip lines with no content. With `trim`, a line of only spaces and
+       * tabs counts as empty too. The final line break never produces a
+       * record either way.
+       *
+       * @default true
+       */
+      skipEmptyLines?: boolean;
+    }
+
+    /**
+     * Options for {@link CSV.stringify}.
+     */
+    interface StringifyOptions {
+      /**
+       * Write a first record with the column names. The names come from
+       * `columns`, or from the keys of the first object row.
+       *
+       * @default true
+       */
+      header?: boolean;
+      /**
+       * The columns to write, in order. For object rows this selects which
+       * properties are written; for array rows it only provides the header.
+       *
+       * @default the own enumerable keys of the first object row
+       */
+      columns?: readonly string[];
+      /**
+       * The character between fields. Exactly one character.
+       *
+       * @default ","
+       */
+      delimiter?: string;
+      /**
+       * The character that encloses a field containing the delimiter, a line
+       * break, the quote character or leading/trailing spaces. Exactly one
+       * character.
+       *
+       * @default '"'
+       */
+      quote?: string;
+    }
+
+    type Input = string | NodeJS.TypedArray | DataView<ArrayBufferLike> | ArrayBufferLike | Blob;
+
+    /**
+     * Parse CSV text (RFC 4180) into records. Every field is a string;
+     * nothing is converted to a number or a boolean.
+     *
+     * A record ends at `\n`, `\r\n` or `\r`. A field that starts with the
+     * quote character runs to the matching quote and may contain the
+     * delimiter, line breaks and doubled quotes (`""` is one `"`). A leading
+     * UTF-8 byte order mark is skipped.
+     *
+     * @category Utilities
+     *
+     * @param input The CSV text, as a string, UTF-8 bytes or a `Blob`
+     * @param options {@link ParseOptions}
+     * @returns An array of objects keyed by the column names (the default), or
+     * an array of string arrays with `header: false`
+     * @throws {SyntaxError} On an unterminated quoted field, or text between a
+     * closing quote and the next delimiter
+     *
+     * @example
+     * ```ts
+     * import { CSV } from "bun";
+     *
+     * CSV.parse("name,age\nAda,36\n");
+     * // [{ name: "Ada", age: "36" }]
+     *
+     * CSV.parse("name,age\nAda,36\n", { header: false });
+     * // [["name", "age"], ["Ada", "36"]]
+     *
+     * CSV.parse("Ada\t36\n", { header: ["name", "age"], delimiter: "\t" });
+     * // [{ name: "Ada", age: "36" }]
+     * ```
+     */
+    export function parse<const Columns extends readonly string[]>(
+      input: Input,
+      options: ParseOptions & { header: Columns },
+    ): Record<Columns[number], string>[];
+    export function parse(input: Input, options: ParseOptions & { header: false }): string[][];
+    export function parse(input: Input, options?: ParseOptions & { header?: true }): Record<string, string>[];
+    export function parse(input: Input, options?: ParseOptions): Record<string, string>[] | string[][];
+
+    /**
+     * Serialize rows to CSV text. Each record ends with `\n`.
+     *
+     * Rows are either all arrays or all objects. Object rows get a header
+     * record from `columns` or the keys of the first row, and each row is
+     * written column by column; a missing property is an empty field. A field
+     * is quoted when it contains the delimiter, the quote character or a line
+     * break, or starts or ends with a space or a tab.
+     *
+     * `null` and `undefined` are empty fields, a `Date` is its ISO 8601
+     * string, a nested object or array is its JSON, and functions and symbols
+     * are empty like in `JSON.stringify`. Everything else is its string form.
+     *
+     * @category Utilities
+     *
+     * @param rows The rows to write
+     * @param options {@link StringifyOptions}
+     * @returns The CSV text
+     *
+     * @example
+     * ```ts
+     * import { CSV } from "bun";
+     *
+     * CSV.stringify([{ name: "Ada", note: 'says "hi"' }]);
+     * // 'name,note\nAda,"says ""hi"""\n'
+     *
+     * CSV.stringify([["a", "b"], [1, 2]]);
+     * // "a,b\n1,2\n"
+     * ```
+     */
+    export function stringify(
+      rows: readonly (readonly unknown[])[] | readonly Record<string, unknown>[],
+      options?: StringifyOptions,
+    ): string;
+  }
+
+  /**
    * INI related APIs
    */
   namespace INI {

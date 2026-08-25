@@ -41,6 +41,8 @@ pub mod cron;
 pub mod cron_parser;
 #[path = "api/csrf_jsc.rs"]
 pub mod csrf_jsc;
+#[path = "api/CSVObject.rs"]
+pub mod csv_object;
 #[path = "api/filesystem_router.rs"]
 pub mod filesystem_router;
 #[path = "api/glob.rs"]
@@ -153,7 +155,7 @@ pub use crate::api::unsafe_object as UnsafeObject;
 pub use crate::api::xml_object as XMLObject;
 pub use crate::api::yaml_object as YAMLObject;
 
-// ─── shared scaffold for Bun.{TOML,JSONC,JSON5,YAML,XML,INI}.parse ───────────
+// ─── shared scaffold for Bun.{TOML,JSONC,JSON5,YAML,XML,INI,CSV}.parse ───────
 //
 // All of these host fns repeat: Arena + ASTMemoryAllocator scope + Log +
 // frame.argument(0) → bytes → Source::init_path_string. They diverge on
