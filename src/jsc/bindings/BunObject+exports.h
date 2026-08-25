@@ -5,6 +5,7 @@
 #define FOR_EACH_GETTER(macro) \
     macro(Archive) \
     macro(CSRF) \
+    macro(CSV) \
     macro(CryptoHasher) \
     macro(FFI) \
     macro(FileSystemRouter) \
