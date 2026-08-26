@@ -91,6 +91,8 @@ pub(crate) mod builtins {
     pub(crate) mod exit;
     #[path = "export.rs"]
     pub(crate) mod export;
+    #[path = "head_tail.rs"]
+    pub(crate) mod head_tail;
     #[path = "ls.rs"]
     pub(crate) mod ls;
     #[path = "mkdir.rs"]
