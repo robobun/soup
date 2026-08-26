@@ -525,6 +525,18 @@ For cross-platform compatibility, Bun Shell implements a set of builtin commands
 - `dirname`
 - `basename`
 - `wc`: count lines, words, bytes (`-l`, `-w`, `-c`) and UTF-8 characters (`-m`) of stdin or files
+- `head`: print the first lines (`-n`) or bytes (`-c`) of stdin or files; `-n -N` prints all but the last N
+- `tail`: print the last lines (`-n`) or bytes (`-c`) of stdin or files; `-n +K` prints from line K on
+
+`head` and `tail` print a `==> name <==` header before each of several files (`-q` never, `-v` always), and `head` stops reading a pipe as soon as it has what it needs, so `yes | head -n 3` ends.
+
+```ts
+await $`git log --oneline | head -n 5`;
+await $`tail -n +2 data.csv | wc -l`; // rows without the header
+const last = await $`tail -n 1 app.log`.text();
+```
+
+`tail -f` is not supported.
 
 **Not** implemented yet, but planned:
 
