@@ -91,6 +91,8 @@ pub(crate) mod builtins {
     pub(crate) mod export;
     #[path = "false_.rs"]
     pub(crate) mod false_;
+    #[path = "head_tail.rs"]
+    pub(crate) mod head_tail;
     #[path = "ls.rs"]
     pub(crate) mod ls;
     #[path = "mkdir.rs"]
