@@ -194,6 +194,8 @@ shell_builtins! {
         Seq      => (seq::Seq,          "seq",      b"usage: seq [-w] [-f format] [-s string] [-t string] [first [incr]] last\n"),
         Yes      => (yes::Yes,          "yes",      b"usage: yes [expletive]\n"),
         Wc       => (wc::Wc,            "wc",       b"usage: wc [-clmw] [file ...]\n"),
+        Head     => (head_tail::Head,   "head",     b"usage: head [-qv] [-n lines | -c bytes] [file ...]\n"),
+        Tail     => (head_tail::Tail,   "tail",     b"usage: tail [-qv] [-n [+]lines | -c [+]bytes] [file ...]\n"),
     }
     posix_disabled: [Cat, Cp]
 }
