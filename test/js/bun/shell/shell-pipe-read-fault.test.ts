@@ -196,7 +196,7 @@ int close(int fd) {
 // stream is the last open one: closing it finishes the Cmd from inside spawn.
 const STDOUT_ONLY_FIXTURE = /* js */ `
 import { $ } from "bun";
-const r = await $\`head -c 64 /dev/zero 2> /dev/null\`.nothrow();
+const r = await $\`\${Bun.which("head")} -c 64 /dev/zero 2> /dev/null\`.nothrow();
 console.log(JSON.stringify({ exitCode: r.exitCode }));
 `;
 
@@ -204,7 +204,7 @@ console.log(JSON.stringify({ exitCode: r.exitCode }));
 // inside spawn_async's own stack frame) is the one that finishes the Cmd.
 const BOTH_PIPES_FIXTURE = /* js */ `
 import { $ } from "bun";
-const r = await $\`head -c 64 /dev/zero\`.nothrow();
+const r = await $\`\${Bun.which("head")} -c 64 /dev/zero\`.nothrow();
 console.log(JSON.stringify({ exitCode: r.exitCode }));
 `;
 
