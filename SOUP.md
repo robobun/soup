@@ -535,6 +535,46 @@ Files: `src/runtime/api/CSVObject.rs`, `src/runtime/api.rs`, `src/runtime/api/Bu
 `docs/runtime/csv.mdx`, `docs/docs.json`, `docs/runtime/bun-apis.mdx`, `test/js/bun/csv/csv.test.ts`,
 `test/integration/bun-types/fixture/csv.ts`.
 
+### 2026-08-26: `head` and `tail` shell builtins
+
+After `wc`, `head` and `tail` are the commands a script most often pipes into, and neither was a
+builtin, so `| head -n 5`, `tail -n +2 data.csv` (skip the header row) and `tail -n 1 app.log` only
+worked where coreutils happened to be installed, which on Windows is usually nowhere. Both are now
+builtins on every platform: `-n N` and `-c N` (also `-N`, `--lines=N`, `--bytes=N`), `head -n -N`
+(everything but the last N), `tail -n +K` and `tail -c +K` (everything from line or byte K on), any
+number of file operands with `-` for stdin, and `==> name <==` headers for more than one file (`-q`
+never, `-v` always). An unreadable operand is reported on stderr, sets the exit code to 1 and does
+not stop the others from being printed, like wc(1). Output matches GNU coreutils byte for byte in
+every case the tests cover, including an unterminated last line, which both print as it is.
+
+```ts
+await $`git log --oneline | head -n 5`;
+await $`tail -n +2 data.csv | wc -l`; // rows without the header
+const last = await $`tail -n 1 app.log`.text();
+await $`yes | head -n 3`; // "y\ny\ny\n", and it ends
+```
+
+The two commands are one program with the selection inverted, so they share one module:
+`Head` and `Tail` differ in how they read a sign on the count (`-N` means "all but the last N" to
+head and "the last N" to tail, `+K` is "from K on" to tail) and in the name on their messages. A
+`Selection` is fed every chunk of an input and says which bytes to write now, so `head` and
+`tail -n +K` stream: a chunk is written as it arrives, and the first lines of a 10 GB file cost
+one chunk's read. The "last N" selections keep the retained suffix in a buffer that is compacted once its
+dead prefix reaches half the buffer; finding where the last N lines start walks backwards over the
+kept lines when fewer are kept than dropped, so `tail -n 1` of a million lines does one search per
+chunk instead of a million. `head` unregisters from its reader as soon as it has what it needs, and
+the shell's `IOReader` now tells the read loop to stop when no listener is left instead of draining
+the source into nothing (Windows ignores that return value and keeps reading until the last `Arc`
+drops, as before). When the command finishes, its end of the pipe closes and the producer sees
+EPIPE, which is how `yes | head -n 3` terminates; with the builtin `cat` that is 40 ms on a
+million-line file in a debug build. Left out: `tail -f` (reported as unsupported), size suffixes
+on `-c`, `-z`, and `head -c -N` through a pipe still buffers N bytes, as it must.
+
+Files: `src/runtime/shell/builtin/head_tail.rs`, `src/runtime/shell/Builtin.rs`,
+`src/runtime/shell/mod.rs`, `src/runtime/shell/IOReader.rs`, `docs/runtime/shell.mdx`,
+`test/js/bun/shell/commands/head.test.ts`, `test/js/bun/shell/commands/tail.test.ts`,
+`test/js/bun/shell/exec.test.ts`.
+
 ## Dropped
 
 Nothing yet.

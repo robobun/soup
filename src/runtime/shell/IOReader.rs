@@ -31,6 +31,8 @@ pub struct ChildPtr {
 pub enum ReaderTag {
     Cat,
     Wc,
+    Head,
+    Tail,
 }
 
 // PERF: an inline small-vec may be worth it — profile if hot.
@@ -364,8 +366,14 @@ impl IOReader {
             }
         }
 
-        let should_continue = has_more != bun_io::ReadState::Eof;
-        if should_continue && !self.state().readers.is_empty() {
+        // With no listener left (a `head` that has what it needs unregisters
+        // mid-stream) the read loop is told to stop instead of draining the
+        // source into nothing; `start()` from a later listener re-arms it.
+        // Windows ignores the return value and keeps reading until the last
+        // `Arc` drops and closes the handle.
+        let should_continue =
+            has_more != bun_io::ReadState::Eof && !self.state().readers.is_empty();
+        if should_continue {
             self.set_reading(true);
             // NOTE: no explicit re-arm (`registerPoll()` on posix /
             // `startWithCurrentPipe()` on windows) here: that would re-derive
@@ -516,6 +524,12 @@ fn dispatch_read_chunk(
         ReaderTag::Wc => {
             crate::shell::builtins::wc::Wc::on_io_reader_chunk(interp, child.node, chunk, remove)
         }
+        ReaderTag::Head => crate::shell::builtins::head_tail::Head::on_io_reader_chunk(
+            interp, child.node, chunk, remove,
+        ),
+        ReaderTag::Tail => crate::shell::builtins::head_tail::Tail::on_io_reader_chunk(
+            interp, child.node, chunk, remove,
+        ),
     }
 }
 
@@ -533,5 +547,11 @@ fn dispatch_reader_done(
             crate::shell::builtins::cat::Cat::on_io_reader_done(interp, child.node, err)
         }
         ReaderTag::Wc => crate::shell::builtins::wc::Wc::on_io_reader_done(interp, child.node, err),
+        ReaderTag::Head => {
+            crate::shell::builtins::head_tail::Head::on_io_reader_done(interp, child.node, err)
+        }
+        ReaderTag::Tail => {
+            crate::shell::builtins::head_tail::Tail::on_io_reader_done(interp, child.node, err)
+        }
     }
 }
