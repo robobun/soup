@@ -1680,9 +1680,40 @@ impl Package<u64> {
         resolver: &mut R,
         features: Features,
     ) -> crate::Result<()> {
+        let parsed = Self::parse_json(source, log);
+        self.parse_with_json::<R>(lockfile, pm, log, source, parsed.root, resolver, features)
+    }
+
+    /// `parse` for the package.json of the project, which can say which bun it needs. Its
+    /// `engines` are read from this parse: the tree that `WorkspacePackageJSONCache` keeps
+    /// points into the text that the file had before a command edited it.
+    pub fn parse_checking_engines<R: ResolverContext>(
+        &mut self,
+        lockfile: &mut Lockfile,
+        pm: &mut PackageManager,
+        log: &mut bun_ast::Log,
+        source: &bun_ast::Source,
+        path: &[u8],
+        resolver: &mut R,
+        features: Features,
+    ) -> crate::Result<()> {
+        let parsed = Self::parse_json(source, log);
+        let bump = bun_alloc::Arena::new();
+        if let Some(range) = parsed
+            .root
+            .get(b"engines")
+            .and_then(|engines| engines.get(b"bun"))
+            .and_then(|bun| bun.as_string(&bump))
+        {
+            crate::engines::enforce_bun_range(range, path);
+        }
+        self.parse_with_json::<R>(lockfile, pm, log, source, parsed.root, resolver, features)
+    }
+
+    fn parse_json(source: &bun_ast::Source, log: &mut bun_ast::Log) -> crate::bun_json::ParsedJson {
         initialize_store();
-        let parsed = match crate::bun_json::ParsedJson::parse_package_json(source, log) {
-            Ok(p) => p,
+        match crate::bun_json::ParsedJson::parse_package_json(source, log) {
+            Ok(parsed) => parsed,
             Err(err) => {
                 let _ = log.print(std::ptr::from_mut(Output::error_writer()));
                 bun_core::pretty_errorln!(
@@ -1692,9 +1723,7 @@ impl Package<u64> {
                 );
                 Global::crash();
             }
-        };
-
-        self.parse_with_json::<R>(lockfile, pm, log, source, parsed.root, resolver, features)
+        }
     }
 
     /// Borrow-splitting bridge for `PackageManager` callers
