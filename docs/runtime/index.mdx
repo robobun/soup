@@ -121,6 +121,16 @@ package.json scripts (2 found):
 
 Bun respects lifecycle hooks. For instance, `bun run clean` runs `preclean` and `postclean`, if defined. If the `pre<script>` fails, Bun does not run the script itself.
 
+If the `package.json` has a `"bun"` entry in its `"engines"` field, Bun checks its own version against that range before it runs the script, and fails with an error when the version is outside the range. See [Required Bun version](/pm/cli/install#required-bun-version).
+
+```json package.json icon="file-json"
+{
+  "engines": {
+    "bun": ">=1.3.0"
+  }
+}
+```
+
 ### `--bun`
 
 It's common for `package.json` scripts to reference locally-installed CLIs like `vite` or `next`. These CLIs are often JavaScript files marked with a [shebang](<https://en.wikipedia.org/wiki/Shebang_(Unix)>) to indicate that they should be executed with `node`.
