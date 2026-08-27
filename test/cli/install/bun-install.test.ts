@@ -5289,6 +5289,104 @@ describe.concurrent("bun-install", () => {
     }
   });
 
+  describe.concurrent("engines.bun in the root package.json", () => {
+    // The check compares the bare `major.minor.patch`: a debug build of 1.2.3 is 1.2.3.
+    const running = Bun.version.replace(/-.*$/, "");
+
+    async function install(files: Record<string, string>, cwd = ".", args: string[] = []) {
+      using dir = tempDir("engines-bun", files);
+      await using proc = spawn({
+        cmd: [bunExe(), "install", ...args],
+        cwd: join(String(dir), cwd),
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout).toMatch(/^bun (install|add) v1\./);
+      return {
+        stderr: normalizeBunSnapshot(stderr, String(dir)),
+        exitCode,
+        packageJson: await file(join(String(dir), "package.json")).text(),
+      };
+    }
+
+    it("fails when the running version is outside the range", async () => {
+      const { stderr, exitCode } = await install({
+        "package.json": JSON.stringify({ name: "foo", engines: { bun: ">=999.0.0" } }),
+      });
+      expect(stderr).toBe(
+        [
+          `error: this project requires bun >=999.0.0, but bun ${running} is running`,
+          'note: "engines" in <dir>/package.json sets the requirement',
+        ].join("\n"),
+      );
+      expect(exitCode).toBe(1);
+    });
+
+    it("installs when the running version is inside the range", async () => {
+      for (const range of [`>=${running}`, `^${running}`, "*", "", ">=1.0.0 <999 || 1000.x"]) {
+        const { stderr, exitCode } = await install({
+          "package.json": JSON.stringify({ name: "foo", engines: { bun: range } }),
+        });
+        expect(stderr, `range ${JSON.stringify(range)}`).not.toContain("error:");
+        expect(exitCode, `range ${JSON.stringify(range)}`).toBe(0);
+      }
+    });
+
+    it("ignores the other engines", async () => {
+      const { stderr, exitCode } = await install({
+        "package.json": JSON.stringify({ name: "foo", engines: { node: ">=999", npm: "1.x", bun: ">=1.0.0" } }),
+      });
+      expect(stderr).not.toContain("error:");
+      expect(exitCode).toBe(0);
+    });
+
+    it("rejects a range it cannot parse", async () => {
+      const { stderr, exitCode } = await install({
+        "package.json": JSON.stringify({ name: "foo", engines: { bun: "latest" } }),
+      });
+      expect(stderr).toBe('error: "engines.bun" in <dir>/package.json is not a valid version range: "latest"');
+      expect(exitCode).toBe(1);
+    });
+
+    it("checks the workspace root from a workspace package", async () => {
+      const { stderr, exitCode } = await install(
+        {
+          "package.json": JSON.stringify({ name: "root", workspaces: ["packages/*"], engines: { bun: "<1.0.0" } }),
+          "packages/a/package.json": JSON.stringify({ name: "a", engines: { bun: "*" } }),
+        },
+        "packages/a",
+      );
+      expect(stderr).toBe(
+        [
+          `error: this project requires bun <1.0.0, but bun ${running} is running`,
+          'note: "engines" in <dir>/package.json sets the requirement',
+        ].join("\n"),
+      );
+      expect(exitCode).toBe(1);
+    });
+
+    it("stops bun add before it writes package.json", async () => {
+      const packageJson = JSON.stringify({ name: "foo", engines: { bun: "<1.0.0" } });
+      const {
+        stderr,
+        exitCode,
+        packageJson: after,
+      } = await install(
+        {
+          "package.json": packageJson,
+          "dep/package.json": JSON.stringify({ name: "dep", version: "1.0.0" }),
+        },
+        ".",
+        ["dep@file:./dep"],
+      );
+      expect(stderr).toStartWith(`error: this project requires bun <1.0.0, but bun ${running} is running`);
+      expect(exitCode).toBe(1);
+      expect(after).toBe(packageJson);
+    });
+  });
+
   test.serial("should report error on invalid format for dependencies", async () => {
     await withContext(defaultOpts, async ctx => {
       await writeFile(

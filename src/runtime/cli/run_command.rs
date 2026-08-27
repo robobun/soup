@@ -2407,6 +2407,16 @@ impl RunCommand {
                             "Found matching script `{}`",
                             bstr::BStr::new(script_content)
                         );
+                        if let Some(&range) = package_json
+                            .engines
+                            .as_deref()
+                            .and_then(|engines| engines.get(b"bun"))
+                        {
+                            bun_install::engines::enforce_bun_range(
+                                range,
+                                package_json.source.path.text,
+                            );
+                        }
                         Global::configure_allocator(core::Global::AllocatorConfiguration {
                             long_running: false,
                             ..Default::default()

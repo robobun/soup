@@ -76,6 +76,8 @@ pub struct PackageJSON {
     pub scripts: Option<Box<ScriptsMap>>,
     // Values borrow the source buffer (lifetime-erased; owned by `source_contents`).
     pub config: Option<Box<StringArrayHashMap<&'static [u8]>>>,
+    /// `"engines"`, read for the project's own package.json only (with `scripts`).
+    pub engines: Option<Box<StringArrayHashMap<&'static [u8]>>>,
 
     pub(crate) arch: Architecture,
     pub(crate) os: OperatingSystem,
@@ -133,6 +135,7 @@ impl Default for PackageJSON {
             version: Box::default(),
             scripts: None,
             config: None,
+            engines: None,
             arch: Architecture::all(),
             os: OperatingSystem::all(),
             package_manager_package_id: INVALID_PACKAGE_ID,
@@ -495,6 +498,7 @@ impl PackageJSON {
             main_fields: MainFieldMap::default(),
             scripts: None,
             config: None,
+            engines: None,
             arch: Architecture::all(),
             os: OperatingSystem::all(),
             package_manager_package_id: INVALID_PACKAGE_ID,
@@ -982,6 +986,9 @@ impl PackageJSON {
             }
             if let Some(config) = property_string_map(b"config") {
                 package_json.config = Some(config);
+            }
+            if let Some(engines) = property_string_map(b"engines") {
+                package_json.engines = Some(engines);
             }
         }
         let _ = (include_scripts, package_id);

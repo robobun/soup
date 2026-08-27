@@ -575,6 +575,53 @@ Files: `src/runtime/shell/builtin/head_tail.rs`, `src/runtime/shell/Builtin.rs`,
 `test/js/bun/shell/commands/head.test.ts`, `test/js/bun/shell/commands/tail.test.ts`,
 `test/js/bun/shell/exec.test.ts`.
 
+### 2026-08-27: `engines.bun` in package.json
+
+A project could not say which version of bun it needs. `"engines": { "bun": ">=1.3.0" }` is the
+field everyone already writes for that (oven-sh/bun#5846, open since 2023 with 109 upvotes;
+yarnpkg/yarn#9214 is the bun team asking yarn to stop warning about it), but bun never read it: a
+teammate on a stale bun got a confusing failure deep inside the code instead of being told what the
+project expects. Now `bun install` (with `add`, `remove`, `update`, `link` and `ci`, everything
+that installs) and `bun run <script>` compare the running version against the range and stop with
+exit code 1 when it does not match:
+
+```
+error: this project requires bun >=1.3.0, but bun 1.2.23 is running
+note: "engines" in /home/me/my-app/package.json sets the requirement
+```
+
+```json
+{
+  "engines": { "bun": ">=1.3.0" }
+}
+```
+
+The check runs before anything is resolved, downloaded or written, so a failing `bun add` leaves
+package.json and the lockfile untouched. For `bun install` it is the workspace root's package.json,
+from whichever package the command runs in; for `bun run` (and the `bun <script>` shorthand) it is
+the package.json the script comes from, and running a file directly is not affected. Only the
+project's own package.json is checked: the `engines` of a dependency are ignored, as are the other
+entries (`node`, `npm`), since bun is not node and its emulated node version says nothing useful.
+The range is parsed by the same code as a dependency version, so `>=1.3`, `1.x`, `^1.3.0 || ^2`,
+`*` and an empty string (no requirement) behave as with `Bun.semver.satisfies`; a value that has no
+comparator at all (`"latest"`) is an error that names the file, instead of the silent pass that
+parser gives it. The running version is the bare `major.minor.patch`, so a debug or canary build of
+1.4.1 is 1.4.1, which is also what `Bun.version` reports. The error has no escape hatch: pnpm and
+yarn fail on the root project's `engines` the same way, and the field is the project's own.
+
+The implementation is one small module, `bun_install::engines`, that both commands call. The
+install side reads the range from the cached root package.json at the single point every install
+path parses it (`root_package_json_source`, which runs before the manifest fetches). The run side
+adds an `engines` map to the resolver's `PackageJSON`, filled only when `scripts` are (the project's
+own package.json, not the thousands in node_modules), and checks it when a script is found. Left for
+later: `devEngines` (`{ "runtime": { "name": "bun", "version": ">=1.3", "onFail": "error" } }`),
+which needs a decision about what `"name": "node"` should mean to bun, and a check in `bunx`.
+
+Files: `src/install/engines.rs`, `src/install/lib.rs`,
+`src/install/PackageManager/install_with_manager.rs`, `src/resolver/package_json.rs`,
+`src/runtime/cli/run_command.rs`, `docs/pm/cli/install.mdx`, `docs/runtime/index.mdx`,
+`test/cli/install/bun-install.test.ts`, `test/cli/install/bun-run.test.ts`.
+
 ## Dropped
 
 Nothing yet.
