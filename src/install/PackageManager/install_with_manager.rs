@@ -177,11 +177,12 @@ pub fn install_with_manager(
 
                 let mut resolver: () = ();
                 let log = manager.log_mut();
-                maybe_root.parse(
+                maybe_root.parse_checking_engines(
                     &mut lockfile,
                     manager,
                     log,
                     &source_copy,
+                    root_package_json_path.as_bytes(),
                     &mut resolver,
                     Features::main(),
                 )?;
@@ -2186,7 +2187,7 @@ fn create_new_lockfile_and_enqueue(
         // SAFETY: `mgr` is the sole provenance root; `parse` reborrows the
         // disjoint `lockfile` field through it. No other live `&mut` to
         // `*mgr` exists across the call.
-        root.parse(
+        root.parse_checking_engines(
             // SAFETY: disjoint field projection through the sole provenance root `mgr`.
             unsafe { &mut (*mgr).lockfile },
             // SAFETY: `parse` touches only `PackageManager` fields disjoint from
@@ -2194,6 +2195,7 @@ fn create_new_lockfile_and_enqueue(
             unsafe { &mut *mgr },
             log,
             &source_copy,
+            root_package_json_path.as_bytes(),
             &mut resolver,
             Features::main(),
         )?;

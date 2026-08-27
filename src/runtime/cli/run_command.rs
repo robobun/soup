@@ -229,6 +229,18 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
         })
     }
 
+    /// Before a script of `package_json` runs: stops when the running bun is outside the
+    /// `engines.bun` of that file.
+    pub(crate) fn enforce_engines(package_json: &PackageJSON) {
+        if let Some(&range) = package_json
+            .engines
+            .as_deref()
+            .and_then(|engines| engines.get(b"bun"))
+        {
+            bun_install::engines::enforce_bun_range(range, package_json.source.path.text);
+        }
+    }
+
     // Look for invocations of any: `yarn run` / `yarn $cmd` / `pnpm run` /
     // `npm run` / `npx` / `pnpx` and replace them with `bun run` / `bun x`.
     //
@@ -2526,6 +2538,7 @@ impl RunCommand {
                             "Found matching script `{}`",
                             bstr::BStr::new(script_content)
                         );
+                        Self::enforce_engines(package_json);
                         Global::configure_allocator(core::Global::AllocatorConfiguration {
                             long_running: false,
                             ..Default::default()
