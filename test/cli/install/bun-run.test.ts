@@ -1617,4 +1617,150 @@ describe.concurrent("bun run", () => {
       exitCode: 0,
     });
   });
+
+  describe.concurrent("engines.bun", () => {
+    // The check compares the bare `major.minor.patch`: a debug build of 1.2.3 is 1.2.3.
+    const running = Bun.version.replace(/-.*$/, "");
+
+    async function run(files: Record<string, string>, ...args: string[]) {
+      using dir = tempDir("bun-run-engines", files);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), ...args],
+        cwd: String(dir),
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout, stderr: stderr.replaceAll(String(dir), "<dir>"), exitCode };
+    }
+
+    for (const withRun of [false, true]) {
+      const cmd = withRun ? ["run"] : [];
+
+      it(`${withRun ? "bun run" : "bun"} <script> fails when the running version is outside the range`, async () => {
+        const { stdout, stderr, exitCode } = await run(
+          {
+            "package.json": JSON.stringify({
+              name: "foo",
+              engines: { bun: ">=999.0.0" },
+              scripts: { prehello: "echo pre", hello: "echo hello" },
+            }),
+          },
+          ...cmd,
+          "hello",
+        );
+        expect(stderr).toBe(
+          [
+            `error: this project requires bun >=999.0.0, but bun ${running} is running`,
+            `note: "engines" in ${join("<dir>", "package.json")} sets the requirement`,
+            "",
+          ].join("\n"),
+        );
+        expect(stdout).toBe("");
+        expect(exitCode).toBe(1);
+      });
+
+      it(`${withRun ? "bun run" : "bun"} <script> runs when the running version is inside the range`, async () => {
+        const { stdout, stderr, exitCode } = await run(
+          {
+            "package.json": JSON.stringify({
+              name: "foo",
+              engines: { node: ">=999", bun: `>=${running}` },
+              scripts: { hello: "echo hello" },
+            }),
+          },
+          ...cmd,
+          "hello",
+        );
+        expect(stderr).toBe("$ echo hello\n");
+        expect(stdout).toBe("hello\n");
+        expect(exitCode).toBe(0);
+      });
+    }
+
+    it("does not apply to a file", async () => {
+      const { stdout, stderr, exitCode } = await run(
+        {
+          "package.json": JSON.stringify({ name: "foo", engines: { bun: ">=999.0.0" } }),
+          "hello.ts": "console.log('hello');",
+        },
+        "run",
+        "./hello.ts",
+      );
+      expect(stderr).toBe("");
+      expect(stdout).toBe("hello\n");
+      expect(exitCode).toBe(0);
+    });
+
+    describe("with --filter, --workspaces, --parallel and --sequential", () => {
+      const workspace = (engines: Record<"a" | "b" | "c", object | undefined>) => ({
+        "package.json": JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+        "packages/a/package.json": JSON.stringify({ name: "a", engines: engines.a, scripts: { hello: "echo a" } }),
+        "packages/b/package.json": JSON.stringify({ name: "b", engines: engines.b, scripts: { hello: "echo b" } }),
+        "packages/c/package.json": JSON.stringify({ name: "c", engines: engines.c, scripts: { other: "echo c" } }),
+      });
+      const modes = [
+        ["--filter", "*"],
+        ["--workspaces", "--if-present"],
+        ["--parallel", "--filter", "*"],
+      ];
+
+      it.each(modes)("%s %s fails for a package whose script would run", async (...mode) => {
+        const { stdout, stderr, exitCode } = await run(
+          workspace({ a: undefined, b: { bun: ">=999.0.0" }, c: undefined }),
+          "run",
+          ...mode.filter(Boolean),
+          "hello",
+        );
+        expect(stderr).toBe(
+          [
+            `error: this project requires bun >=999.0.0, but bun ${running} is running`,
+            `note: "engines" in ${join("<dir>", "packages", "b", "package.json")} sets the requirement`,
+            "",
+          ].join("\n"),
+        );
+        expect(stdout).toBe("");
+        expect(exitCode).toBe(1);
+      });
+
+      it.each(modes)("%s %s skips a package that has no such script", async (...mode) => {
+        const { stdout, stderr, exitCode } = await run(
+          workspace({ a: { bun: `>=${running}` }, b: undefined, c: { bun: ">=999.0.0" } }),
+          "run",
+          ...mode.filter(Boolean),
+          "hello",
+        );
+        expect(stderr).not.toContain("error:");
+        // `a hello: a` with --filter, `a:hello | a` with --parallel.
+        expect(stdout).toMatch(/^a[ :]hello(:| \|) a$/m);
+        expect(stdout).toMatch(/^b[ :]hello(:| \|) b$/m);
+        expect(exitCode).toBe(0);
+      });
+
+      it.each(["--parallel", "--sequential"])("%s fails in a single package", async mode => {
+        const { stdout, stderr, exitCode } = await run(
+          {
+            "package.json": JSON.stringify({
+              name: "foo",
+              engines: { bun: ">=999.0.0" },
+              scripts: { "build:a": "echo a", "build:b": "echo b" },
+            }),
+          },
+          "run",
+          mode,
+          "build:*",
+        );
+        expect(stderr).toBe(
+          [
+            `error: this project requires bun >=999.0.0, but bun ${running} is running`,
+            `note: "engines" in ${join("<dir>", "package.json")} sets the requirement`,
+            "",
+          ].join("\n"),
+        );
+        expect(stdout).toBe("");
+        expect(exitCode).toBe(1);
+      });
+    });
+  });
 });

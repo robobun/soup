@@ -697,6 +697,16 @@ fn matches_glob(pattern: &[u8], name: &[u8]) -> bool {
     true
 }
 
+/// Whether `name`, a script name or a glob of them from the command line, selects a script
+/// of `scripts`.
+fn names_a_script(name: &[u8], scripts: &ScriptsMap) -> bool {
+    if strings::contains_char(name, b'*') {
+        scripts.keys().iter().any(|key| matches_glob(name, key))
+    } else {
+        scripts.get(name).is_some()
+    }
+}
+
 struct GroupInfo {
     start: usize,
     count: usize,
@@ -942,6 +952,12 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
             let Some(pkg_scripts) = &package.json.scripts else {
                 continue;
             };
+            if script_names
+                .iter()
+                .any(|name| names_a_script(name, pkg_scripts))
+            {
+                RunCommand::enforce_engines(&package.json);
+            }
             let mut owned_scripts = OwnedScriptsMap::with_capacity(pkg_scripts.count());
             for (key, value) in pkg_scripts.iter() {
                 owned_scripts
@@ -1046,6 +1062,13 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
 
         let package_json = (*root_dir_info).enclosing_package_json;
         let scripts_map: Option<&ScriptsMap> = package_json.and_then(|pkg| pkg.scripts.as_deref());
+        if let (Some(package_json), Some(scripts)) = (package_json, scripts_map)
+            && script_names
+                .iter()
+                .any(|name| names_a_script(name, scripts))
+        {
+            RunCommand::enforce_engines(package_json);
+        }
 
         for raw_name in &script_names {
             // Check if this is a glob pattern
