@@ -77,6 +77,7 @@ pub mod auto_installer;
 #[path = "ConfigVersion.rs"]
 pub mod config_version;
 pub mod dependency;
+pub mod engines;
 pub mod hosted_git_info;
 pub mod integrity;
 pub mod padding_checker;

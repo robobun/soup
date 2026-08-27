@@ -1248,4 +1248,80 @@ describe.concurrent("bun run", () => {
       expect(exitCode).toBe(1);
     }
   });
+
+  describe.concurrent("engines.bun", () => {
+    // The check compares the bare `major.minor.patch`: a debug build of 1.2.3 is 1.2.3.
+    const running = Bun.version.replace(/-.*$/, "");
+
+    async function run(files: Record<string, string>, ...args: string[]) {
+      using dir = tempDir("bun-run-engines", files);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), ...args],
+        cwd: String(dir),
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout, stderr: stderr.replaceAll(String(dir), "<dir>"), exitCode };
+    }
+
+    for (const withRun of [false, true]) {
+      const cmd = withRun ? ["run"] : [];
+
+      it(`${withRun ? "bun run" : "bun"} <script> fails when the running version is outside the range`, async () => {
+        const { stdout, stderr, exitCode } = await run(
+          {
+            "package.json": JSON.stringify({
+              name: "foo",
+              engines: { bun: ">=999.0.0" },
+              scripts: { prehello: "echo pre", hello: "echo hello" },
+            }),
+          },
+          ...cmd,
+          "hello",
+        );
+        expect(stderr).toBe(
+          [
+            `error: this project requires bun >=999.0.0, but bun ${running} is running`,
+            `note: "engines" in ${join("<dir>", "package.json")} sets the requirement`,
+            "",
+          ].join("\n"),
+        );
+        expect(stdout).toBe("");
+        expect(exitCode).toBe(1);
+      });
+
+      it(`${withRun ? "bun run" : "bun"} <script> runs when the running version is inside the range`, async () => {
+        const { stdout, stderr, exitCode } = await run(
+          {
+            "package.json": JSON.stringify({
+              name: "foo",
+              engines: { node: ">=999", bun: `>=${running}` },
+              scripts: { hello: "echo hello" },
+            }),
+          },
+          ...cmd,
+          "hello",
+        );
+        expect(stderr).toBe("$ echo hello\n");
+        expect(stdout).toBe("hello\n");
+        expect(exitCode).toBe(0);
+      });
+    }
+
+    it("does not apply to a file", async () => {
+      const { stdout, stderr, exitCode } = await run(
+        {
+          "package.json": JSON.stringify({ name: "foo", engines: { bun: ">=999.0.0" } }),
+          "hello.ts": "console.log('hello');",
+        },
+        "run",
+        "./hello.ts",
+      );
+      expect(stderr).toBe("");
+      expect(stdout).toBe("hello\n");
+      expect(exitCode).toBe(0);
+    });
+  });
 });

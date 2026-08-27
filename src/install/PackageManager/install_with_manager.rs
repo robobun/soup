@@ -1873,7 +1873,17 @@ fn root_package_json_source(
         root_package_json_path.as_bytes(),
         Default::default(),
     ) {
-        WorkspacePackageJsonCacheResult::Entry(entry) => return Ok(entry.source.clone()),
+        WorkspacePackageJsonCacheResult::Entry(entry) => {
+            if let Some(range) = entry
+                .root
+                .get(b"engines")
+                .and_then(|engines| engines.get(b"bun"))
+                .and_then(|bun| bun.as_string(&entry.json_arena))
+            {
+                crate::engines::enforce_bun_range(range, root_package_json_path.as_bytes());
+            }
+            return Ok(entry.source.clone());
+        }
         WorkspacePackageJsonCacheResult::ReadErr(err) => ("read", err),
         WorkspacePackageJsonCacheResult::ParseErr(err) => ("parse", err),
     };
