@@ -17,6 +17,7 @@ use bun_resolver::fs as Fs;
 use bun_sys::{self, Dir, Fd, File};
 
 use crate::cli::Command;
+use crate::cli::did_you_mean;
 use crate::cli::pm_cache_prune_command::{DEFAULT_MAX_AGE_DAYS, PmCachePruneCommand};
 use crate::cli::pm_diff_command as PmDiffCommand;
 use crate::cli::pm_licenses_command::{BunStore, LicensesFlags, PmLicensesCommand};
@@ -31,6 +32,33 @@ use bun_collections::index_sort;
 
 pub(crate) use crate::cli::pack_command::PackCommand;
 pub(crate) use crate::cli::scan_command::ScanCommand;
+
+/// The words `bun pm` dispatches on, each with the name `bun pm --help` lists
+/// it under, in the order of the help. An unknown word is pointed at the
+/// closest of them.
+const SUBCOMMANDS: &[(&[u8], &[u8])] = &[
+    (b"scan", b"scan"),
+    (b"pack", b"pack"),
+    (b"bin", b"bin"),
+    (b"ls", b"ls"),
+    (b"list", b"ls"),
+    (b"why", b"why"),
+    (b"diff", b"diff"),
+    (b"licenses", b"licenses"),
+    (b"whoami", b"whoami"),
+    (b"view", b"view"),
+    (b"version", b"version"),
+    (b"pkg", b"pkg"),
+    (b"hash", b"hash"),
+    (b"hash-string", b"hash-string"),
+    (b"hash-print", b"hash-print"),
+    (b"cache", b"cache"),
+    (b"fetch", b"fetch"),
+    (b"migrate", b"migrate"),
+    (b"untrusted", b"untrusted"),
+    (b"trust", b"trust"),
+    (b"default-trusted", b"default-trusted"),
+];
 
 // An owned `tree::IteratorNext`, which borrows the iterator's path buffer.
 struct NodeModulesFolder {
@@ -840,6 +868,16 @@ impl PackageManagerCommand {
                 "\n<red>error<r>: \"{}\" unknown command\n",
                 bstr::BStr::new(subcommand),
             );
+            let commands: Vec<Vec<u8>> = did_you_mean::closest(
+                subcommand,
+                SUBCOMMANDS,
+                |&(word, _)| word,
+                |a, b| a.1 == b.1,
+            )
+            .into_iter()
+            .map(|&(_, name)| [b"bun pm ".as_slice(), name].concat())
+            .collect();
+            did_you_mean::note(&commands);
             Output::flush();
 
             Global::exit(1);
