@@ -622,6 +622,68 @@ Files: `src/install/engines.rs`, `src/install/lib.rs`,
 `src/runtime/cli/run_command.rs`, `docs/pm/cli/install.mdx`, `docs/runtime/index.mdx`,
 `test/cli/install/bun-install.test.ts`, `test/cli/install/bun-run.test.ts`.
 
+### 2026-08-28: "did you mean" for `bun run` and `bun pm`
+
+`bun run buidl` said `error: Script not found "buidl"` and nothing else, so the next step was
+always `bun run` to list the scripts, or a look at package.json. npm, pnpm, yarn and cargo all
+answer a typo with the name that was probably meant. Now bun does too:
+
+```
+$ bun run buidl
+error: Script not found "buidl"
+note: did you mean "bun run build"?
+
+$ bun run Buil
+error: Script not found "Buil"
+note: did you mean "bun run build", "bun run build:watch" or "bun run build:server"?
+
+$ bun instal
+error: Script not found "instal"
+note: did you mean "bun install"?
+
+$ bun pm lsit
+error: "lsit" unknown command
+note: did you mean "bun pm ls"?
+```
+
+The candidates are what `bun run <name>` could have run: the `scripts` of the enclosing
+package.json, the executables in every `node_modules/.bin` that `bun run` puts on `PATH` (the
+current directory's and its ancestors', so `bun run eslnt` finds `eslint` from a subdirectory),
+and, for the bare `bun <name>` form only, bun's own commands, since that is where `bun instal`
+ends up. A name counts as close when the edit distance is at most one per three typed bytes
+(at least one, so `tset` finds `test` and `typechek` finds `typecheck`), or when what was typed is
+a prefix of it, which is how `bun run build` finds `build:client` when there is no plain `build`.
+The distance is the optimal string alignment distance: insertions, deletions, substitutions and a
+swap of two adjacent bytes, which is the typo people make most and which plain Levenshtein counts
+as two; ASCII case is ignored, so `bun run Build` is pointed at `build`. The closest three are
+listed, closest first and in the order they are defined on a tie, as `bun run <script>` rather
+than a bare name because `bun build` would start the bundler. A command is matched through its
+aliases too but always suggested by its name: `bun uninstal` points at `bun remove`, `bun pm lsit`
+at `bun pm ls`. Words reserved for later (`deploy`, `login`) and the commands bun runs on itself
+(`getcompletes`) are never suggested. `Module not found` (a path or a file with a JavaScript
+extension) and `File not found` (any other extension) keep their messages, and `--if-present`
+still exits quietly. `bun pm <typo>` still prints the `bun pm` help first, as it did, with the note
+after the error line.
+
+The command lists are not kept by hand. `Command::which`, which turned the first argument into a
+`Tag` with a chain of forty string compares, now walks `ROOT_COMMANDS`, a table of name, aliases
+and `Tag`, and the suggestions read that same table, so a new command is a new line in one place.
+`bun pm` got the same treatment: its `if`/`else if` chain over the subcommand word is a
+`PmSubcommand` enum parsed from one table and dispatched with an exhaustive `match`, so a
+subcommand without a branch is a compile error. The selection and the note live in
+`cli::did_you_mean` (`closest` takes any candidate type, a word accessor and a "same command"
+predicate so an alias and its name count once), on top of `bun_core::strings::edit_distance`, the
+first edit-distance helper in the tree (`bun audit fix` and `bun pm licenses` had hard-coded "did
+you mean" notes). The `.bin` directories are listed with `bun_sys::iterate_dir`, skipping dotfiles
+and, on Windows, folding the `.cmd`, `.ps1`, `.bunx`, `.exe` and `.bat` shims into the one name
+they wrap. The whole thing runs only on the error path, after the exact lookups have failed.
+
+Files: `src/bun_core/string/immutable.rs` (`edit_distance`), `src/runtime/cli/did_you_mean.rs`,
+`src/runtime/cli/mod.rs` (`ROOT_COMMANDS`, `RootCommand`, `Command::which`),
+`src/runtime/cli/run_command.rs` (`print_did_you_mean`), `src/runtime/cli/package_manager_command.rs`
+(`PmSubcommand`), `docs/runtime/index.mdx`, `docs/pm/cli/pm.mdx`, `test/cli/run/run_command.test.ts`,
+`test/cli/install/bun-pm.test.ts`.
+
 ## Dropped
 
 Nothing yet.
