@@ -107,6 +107,7 @@ pub(crate) struct WriteFile {
     pub(crate) close_after_io: bool,
     #[cfg(not(windows))]
     pub(crate) mkdirp_if_not_exists: bool,
+    pub(crate) append: bool,
 }
 
 bun_threading::intrusive_work_task!(WriteFile, task);
@@ -119,6 +120,14 @@ bun_io::intrusive_io_request!(WriteFile, io_request);
 impl FileOpener for WriteFile {
     const OPEN_FLAGS: i32 =
         bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::TRUNC | bun_sys::O::NONBLOCK;
+
+    fn open_flags(&self) -> i32 {
+        if self.append {
+            (Self::OPEN_FLAGS & !bun_sys::O::TRUNC) | bun_sys::O::APPEND
+        } else {
+            Self::OPEN_FLAGS
+        }
+    }
 
     fn opened_fd(&self) -> Fd {
         self.opened_fd
@@ -287,6 +296,7 @@ impl WriteFile {
         file_blob: Blob,
         bytes_blob: Blob,
         mkdirp_if_not_exists: bool,
+        append: bool,
     ) -> Result<WriteFile, Error> {
         let write_file = WriteFile {
             file_blob,
@@ -307,6 +317,7 @@ impl WriteFile {
             could_block: false,
             close_after_io: false,
             mkdirp_if_not_exists,
+            append,
         };
         Ok(write_file)
     }
@@ -350,7 +361,7 @@ impl WriteFile {
         let system_error = this.system_error.take();
         let total_written = this.total_written;
         if system_error.is_none() {
-            note_written(&this.file_blob);
+            note_written(&this.file_blob, !this.append);
         }
         drop(this);
 
@@ -463,7 +474,11 @@ impl WriteFile {
             // We only do this on Linux because the equivalent on macOS
             // seemed to have zero performance impact in
             // microbenchmarks.
-            if !self.could_block && self.bytes_blob.shared_view().len() > 1024 {
+            //
+            // Not in append mode: fallocate from offset 0 would grow the file
+            // with zeros up to the new data's length, and the append would then
+            // land after those zeros.
+            if !self.could_block && !self.append && self.bytes_blob.shared_view().len() > 1024 {
                 let _ = sys::preallocate_file(
                     fd.native(),
                     0,
@@ -575,6 +590,7 @@ mod windows_impl {
         /// The context of the script that asked for the write.
         pub(crate) context: bun_jsc::ContextId,
         pub(crate) mkdirp_if_not_exists: bool,
+        pub(crate) append: bool,
         pub(crate) uv_bufs: [uv::uv_buf_t; 1],
 
         pub(crate) fd: uv::uv_file,
@@ -637,6 +653,7 @@ mod windows_impl {
             promise: jsc::JSPromiseStrong,
             global_this: &JSGlobalObject,
             mkdirp_if_not_exists: bool,
+            append: bool,
         ) -> Result<*mut WriteFileWindows, WriteFileWindowsError> {
             let mkdirp = mkdirp_if_not_exists
                 && file_blob
@@ -655,6 +672,7 @@ mod windows_impl {
                 global_this: bun_ptr::BackRef::new(global_this),
                 context: script_context.id(),
                 mkdirp_if_not_exists: mkdirp,
+                append,
                 io_request: bun_core::ffi::zeroed::<uv::fs_t>(),
                 uv_bufs: [uv::uv_buf_t {
                     base: null_mut(),
@@ -779,6 +797,17 @@ mod windows_impl {
                     });
                 }
             };
+            // SAFETY: caller contract — `this` is live.
+            let flags = uv::O::CREAT
+                | uv::O::WRONLY
+                | uv::O::NOCTTY
+                | uv::O::NONBLOCK
+                | uv::O::SEQUENTIAL
+                | if unsafe { (*this).append } {
+                    uv::O::APPEND
+                } else {
+                    uv::O::TRUNC
+                };
             // SAFETY: (*this).io_request is a valid uv_fs_t embedded in a Box-allocated WriteFileWindows;
             // (*this).loop_() is the VM's libuv loop which outlives this request; posix_path is NUL-terminated.
             let rc = unsafe {
@@ -786,12 +815,7 @@ mod windows_impl {
                     (*this).loop_(),
                     &mut (*this).io_request,
                     posix_path.as_ptr(),
-                    uv::O::CREAT
-                        | uv::O::WRONLY
-                        | uv::O::NOCTTY
-                        | uv::O::NONBLOCK
-                        | uv::O::SEQUENTIAL
-                        | uv::O::TRUNC,
+                    flags,
                     0o644,
                     Some(Self::on_open),
                 )
@@ -1048,7 +1072,7 @@ mod windows_impl {
             } else {
                 // SAFETY: caller contract — `this` is live.
                 let wrote = unsafe {
-                    note_written(&(*this).file_blob);
+                    note_written(&(*this).file_blob, !(*this).append);
                     (*this).total_written
                 };
                 // SAFETY: caller contract — `this` is live; consumed here.
@@ -1217,12 +1241,12 @@ fn settle(
 
 // ──────────────────────────────────────────────────────────────────────────
 
-fn note_written(file: &Blob) {
+fn note_written(file: &Blob, is_whole: bool) {
     let store = file.store.get().as_ref();
     if let Some(blob::store::Data::File(file)) = store.map(|it| &it.data)
         && file.pathlike.is_path()
     {
-        crate::node::fs::note_opened_for_write(file.pathlike.path().slice(), true);
+        crate::node::fs::note_opened_for_write(file.pathlike.path().slice(), is_whole);
     }
 }
 
@@ -1236,6 +1260,7 @@ pub(crate) struct WriteFileWaitFromLockedValueTask {
     pub global_this: bun_ptr::BackRef<JSGlobalObject>,
     pub(crate) promise: jsc::JSPromiseStrong,
     pub(crate) mkdirp_if_not_exists: bool,
+    pub(crate) append: bool,
 }
 
 impl WriteFileWaitFromLockedValueTask {
@@ -1289,6 +1314,7 @@ impl WriteFileWaitFromLockedValueTask {
                     &mut file_blob,
                     &blob::WriteFileOptions {
                         mkdirp_if_not_exists: Some(this.mkdirp_if_not_exists),
+                        append: this.append,
                         ..Default::default()
                     },
                 ) {
