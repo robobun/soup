@@ -208,6 +208,8 @@ pub(crate) fn write(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<
         blob::WriteFileOptions {
             mkdirp_if_not_exists: Some(false),
             extra_options: options,
+            // Refused for S3 in `write_file_internal`, rather than ignored.
+            append: blob::append_option_from_js(global, options)?,
             ..Default::default()
         },
     )

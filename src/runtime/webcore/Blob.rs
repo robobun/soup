@@ -1298,6 +1298,7 @@ impl BlobExt for Blob {
         }
         let mut mkdirp_if_not_exists: Option<bool> = None;
         let options = args.next_eat();
+        let append = append_option_from_js(global_this, options)?;
         if let Some(options_object) = options {
             if options_object.is_object() {
                 if let Some(create_directory) =
@@ -1331,6 +1332,7 @@ impl BlobExt for Blob {
                 mkdirp_if_not_exists,
                 extra_options: options,
                 mode: None,
+                append,
             },
         )
     }
@@ -1445,7 +1447,11 @@ impl BlobExt for Blob {
                     let path = pathlike.path().slice_z(&mut file_path);
                     let flags = bun_sys::O::WRONLY
                         | bun_sys::O::CREAT
-                        | bun_sys::O::TRUNC
+                        | if options.append {
+                            bun_sys::O::APPEND
+                        } else {
+                            bun_sys::O::TRUNC
+                        }
                         | bun_sys::O::NONBLOCK;
                     let mode = options.mode.unwrap_or(WRITE_PERMISSIONS);
                     let mut result = bun_sys::open(path, flags, mode);
@@ -1550,10 +1556,10 @@ impl BlobExt for Blob {
 
                 let stream_start = streams::Start::FileSink(streams::FileSinkOptions {
                     truncate: matches!(input_path, webcore::PathOrFileDescriptor::Path(_)),
+                    append: options.append,
                     mkdirp: options.mkdirp_if_not_exists.unwrap_or(true),
                     mode: options.mode.unwrap_or(WRITE_PERMISSIONS),
                     input_path,
-                    ..Default::default()
                 });
 
                 if let bun_sys::Result::Err(err) = sink.start(&stream_start, cx.context()) {
@@ -1588,8 +1594,15 @@ impl BlobExt for Blob {
 
         validate_writable_blob(global_this, self)?;
 
+        let append = append_option_from_js(global_this, has_args.then_some(arg0))?;
+
         let store = self.store().expect("infallible: store present").clone();
         if self.is_s3() {
+            if append {
+                return Err(global_this.throw_invalid_arguments(format_args!(
+                    "append is not supported for S3 files"
+                )));
+            }
             // Borrow `s3` through the
             // cloned `store: RefPtr<Store>` (independent of `self`) so the
             // content-type writes below don't conflict.
@@ -1672,7 +1685,10 @@ impl BlobExt for Blob {
                     let mut file_path = bun_paths::path_buffer_pool::get();
                     match bun_sys::open(
                         p.slice_z(&mut file_path),
-                        bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::NONBLOCK,
+                        bun_sys::O::WRONLY
+                            | bun_sys::O::CREAT
+                            | bun_sys::O::NONBLOCK
+                            | if append { bun_sys::O::APPEND } else { 0 },
                         WRITE_PERMISSIONS,
                     ) {
                         bun_sys::Result::Ok(result) => result,
@@ -1772,6 +1788,7 @@ impl BlobExt for Blob {
             };
             if let streams::Start::FileSink(ref mut opts) = stream_start {
                 opts.input_path = input_path;
+                opts.append = append;
             }
 
             if let bun_sys::Result::Err(err) = sink.start(&stream_start, context) {
@@ -4125,6 +4142,10 @@ pub(crate) struct WriteFileOptions {
     pub(crate) mkdirp_if_not_exists: Option<bool>,
     pub(crate) extra_options: Option<JSValue>,
     pub(crate) mode: Option<bun_sys::Mode>,
+    /// `{ append: true }`: write after the file's current contents instead of
+    /// replacing them. A file descriptor destination is written at its own
+    /// position, as always.
+    pub(crate) append: bool,
 }
 
 /// Write an empty string to a file by truncating it.
@@ -4151,6 +4172,42 @@ fn write_file_with_empty_source_to_destination(
     let _detach = scopeguard::guard((), move |_| unsafe { (*dest_ptr).detach() });
 
     match &destination_store.data {
+        store::Data::File(file) if options.append => {
+            // Nothing to append, so the file is only created when it is missing.
+            if let PathOrFileDescriptor::Path(path) = &file.pathlike {
+                let mut buf = bun_paths::path_buffer_pool::get();
+                let path_z = path.slice_z(&mut buf);
+                // Non-blocking, like the other main-thread opens here: a FIFO
+                // with no reader must not stall the event loop.
+                let flags = bun_sys::O::WRONLY
+                    | bun_sys::O::CREAT
+                    | bun_sys::O::APPEND
+                    | bun_sys::O::NONBLOCK
+                    | bun_sys::O::CLOEXEC;
+                let mode = options.mode.unwrap_or(node::fs::DEFAULT_PERMISSION);
+                let mut result = bun_sys::File::open(path_z, flags, mode);
+                if let bun_sys::Result::Err(err) = &result {
+                    if err.get_errno() == bun_sys::E::ENOENT
+                        && options.mkdirp_if_not_exists.unwrap_or(true)
+                    {
+                        result = mkdirp_parent(path.slice())
+                            .and_then(|()| bun_sys::File::open(path_z, flags, mode));
+                    }
+                }
+                match result {
+                    bun_sys::Result::Ok(f) => {
+                        let _ = f.close(); // close error is non-actionable
+                    }
+                    bun_sys::Result::Err(err) => {
+                        return Ok(JSPromise::rejected_promise(
+                            cx.global(),
+                            err.with_path(path.slice()).to_js(cx.global()),
+                        )
+                        .to_js());
+                    }
+                }
+            }
+        }
         store::Data::File(file) => {
             // TODO: make this async
             // `VirtualMachine::node_fs()` currently returns `*mut c_void`; the
@@ -4374,6 +4431,7 @@ pub(crate) fn write_file_with_source_destination(
                 write_file_promise,
                 WriteFilePromise::run,
                 options.mkdirp_if_not_exists.unwrap_or(true),
+                options.append,
             ) {
                 Err(write_file_mod::WriteFileWindowsError::WriteFileWindowsDeinitialized) => {}
                 Err(write_file_mod::WriteFileWindowsError::Js(err)) => return Err(err),
@@ -4388,6 +4446,7 @@ pub(crate) fn write_file_with_source_destination(
                 destination_blob.borrowed_view(),
                 source_blob.borrowed_view(),
                 options.mkdirp_if_not_exists.unwrap_or(true),
+                options.append,
             )
             .expect("unreachable");
             // SAFETY: `write_file_promise` was just produced by heap::alloc above; sole owner.
@@ -4402,16 +4461,25 @@ pub(crate) fn write_file_with_source_destination(
     }
     // If this is file <> file, we can just copy the file
     else if destination_type == store::DataTag::File && source_type == store::DataTag::File {
+        // The destination's window (its resolved size, or a slice) bounds the
+        // copy. An append goes past the end of the file, so it has no window.
+        let (offset, size) = if options.append {
+            (0, MAX_SIZE)
+        } else {
+            (destination_blob.offset.get(), destination_blob.size.get())
+        };
         #[cfg(windows)]
         {
+            let _ = offset;
             return Ok(copy_file::CopyFileWindows::init(
                 destination_store,
                 source_store,
                 cx.vm().event_loop_shared(),
                 cx.context(),
                 options.mkdirp_if_not_exists.unwrap_or(true),
-                destination_blob.size.get(),
+                size,
                 options.mode,
+                options.append,
             ));
         }
         #[cfg(not(windows))]
@@ -4419,11 +4487,12 @@ pub(crate) fn write_file_with_source_destination(
             return Ok(copy_file::CopyFile::create(
                 destination_store,
                 source_store,
-                destination_blob.offset.get(),
-                destination_blob.size.get(),
+                offset,
+                size,
                 cx,
                 options.mkdirp_if_not_exists.unwrap_or(true),
                 options.mode,
+                options.append,
             ));
         }
     } else if destination_type == store::DataTag::File && source_type == store::DataTag::S3 {
@@ -4708,6 +4777,7 @@ pub(crate) fn write_file_internal(
                             cx.global(),
                             pathlike,
                             &str,
+                            options.append,
                             &mut needs_async,
                         )
                     } else {
@@ -4715,6 +4785,7 @@ pub(crate) fn write_file_internal(
                             cx.global(),
                             pathlike,
                             &str,
+                            options.append,
                             &mut needs_async,
                         )
                     };
@@ -4739,6 +4810,7 @@ pub(crate) fn write_file_internal(
                             cx.global(),
                             pathlike,
                             buffer_view.byte_slice(),
+                            options.append,
                             &mut needs_async,
                         )
                     } else {
@@ -4746,6 +4818,7 @@ pub(crate) fn write_file_internal(
                             cx.global(),
                             pathlike,
                             buffer_view.byte_slice(),
+                            options.append,
                             &mut needs_async,
                         )
                     };
@@ -4773,6 +4846,13 @@ pub(crate) fn write_file_internal(
             b.dupe()
         }
     };
+
+    if options.append && destination_blob.is_s3() {
+        destination_blob.detach();
+        return Err(cx
+            .global()
+            .throw_invalid_arguments(format_args!("append is not supported for S3 files")));
+    }
 
     // TODO: implement a writev() fast path
     let source_blob: Blob = 'brk: {
@@ -4956,6 +5036,7 @@ pub(crate) fn write_file_internal(
                             ),
                             promise: jsc::JSPromiseStrong::init(cx.global()),
                             mkdirp_if_not_exists: options.mkdirp_if_not_exists.unwrap_or(true),
+                            append: options.append,
                         }));
                     // SAFETY: re-borrow after the early-return paths.
                     let BodyValue::Locked(locked) = (unsafe { &mut *body_value }) else {
@@ -5032,6 +5113,21 @@ fn validate_writable_blob(global_this: &JSGlobalObject, blob: &Blob) -> JsResult
     Ok(())
 }
 
+/// `options.append` of `Bun.write`, `BunFile.write`, `BunFile.writer` and the
+/// S3 write entry points. Missing or `undefined` is `false`; anything that is
+/// not a boolean throws.
+pub(crate) fn append_option_from_js(
+    global_this: &JSGlobalObject,
+    options: Option<JSValue>,
+) -> JsResult<bool> {
+    match options {
+        Some(options) if options.is_object() => Ok(options
+            .get_boolean_strict(global_this, "append")?
+            .unwrap_or(false)),
+        _ => Ok(false),
+    }
+}
+
 /// Parses the destination argument of `Bun.write` (shared by `Image.write`):
 /// a path, a file descriptor, or a `Bun.file()` / S3 blob. A `Blob` that is
 /// not backed by a file or S3 is rejected here; that is the precondition
@@ -5087,6 +5183,7 @@ pub(crate) fn write_file(global_this: &JSGlobalObject, callframe: &CallFrame) ->
     let mut mkdirp_if_not_exists: Option<bool> = None;
     let mut mode: Option<bun_sys::Mode> = None;
     let options = args.next_eat();
+    let append = append_option_from_js(global_this, options)?;
     if let Some(options_object) = options {
         if options_object.is_object() {
             if let Some(create_directory) = options_object.get_truthy(global_this, "createPath")? {
@@ -5135,17 +5232,30 @@ pub(crate) fn write_file(global_this: &JSGlobalObject, callframe: &CallFrame) ->
             mkdirp_if_not_exists,
             extra_options: options,
             mode,
+            append,
         },
     )
 }
 
 const WRITE_PERMISSIONS: bun_sys::Mode = 0o664;
 
+/// Open flags for the fast paths. `O_TRUNC` is deliberately left out as a perf
+/// optimization: the file is cut to the written length after the write instead.
+/// In append mode every write goes to the end and nothing is truncated.
+#[cfg(not(windows))]
+fn fast_path_open_flags(append: bool) -> i32 {
+    bun_sys::O::WRONLY
+        | bun_sys::O::CREAT
+        | bun_sys::O::NONBLOCK
+        | if append { bun_sys::O::APPEND } else { 0 }
+}
+
 #[cfg(not(windows))]
 fn write_string_to_file_fast<const NEEDS_OPEN: bool>(
     global_this: &JSGlobalObject,
     pathlike: &PathOrFileDescriptor,
     str: &BunString,
+    append: bool,
     needs_async: &mut bool,
 ) -> JSValue {
     let fd: Fd = if !NEEDS_OPEN {
@@ -5154,9 +5264,7 @@ fn write_string_to_file_fast<const NEEDS_OPEN: bool>(
         let mut file_path = bun_paths::path_buffer_pool::get();
         match bun_sys::open(
             pathlike.path().slice_z(&mut file_path),
-            // we deliberately don't use O_TRUNC here
-            // it's a perf optimization
-            bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::NONBLOCK,
+            fast_path_open_flags(append),
             WRITE_PERMISSIONS,
         ) {
             bun_sys::Result::Ok(result) => result,
@@ -5180,7 +5288,7 @@ fn write_string_to_file_fast<const NEEDS_OPEN: bool>(
     // scopeguard's closure captures borrows at construction, conflicting
     // with later `written += ...` / `truncate = false`. Route through `Cell`
     // so the guard and the loop body share `&Cell<_>` (no mutable-borrow conflict).
-    let truncate = core::cell::Cell::new(NEEDS_OPEN || str.is_empty());
+    let truncate = core::cell::Cell::new(!append && (NEEDS_OPEN || str.is_empty()));
     let written = core::cell::Cell::new(0usize);
 
     // we only truncate if it's a path
@@ -5228,20 +5336,16 @@ fn write_bytes_to_file_fast<const NEEDS_OPEN: bool>(
     global_this: &JSGlobalObject,
     pathlike: &PathOrFileDescriptor,
     bytes: &[u8],
+    append: bool,
     _needs_async: &mut bool,
 ) -> JSValue {
     let fd: Fd = if !NEEDS_OPEN {
         pathlike.fd()
     } else {
         let mut file_path = bun_paths::path_buffer_pool::get();
-        let flags = if cfg!(not(windows)) {
-            bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::NONBLOCK
-        } else {
-            bun_sys::O::WRONLY | bun_sys::O::CREAT
-        };
         match bun_sys::open(
             pathlike.path().slice_z(&mut file_path),
-            flags,
+            fast_path_open_flags(append),
             WRITE_PERMISSIONS,
         ) {
             bun_sys::Result::Ok(result) => result,
@@ -5262,7 +5366,7 @@ fn write_bytes_to_file_fast<const NEEDS_OPEN: bool>(
 
     // TODO: on windows this is always synchronous
 
-    let truncate = NEEDS_OPEN || bytes.is_empty();
+    let truncate = !append && (NEEDS_OPEN || bytes.is_empty());
     let mut written: usize = 0;
     let _close = NEEDS_OPEN.then(|| bun_sys::CloseOnDrop::new(fd));
 
@@ -6459,6 +6563,11 @@ pub(crate) trait FileOpener: Sized {
     const OPEN_FLAGS: i32 = bun_sys::O::RDONLY;
     const OPENER_FLAGS: i32 = bun_sys::O::NONBLOCK | bun_sys::O::CLOEXEC;
 
+    /// Override when the flags depend on the request (`WriteFile` in append mode).
+    fn open_flags(&self) -> i32 {
+        Self::OPEN_FLAGS
+    }
+
     fn opened_fd(&self) -> Fd;
     fn set_opened_fd(&mut self, fd: Fd);
     fn set_errno(&mut self, e: crate::Error);
@@ -6497,6 +6606,7 @@ pub(crate) trait FileOpener: Sized {
             PathOrFileDescriptor::Fd(_) => unreachable!(),
         };
         let path = path_string.slice_z(&mut buf);
+        let open_flags = self.open_flags();
 
         #[cfg(windows)]
         {
@@ -6557,7 +6667,7 @@ pub(crate) trait FileOpener: Sized {
                     loop_,
                     req,
                     path.as_ptr(),
-                    Self::OPEN_FLAGS | Self::OPENER_FLAGS,
+                    open_flags | Self::OPENER_FLAGS,
                     node::fs::DEFAULT_PERMISSION as i32,
                     Some(wrapped_callback::<Self>),
                 )
@@ -6584,7 +6694,7 @@ pub(crate) trait FileOpener: Sized {
             loop {
                 match bun_sys::open(
                     path,
-                    Self::OPEN_FLAGS | Self::OPENER_FLAGS,
+                    open_flags | Self::OPENER_FLAGS,
                     crate::node::fs::DEFAULT_PERMISSION,
                 ) {
                     bun_sys::Result::Ok(fd) => {
