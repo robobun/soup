@@ -159,6 +159,9 @@ pub struct Options {
     pub(crate) mode: bun_sys::Mode,
     /// `Bun.write(path, stream)`: replace the file's contents.
     pub(crate) truncate: bool,
+    /// `{ append: true }`: every write goes to the end of the file. Wins over
+    /// `truncate`.
+    pub(crate) append: bool,
     /// `Bun.write(path, stream)`: create missing parent directories.
     pub(crate) mkdirp: bool,
 }
@@ -169,6 +172,7 @@ impl Default for Options {
             input_path: PathOrFileDescriptor::Fd(Fd::INVALID),
             mode: 0o664,
             truncate: false,
+            append: false,
             mkdirp: false,
         }
     }
@@ -178,7 +182,9 @@ impl Options {
     pub(crate) fn flags(&self) -> i32 {
         let flags =
             bun_sys::O::NONBLOCK | bun_sys::O::CLOEXEC | bun_sys::O::CREAT | bun_sys::O::WRONLY;
-        if self.truncate {
+        if self.append {
+            flags | bun_sys::O::APPEND
+        } else if self.truncate {
             flags | bun_sys::O::TRUNC
         } else {
             flags
