@@ -175,6 +175,30 @@ const response = await fetch("https://bun.com");
 await Bun.write("index.html", response);
 ```
 
+### Appending to a file
+
+By default `Bun.write` replaces the contents of the destination. Pass `append: true` to write after the existing contents instead. The file is created if it does not exist, and the same option works for every kind of input above.
+
+```ts
+await Bun.write("app.log", `${new Date().toISOString()} started\n`, { append: true });
+
+// append one file to another
+await Bun.write("all.log", Bun.file("today.log"), { append: true });
+
+// append a response body as it streams in
+const response = await fetch("https://example.com/events.ndjson");
+await Bun.write("events.ndjson", response, { append: true });
+```
+
+`BunFile.write()` takes the same option:
+
+```ts
+const log = Bun.file("app.log");
+await log.write("one more line\n", { append: true });
+```
+
+A file-to-file copy in append mode uses a plain read/write loop instead of the system calls in the table above. A file descriptor destination is written at its current position either way; open it for appending (`fs.openSync(path, "a")`) to append through it. The option is not supported for S3 files.
+
 ---
 
 ## Incremental writing with `FileSink`
@@ -207,6 +231,13 @@ The buffer also auto-flushes when the `FileSink`'s _high water mark_ is reached;
 ```ts
 const file = Bun.file("output.txt");
 const writer = file.writer({ highWaterMark: 1024 * 1024 }); // 1MB
+```
+
+To add to a file instead of writing over its contents, for example a log file, pass `append: true`. Every write then goes to the end of the file, and the file is created if it does not exist.
+
+```ts
+const log = Bun.file("app.log").writer({ append: true });
+log.write("server started\n");
 ```
 
 To flush the buffer and close the file:
@@ -303,6 +334,7 @@ interface Bun {
   write(
     destination: string | number | BunFile | URL,
     input: string | Blob | ArrayBuffer | SharedArrayBuffer | TypedArray | Response,
+    options?: { createPath?: boolean; mode?: number; append?: boolean },
   ): Promise<number>;
 }
 
@@ -315,7 +347,11 @@ interface BunFile {
   arrayBuffer(): Promise<ArrayBuffer>;
   json(): Promise<any>;
   bytes(): Promise<Uint8Array>;
-  writer(params?: { highWaterMark?: number }): FileSink;
+  write(
+    input: string | Blob | ArrayBuffer | SharedArrayBuffer | TypedArray | Response,
+    options?: { createPath?: boolean; append?: boolean },
+  ): Promise<number>;
+  writer(params?: { highWaterMark?: number; append?: boolean }): FileSink;
   exists(): Promise<boolean>;
   delete(): Promise<void>;
 }
