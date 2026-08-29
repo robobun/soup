@@ -2350,7 +2350,7 @@ impl fmt::Display for ReturnCodeI64 {
 // these fns map to/from libuv's MSVC `_O_*` values that `uv_fs_open` expects.
 // ──────────────────────────────────────────────────────────────────────────
 pub mod O {
-    pub(crate) const APPEND: i32 = 0x0008;
+    pub const APPEND: i32 = 0x0008;
     pub const CREAT: i32 = 0x0100;
     pub(crate) const EXCL: i32 = 0x0400;
     pub(crate) const FILEMAP: i32 = 0x2000_0000;

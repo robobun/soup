@@ -684,6 +684,59 @@ Files: `src/bun_core/string/immutable.rs` (`edit_distance`), `src/runtime/cli/di
 (`PmSubcommand`), `docs/runtime/index.mdx`, `docs/pm/cli/pm.mdx`, `test/cli/run/run_command.test.ts`,
 `test/cli/install/bun-pm.test.ts`.
 
+### 2026-08-29: `append: true` for `Bun.write()`, `BunFile.write()` and `BunFile.writer()`
+
+Bun's file API could create, read, copy, stream and delete a file, but not add to one: `Bun.write`
+always replaced the contents, and `Bun.file(path).writer()` started at offset 0. Appending is the
+most common thing a script does with a log file, so every such script fell back to
+`node:fs.appendFile` (oven-sh/bun#10473, open since 2024, plus #16768, #6559 and #5821 asking for
+the same in three spellings; oven-sh/bun#25751 implemented it for the Zig tree and was closed as
+stale when that tree went away). All three entry points now take `append: true`:
+
+```ts
+await Bun.write("app.log", `${new Date().toISOString()} started\n`, {
+  append: true,
+});
+await Bun.write("all.log", Bun.file("today.log"), { append: true }); // file onto file
+await Bun.write("events.ndjson", await fetch(url), { append: true }); // streamed body
+await Bun.file("app.log").write("one more line\n", { append: true });
+
+const log = Bun.file("app.log").writer({ append: true });
+log.write("server started\n");
+await log.end();
+```
+
+The file is opened `O_APPEND` instead of `O_TRUNC`, so the bytes land after whatever is there when
+each write happens (two processes appending to the same log do not overwrite each other), and it is
+created, with `createPath` and `mode` honoured, when it does not exist. Every input kind appends:
+strings and buffers on both the main-thread fast path and the thread-pool `WriteFile` task, a `Blob`,
+a `BunFile` (the copy takes a plain read/write loop, because `copy_file_range` and `sendfile` reject
+an append descriptor, `fcopyfile` writes from offset 0 and `clonefile` replaces the file), a
+`Response`/`Request` whether its body is already in memory or still streaming, and a bare
+`ReadableStream`. Nothing to append (`""`, an empty `Blob`) creates the file and otherwise leaves it
+alone, where the default mode truncates it. A file descriptor destination keeps writing at its own
+position and is never truncated; open it with `"a"` to append through it. S3 objects cannot be
+appended to, so `append: true` on an `S3File`, or on `Bun.s3.write()`, is a `TypeError` rather than a
+silent overwrite. `append` must be a boolean.
+
+Three pre-existing optimizations had to step aside in append mode: the `fallocate` that the
+`WriteFile` task and the file copier issue from offset 0 would have extended the file with zeros
+before the appended bytes; the clone/copy syscalls above; and the copier's use of the destination's
+known size as a bound on the copy, which would have cut an append short once `file.size` had been
+read. On Windows the writer and the copier open the destination through libuv with `UV_FS_O_APPEND`,
+which is a kernel-enforced append (`FILE_APPEND_DATA` without `FILE_WRITE_DATA`), the copier skips
+`uv_fs_copyfile`, and it caps the copy at the source's starting size as the POSIX copier does, so a
+file appended onto itself is doubled instead of growing until the disk is full. The tests were run on
+Windows as well as Linux.
+
+Files: `src/runtime/webcore/Blob.rs` (options, fast paths, empty source, S3 check), `src/runtime/webcore/FileSink.rs`
+(`Options::append`), `src/runtime/webcore/blob/write_file.rs` (`FileOpener::open_flags`, `WriteFileWindows`),
+`src/runtime/webcore/blob/copy_file.rs` (`CopyFile`, `CopyFileWindows`), `src/runtime/webcore/S3Client.rs`,
+`src/runtime/webcore/S3File.rs`, `src/libuv_sys/libuv.rs` (`O::APPEND` made public), `packages/bun-types/bun.d.ts`,
+`docs/runtime/file-io.mdx`, `docs/guides/write-file/append.mdx`, `test/js/bun/io/bun-write.test.js`,
+`test/js/bun/util/filesink.test.ts`, `test/integration/bun-types/fixture/globals.ts`,
+`test/integration/bun-types/bun-types.test.ts` (a pinned diagnostic moved four lines).
+
 ## Dropped
 
 Nothing yet.

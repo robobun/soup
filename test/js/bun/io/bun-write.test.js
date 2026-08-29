@@ -1160,4 +1160,159 @@ int posix_fadvise(int fd, off_t offset, off_t len, int advice) {
 
     expect(f.name).toBe(filePath);
   });
+
+  describe("{ append: true }", () => {
+    // Below 256 KiB a string or buffer is written on the main thread; above it
+    // the write goes through the thread pool. Both paths must append.
+    const small = "small\n";
+    const large = Buffer.alloc(300 * 1024, "L").toString();
+
+    it("string: writes after the existing contents", async () => {
+      using dir = tempDir("bun-write-append-string", { "log.txt": "first\n" });
+      const file = join(String(dir), "log.txt");
+      expect(await Bun.write(file, small, { append: true })).toBe(small.length);
+      expect(await Bun.write(file, large, { append: true })).toBe(large.length);
+      expect(await Bun.write(Bun.file(file), small, { append: true })).toBe(small.length);
+      expect(await Bun.file(file).text()).toBe("first\n" + small + large + small);
+    });
+
+    it("bytes: writes after the existing contents", async () => {
+      using dir = tempDir("bun-write-append-bytes", { "log.bin": "first\n" });
+      const file = join(String(dir), "log.bin");
+      expect(await Bun.write(file, Buffer.from(small), { append: true })).toBe(small.length);
+      expect(await Bun.write(file, new TextEncoder().encode(large), { append: true })).toBe(large.length);
+      expect(await Bun.write(Bun.file(file), new Blob([small]), { append: true })).toBe(small.length);
+      expect(await Bun.file(file).text()).toBe("first\n" + small + large + small);
+    });
+
+    it("Bun.file: copies the source after the existing contents", async () => {
+      using dir = tempDir("bun-write-append-file", {
+        "log.txt": "first\n",
+        "small.txt": small,
+        "large.txt": large,
+      });
+      const file = join(String(dir), "log.txt");
+      expect(await Bun.write(file, Bun.file(join(String(dir), "small.txt")), { append: true })).toBe(small.length);
+      // A destination whose size is already known must not bound the copy.
+      const dest = Bun.file(file);
+      expect(dest.size).toBe("first\n".length + small.length);
+      expect(await Bun.write(dest, Bun.file(join(String(dir), "large.txt")), { append: true })).toBe(large.length);
+      expect(await Bun.file(file).text()).toBe("first\n" + small + large);
+    });
+
+    it("Bun.file: appending a file onto itself doubles it", async () => {
+      using dir = tempDir("bun-write-append-self", { "log.txt": large });
+      const file = join(String(dir), "log.txt");
+      expect(await Bun.write(file, Bun.file(file), { append: true })).toBe(large.length);
+      expect(await Bun.file(file).text()).toBe(large + large);
+    });
+
+    it("Response and ReadableStream: writes the body after the existing contents", async () => {
+      using dir = tempDir("bun-write-append-stream", { "log.txt": "first\n" });
+      const file = join(String(dir), "log.txt");
+      // A Response whose body is already in memory, one that streams in from the network, and a bare stream.
+      expect(await Bun.write(file, new Response(small), { append: true })).toBe(small.length);
+      const chunks = 16;
+      using server = Bun.serve({
+        port: 0,
+        fetch() {
+          let sent = 0;
+          return new Response(
+            new ReadableStream({
+              pull(controller) {
+                controller.enqueue(new TextEncoder().encode(large));
+                if (++sent === chunks) controller.close();
+              },
+            }),
+          );
+        },
+      });
+      expect(await Bun.write(file, await fetch(server.url), { append: true })).toBe(large.length * chunks);
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode(small));
+          controller.close();
+        },
+      });
+      expect(await Bun.write(file, stream, { append: true })).toBe(small.length);
+      const text = await Bun.file(file).text();
+      expect(text.length).toBe("first\n".length + small.length + large.length * chunks + small.length);
+      expect(text.startsWith("first\n" + small + "L")).toBe(true);
+      expect(text.endsWith("L" + small)).toBe(true);
+    });
+
+    it("BunFile.write", async () => {
+      using dir = tempDir("bun-write-append-method", { "log.txt": "first\n" });
+      const file = Bun.file(join(String(dir), "log.txt"));
+      expect(await file.write(small, { append: true })).toBe(small.length);
+      expect(await file.write(Buffer.from(small), { append: true })).toBe(small.length);
+      expect(await file.write(new Response(small), { append: true })).toBe(small.length);
+      expect(
+        await file.write(new Request("http://localhost/", { method: "POST", body: small }), { append: true }),
+      ).toBe(small.length);
+      expect(await file.text()).toBe("first\n" + small + small + small + small);
+    });
+
+    it("a file descriptor is written at its own position and never truncated", async () => {
+      using dir = tempDir("bun-write-append-fd", { "log.txt": "first\n" });
+      const file = join(String(dir), "log.txt");
+      const fd = fs.openSync(file, "a");
+      try {
+        expect(await Bun.write(Bun.file(fd), small, { append: true })).toBe(small.length);
+        expect(await Bun.write(Bun.file(fd), "", { append: true })).toBe(0);
+        expect(await Bun.write(Bun.file(fd), Buffer.from(small), { append: true })).toBe(small.length);
+      } finally {
+        fs.closeSync(fd);
+      }
+      expect(await Bun.file(file).text()).toBe("first\n" + small + small);
+    });
+
+    it("creates a missing file and its directory, and leaves the file alone when there is nothing to append", async () => {
+      using dir = tempDir("bun-write-append-create", {});
+      const file = join(String(dir), "nested", "deeper", "log.txt");
+      expect(await Bun.write(file, "", { append: true })).toBe(0);
+      expect(await Bun.file(file).text()).toBe("");
+      expect(await Bun.write(file, small, { append: true })).toBe(small.length);
+      expect(await Bun.write(file, "", { append: true })).toBe(0);
+      expect(await Bun.write(file, new Blob([]), { append: true })).toBe(0);
+      expect(await Bun.file(file).text()).toBe(small);
+
+      await expect(
+        Bun.write(join(String(dir), "missing", "log.txt"), small, { append: true, createPath: false }),
+      ).rejects.toThrow(expect.objectContaining({ code: "ENOENT" }));
+    });
+
+    it("without append the file is still replaced", async () => {
+      using dir = tempDir("bun-write-append-off", { "log.txt": large });
+      const file = join(String(dir), "log.txt");
+      await Bun.write(file, small, { append: false });
+      expect(await Bun.file(file).text()).toBe(small);
+    });
+
+    it("rejects a non-boolean append option", async () => {
+      using dir = tempDir("bun-write-append-invalid", {});
+      const file = join(String(dir), "log.txt");
+      expect(() => Bun.write(file, small, { append: "yes" })).toThrow(TypeError);
+      expect(() => Bun.write(file, small, { append: null })).toThrow(TypeError);
+      expect(() => Bun.file(file).write(small, { append: 1 })).toThrow(TypeError);
+      expect(fs.existsSync(file)).toBe(false);
+      // undefined is the default
+      expect(await Bun.write(file, small, { append: undefined })).toBe(small.length);
+    });
+
+    it("is not supported for S3 files", () => {
+      const credentials = {
+        bucket: "bucket",
+        accessKeyId: "key",
+        secretAccessKey: "secret",
+        endpoint: "http://127.0.0.1:1",
+      };
+      const s3 = Bun.s3.file("log.txt", credentials);
+      expect(() => Bun.write(s3, small, { append: true })).toThrow("append is not supported for S3 files");
+      expect(() => s3.write(small, { append: true })).toThrow("append is not supported for S3 files");
+      expect(() => s3.writer({ append: true })).toThrow("append is not supported for S3 files");
+      const client = new Bun.S3Client(credentials);
+      expect(() => client.write("log.txt", small, { append: true })).toThrow("append is not supported for S3 files");
+    });
+  });
 });

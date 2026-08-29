@@ -1017,3 +1017,53 @@ it("start() with invalid options throws instead of silently ignoring them", asyn
   await writer.end();
   expect(await Bun.file(join(dir, "start-invalid.txt")).text()).toBe("ok");
 });
+
+describe("writer({ append: true })", () => {
+  it("writes after the existing contents and keeps appending across writers", async () => {
+    using _ = fileDescriptorLeakChecker();
+    const file = join(tmpdirSync(), "append.log");
+    await Bun.write(file, "first\n");
+
+    const writer = Bun.file(file).writer({ append: true });
+    writer.write("second\n");
+    writer.write(Buffer.from("third\n"));
+    await writer.end();
+    expect(await Bun.file(file).text()).toBe("first\nsecond\nthird\n");
+
+    const again = Bun.file(file).writer({ append: true });
+    again.write("fourth\n");
+    await again.end();
+    expect(await Bun.file(file).text()).toBe("first\nsecond\nthird\nfourth\n");
+  });
+
+  it("creates the file when it does not exist", async () => {
+    using _ = fileDescriptorLeakChecker();
+    const file = join(tmpdirSync(), "new.log");
+    const writer = Bun.file(file).writer({ append: true });
+    expect(await writer.write("hello")).toBe(5);
+    await writer.end();
+    expect(await Bun.file(file).text()).toBe("hello");
+  });
+
+  it("flushes more than the buffer holds to the end of the file", async () => {
+    using _ = fileDescriptorLeakChecker();
+    const file = join(tmpdirSync(), "big.log");
+    const head = Buffer.alloc(1024, "h").toString();
+    await Bun.write(file, head);
+
+    const chunk = Buffer.alloc(256 * 1024, "x").toString();
+    const writer = Bun.file(file).writer({ append: true, highWaterMark: 4096 });
+    for (let i = 0; i < 8; i++) writer.write(chunk);
+    await writer.end();
+
+    const bytes = await Bun.file(file).bytes();
+    expect(bytes.length).toBe(head.length + chunk.length * 8);
+    expect(Buffer.from(bytes.subarray(0, head.length)).toString()).toBe(head);
+    expect(Buffer.from(bytes.subarray(head.length)).equals(Buffer.alloc(chunk.length * 8, "x"))).toBe(true);
+  });
+
+  it("rejects a non-boolean append option", () => {
+    const file = Bun.file(join(tmpdirSync(), "bad.log"));
+    expect(() => file.writer({ append: "yes" } as any)).toThrow(TypeError);
+  });
+});
