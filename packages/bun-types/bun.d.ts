@@ -2392,6 +2392,21 @@ declare module "bun" {
        * @default true
        */
       createPath?: boolean;
+      /**
+       * If `true`, write `input` after the existing contents of the file
+       * instead of replacing them. The file is created if it does not exist.
+       *
+       * A file descriptor is written at its current position either way.
+       * Not supported for S3 files.
+       *
+       * @example
+       * ```ts
+       * await Bun.write("app.log", `${new Date().toISOString()} started\n`, { append: true });
+       * ```
+       *
+       * @default false
+       */
+      append?: boolean;
     },
   ): Promise<number>;
 
@@ -2419,6 +2434,13 @@ declare module "bun" {
        * @default true
        */
       createPath?: boolean;
+      /**
+       * If `true`, write the body after the existing contents of the file
+       * instead of replacing them. The file is created if it does not exist.
+       *
+       * @default false
+       */
+      append?: boolean;
     },
   ): Promise<number>;
 
@@ -2444,6 +2466,13 @@ declare module "bun" {
        * @default true
        */
       createPath?: boolean;
+      /**
+       * If `true`, write the body after the existing contents of the file
+       * instead of replacing them. The file is created if it does not exist.
+       *
+       * @default false
+       */
+      append?: boolean;
     },
   ): Promise<number>;
 
@@ -2491,6 +2520,13 @@ declare module "bun" {
        * @default true
        */
       createPath?: boolean;
+      /**
+       * If `true`, copy `input` after the existing contents of the file
+       * instead of replacing them. The file is created if it does not exist.
+       *
+       * @default false
+       */
+      append?: boolean;
     },
   ): Promise<number>;
 
@@ -2537,6 +2573,13 @@ declare module "bun" {
        * @default true
        */
       createPath?: boolean;
+      /**
+       * If `true`, copy `input` after the existing contents of the file
+       * instead of replacing them. The file is created if it does not exist.
+       *
+       * @default false
+       */
+      append?: boolean;
     },
   ): Promise<number>;
 
@@ -2942,8 +2985,27 @@ declare module "bun" {
 
     /**
      * Incremental writer for files and pipes.
+     *
+     * @example
+     * ```ts
+     * // Keep adding to a log file instead of overwriting it.
+     * const log = Bun.file("app.log").writer({ append: true });
+     * log.write("started\n");
+     * await log.end();
+     * ```
      */
-    writer(options?: { highWaterMark?: number }): FileSink;
+    writer(options?: {
+      highWaterMark?: number;
+      /**
+       * If `true`, every write goes to the end of the file. The file is
+       * created if it does not exist.
+       *
+       * Not supported for S3 files.
+       *
+       * @default false
+       */
+      append?: boolean;
+    }): FileSink;
 
     // TODO
     // readonly readable: ReadableStream<Uint8Array>;
@@ -2987,7 +3049,26 @@ declare module "bun" {
      */
     write(
       data: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer | Request | Response | BunFile | ReadableStream,
-      options?: { highWaterMark?: number },
+      options?: {
+        highWaterMark?: number;
+        /**
+         * If `true`, create the parent directory if it doesn't exist.
+         *
+         * If `false`, the write throws an error when the directory doesn't exist.
+         *
+         * @default true
+         */
+        createPath?: boolean;
+        /**
+         * If `true`, write `data` after the existing contents of the file
+         * instead of replacing them. The file is created if it does not exist.
+         *
+         * Not supported for S3 files.
+         *
+         * @default false
+         */
+        append?: boolean;
+      },
     ): Promise<number>;
 
     /**
