@@ -26,6 +26,7 @@ pub(crate) struct WriteFile {
     written: usize,
     could_block: bool,
     mkdirp: bool,
+    append: bool,
 }
 
 #[cfg(not(windows))]
@@ -36,6 +37,7 @@ impl WriteFile {
         source: RefPtr<Store>,
         source_blob: &Blob,
         mkdirp: bool,
+        append: bool,
         cx: &bun_jsc::JsThread<'_>,
     ) -> JSValue {
         let start = (source_blob.offset.get() as usize).min(source.shared_view().len());
@@ -44,6 +46,7 @@ impl WriteFile {
             written: 0,
             could_block: false,
             mkdirp,
+            append,
             destination,
             source,
         };
@@ -64,9 +67,14 @@ impl FdOp for WriteFile {
     fn open(&mut self) -> Result<(JobFd, Step), Box<SystemError>> {
         let file = self.destination.data.as_file();
         let pathlike = &file.pathlike;
+        let position = if self.append {
+            sys::O::APPEND
+        } else {
+            sys::O::TRUNC
+        };
         let fd = fd_job::open(
             pathlike,
-            sys::O::WRONLY | sys::O::CREAT | sys::O::TRUNC,
+            sys::O::WRONLY | sys::O::CREAT | position,
             self.mkdirp,
         )?;
 
@@ -74,8 +82,10 @@ impl FdOp for WriteFile {
         self.could_block =
             pathlike.is_fd() && file.seekable.is_some() && !sys::is_regular_file(file.mode);
 
+        // Not in append mode: fallocate from offset 0 would grow the file with zeros
+        // up to the new data's length, and the append would land after those zeros.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if !self.could_block && self.range.len() > 1024 {
+        if !self.could_block && !self.append && self.range.len() > 1024 {
             let _ = sys::preallocate_file(fd.get().native(), 0, self.range.len() as i64);
         }
         let step = self.step(fd.get(), false)?;
@@ -116,7 +126,7 @@ impl FdOp for WriteFile {
         (mut promise, global_this): Self::Js,
     ) -> jsc::JsResult<()> {
         let result = result.map(|()| {
-            note_written(&self.destination);
+            note_written(&self.destination, !self.append);
             self.written as SizeType
         });
         drop(self);
@@ -158,6 +168,7 @@ mod windows_impl {
         /// The context of the script that asked for the write.
         pub(crate) context: bun_jsc::ContextId,
         pub(crate) mkdirp_if_not_exists: bool,
+        pub(crate) append: bool,
 
         pub(crate) fd: StreamFd,
         pub(crate) err: Option<sys::Error>,
@@ -197,6 +208,7 @@ mod windows_impl {
             promise: jsc::JSPromiseStrong,
             global_this: &JSGlobalObject,
             mkdirp_if_not_exists: bool,
+            append: bool,
         ) -> jsc::JsResult<()> {
             let mkdirp = mkdirp_if_not_exists
                 && file_blob
@@ -215,6 +227,7 @@ mod windows_impl {
                 global_this: bun_ptr::BackRef::new(global_this),
                 context: script_context.id(),
                 mkdirp_if_not_exists: mkdirp,
+                append,
                 io_request: bun_core::ffi::zeroed::<uv::fs_t>(),
                 event_loop,
                 fd: StreamFd::borrowed(Fd::INVALID),
@@ -247,6 +260,16 @@ mod windows_impl {
                 });
             };
             let loop_ = self.event_loop.uv_loop();
+            let flags = uv::O::CREAT
+                | uv::O::WRONLY
+                | uv::O::NOCTTY
+                | uv::O::NONBLOCK
+                | uv::O::SEQUENTIAL
+                | if self.append {
+                    uv::O::APPEND
+                } else {
+                    uv::O::TRUNC
+                };
             let this = bun_core::heap::into_raw(self);
             // SAFETY: the VM's loop outlives the request, libuv copies the NUL-terminated path
             // before it returns, and it has `this` until `on_open`.
@@ -255,12 +278,7 @@ mod windows_impl {
                     loop_,
                     &raw mut (*this).io_request,
                     posix_path.as_ptr(),
-                    uv::O::CREAT
-                        | uv::O::WRONLY
-                        | uv::O::NOCTTY
-                        | uv::O::NONBLOCK
-                        | uv::O::SEQUENTIAL
-                        | uv::O::TRUNC,
+                    flags,
                     0o644,
                     Some(Self::on_open),
                 )
@@ -342,7 +360,7 @@ mod windows_impl {
                 Err(Box::new(err))
             } else {
                 if let Some(store) = self.file_blob.store() {
-                    note_written(store);
+                    note_written(store, !self.append);
                 }
                 Ok(self.total_written as SizeType)
             };
@@ -450,11 +468,11 @@ fn settle(
 
 // ──────────────────────────────────────────────────────────────────────────
 
-fn note_written(destination: &blob::Store) {
+fn note_written(destination: &blob::Store, is_whole: bool) {
     if let blob::store::Data::File(file) = &destination.data
         && let PathOrFileDescriptor::Path(path) = &file.pathlike
     {
-        crate::node::fs::note_opened_for_write(path.slice(), true);
+        crate::node::fs::note_opened_for_write(path.slice(), is_whole);
     }
 }
 
@@ -468,6 +486,7 @@ pub(crate) struct WriteFileWaitFromLockedValueTask {
     pub global_this: bun_ptr::BackRef<JSGlobalObject>,
     pub(crate) promise: jsc::JSPromiseStrong,
     pub(crate) mkdirp_if_not_exists: bool,
+    pub(crate) append: bool,
 }
 
 impl WriteFileWaitFromLockedValueTask {
@@ -518,6 +537,7 @@ impl WriteFileWaitFromLockedValueTask {
                     &mut this.file_blob,
                     &blob::WriteFileOptions {
                         mkdirp_if_not_exists: Some(this.mkdirp_if_not_exists),
+                        append: this.append,
                         ..Default::default()
                     },
                 ) {

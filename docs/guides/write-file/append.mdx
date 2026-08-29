@@ -4,7 +4,27 @@ sidebarTitle: Append to file
 mode: center
 ---
 
-Bun implements the `node:fs` module, which includes the `fs.appendFile` and `fs.appendFileSync` functions for appending content to files.
+Pass `append: true` to `Bun.write` to add content to the end of a file instead of replacing it. The file is created if it does not yet exist. The content can be a string, binary data, another file, a `Response` or a `ReadableStream`.
+
+```ts
+await Bun.write("message.txt", "data to append\n", { append: true });
+await Bun.write("message.txt", Bun.file("more.txt"), { append: true });
+```
+
+---
+
+To append many times, use a `FileSink` opened with `append: true`. Every write goes to the end of the file.
+
+```ts
+const log = Bun.file("app.log").writer({ append: true });
+log.write("started\n");
+log.write("listening\n");
+await log.end();
+```
+
+---
+
+Bun also implements the `node:fs` module, which includes the `fs.appendFile` and `fs.appendFileSync` functions for appending content to files.
 
 ---
 
