@@ -40,6 +40,10 @@ expectAssignable<Bun.ZlibCompressionOptions>({ windowBits: -11 });
 // Other
 expectType<Promise<number>>(Bun.write("test.json", "lol"));
 expectType<Promise<number>>(Bun.write("test.json", new ArrayBuffer(32)));
+expectType<Promise<number>>(Bun.write("test.log", "line\n", { append: true }));
+expectType<Promise<number>>(Bun.write(Bun.file("test.log"), Bun.file("other.log"), { append: true }));
+expectType<Promise<number>>(Bun.file("test.log").write("line\n", { append: true }));
+expectType<Bun.FileSink>(Bun.file("test.log").writer({ append: true }));
 expectType<URL>(Bun.pathToFileURL("/foo/bar.txt"));
 expectType<string>(Bun.fileURLToPath(new URL("file:///foo/bar.txt")));
 
