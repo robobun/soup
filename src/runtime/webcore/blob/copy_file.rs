@@ -53,6 +53,10 @@ pub(crate) struct CopyFile {
     max_length: SizeType,
     mkdirp: bool,
     new_mode: Option<Mode>,
+    /// Open the destination `O_APPEND` and copy with a plain read/write loop:
+    /// `copy_file_range`, `sendfile` and `fcopyfile` either reject an append
+    /// descriptor or write from offset 0, and `clonefile` replaces the file.
+    append: bool,
     copied: Result<SizeType, Box<SystemError>>,
 }
 
@@ -80,7 +84,7 @@ impl jsc::JobContext for CopyFile {
             err
         });
         if copied.is_ok() {
-            note_written(&this.destination);
+            note_written(&this.destination, !this.append);
         }
         settle(promise.swap(), cx.global(), copied)
     }
@@ -97,6 +101,7 @@ impl CopyFile {
         cx: &bun_jsc::JsThread<'_>,
         mkdirp: bool,
         new_mode: Option<Mode>,
+        append: bool,
     ) -> JSValue {
         let copy = CopyFile {
             destination_file: Target::of(&destination),
@@ -111,6 +116,7 @@ impl CopyFile {
             max_length,
             mkdirp,
             new_mode,
+            append,
             copied: Ok(0),
         };
         let promise = jsc::JSPromiseStrong::init(cx.global());
@@ -133,7 +139,7 @@ impl CopyFile {
         #[cfg(target_os = "macos")]
         let known_stat = match (source_file, destination_file) {
             (PathOrFileDescriptor::Path(from), PathOrFileDescriptor::Path(to))
-                if self.offset == 0 =>
+                if self.offset == 0 && !self.append =>
             {
                 let from = &Path::from(from.slice());
                 let stat = bun_sys::stat(from)?;
@@ -165,7 +171,7 @@ impl CopyFile {
             PathOrFileDescriptor::Path(path) => {
                 let path = &Path::from(path.slice());
                 let mode = self.new_mode.unwrap_or(node_fs::DEFAULT_PERMISSION);
-                let open = || File::open(path, OPEN_DESTINATION_FLAGS, mode);
+                let open = || File::open(path, open_destination_flags(self.append), mode);
                 creating_parents(&mut self.mkdirp, path.as_bytes(), open)?.into()
             }
         };
@@ -220,10 +226,19 @@ impl CopyFile {
             }
 
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            if self.opens_destination() && max_length > PREALLOCATE_LENGTH && max_length != MAX_SIZE
+            if self.opens_destination()
+                && !self.append
+                && max_length > PREALLOCATE_LENGTH
+                && max_length != MAX_SIZE
             {
                 let _ = bun_sys::preallocate_file(dest.native(), 0, max_length as i64);
             }
+        }
+
+        if self.append {
+            let mut copied = 0;
+            read_write_loop_capped(src, dest, max_length, &mut copied)?;
+            return Ok(copied);
         }
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -405,8 +420,16 @@ fn read_write_loop_capped(
 const PREALLOCATE_LENGTH: SizeType = 2048 * 1024;
 
 #[cfg(not(windows))]
-const OPEN_DESTINATION_FLAGS: i32 =
-    bun_sys::O::CLOEXEC | bun_sys::O::CREAT | bun_sys::O::WRONLY | bun_sys::O::TRUNC;
+const fn open_destination_flags(append: bool) -> i32 {
+    bun_sys::O::CLOEXEC
+        | bun_sys::O::CREAT
+        | bun_sys::O::WRONLY
+        | if append {
+            bun_sys::O::APPEND
+        } else {
+            bun_sys::O::TRUNC
+        }
+}
 #[cfg(not(windows))]
 const OPEN_SOURCE_FLAGS: i32 = bun_sys::O::CLOEXEC | bun_sys::O::RDONLY;
 
@@ -443,6 +466,9 @@ pub(crate) struct CopyFileWindows {
     pub(crate) promise: jsc::JSPromiseStrong,
     pub(crate) mkdirp_if_not_exists: bool,
     pub(crate) destination_mode: Option<Mode>,
+    /// `uv_fs_copyfile` replaces the destination, so an append always takes
+    /// the read/write loop, with the destination opened `O_APPEND`.
+    pub(crate) append: bool,
     pub(crate) event_loop: &'static jsc::event_loop::EventLoop,
     _keep_alive: aio::JsKeepAlive,
     /// The context of the script that asked for the copy.
@@ -468,6 +494,10 @@ pub(crate) struct ReadWriteLoop {
     pub(crate) destination_fd: StreamFd,
     pub(crate) read_buf: Vec<u8>,
     pub(crate) uv_buf: libuv::uv_buf_t,
+    /// Bytes still to read. Capped at the source's size for an append, so a
+    /// file appended onto itself stops where it started instead of growing
+    /// until the disk is full (the POSIX copier caps at `max_length`).
+    pub(crate) remaining: u64,
 }
 
 #[cfg(windows)]
@@ -481,6 +511,7 @@ impl Default for ReadWriteLoop {
                 len: 0,
                 base: core::ptr::null_mut(),
             },
+            remaining: u64::MAX,
         }
     }
 }
@@ -489,8 +520,10 @@ impl Default for ReadWriteLoop {
 impl CopyFileWindows {
     fn read_write_loop_read(mut self: Box<Self>) {
         self.read_write_loop.read_buf.clear();
-        // reshaped for borrowck — use the full capacity slice.
-        let cap = self.read_write_loop.read_buf.capacity();
+        // reshaped for borrowck — use the full capacity slice. A zero-length
+        // read (nothing remaining) reports EOF through `on_read`.
+        let cap = (self.read_write_loop.read_buf.capacity() as u64)
+            .min(self.read_write_loop.remaining) as usize;
         self.read_write_loop.uv_buf = libuv::uv_buf_t {
             len: cap as libuv::ULONG,
             base: self.read_write_loop.read_buf.as_mut_ptr(),
@@ -574,6 +607,7 @@ extern "C" fn on_read(req: *mut libuv::fs_t) {
     // SAFETY: libuv wrote `n` bytes into the buffer's capacity.
     unsafe { read_buf.set_len(n) };
     this.read_write_loop.uv_buf = libuv::uv_buf_t::init(read_buf.as_slice());
+    this.read_write_loop.remaining = this.read_write_loop.remaining.saturating_sub(n as u64);
 
     if rc.int() == 0 {
         // Handle EOF. We can't read any more.
@@ -648,6 +682,7 @@ impl CopyFileWindows {
         mkdirp_if_not_exists: bool,
         size_: SizeType,
         destination_mode: Option<Mode>,
+        append: bool,
     ) -> JSValue {
         // destination_file_store.ref() / source_file_store.ref() — Arc clone
         let global = event_loop.global_ref();
@@ -662,6 +697,7 @@ impl CopyFileWindows {
             context: context.id(),
             mkdirp_if_not_exists,
             destination_mode,
+            append,
             size: size_,
             written_bytes: 0,
             err: None,
@@ -676,19 +712,19 @@ impl CopyFileWindows {
 
     fn prepare_pathlike(
         pathlike: &mut PathOrFileDescriptor,
-        is_reading: bool,
+        flags: i32,
     ) -> bun_sys::Result<StreamFd> {
         if let PathOrFileDescriptor::Path(path) = pathlike {
-            let fd = bun_sys::openat_windows_a(
-                Fd::INVALID,
-                path.slice(),
-                if is_reading {
-                    bun_sys::O::RDONLY
-                } else {
-                    bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::TRUNC
-                },
-                0,
-            )?;
+            let fd = if (flags & bun_sys::O::APPEND) != 0 {
+                // libuv opens an append destination with FILE_APPEND_DATA only,
+                // so every write lands at the end of the file, as O_APPEND does
+                // on POSIX. The NT open below keeps FILE_WRITE_DATA and only
+                // seeks to the end once.
+                let mut buf = Path::new();
+                bun_sys::open(path.slice_z(&mut buf), flags, 0)?
+            } else {
+                bun_sys::openat_windows_a(Fd::INVALID, path.slice(), flags, 0)?
+            };
             bun_sys::File::from_fd(fd)
                 .make_lib_uv_owned_for_syscall(bun_sys::Tag::open)
                 .map(StreamFd::from)
@@ -703,11 +739,18 @@ impl CopyFileWindows {
         // Open the destination first, so that if we need to call
         // mkdirp(), we don't spend extra time opening the file handle for
         // the source.
+        let destination_flags = bun_sys::O::WRONLY
+            | bun_sys::O::CREAT
+            | if self.append {
+                bun_sys::O::APPEND
+            } else {
+                bun_sys::O::TRUNC
+            };
         self.read_write_loop.destination_fd = match Self::prepare_pathlike(
             &mut Store::data_mut(&self.destination_file_store)
                 .as_file_mut()
                 .pathlike,
-            false,
+            destination_flags,
         ) {
             bun_sys::Result::Ok(fd) => fd,
             bun_sys::Result::Err(err) => {
@@ -725,7 +768,7 @@ impl CopyFileWindows {
             &mut Store::data_mut(&self.source_file_store)
                 .as_file_mut()
                 .pathlike,
-            true,
+            bun_sys::O::RDONLY,
         ) {
             bun_sys::Result::Ok(fd) => fd,
             bun_sys::Result::Err(err) => {
@@ -733,6 +776,15 @@ impl CopyFileWindows {
                 return;
             }
         };
+
+        if self.append {
+            if let bun_sys::Result::Ok(stat) = bun_sys::fstat(self.read_write_loop.source_fd.get())
+            {
+                if bun_sys::S::ISREG(stat.st_mode as _) {
+                    self.read_write_loop.remaining = stat.st_size as u64;
+                }
+            }
+        }
 
         self.read_write_loop.read_buf.reserve_exact(64 * 1024);
 
@@ -779,9 +831,10 @@ impl CopyFileWindows {
 
     fn copyfile(self: Box<Self>) {
         // This is for making it easier for us to test this code path
-        if bun_core::env_var::feature_flag::BUN_FEATURE_FLAG_DISABLE_UV_FS_COPYFILE
-            .get()
-            .unwrap_or(false)
+        if self.append
+            || bun_core::env_var::feature_flag::BUN_FEATURE_FLAG_DISABLE_UV_FS_COPYFILE
+                .get()
+                .unwrap_or(false)
         {
             self.prepare_read_write_loop();
             return;
@@ -834,7 +887,10 @@ impl CopyFileWindows {
 
     fn on_complete(mut self: Box<Self>, written_actual: usize) {
         let mut written = written_actual;
-        if written > usize::try_from(self.size).expect("int cast") && self.size != MAX_SIZE {
+        if !self.append
+            && written > usize::try_from(self.size).expect("int cast")
+            && self.size != MAX_SIZE
+        {
             self.truncate();
             written = usize::try_from(self.size).expect("int cast");
         }
@@ -893,7 +949,7 @@ impl CopyFileWindows {
         if let PathOrFileDescriptor::Path(path) =
             &self.destination_file_store.data.as_file().pathlike
         {
-            crate::node::fs::note_opened_for_write(path.slice(), true);
+            crate::node::fs::note_opened_for_write(path.slice(), !self.append);
         }
         let _context = jsc::virtual_machine::VirtualMachine::get().enter_context(self.context);
         let global_this = self.event_loop.global_ref();

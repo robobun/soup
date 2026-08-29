@@ -515,6 +515,9 @@ impl S3Client {
                 mkdirp_if_not_exists: Some(false),
                 extra_options: options,
                 mode: None,
+                // Parsed so that `append: true` is refused like it is for
+                // `Bun.write(s3file, ...)`, instead of being ignored.
+                append: crate::webcore::blob::append_option_from_js(global, options)?,
             },
         )
     }
@@ -599,6 +602,8 @@ impl S3Client {
                 mkdirp_if_not_exists: Some(false),
                 extra_options: options,
                 mode: None,
+                // Refused for S3 in `write_file_internal`, rather than ignored.
+                append: crate::webcore::blob::append_option_from_js(global, options)?,
             },
         )
     }
