@@ -16,7 +16,7 @@
 
 import { bunEnv, bunExe } from "harness";
 import { unsortedPrereleases } from "./semver-fixture.js";
-const { satisfies, order, parse } = Bun.semver;
+const { satisfies, order, parse, inc, maxSatisfying, minSatisfying } = Bun.semver;
 
 function testSatisfiesExact(left: any, right: any, expected: boolean) {
   expect(satisfies(left, right)).toBe(expected);
@@ -928,6 +928,297 @@ describe("Bun.semver.parse()", () => {
       return !Bun.deepEquals(parse(parsed.version), { ...parsed, build: [] }, true);
     });
     expect(mismatches).toEqual([]);
+  });
+});
+
+describe("Bun.semver.inc()", () => {
+  type Release = Bun.semver.ReleaseType;
+  type Case = [
+    version: string,
+    release: Release,
+    expected: string | null,
+    identifier?: string,
+    base?: "0" | "1" | false,
+  ];
+
+  // https://github.com/npm/node-semver/blob/main/test/fixtures/increments.js, minus the
+  // `loose` cases. Same expectations, so `Bun.semver.inc` is a drop-in for `semver.inc`.
+  const increments: Case[] = [
+    ["1.2.3", "major", "2.0.0"],
+    ["1.2.3", "minor", "1.3.0"],
+    ["1.2.3", "patch", "1.2.4"],
+    ["1.2.3-tag", "major", "2.0.0"],
+    ["1.2.0-0", "patch", "1.2.0"],
+    ["1.2.3-4", "major", "2.0.0"],
+    ["1.2.3-4", "minor", "1.3.0"],
+    ["1.2.3-4", "patch", "1.2.3"],
+    ["1.2.3-alpha.0.beta", "major", "2.0.0"],
+    ["1.2.3-alpha.0.beta", "minor", "1.3.0"],
+    ["1.2.3-alpha.0.beta", "patch", "1.2.3"],
+    ["1.2.4", "prerelease", "1.2.5-0"],
+    ["1.2.3-0", "prerelease", "1.2.3-1"],
+    ["1.2.3-alpha.0", "prerelease", "1.2.3-alpha.1"],
+    ["1.2.3-alpha.1", "prerelease", "1.2.3-alpha.2"],
+    ["1.2.3-alpha.2", "prerelease", "1.2.3-alpha.3"],
+    ["1.2.3-alpha.0.beta", "prerelease", "1.2.3-alpha.1.beta"],
+    ["1.2.3-alpha.1.beta", "prerelease", "1.2.3-alpha.2.beta"],
+    ["1.2.3-alpha.2.beta", "prerelease", "1.2.3-alpha.3.beta"],
+    ["1.2.3-alpha.10.0.beta", "prerelease", "1.2.3-alpha.10.1.beta"],
+    ["1.2.3-alpha.10.1.beta", "prerelease", "1.2.3-alpha.10.2.beta"],
+    ["1.2.3-alpha.10.2.beta", "prerelease", "1.2.3-alpha.10.3.beta"],
+    ["1.2.3-alpha.10.beta.0", "prerelease", "1.2.3-alpha.10.beta.1"],
+    ["1.2.3-alpha.10.beta.1", "prerelease", "1.2.3-alpha.10.beta.2"],
+    ["1.2.3-alpha.10.beta.2", "prerelease", "1.2.3-alpha.10.beta.3"],
+    ["1.2.3-alpha.9.beta", "prerelease", "1.2.3-alpha.10.beta"],
+    ["1.2.3-alpha.10.beta", "prerelease", "1.2.3-alpha.11.beta"],
+    ["1.2.3-alpha.11.beta", "prerelease", "1.2.3-alpha.12.beta"],
+    ["1.2.0", "prepatch", "1.2.1-0"],
+    ["1.2.0-1", "prepatch", "1.2.1-0"],
+    ["1.2.0", "preminor", "1.3.0-0"],
+    ["1.2.3-1", "preminor", "1.3.0-0"],
+    ["1.2.0", "premajor", "2.0.0-0"],
+    ["1.2.3-1", "premajor", "2.0.0-0"],
+    ["1.2.0-1", "minor", "1.2.0"],
+    ["1.0.0-1", "major", "1.0.0"],
+    ["1.2.3-dev.bar", "prerelease", "1.2.3-dev.0", "dev"],
+
+    ["1.2.3", "major", "2.0.0", "dev"],
+    ["1.2.3", "minor", "1.3.0", "dev"],
+    ["1.2.3", "patch", "1.2.4", "dev"],
+    ["1.2.3-tag", "major", "2.0.0", "dev"],
+    ["1.2.0-0", "patch", "1.2.0", "dev"],
+    ["1.2.3-4", "major", "2.0.0", "dev"],
+    ["1.2.3-4", "minor", "1.3.0", "dev"],
+    ["1.2.3-4", "patch", "1.2.3", "dev"],
+    ["1.2.3-alpha.0.beta", "major", "2.0.0", "dev"],
+    ["1.2.3-alpha.0.beta", "minor", "1.3.0", "dev"],
+    ["1.2.3-alpha.0.beta", "patch", "1.2.3", "dev"],
+    ["1.2.4", "prerelease", "1.2.5-dev.0", "dev"],
+    ["1.2.3-0", "prerelease", "1.2.3-dev.0", "dev"],
+    ["1.2.3-alpha.0", "prerelease", "1.2.3-dev.0", "dev"],
+    ["1.2.3-alpha.0", "prerelease", "1.2.3-alpha.1", "alpha"],
+    ["1.2.3-alpha.0.beta", "prerelease", "1.2.3-dev.0", "dev"],
+    ["1.2.3-alpha.0.beta", "prerelease", "1.2.3-alpha.1.beta", "alpha"],
+    ["1.2.3-alpha.10.0.beta", "prerelease", "1.2.3-dev.0", "dev"],
+    ["1.2.3-alpha.10.0.beta", "prerelease", "1.2.3-alpha.10.1.beta", "alpha"],
+    ["1.2.3-alpha.10.1.beta", "prerelease", "1.2.3-alpha.10.2.beta", "alpha"],
+    ["1.2.3-alpha.10.2.beta", "prerelease", "1.2.3-alpha.10.3.beta", "alpha"],
+    ["1.2.3-alpha.10.beta.0", "prerelease", "1.2.3-dev.0", "dev"],
+    ["1.2.3-alpha.10.beta.0", "prerelease", "1.2.3-alpha.10.beta.1", "alpha"],
+    ["1.2.3-alpha.10.beta.1", "prerelease", "1.2.3-alpha.10.beta.2", "alpha"],
+    ["1.2.3-alpha.10.beta.2", "prerelease", "1.2.3-alpha.10.beta.3", "alpha"],
+    ["1.2.3-alpha.9.beta", "prerelease", "1.2.3-dev.0", "dev"],
+    ["1.2.3-alpha.9.beta", "prerelease", "1.2.3-alpha.10.beta", "alpha"],
+    ["1.2.3-alpha.10.beta", "prerelease", "1.2.3-alpha.11.beta", "alpha"],
+    ["1.2.3-alpha.11.beta", "prerelease", "1.2.3-alpha.12.beta", "alpha"],
+    ["1.2.0", "prepatch", "1.2.1-dev.0", "dev"],
+    ["1.2.0-1", "prepatch", "1.2.1-dev.0", "dev"],
+    ["1.2.0", "preminor", "1.3.0-dev.0", "dev"],
+    ["1.2.3-1", "preminor", "1.3.0-dev.0", "dev"],
+    ["1.2.0", "premajor", "2.0.0-dev.0", "dev"],
+    ["1.2.3-1", "premajor", "2.0.0-dev.0", "dev"],
+    ["1.2.0-1", "minor", "1.2.0", "dev"],
+    ["1.0.0-1", "major", "1.0.0", "dev"],
+
+    // identifierBase
+    ["1.2.0", "prepatch", "1.2.1-dev.1", "dev", "1"],
+    ["1.2.0-1", "prepatch", "1.2.1-dev.1", "dev", "1"],
+    ["1.2.0", "preminor", "1.3.0-dev.1", "dev", "1"],
+    ["1.2.3-1", "preminor", "1.3.0-dev.1", "dev", "1"],
+    ["1.2.0", "premajor", "2.0.0-dev.1", "dev", "1"],
+    ["1.2.3-1", "premajor", "2.0.0-dev.1", "dev", "1"],
+    ["1.2.0-1", "minor", "1.2.0", "dev", "1"],
+    ["1.0.0-1", "major", "1.0.0", "dev", "1"],
+    ["1.2.3-dev.bar", "prerelease", "1.2.3-dev.1", "dev", "1"],
+    ["1.2.4", "prerelease", "1.2.5-1", "", "1"],
+    ["1.2.4", "prerelease", "1.2.5-0", "", "0"],
+    ["1.2.3-alpha.0", "prerelease", "1.2.3-alpha.1", "alpha", "1"],
+    ["1.2.3-alpha.0", "prerelease", "1.2.3-dev.1", "dev", "1"],
+    // `false`: no number
+    ["1.2.0", "prepatch", "1.2.1-dev", "dev", false],
+    ["1.2.0", "preminor", "1.3.0-dev", "dev", false],
+    ["1.2.0", "premajor", "2.0.0-dev", "dev", false],
+    ["1.2.3", "prerelease", "1.2.4-alpha", "alpha", false],
+    ["1.2.3-dev.bar", "prerelease", "1.2.3-alpha", "alpha", false],
+    ["1.2.3-alpha.1", "prerelease", "1.2.3-alpha.2", "alpha", false],
+    // `1.2.3-alpha` is already the prerelease `alpha` with no number.
+    ["1.2.3-alpha", "prerelease", null, "alpha", false],
+    // Nothing to put after the `-`.
+    ["1.2.3", "prerelease", null, undefined, false],
+    ["1.2.3", "premajor", null, "", false],
+
+    // release
+    ["1.2.3", "release", null],
+    ["1.2.3-alpha", "release", "1.2.3"],
+    ["1.2.3-alpha.1", "release", "1.2.3"],
+    ["1.2.3-alpha.1", "release", "1.2.3", "alpha"],
+    ["1.2.3-alpha.1", "release", "1.2.3", "alpha", "1"],
+    ["1.2.3-alpha.1+build.5", "release", "1.2.3"],
+  ];
+
+  // A rest parameter, so that bun:test does not take the shorter rows as a request for `done`.
+  test.each(increments)(
+    "inc(%j, %j) is %j (identifier %j, base %j)",
+    (...[version, release, expected, identifier, base]) => {
+      expect(inc(version, release, identifier, base)).toBe(expected);
+    },
+  );
+
+  test("returns null for anything that is not a complete version", () => {
+    for (const input of ["", "fake", "1.2", "1.x", "^1.2.3", "1.2.3 || 2.0.0", "1.2.3 trailing", "1.2.3-\u00df"]) {
+      expect(inc(input, "patch")).toBeNull();
+      expect(inc(input, "prerelease", "beta")).toBeNull();
+    }
+    expect(inc(undefined, "patch")).toBeNull();
+    expect(inc(null, "patch")).toBeNull();
+  });
+
+  test("accepts the same prefixes and whitespace as parse()", () => {
+    for (const input of ["v1.2.3", "=1.2.3", " 1.2.3", "1.2.3 ", "\t v1.2.3 "]) {
+      expect(inc(input, "patch")).toBe("1.2.4");
+    }
+    for (const input of ["v1.2.3-rc.1", "=1.2.3-rc.1", "1.2.3-rc.1\n", "\t v1.2.3-rc.1 \r\n"]) {
+      expect(inc(input, "prerelease")).toBe("1.2.3-rc.2");
+    }
+    expect(inc(Buffer.from("1.2.3"), "minor")).toBe("1.3.0");
+    expect(inc({ toString: () => "4.5.6" }, "major")).toBe("5.0.0");
+  });
+
+  test("drops build metadata", () => {
+    expect(inc("1.2.3+build.5", "patch")).toBe("1.2.4");
+    expect(inc("1.2.3-beta.1+sha.abc", "prerelease")).toBe("1.2.3-beta.2");
+  });
+
+  test("counts up the numeric identifiers parse() reports as numbers", () => {
+    expect(inc("1.2.3-beta.9007199254740991", "prerelease")).toBe("1.2.3-beta.9007199254740992");
+    // Too big to be a number, so it stays text and a new number is started.
+    expect(inc("1.2.3-beta.9007199254740992", "prerelease")).toBe("1.2.3-beta.9007199254740992.0");
+    expect(inc("1.2.3-beta.01", "prerelease")).toBe("1.2.3-beta.2");
+  });
+
+  test("an identifier must be a valid prerelease identifier", () => {
+    expect(inc("1.2.3", "prerelease", "beta.rc")).toBe("1.2.4-beta.rc.0");
+    expect(inc("1.2.3", "prerelease", "0")).toBe("1.2.4-0.0");
+    expect(inc("1.2.3", "prerelease", "build-2024")).toBe("1.2.4-build-2024.0");
+    for (const invalid of ["beta!", "beta rc", "01", "beta.", ".beta", "beta..rc", "bêta", "beta+1"]) {
+      expect(inc("1.2.3", "prerelease", invalid)).toBeNull();
+      expect(inc("1.2.3", "premajor", invalid)).toBeNull();
+    }
+    // Like node-semver, the identifier is not looked at unless the release type is a prerelease one.
+    expect(inc("1.2.3", "patch", "beta!")).toBe("1.2.4");
+  });
+
+  test("argument validation", () => {
+    // @ts-expect-error
+    expect(() => inc("1.2.3")).toThrow(TypeError);
+    // @ts-expect-error
+    expect(() => inc("1.2.3", "bump")).toThrow('`release` must be one of "major", "minor"');
+    // A bad release type is reported even when the version is not valid.
+    // @ts-expect-error
+    expect(() => inc("nope", "bump")).toThrow(TypeError);
+    // @ts-expect-error
+    expect(() => inc("1.2.3", "prerelease", 5)).toThrow("`identifier` must be a string");
+    // @ts-expect-error
+    expect(() => inc("1.2.3", "prerelease", "beta", "2")).toThrow('`identifierBase` must be "0", "1" or false');
+    // @ts-expect-error
+    expect(() => inc("1.2.3", "prerelease", "beta", true)).toThrow(TypeError);
+    // @ts-expect-error
+    expect(inc("1.2.3", "prerelease", "beta", 1)).toBe("1.2.4-beta.1");
+    // @ts-expect-error
+    expect(inc("1.2.3", "prerelease", "beta", 0)).toBe("1.2.4-beta.0");
+    expect(inc("1.2.3", "prerelease", null)).toBe("1.2.4-0");
+  });
+
+  test("the result is a version parse() and order() agree on", () => {
+    const releases: Release[] = ["major", "minor", "patch", "premajor", "preminor", "prepatch", "prerelease"];
+    for (const version of ["1.2.3", "0.0.0", "1.2.3-beta.1", "2.0.0-rc.0", "1.0.0-alpha.beta.1+sha"]) {
+      for (const release of releases) {
+        for (const identifier of [undefined, "zeta"]) {
+          const next = inc(version, release, identifier)!;
+          expect(parse(next)).not.toBeNull();
+          expect([version, release, identifier, order(next, version)]).toEqual([version, release, identifier, 1]);
+        }
+      }
+    }
+  });
+});
+
+describe("Bun.semver.maxSatisfying() and minSatisfying()", () => {
+  // https://github.com/npm/node-semver/blob/main/test/functions/max-satisfying.js and
+  // min-satisfying.js, minus the `loose` cases.
+  test.each([
+    [["1.2.3", "1.2.4"], "1.2", "1.2.4", "1.2.3"],
+    [["1.2.4", "1.2.3"], "1.2", "1.2.4", "1.2.3"],
+    [["1.2.3", "1.2.4", "1.2.5", "1.2.6"], "~1.2.3", "1.2.6", "1.2.3"],
+    [
+      ["1.1.0", "1.2.0", "1.2.1", "1.3.0", "2.0.0-b1", "2.0.0-b2", "2.0.0-b3", "2.0.0", "2.1.0"],
+      "~2.0.0",
+      "2.0.0",
+      "2.0.0",
+    ],
+    [["1.2.3", "1.2.4"], "3.x", null, null],
+    [["1.2.3", "1.2.4"], "not a range", null, null],
+    [[], "*", null, null],
+  ])("%j with %j: max %j, min %j", (versions, range, max, min) => {
+    expect(maxSatisfying(versions, range)).toBe(max);
+    expect(minSatisfying(versions, range)).toBe(min);
+  });
+
+  test("agrees with satisfies() and order()", () => {
+    const versions = [
+      "0.9.0",
+      "1.0.0",
+      "1.2.3",
+      "v1.2.3",
+      "1.2.3+build",
+      "1.2.4-alpha.1",
+      "1.3.0",
+      "2.0.0-rc.1",
+      "2.0.0",
+      "2.1.0",
+      ...unsortedPrereleases.slice(0, 200),
+    ];
+    const ranges = ["*", "^1.0.0", "~1.2.3", ">=1.0.0-0", "1.x", ">1.2.3-alpha.1 <2", "1.2.3", "1.0.0-alpha.4", "<0"];
+    for (const range of ranges) {
+      let max: string | null = null;
+      let min: string | null = null;
+      for (const version of versions) {
+        if (!satisfies(version, range)) continue;
+        if (max === null || order(version, max) > 0) max = version;
+        if (min === null || order(version, min) < 0) min = version;
+      }
+      expect([range, maxSatisfying(versions, range), minSatisfying(versions, range)]).toEqual([range, max, min]);
+    }
+  });
+
+  test("prereleases only satisfy a range that opts into their version", () => {
+    expect(maxSatisfying(["1.2.3", "1.3.0-beta.1"], "^1.2.0")).toBe("1.2.3");
+    expect(maxSatisfying(["1.3.0-beta.1", "1.3.0-beta.2", "1.2.3"], ">=1.3.0-beta.0")).toBe("1.3.0-beta.2");
+    expect(minSatisfying(["1.3.0-beta.1", "1.3.0-beta.2", "1.2.3"], ">=1.3.0-beta.0")).toBe("1.3.0-beta.1");
+    expect(maxSatisfying(["1.3.0-beta.1"], "^1.2.0")).toBeNull();
+  });
+
+  test("skips entries that are not complete versions and keeps the spelling of the winner", () => {
+    expect(maxSatisfying(["nope", "1.2.3", "^2.0.0", "1.x", "", "2.0.0.1", "2.0.0 || 3.0.0"], "*")).toBe("1.2.3");
+    expect(maxSatisfying([1, null, undefined, {}, "1.0.0"] as any[], "*")).toBe("1.0.0");
+    expect(maxSatisfying(["v1.2.3", " 1.2.4 "], "*")).toBe(" 1.2.4 ");
+    expect(minSatisfying(["v1.2.3", " 1.2.4 "], "*")).toBe("v1.2.3");
+    // A tie goes to the first entry; build metadata does not order.
+    expect(maxSatisfying(["1.2.3+a", "1.2.3+b", "v1.2.3"], "*")).toBe("1.2.3+a");
+    expect(minSatisfying(["v1.2.3", "1.2.3"], "*")).toBe("v1.2.3");
+  });
+
+  test("argument validation", () => {
+    // @ts-expect-error
+    expect(() => maxSatisfying("1.2.3", "*")).toThrow("`versions` must be an array of strings");
+    // @ts-expect-error
+    expect(() => minSatisfying(new Set(["1.2.3"]), "*")).toThrow("`versions` must be an array of strings");
+    // @ts-expect-error
+    expect(() => maxSatisfying()).toThrow(TypeError);
+    // The range is stringified like in satisfies().
+    expect(maxSatisfying(["1.2.3"], Buffer.from("^1.0.0"))).toBe("1.2.3");
+    // @ts-expect-error
+    expect(maxSatisfying(["1.2.3"], undefined)).toBeNull();
   });
 });
 

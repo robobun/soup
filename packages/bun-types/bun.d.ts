@@ -5712,6 +5712,68 @@ declare module "bun" {
      * ```
      */
     function parse(version: StringLike | null | undefined): Version | null;
+
+    /**
+     * The part of a version {@link inc} bumps, as in `node-semver`.
+     *
+     * - `"major"`, `"minor"`, `"patch"`: the next release. A prerelease of that release
+     *   (`2.0.0-beta.1` for `"major"`) becomes the release itself.
+     * - `"premajor"`, `"preminor"`, `"prepatch"`: a prerelease of the next release.
+     * - `"prerelease"`: the next prerelease, or a prerelease of the next patch version.
+     * - `"release"`: the version without its prerelease tag.
+     */
+    type ReleaseType = "major" | "minor" | "patch" | "premajor" | "preminor" | "prepatch" | "prerelease" | "release";
+
+    /**
+     * Returns `version` incremented by `release`, like `semver.inc()` from `node-semver`.
+     *
+     * `identifier` names the prerelease (`"beta"` in `1.2.3-beta.0`). `identifierBase` is the
+     * number a new prerelease starts at: `"0"` (the default), `"1"`, or `false` for no number
+     * at all (`1.2.3-beta`).
+     *
+     * Returns `null` if `version` is not a complete version, if `release` is `"release"` and
+     * the version is not a prerelease, or if `identifier` is not a valid prerelease
+     * identifier. Build metadata is dropped from the result.
+     *
+     * @example
+     * ```ts
+     * Bun.semver.inc("1.2.3", "minor"); // "1.3.0"
+     * Bun.semver.inc("1.2.3", "prerelease", "beta"); // "1.2.4-beta.0"
+     * Bun.semver.inc("1.2.4-beta.0", "prerelease"); // "1.2.4-beta.1"
+     * Bun.semver.inc("1.2.4-beta.1", "patch"); // "1.2.4"
+     * Bun.semver.inc("1.2.3", "premajor", "rc", "1"); // "2.0.0-rc.1"
+     * ```
+     */
+    function inc(
+      version: StringLike | null | undefined,
+      release: ReleaseType,
+      identifier?: string | null,
+      identifierBase?: "0" | "1" | false,
+    ): string | null;
+
+    /**
+     * Returns the highest version in `versions` that satisfies `range`, or `null` if none
+     * does. Elements that are not complete versions are skipped. The winner is returned as it
+     * appears in `versions`.
+     *
+     * @example
+     * ```ts
+     * Bun.semver.maxSatisfying(["1.2.3", "1.3.0", "2.0.0"], "^1.0.0"); // "1.3.0"
+     * ```
+     */
+    function maxSatisfying(versions: readonly string[], range: StringLike): string | null;
+
+    /**
+     * Returns the lowest version in `versions` that satisfies `range`, or `null` if none
+     * does. Elements that are not complete versions are skipped. The winner is returned as it
+     * appears in `versions`.
+     *
+     * @example
+     * ```ts
+     * Bun.semver.minSatisfying(["1.2.3", "1.3.0", "2.0.0"], "^1.0.0"); // "1.2.3"
+     * ```
+     */
+    function minSatisfying(versions: readonly string[], range: StringLike): string | null;
   }
 
   namespace unsafe {
