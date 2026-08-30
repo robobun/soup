@@ -99,6 +99,13 @@ tsd.expectType(Bun.semver.parse(undefined)).is<Bun.semver.Version | null>();
 tsd.expectType(Bun.semver.parse("1.2.3")!.prerelease).is<(string | number)[]>();
 tsd.expectType(Bun.semver.parse("1.2.3")!.build).is<string[]>();
 tsd.expectType(Bun.semver.parse("1.2.3")!.version).is<string>();
+tsd.expectType(Bun.semver.inc("1.2.3", "minor")).is<string | null>();
+tsd.expectType(Bun.semver.inc("1.2.3", "prerelease", "beta", "1")).is<string | null>();
+tsd.expectType(Bun.semver.inc("1.2.3", "prerelease", "beta", false)).is<string | null>();
+// @ts-expect-error release must be one of the node-semver release types
+Bun.semver.inc("1.2.3", "bump");
+tsd.expectType(Bun.semver.maxSatisfying(["1.2.3", "1.3.0"], "^1.0.0")).is<string | null>();
+tsd.expectType(Bun.semver.minSatisfying(["1.2.3", "1.3.0"], "^1.0.0")).is<string | null>();
 
 new Bun.Glob("**/*.ts").scan({ ignore: "node_modules/**" }) satisfies AsyncIterableIterator<string>;
 new Bun.Glob("**/*.ts").scanSync({ ignore: ["node_modules/**", "dist/**"] }) satisfies IterableIterator<string>;
