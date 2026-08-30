@@ -737,6 +737,71 @@ Files: `src/runtime/webcore/Blob.rs` (options, fast paths, empty source, S3 chec
 `test/js/bun/util/filesink.test.ts`, `test/integration/bun-types/fixture/globals.ts`,
 `test/integration/bun-types/bun-types.test.ts` (a pinned diagnostic moved four lines).
 
+### 2026-08-30: `Bun.semver.inc()`, `maxSatisfying()` and `minSatisfying()`
+
+`Bun.semver` could compare versions, match them against ranges and, since day one, take them
+apart, but it could not produce one. The two things a release script or a registry tool does with
+semver beyond that are "bump this version" and "which of these versions is the best match for this
+range", and for both people still install `semver` from npm next to a runtime that has a semver
+engine built in. Today adds the three `node-semver` functions that cover them, with `node-semver`'s
+exact semantics, so `semver.inc`, `semver.maxSatisfying` and `semver.minSatisfying` can be replaced
+one for one.
+
+```ts
+const { semver } = Bun;
+
+semver.inc("1.2.3", "minor"); // "1.3.0"
+semver.inc("1.2.3", "prerelease", "beta"); // "1.2.4-beta.0"
+semver.inc("1.2.4-beta.0", "prerelease"); // "1.2.4-beta.1"
+semver.inc("1.2.4-beta.1", "patch"); // "1.2.4", the release of that prerelease
+semver.inc("1.2.3", "premajor", "rc", "1"); // "2.0.0-rc.1"
+semver.inc("1.2.4-beta.1", "release"); // "1.2.4"
+
+semver.maxSatisfying(["1.2.3", "1.3.0", "1.4.0-beta.1", "2.0.0"], "^1.0.0"); // "1.3.0"
+semver.maxSatisfying(Object.keys(packument.versions), "^1.2.0"); // what `bun add pkg@^1.2.0` would pick
+semver.minSatisfying(["1.2.3", "1.3.0", "2.0.0"], "^1.0.0"); // "1.2.3"
+```
+
+`inc(version, release, identifier?, identifierBase?)` takes the eight `node-semver` release types
+(`major`, `minor`, `patch`, `premajor`, `preminor`, `prepatch`, `prerelease`, `release`) and
+follows `node-semver`'s rules to the letter, which are less obvious than they look: `major`,
+`minor` and `patch` on a prerelease of the next release land on that release (`2.0.0-rc.0` →
+`2.0.0`, not `3.0.0`); `prerelease` counts up the last numeric identifier, wherever it sits
+(`1.2.3-alpha.9.beta` → `1.2.3-alpha.10.beta`), starts one when there is none, and with an
+identifier keeps the tag only when it already has that name (`beta.1` → `beta.2` for `beta`, →
+`rc.0` for `rc`); `identifierBase` is `"0"`, `"1"` or `false` for a tag with no number; `release`
+drops the tag and is `null` on a version that has none. Build metadata is dropped, as
+`node-semver` does. The result is `null` for anything that is not a complete version, for an
+identifier that is not a valid prerelease identifier, and for a prerelease that would come out
+empty. Unlike `node-semver`, an unknown release type or a non-string identifier is a `TypeError`
+rather than `null`, since that is a typo and not data, and that is how the rest of `Bun.*`
+validates arguments. The whole of `node-semver`'s `increments.js` fixture (minus its loose-mode
+rows) runs as a test table. The one place this deliberately differs from `bun pm version` is the
+CLI's own bump rules, which its tests pin (`1.0.3-alpha.1` → `1.0.4` for `patch`, `1.0.0-alpha` →
+`1.0.0-alpha.1` for `prerelease`); `Bun.semver.inc` is the library function JavaScript code expects,
+and the CLI was left as it is.
+
+`maxSatisfying(versions, range)` and `minSatisfying(versions, range)` parse the range once, skip
+entries that are not complete versions (and entries that are not strings), decide each candidate
+exactly as `satisfies()` does, so the prerelease rule is the same one `bun install` uses, and return
+the winning entry as it was given (`"v1.2.3"` stays `"v1.2.3"`), first one on a tie; build metadata
+does not order. A range with no comparator in it (`"latest"`, `"nope"`) yields `null`, where
+`satisfies()` has always treated such a string as `*` (a pre-existing quirk that was left alone,
+and that `engines.bun` already works around). A test checks the two against `satisfies()` and
+`order()` over 200 versions and nine ranges.
+
+The increment itself lives in the `bun_semver` crate (`inc.rs`), on the parsed `Version` the
+lockfile and `bun install` use, so it can be reused from Rust; the JS layer in `SemverObject.rs`
+only validates arguments, and `parse()`, `inc()` and the two searches now share one "is this a
+complete version" check. While testing, the version parser turned out to reject a bare version
+followed by a newline or tab (`"1.2.3\n"` is "Invalid SemVer" to `order()`, while `"1.2.3 "` and
+`"1.2.3-rc.1\n"` are fine); that is upstream behaviour and was reported separately rather than fixed
+here.
+
+Files: `src/semver/inc.rs`, `src/semver/lib.rs`, `src/semver_jsc/SemverObject.rs`,
+`packages/bun-types/bun.d.ts`, `docs/runtime/semver.mdx`, `test/cli/install/semver.test.ts`,
+`test/integration/bun-types/fixture/bun.ts`.
+
 ## Dropped
 
 Nothing yet.
