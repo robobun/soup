@@ -9,7 +9,7 @@ description: Use Bun's semantic versioning API
 
 <Frame>![Benchmark](https://github.com/oven-sh/bun/assets/709451/94746adc-8aba-4baf-a143-3c355f8e0f78)</Frame>
 
-The API provides three functions:
+The API provides six functions:
 
 ## `Bun.semver.satisfies(version: string, range: string): boolean`
 
@@ -90,6 +90,71 @@ if (major > 1 || minor >= 3) {
 }
 
 const isValid = semver.parse(pkg.version) !== null;
+```
+
+## `Bun.semver.inc(version: string, release: ReleaseType, identifier?: string, identifierBase?: "0" | "1" | false): string | null`
+
+Returns `version` bumped by `release`, the same way `semver.inc()` from `node-semver` does. `release` is one of `"major"`, `"minor"`, `"patch"`, `"premajor"`, `"preminor"`, `"prepatch"`, `"prerelease"` or `"release"`.
+
+```typescript
+import { semver } from "bun";
+
+semver.inc("1.2.3", "patch"); // "1.2.4"
+semver.inc("1.2.3", "minor"); // "1.3.0"
+semver.inc("1.2.3", "major"); // "2.0.0"
+
+semver.inc("1.2.3", "prerelease"); // "1.2.4-0"
+semver.inc("1.2.3", "prerelease", "beta"); // "1.2.4-beta.0"
+semver.inc("1.2.4-beta.0", "prerelease"); // "1.2.4-beta.1"
+semver.inc("1.2.4-beta.1", "prerelease", "rc"); // "1.2.4-rc.0"
+semver.inc("1.2.3", "premajor", "rc"); // "2.0.0-rc.0"
+semver.inc("1.2.3", "premajor", "rc", "1"); // "2.0.0-rc.1"
+semver.inc("1.2.3", "premajor", "rc", false); // "2.0.0-rc"
+
+semver.inc("1.2.4-beta.1", "patch"); // "1.2.4", the release of the prerelease
+semver.inc("2.0.0-rc.0", "major"); // "2.0.0"
+semver.inc("1.2.4-beta.1", "release"); // "1.2.4"
+semver.inc("1.2.4", "release"); // null, not a prerelease
+```
+
+- A prerelease is bumped to its own release by `"major"`, `"minor"` and `"patch"`: `2.0.0-rc.0` becomes `2.0.0`, not `3.0.0`.
+- `"prerelease"` counts up the last numeric prerelease identifier, or starts one. With an `identifier`, the prerelease is kept only when it already has that name (`1.2.3-beta.1` becomes `1.2.3-beta.2` for `"beta"` and `1.2.3-rc.0` for `"rc"`). On a version that is not a prerelease it acts like `"prepatch"`.
+- `identifierBase` is the number a new prerelease starts at: `"0"` (the default), `"1"`, or `false` for no number at all.
+- Build metadata is dropped from the result.
+- Returns `null` when `version` is not a complete version, when `"release"` is asked of a version that is not a prerelease, or when `identifier` is not a valid prerelease identifier.
+
+```typescript
+const pkg = await Bun.file("package.json").json();
+pkg.version = semver.inc(pkg.version, process.argv[2] ?? "patch");
+await Bun.write("package.json", JSON.stringify(pkg, null, 2) + "\n");
+```
+
+## `Bun.semver.maxSatisfying(versions: string[], range: string): string | null`
+
+Returns the highest version in `versions` that satisfies `range`, or `null` when none does. Entries that are not complete versions are skipped, and the winner is returned as it appears in `versions`.
+
+```typescript
+import { semver } from "bun";
+
+const versions = ["1.2.3", "1.3.0", "1.4.0-beta.1", "2.0.0"];
+
+semver.maxSatisfying(versions, "^1.0.0"); // "1.3.0", prereleases need a range that names their version
+semver.maxSatisfying(versions, "~1.4.0-0"); // "1.4.0-beta.1"
+semver.maxSatisfying(versions, "^3.0.0"); // null
+
+// Which published version would `bun add pkg@^1.2.0` pick?
+const { versions: published } = await (await fetch("https://registry.npmjs.org/pkg")).json();
+semver.maxSatisfying(Object.keys(published), "^1.2.0");
+```
+
+## `Bun.semver.minSatisfying(versions: string[], range: string): string | null`
+
+Returns the lowest version in `versions` that satisfies `range`, or `null` when none does.
+
+```typescript
+import { semver } from "bun";
+
+semver.minSatisfying(["1.2.3", "1.3.0", "2.0.0"], "^1.0.0"); // "1.2.3"
 ```
 
 If you need other semver functions, open an issue or pull request.
