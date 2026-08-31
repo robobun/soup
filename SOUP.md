@@ -802,6 +802,77 @@ Files: `src/semver/inc.rs`, `src/semver/lib.rs`, `src/semver_jsc/SemverObject.rs
 `packages/bun-types/bun.d.ts`, `docs/runtime/semver.mdx`, `test/cli/install/semver.test.ts`,
 `test/integration/bun-types/fixture/bun.ts`.
 
+### 2026-08-31: user-defined functions for `bun:sqlite`
+
+`bun:sqlite` could not be taught a new SQL function. `db.function()` is the one piece of the
+`better-sqlite3` API it lacked that has no workaround: `x REGEXP y` is a hard error in SQLite until
+the application supplies `regexp()`, a trigger cannot call back into JavaScript, and anything SQLite
+cannot compute itself has to be pulled out row by row and computed in a loop (oven-sh/bun#1474, open
+since 2022, is the request; three PRs have been opened against it and none merged). Meanwhile
+`node:sqlite` in bun has had `function()` and `aggregate()` for a while. Today adds
+`db.function(name, [options], fn)` to `bun:sqlite` in the `better-sqlite3` shape: SQLite calls `fn`
+once per row with the column values, stores what it returns, and the registration returns the database
+for chaining.
+
+```ts
+import { Database } from "bun:sqlite";
+
+const db = new Database("app.db");
+
+db.function("regexp", (re, s) => Number(new RegExp(re).test(s)));
+db.query("SELECT name FROM users WHERE name REGEXP ?").all("^J");
+
+const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+db.function("clamp", { deterministic: true }, clamp);
+db.run("CREATE INDEX scores_clamped ON results (clamp(score, 0, 100))");
+
+db.function("notify", { directOnly: true }, id => void changed.push(id));
+db.run(`
+  CREATE TRIGGER on_event AFTER INSERT ON events
+  BEGIN SELECT notify(new.id); END
+`);
+```
+
+Arguments are converted exactly like result columns (`TEXT` to `string`, `INTEGER` to `number`, or to
+`bigint` with `safeIntegers`, `BLOB` to `Uint8Array`) and the return value exactly like a bound
+parameter (a safe integer is `INTEGER`, any other number `REAL`, booleans `1`/`0`, `undefined` is
+`NULL`); an object or a `Promise` is a `TypeError` with a message that says so, and a `bigint` outside
+int64 a `RangeError`, where `node:sqlite` reports both as SQLite errors. Options are `better-sqlite3`'s:
+`varargs` (otherwise the arity is `fn.length` and SQLite rejects other counts), `deterministic`
+(`SQLITE_DETERMINISTIC`, required for index expressions), `directOnly` (`SQLITE_DIRECTONLY`, blocks
+calls from views, triggers and defaults) and `safeIntegers`, which defaults to the database's setting.
+An exception thrown by the function fails the statement and is rethrown as the same object by `.get()`,
+`.all()`, `.values()`, `.run()`, the iterator, `db.run()` and even `columnTypes`; the statement is
+reset on that path so its next execution does not report the stale error. Other statements on the
+same database work from inside the function, which is what the trigger example relies on. The one
+thing the function cannot touch is the statement that is calling it: running it again (easy to do by
+accident, because `db.query()` hands out the same cached `Statement` for the same SQL string, so a
+recursive `depth(id)` that queries itself hits it), finalizing it, or closing the database all throw,
+because a `sqlite3_reset()` or `sqlite3_finalize()` issued from inside that statement's own
+`sqlite3_step()` tears down the VDBE frame SQLite is about to return into and the next opcode reads a
+freed cursor. The statement carries a `stepping` bit for exactly the duration of each `sqlite3_step()`,
+so a statement merely paused between rows of an iterator can still be finalized, and the connection
+counts the functions currently running on it so `close()` can refuse (`node:sqlite` defers the close
+instead; for `bun:sqlite` an error is simpler and nobody closes a database from inside a row callback).
+
+The JavaScript callback is rooted by a `Strong` handle owned by the SQLite-side registration object,
+freed by `sqlite3_create_function_v2`'s destructor when the function is replaced or the connection
+closes, so `db.function("f", () => 42)` with no other reference to the closure keeps working across
+GCs, and a closure that captures `db` keeps the database alive, as in `better-sqlite3`. Inside the
+callback a `TopExceptionScope` leaves the exception pending on the VM and fails the step with an
+empty message; each of the eight `sqlite3_step()` sites checks for that pending exception and rethrows
+it instead of wrapping SQLite's empty message, which reuses the pattern the `node:sqlite` binding in
+the same tree established. While testing, a pre-existing bug turned up and was reported separately
+rather than fixed here: `db.exec("a; b; c")` swallows a step error in `b` when `c` succeeds, because
+the statement loop only breaks on a prepare error. `aggregate()` and window functions are left for
+another day.
+
+Files: `src/jsc/bindings/sqlite/JSSQLStatement.cpp` (`SQLiteUserFunction`, `jsSQLStatementCreateFunction`,
+`RETURN_IF_UDF_THREW`, `JSSQLStatement::step`, `CHECK_NOT_STEPPING`, close/finalize guards),
+`src/js/bun/sqlite.ts` (`Database.prototype.function`),
+`packages/bun-types/sqlite.d.ts` (`FunctionOptions`, `FunctionArgument`, `FunctionResult`),
+`docs/runtime/sqlite.mdx`, `test/js/bun/sqlite/sqlite.test.js`, `test/integration/bun-types/fixture/sqlite.ts`.
+
 ## Dropped
 
 Nothing yet.

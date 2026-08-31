@@ -6,6 +6,11 @@ const kStrictFlag = 1 << 2;
 const kOwnedByDatabaseFlag = 1 << 3;
 const kPrepareOwned = Symbol("prepareOwned");
 
+// Database.prototype.function options, as JSSQLStatement.cpp reads them.
+const kFunctionDeterministicFlag = 1 << 0;
+const kFunctionDirectOnlyFlag = 1 << 1;
+const kFunctionSafeIntegersFlag = 1 << 2;
+
 const defineProperties = Object.defineProperties;
 const toStringTag = Symbol.toStringTag;
 const isArray = Array.isArray;
@@ -120,6 +125,7 @@ interface CppSQL {
   open(filename: string, flags: number, db: Database): TODO;
   isInTransaction(handle: TODO): boolean;
   loadExtension(handle: TODO, name: string, entryPoint: string): void;
+  createFunction(handle: TODO, name: string, fn: Function, argumentCount: number, flags: number): void;
   serialize(handle: TODO, name: string): Buffer;
   deserialize(serialized: NodeJS.TypedArray | ArrayBufferLike, openFlags: number, deserializeFlags: number): TODO;
   fcntl(handle: TODO, ...args: TODO[]): TODO;
@@ -448,6 +454,53 @@ class Database implements SqliteTypes.Database {
     return SQL.loadExtension(this.#handle, name, entryPoint);
   }
 
+  function(name: string, optionsOrFn: SqliteTypes.FunctionOptions | Function, maybeFn?: Function) {
+    let options: SqliteTypes.FunctionOptions | undefined;
+    let fn: Function;
+    if (typeof optionsOrFn === "function" && maybeFn === undefined) {
+      fn = optionsOrFn;
+    } else {
+      options = optionsOrFn as SqliteTypes.FunctionOptions;
+      fn = maybeFn!;
+    }
+
+    if (typeof name !== "string") {
+      throw new TypeError(`Expected 'name' to be a string, got '${typeof name}'`);
+    }
+    if (name.length === 0) {
+      throw new TypeError("Expected 'name' to be a non-empty string");
+    }
+    if (typeof fn !== "function") {
+      throw new TypeError(`Expected 'fn' to be a function, got '${typeof fn}'`);
+    }
+
+    let safeIntegers = (this.#internalFlags & kSafeIntegersFlag) !== 0;
+    let flags = 0;
+    let argumentCount = -1;
+    let varargs = false;
+    if (options != null) {
+      if (typeof options !== "object") {
+        throw new TypeError(`Expected 'options' to be an object, got '${typeof options}'`);
+      }
+      const { deterministic, directOnly, safeIntegers: safeIntegersOption } = options;
+      if (deterministic) flags |= kFunctionDeterministicFlag;
+      if (directOnly) flags |= kFunctionDirectOnlyFlag;
+      if (safeIntegersOption !== undefined) safeIntegers = !!safeIntegersOption;
+      varargs = !!options.varargs;
+    }
+    if (safeIntegers) flags |= kFunctionSafeIntegersFlag;
+
+    if (!varargs) {
+      argumentCount = fn.length;
+      if (!Number.isInteger(argumentCount) || argumentCount < 0) {
+        throw new TypeError("Expected 'fn.length' to be a non-negative integer");
+      }
+    }
+
+    SQL.createFunction(this.#handle, name, fn, argumentCount, flags);
+    return this;
+  }
+
   serialize(optionalName?: string) {
     return SQL.serialize(this.#handle, optionalName || "main");
   }
@@ -497,10 +550,11 @@ class Database implements SqliteTypes.Database {
   }
 
   close(throwOnError = false) {
-    // native close finalizes every kOwnedByDatabaseFlag statement (query cache + transaction controller)
+    // native close finalizes every kOwnedByDatabaseFlag statement (query cache + transaction controller),
+    // or throws and leaves them usable when called from inside a user-defined function
+    SQL.close(this.#handle, throwOnError);
     this.#queryCache.$clear();
     controllers?.delete(this);
-    return SQL.close(this.#handle, throwOnError);
   }
   clearQueryCache() {
     this.#queryCache.$forEach(stmt => stmt.finalize());
