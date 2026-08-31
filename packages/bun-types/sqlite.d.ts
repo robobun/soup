@@ -85,6 +85,68 @@ declare module "bun:sqlite" {
   }
 
   /**
+   * Options for {@link Database.function}
+   */
+  export interface FunctionOptions {
+    /**
+     * Let the function take any number of arguments.
+     *
+     * By default, the function takes exactly `fn.length` arguments and SQLite
+     * rejects a call with a different count.
+     *
+     * @default false
+     */
+    varargs?: boolean;
+
+    /**
+     * Promise SQLite that the function always returns the same result for the
+     * same arguments. This lets SQLite call it from an index expression or a
+     * CHECK constraint, and evaluate a call with constant arguments once per
+     * query.
+     *
+     * Equivalent to `SQLITE_DETERMINISTIC`
+     *
+     * @default false
+     */
+    deterministic?: boolean;
+
+    /**
+     * Only allow the function in SQL that the application runs directly. A
+     * view, trigger, CHECK constraint, DEFAULT or generated column that calls
+     * it fails with `unsafe use of <name>()`. Recommended for a function with
+     * side effects.
+     *
+     * Equivalent to `SQLITE_DIRECTONLY`
+     *
+     * @default false
+     */
+    directOnly?: boolean;
+
+    /**
+     * Pass INTEGER arguments as `bigint` instead of `number`.
+     *
+     * Defaults to the `safeIntegers` option of the database.
+     */
+    safeIntegers?: boolean;
+  }
+
+  /**
+   * An argument SQLite passes to a user-defined function.
+   *
+   * An INTEGER is a `bigint` when `safeIntegers` is `true`, otherwise a
+   * `number`. A BLOB is a `Uint8Array`.
+   */
+  export type FunctionArgument = string | number | bigint | Uint8Array | null;
+
+  /**
+   * A value a user-defined function can return, stored like a bound parameter:
+   * an integer `number` as INTEGER and any other `number` as REAL, a `boolean`
+   * as 1 or 0, `undefined` and `null` as NULL. A `bigint` outside the 64-bit
+   * range throws a `RangeError`.
+   */
+  export type FunctionResult = string | number | bigint | boolean | NodeJS.TypedArray | null | undefined | void;
+
+  /**
    * A SQLite3 database
    *
    * @example
@@ -335,6 +397,47 @@ declare module "bun:sqlite" {
      * @param entryPoint optional entry point of the extension
      */
     loadExtension(extension: string, entryPoint?: string): void;
+
+    /**
+     * Register a JavaScript function that SQL statements on this database can
+     * call, like a built-in SQLite function.
+     *
+     * Arguments arrive as {@link FunctionArgument} values. Annotate the
+     * parameters with the types the SQL passes, or narrow the union. The
+     * return value is stored with the rules of {@link FunctionResult}. An
+     * exception thrown by the function fails the statement and propagates to
+     * the caller of `.get()`, `.all()`, `.run()` or the iterator.
+     *
+     * The function may run other statements on the database, but not the
+     * statement that is calling it. Registering a second function with the
+     * same name and argument count replaces the first. A function stays
+     * registered until the database is closed, and a closure that captures
+     * the database keeps it open until then.
+     *
+     * @param name The name to call the function by in SQL. Case-insensitive.
+     * @param fn The function. Without `varargs`, SQLite requires calls to pass exactly `fn.length` arguments.
+     * @returns the database, for chaining
+     *
+     * @example
+     * ```ts
+     * import { Database } from "bun:sqlite";
+     *
+     * const db = new Database(":memory:");
+     *
+     * // SQLite turns `x REGEXP y` into a call to regexp(y, x)
+     * db.function("regexp", (pattern: string, text: string) => new RegExp(pattern).test(text) ? 1 : 0);
+     * db.query("SELECT name FROM users WHERE name REGEXP ?").all("^J");
+     *
+     * db.function("clamp", { deterministic: true }, (x: number, lo: number, hi: number) => Math.min(Math.max(x, lo), hi));
+     * db.query("SELECT clamp(score, 0, 100) AS score FROM results").all();
+     * ```
+     */
+    function<Args extends FunctionArgument[]>(name: string, fn: (...args: Args) => FunctionResult): this;
+    function<Args extends FunctionArgument[]>(
+      name: string,
+      options: FunctionOptions,
+      fn: (...args: Args) => FunctionResult,
+    ): this;
 
     /**
      * Change the dynamic library path to SQLite
