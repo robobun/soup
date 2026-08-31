@@ -113,6 +113,352 @@ describe("safeIntegers", () => {
   });
 });
 
+describe("db.function()", () => {
+  it("registers a scalar function and returns the database", () => {
+    const db = new Database(":memory:");
+    expect(db.function("plus", (a, b) => a + b)).toBe(db);
+    expect(db.query("SELECT plus(1, 2) AS sum").get()).toEqual({ sum: 3 });
+    expect(db.query("SELECT plus(?, ?) AS sum").get(40, 2)).toEqual({ sum: 42 });
+  });
+
+  it("takes exactly fn.length arguments unless varargs is set", () => {
+    const db = new Database(":memory:");
+    db.function("plus", (a, b) => a + b);
+    expect(() => db.query("SELECT plus(1)").get()).toThrow("wrong number of arguments to function plus()");
+    expect(() => db.query("SELECT plus(1, 2, 3)").get()).toThrow("wrong number of arguments to function plus()");
+
+    db.function("sum_all", { varargs: true }, (...values) => values.reduce((a, b) => a + b, 0));
+    expect(db.query("SELECT sum_all() AS s").get()).toEqual({ s: 0 });
+    expect(db.query("SELECT sum_all(1, 2, 3, 4, 5) AS s").get()).toEqual({ s: 15 });
+  });
+
+  it("converts arguments like result columns", () => {
+    const db = new Database(":memory:");
+    const seen = [];
+    db.function("record", value => {
+      seen.push(value);
+      return null;
+    });
+    db.query("SELECT record(1), record(1.5), record('text'), record(X'0102ff'), record(NULL), record('')").get();
+    expect(seen).toEqual([1, 1.5, "text", new Uint8Array([1, 2, 0xff]), null, ""]);
+    expect(seen[3]).toBeInstanceOf(Uint8Array);
+  });
+
+  it("stores return values like bound parameters", () => {
+    const db = new Database(":memory:");
+    let result;
+    db.function("value", () => result);
+    const stmt = db.query("SELECT value() AS v, typeof(value()) AS t");
+
+    result = 42;
+    expect(stmt.get()).toEqual({ v: 42, t: "integer" });
+    result = 2 ** 40;
+    expect(stmt.get()).toEqual({ v: 2 ** 40, t: "integer" });
+    result = 1.5;
+    expect(stmt.get()).toEqual({ v: 1.5, t: "real" });
+    result = "héllo wörld";
+    expect(stmt.get()).toEqual({ v: "héllo wörld", t: "text" });
+    result = "emoji 🐰 and 日本語";
+    expect(stmt.get()).toEqual({ v: "emoji 🐰 and 日本語", t: "text" });
+    result = "";
+    expect(stmt.get()).toEqual({ v: "", t: "text" });
+    result = true;
+    expect(stmt.get()).toEqual({ v: 1, t: "integer" });
+    result = false;
+    expect(stmt.get()).toEqual({ v: 0, t: "integer" });
+    result = null;
+    expect(stmt.get()).toEqual({ v: null, t: "null" });
+    result = undefined;
+    expect(stmt.get()).toEqual({ v: null, t: "null" });
+    result = 123n;
+    expect(stmt.get()).toEqual({ v: 123, t: "integer" });
+    result = new Uint8Array([1, 2, 3]);
+    expect(stmt.get()).toEqual({ v: new Uint8Array([1, 2, 3]), t: "blob" });
+    result = Buffer.from("hi");
+    expect(stmt.get()).toEqual({ v: new Uint8Array([104, 105]), t: "blob" });
+    result = new Uint8Array(0);
+    expect(stmt.get()).toEqual({ v: new Uint8Array(0), t: "blob" });
+  });
+
+  it("rejects return values SQLite cannot store", () => {
+    const db = new Database(":memory:");
+    let result;
+    db.function("value", () => result);
+    const stmt = db.query("SELECT value() AS v");
+
+    result = {};
+    expect(() => stmt.get()).toThrow(TypeError);
+    result = [1, 2];
+    expect(() => stmt.get()).toThrow(TypeError);
+    result = Symbol("nope");
+    expect(() => stmt.get()).toThrow(TypeError);
+    result = Promise.resolve(1);
+    expect(() => stmt.get()).toThrow(/synchronous/);
+    result = 2n ** 64n;
+    expect(() => stmt.get()).toThrow(RangeError);
+    result = -(2n ** 63n);
+    expect(stmt.get()).toEqual({ v: -(2 ** 63) });
+  });
+
+  it("passes integers as bigint with safeIntegers", () => {
+    const db = new Database(":memory:");
+    db.function("kind", value => typeof value);
+    db.function("kind_big", { safeIntegers: true }, value => typeof value);
+    db.function("double", { safeIntegers: true }, value => value * 2n);
+    expect(db.query("SELECT kind(1) AS a, kind_big(1) AS b, kind_big(1.5) AS c").get()).toEqual({
+      a: "number",
+      b: "bigint",
+      c: "number",
+    });
+    expect(db.query("SELECT double(?) AS v").safeIntegers(true).get(BigInt(Number.MAX_SAFE_INTEGER))).toEqual({
+      v: BigInt(Number.MAX_SAFE_INTEGER) * 2n,
+    });
+
+    const safeDb = new Database(":memory:", { safeIntegers: true });
+    safeDb.function("kind", value => typeof value);
+    safeDb.function("kind_number", { safeIntegers: false }, value => typeof value);
+    expect(safeDb.query("SELECT kind(1) AS a, kind_number(1) AS b").get()).toEqual({ a: "bigint", b: "number" });
+  });
+
+  it("propagates exceptions from the function", () => {
+    const db = new Database(":memory:");
+    const error = new Error("kaboom");
+    db.function("verify", n => {
+      if (n === 3) throw error;
+      return n;
+    });
+
+    const stmt = db.query("SELECT verify(?) AS n");
+    let thrown;
+    try {
+      stmt.get(3);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBe(error);
+    expect(() => stmt.all(3)).toThrow("kaboom");
+    expect(() => stmt.values(3)).toThrow("kaboom");
+    expect(() => stmt.run(3)).toThrow("kaboom");
+    expect(() => Array.from(stmt.iterate(3))).toThrow("kaboom");
+    expect(() => db.run("SELECT verify(3)")).toThrow("kaboom");
+    expect(() => db.query("SELECT verify(3)").columnTypes).toThrow("kaboom");
+
+    // The statement is reusable after a failure, and the next call does not
+    // report the failure again.
+    expect(stmt.get(1)).toEqual({ n: 1 });
+    expect(stmt.all(2)).toEqual([{ n: 2 }]);
+    expect(db.query("SELECT 1 AS ok").get()).toEqual({ ok: 1 });
+  });
+
+  it("reports an error from SQLite while the function runs", () => {
+    const db = new Database(":memory:");
+    let attempts = 0;
+    db.function("redefine", () => {
+      // A function cannot be replaced while a statement is using it.
+      if (attempts++ === 0) db.function("redefine", () => 2);
+      return 1;
+    });
+    expect(() => db.query("SELECT redefine()").get()).toThrow(
+      "unable to delete/modify user-function due to active statements",
+    );
+    expect(db.query("SELECT redefine() AS v").get()).toEqual({ v: 1 });
+  });
+
+  it("surfaces an exception thrown for a later row of .all()", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE items (n INTEGER)");
+    db.run("INSERT INTO items VALUES (1), (2), (3)");
+    db.function("fail_at", (n, limit) => {
+      if (n >= limit) throw new Error(`too big: ${n}`);
+      return n;
+    });
+    const stmt = db.query("SELECT fail_at(n, ?) AS n FROM items");
+    expect(() => stmt.all(3)).toThrow("too big: 3");
+    expect(() => stmt.values(2)).toThrow("too big: 2");
+    expect(stmt.all(4)).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+  });
+
+  it("replaces a function with the same name and argument count", () => {
+    const db = new Database(":memory:");
+    db.function("f", () => "first");
+    expect(db.query("SELECT f() AS v").get()).toEqual({ v: "first" });
+    db.function("f", () => "second");
+    expect(db.query("SELECT f() AS v").get()).toEqual({ v: "second" });
+
+    // A different argument count is a separate overload.
+    db.function("f", x => `one:${x}`);
+    expect(db.query("SELECT f() AS a, f(1) AS b").get()).toEqual({ a: "second", b: "one:1" });
+  });
+
+  it("implements the REGEXP operator", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE cats (name TEXT)");
+    db.run("INSERT INTO cats VALUES ('Joey'), ('Sally'), ('Junior')");
+    expect(() => db.query("SELECT name FROM cats WHERE name REGEXP '^J'").all()).toThrow("no such function: REGEXP");
+
+    db.function("regexp", (pattern, text) => (new RegExp(pattern).test(text) ? 1 : 0));
+    expect(db.query("SELECT name FROM cats WHERE name REGEXP ? ORDER BY name").all("^J")).toEqual([
+      { name: "Joey" },
+      { name: "Junior" },
+    ]);
+  });
+
+  it("deterministic functions can be used in index expressions", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE t (x INTEGER)");
+    db.function("plain", x => x * 2);
+    db.function("det", { deterministic: true }, x => x * 2);
+    expect(() => db.run("CREATE INDEX t_plain ON t (plain(x))")).toThrow(
+      "non-deterministic functions prohibited in index expressions",
+    );
+    db.run("CREATE INDEX t_det ON t (det(x))");
+    db.run("INSERT INTO t VALUES (1), (2), (3)");
+    expect(db.query("SELECT x FROM t WHERE det(x) = 4").all()).toEqual([{ x: 2 }]);
+  });
+
+  it("directOnly functions cannot be called from a view or trigger", () => {
+    const db = new Database(":memory:");
+    db.function("direct", { directOnly: true }, () => 1);
+    db.function("indirect", () => 1);
+    db.run("CREATE VIEW v_direct AS SELECT direct() AS v");
+    db.run("CREATE VIEW v_indirect AS SELECT indirect() AS v");
+    expect(db.query("SELECT * FROM v_indirect").get()).toEqual({ v: 1 });
+    expect(() => db.query("SELECT * FROM v_direct").get()).toThrow("unsafe use of direct()");
+  });
+
+  it("runs from triggers and can query the same database", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+    db.run("CREATE TABLE events (user_id INTEGER)");
+    const notified = [];
+    db.function("notify", id => {
+      notified.push({ id, name: db.query("SELECT name FROM users WHERE id = ?").get(id).name });
+    });
+    db.run("CREATE TRIGGER on_event AFTER INSERT ON events BEGIN SELECT notify(new.user_id); END");
+    db.run("INSERT INTO users VALUES (1, 'Joey'), (2, 'Sally')");
+    db.run("INSERT INTO events VALUES (2), (1)");
+    expect(notified).toEqual([
+      { id: 2, name: "Sally" },
+      { id: 1, name: "Joey" },
+    ]);
+  });
+
+  it("refuses to close the database or finalize the running statement from inside the function", () => {
+    const db = new Database(":memory:");
+    let stmt;
+    db.function("act", what => {
+      if (what === "close") db.close();
+      if (what === "finalize") stmt.finalize();
+      return 1;
+    });
+    stmt = db.prepare("SELECT act(?) AS v");
+    expect(() => stmt.get("close")).toThrow("Cannot close the database from inside a user-defined function");
+    expect(() => stmt.get("finalize")).toThrow("Cannot finalize a statement that is executing");
+    expect(stmt.get("nothing")).toEqual({ v: 1 });
+    // The refused close left the database and its query cache intact.
+    expect(db.query("SELECT act('nothing') AS v").get()).toEqual({ v: 1 });
+
+    // A statement that has finished, or one paused between rows, can be
+    // finalized from inside the function.
+    const paused = db.prepare("SELECT 1 AS v UNION ALL SELECT 2");
+    const iterator = paused.iterate();
+    expect(iterator.next().value).toEqual({ v: 1 });
+    db.function("lookup", () => {
+      const nested = db.prepare("SELECT 42 AS v");
+      const value = nested.get().v;
+      nested.finalize();
+      paused.finalize();
+      return value;
+    });
+    expect(db.query("SELECT lookup() AS v").get()).toEqual({ v: 42 });
+    expect(paused.isFinalized).toBe(true);
+
+    db.close(true);
+    expect(stmt.isFinalized).toBe(true);
+  });
+
+  it("refuses to run the statement that is calling the function", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE nodes (id INTEGER, parent INTEGER)");
+    db.run("INSERT INTO nodes VALUES (1, NULL), (2, 1), (3, 2)");
+    const error = "Statement is still executing: a user-defined function cannot run the statement that called it";
+
+    // db.query() returns the cached Statement for the same SQL, which is the one being stepped.
+    const sql = "SELECT depth(?) AS d FROM nodes WHERE id = ?";
+    db.function("depth", id => {
+      const parent = db.query("SELECT parent FROM nodes WHERE id = ?").get(id)?.parent;
+      return parent == null ? 0 : 1 + db.query(sql).get(parent, parent).d;
+    });
+    expect(() => db.query(sql).get(3, 3)).toThrow(error);
+
+    // Every way of running the statement is refused, and the outer statement
+    // finishes normally when the function handles the error itself.
+    let stmt;
+    const attempts = [];
+    db.function("reenter", how => {
+      try {
+        if (how === "get") stmt.get(how);
+        if (how === "all") stmt.all(how);
+        if (how === "values") stmt.values(how);
+        if (how === "run") stmt.run(how);
+        if (how === "iterate") stmt.iterate(how).next();
+        if (how === "columnTypes") stmt.columnTypes;
+        if (how === "finalize") stmt.finalize();
+      } catch (e) {
+        attempts.push(e.message);
+        return "refused";
+      }
+      return "ran";
+    });
+    stmt = db.prepare("SELECT reenter(?) AS outcome");
+    for (const how of ["get", "all", "values", "run", "iterate", "columnTypes", "finalize"]) {
+      expect(stmt.get(how)).toEqual({ outcome: "refused" });
+    }
+    expect(attempts).toEqual([
+      error,
+      error,
+      error,
+      error,
+      error,
+      error,
+      "Cannot finalize a statement that is executing",
+    ]);
+    expect(stmt.get("nothing")).toEqual({ outcome: "ran" });
+    expect(db.query("SELECT id FROM nodes ORDER BY id").all()).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+  });
+
+  it("stays registered without a JavaScript reference to the function", () => {
+    const db = new Database(":memory:");
+    db.function("answer", () => 42);
+    Bun.gc(true);
+    expect(db.query("SELECT answer() AS v").get()).toEqual({ v: 42 });
+    Bun.gc(true);
+    expect(db.query("SELECT answer() AS v").get()).toEqual({ v: 42 });
+  });
+
+  it("validates its arguments", () => {
+    const db = new Database(":memory:");
+    expect(() => db.function(1, () => 1)).toThrow("Expected 'name' to be a string, got 'number'");
+    expect(() => db.function("", () => 1)).toThrow("Expected 'name' to be a non-empty string");
+    expect(() => db.function("f")).toThrow("Expected 'fn' to be a function, got 'undefined'");
+    expect(() => db.function("f", {}, "nope")).toThrow("Expected 'fn' to be a function, got 'string'");
+    expect(() => db.function("f", 42, () => 1)).toThrow("Expected 'options' to be an object, got 'number'");
+    expect(() =>
+      db.function(
+        "f",
+        () => 1,
+        () => 2,
+      ),
+    ).toThrow("Expected 'options' to be an object, got 'function'");
+    expect(() => db.function(Buffer.alloc(300, "x").toString(), () => 1)).toThrow(RangeError);
+    expect(() => db.function("f", { varargs: false }, (...args) => args.length)).not.toThrow();
+    expect(db.query("SELECT f() AS v").get()).toEqual({ v: 0 });
+
+    db.close();
+    expect(() => db.function("f", () => 1)).toThrow("Database has closed");
+  });
+});
+
 {
   const strictInputs = [
     { name: "myname", age: 42 },
