@@ -619,6 +619,60 @@ insertCats.immediate(cats); // uses "BEGIN IMMEDIATE"
 insertCats.exclusive(cats); // uses "BEGIN EXCLUSIVE"
 ```
 
+## User-defined functions
+
+`db.function(name, fn)` registers a JavaScript function that SQL statements on that database can call like a built-in function. SQLite calls it once per row, with the column values as arguments, and stores whatever it returns.
+
+```ts db.ts icon="/icons/typescript.svg" highlight={4,5}
+import { Database } from "bun:sqlite";
+
+const db = new Database(":memory:");
+db.function("slugify", (title: string) => title.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-"));
+db.query("SELECT slugify(title) AS slug FROM posts").all();
+```
+
+SQLite has no `REGEXP` function of its own. It turns `x REGEXP y` into a call to `regexp(y, x)`, so registering one makes the operator work:
+
+```ts db.ts icon="/icons/typescript.svg" highlight={1}
+db.function("regexp", (pattern: string, text: string) => (new RegExp(pattern).test(text) ? 1 : 0));
+db.query("SELECT name FROM cats WHERE name REGEXP ?").all("^J");
+```
+
+Arguments arrive with the same types as query results: `TEXT` is a `string`, `INTEGER` and `REAL` are `number`s, `BLOB` is a `Uint8Array`, and `NULL` is `null`. In TypeScript, each parameter is typed as that union (`FunctionArgument`) unless you annotate it with the type the SQL passes. The return value is stored like a [bound parameter](#datatypes): an integer `number` as `INTEGER`, any other `number` as `REAL`, a `boolean` as `1` or `0`, `undefined` as `NULL`. Returning an object or a `Promise` throws a `TypeError`, and a `bigint` outside the 64-bit range throws a `RangeError`.
+
+When the function throws, the statement fails and the exception propagates to the caller of `.get()`, `.all()`, `.run()` or the iterator:
+
+```ts db.ts icon="/icons/typescript.svg"
+db.function("check", (value: number) => {
+  if (value < 0) throw new RangeError(`negative: ${value}`);
+  return value;
+});
+
+db.query("SELECT check(-1)").get(); // throws RangeError: negative: -1
+```
+
+By default, the function takes exactly `fn.length` arguments, and SQLite rejects a call with a different count. Pass options as the second argument to change that and the other registration flags:
+
+```ts db.ts icon="/icons/typescript.svg"
+db.function("sum_all", { varargs: true }, (...values: number[]) => values.reduce((a, b) => a + b, 0));
+
+db.function("clamp", { deterministic: true }, (x: number, lo: number, hi: number) => Math.min(Math.max(x, lo), hi));
+db.run("CREATE INDEX scores_clamped ON results (clamp(score, 0, 100))");
+
+db.function("notify", { directOnly: true }, (id: number) => void queue.push(id));
+
+db.function("double", { safeIntegers: true }, (n: bigint) => n * 2n);
+```
+
+| Option          | Effect                                                                                                                                                                                    |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `varargs`       | Accept any number of arguments instead of `fn.length`.                                                                                                                                    |
+| `deterministic` | Promise SQLite that the same arguments always give the same result, which lets it call the function from an index expression or `CHECK` constraint (`SQLITE_DETERMINISTIC`).              |
+| `directOnly`    | Only allow calls from SQL the application runs directly, not from a view, trigger, `CHECK` constraint, `DEFAULT` or generated column (`SQLITE_DIRECTONLY`). Recommended for side effects. |
+| `safeIntegers`  | Pass `INTEGER` arguments as `bigint`. Defaults to the database's [`safeIntegers`](#integers) setting.                                                                                     |
+
+A function stays registered until the database is closed, and a closure that captures the database keeps it open until then. Registering another function with the same name and argument count replaces it. The function may run other statements on the same database, for example to look something up for each row, but not the statement that is calling it: that statement is still executing, so running, finalizing it or closing the database from inside the function throws.
+
 ### `.loadExtension()`
 
 To load a [SQLite extension](https://www.sqlite.org/loadext.html), call `.loadExtension(name)` on your `Database` instance:
@@ -700,6 +754,13 @@ class Database {
     exclusive: (...args: any) => void;
   };
 
+  function(name: string, fn: (...args: FunctionArgument[]) => FunctionResult): this;
+  function(
+    name: string,
+    options: { varargs?: boolean; deterministic?: boolean; directOnly?: boolean; safeIntegers?: boolean },
+    fn: (...args: FunctionArgument[]) => FunctionResult,
+  ): this;
+
   close(throwOnError?: boolean): void;
 }
 
@@ -732,6 +793,9 @@ type SQLQueryBindings =
   | boolean
   | null
   | Record<string, string | bigint | TypedArray | number | boolean | null>;
+
+type FunctionArgument = string | number | bigint | Uint8Array | null;
+type FunctionResult = string | number | bigint | boolean | TypedArray | null | undefined | void;
 ```
 
 ### Datatypes

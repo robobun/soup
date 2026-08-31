@@ -1,4 +1,4 @@
-import { type Changes, Database, constants } from "bun:sqlite";
+import { type Changes, Database, type FunctionArgument, constants } from "bun:sqlite";
 import { expectType } from "./utilities";
 
 expectType(constants.SQLITE_FCNTL_BEGIN_ATOMIC_WRITE).is<number>();
@@ -50,3 +50,23 @@ insertManyCats([
   // @ts-expect-error - Should fail
   { fail: true },
 ]);
+
+// user-defined functions
+expectType<Database>(
+  db.function("regexp", (pattern: string, text: string) => (new RegExp(pattern).test(text) ? 1 : 0)),
+);
+db.function("kind", value => {
+  expectType(value).is<FunctionArgument>();
+  return typeof value;
+});
+db.function("add", { deterministic: true, directOnly: true }, (a: number, b: number) => a + b);
+db.function("big", { safeIntegers: true }, (a: bigint) => a * 2n);
+db.function("concat", { varargs: true }, (...parts: FunctionArgument[]) => parts.join(""));
+db.function("blob", () => new Uint8Array(4));
+db.function("none", () => {});
+db.function("nil", () => null);
+db.function("flag", () => true);
+// @ts-expect-error - objects cannot be stored
+db.function("object", () => ({}));
+// @ts-expect-error - arguments are never objects
+db.function("object", (a: { x: number }) => 1);
