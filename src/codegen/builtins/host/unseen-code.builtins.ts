@@ -260,6 +260,7 @@ const moduleNamespaces = [
 
 const nativeFiles = [
   "CallSite.cpp",
+  "EventSourceBinding.cpp",
   "InternalForTesting.cpp",
   "InternalModuleRegistry.cpp",
   "IsolatedModuleCache.cpp",
