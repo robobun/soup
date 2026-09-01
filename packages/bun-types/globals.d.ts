@@ -1419,7 +1419,26 @@ declare function structuredClone<T>(value: T, options?: Bun.StructuredSerializeO
 declare function postMessage(message: any, transfer?: Bun.Transferable[]): void;
 
 interface EventSourceInit {
+  /**
+   * Accepted for compatibility with browsers. Bun has no cookie jar, so this
+   * value has no effect on the request.
+   */
   withCredentials?: boolean;
+  /**
+   * Headers to send with the request for the event stream, and with every
+   * reconnection. `Accept` is always `text/event-stream`, and `Last-Event-ID`
+   * is set by the `EventSource` once the server has sent an event with an `id`.
+   *
+   * This is a Bun-specific extension. It does not exist in browsers.
+   *
+   * @example
+   * ```ts
+   * const events = new EventSource("https://example.com/events", {
+   *   headers: { Authorization: `Bearer ${token}` },
+   * });
+   * ```
+   */
+  headers?: Bun.HeadersInit;
 }
 
 interface PromiseConstructor {
@@ -1748,9 +1767,33 @@ interface FormData {
 declare var FormData: Bun.__internal.UseLibDomIfAvailable<"FormData", { prototype: FormData; new (): FormData }>;
 
 interface EventSource extends Bun.__internal.LibEmptyOrEventSource {}
+/**
+ * A client for [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events).
+ *
+ * `EventSource` opens a `GET` request to a URL that responds with
+ * `Content-Type: text/event-stream` and dispatches a `MessageEvent` for every
+ * event in the stream. If the connection drops, it reconnects with the
+ * `Last-Event-ID` header after the server's `retry` time (3 seconds by default).
+ *
+ * @example
+ * ```ts
+ * const events = new EventSource("http://localhost:3000/events");
+ * events.onmessage = event => console.log(event.data);
+ * events.addEventListener("ticket", event => console.log(event.lastEventId));
+ * events.onerror = () => {
+ *   if (events.readyState === EventSource.CLOSED) console.log("gave up");
+ * };
+ * ```
+ */
 declare var EventSource: Bun.__internal.UseLibDomIfAvailable<
   "EventSource",
-  { prototype: EventSource; new (): EventSource }
+  {
+    prototype: EventSource;
+    new (url: string | URL, eventSourceInitDict?: EventSourceInit): EventSource;
+    readonly CONNECTING: 0;
+    readonly OPEN: 1;
+    readonly CLOSED: 2;
+  }
 >;
 
 interface Performance extends Bun.__internal.LibPerformanceOrNodePerfHooksPerformance {}

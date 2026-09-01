@@ -1269,6 +1269,17 @@ WEBCORE_GENERATED_CONSTRUCTOR_GETTER(WritableStream);
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(WritableStreamDefaultController);
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(WritableStreamDefaultWriter);
 
+// `EventSource` is implemented in JavaScript (src/js/internal/event_source.ts). The module is
+// evaluated the first time the global is read. This is a custom getter rather than a
+// `PropertyCallback` in the static table because the static table is reified in places
+// where the VM cannot run JavaScript.
+JSC_DEFINE_CUSTOM_GETTER(getEventSourceConstructor, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue, PropertyName))
+{
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+    auto& vm = JSC::getVM(globalObject);
+    return JSValue::encode(globalObject->internalModuleRegistry()->requireId(globalObject, vm, Bun::InternalModuleRegistry::Field::InternalEventSource));
+}
+
 JSC_DEFINE_HOST_FUNCTION(functionGetSelf,
     (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
@@ -2951,6 +2962,8 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     // TODO: this should be usable on the lookup table. it crashed las time i tried it
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onmessage"_s), JSC::CustomGetterSetter::create(vm, globalOnMessage, setGlobalOnMessage), 0);
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onerror"_s), JSC::CustomGetterSetter::create(vm, globalOnError, setGlobalOnError), 0);
+
+    putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "EventSource"_s), JSC::CustomGetterSetter::create(vm, getEventSourceConstructor, nullptr), PropertyAttribute::CustomValue | 0);
 
     // ----- Extensions to Built-in objects -----
 

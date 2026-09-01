@@ -873,6 +873,67 @@ Files: `src/jsc/bindings/sqlite/JSSQLStatement.cpp` (`SQLiteUserFunction`, `jsSQ
 `packages/bun-types/sqlite.d.ts` (`FunctionOptions`, `FunctionArgument`, `FunctionResult`),
 `docs/runtime/sqlite.mdx`, `test/js/bun/sqlite/sqlite.test.js`, `test/integration/bun-types/fixture/sqlite.ts`.
 
+### 2026-09-01: `EventSource`
+
+Bun can serve server-sent events (the docs have a guide for it) but could not consume them:
+`EventSource`, the web API for that, was not defined. bun-types has declared the global since 2023,
+so `new EventSource(url)` type-checked and then threw `ReferenceError` at runtime. A native
+implementation landed in 2023 (oven-sh/bun#3074, a hand-written HTTP/1.1 client over `Bun.connect`),
+never became reachable and was removed in oven-sh/bun#14421 as "doesn't work anyway";
+oven-sh/bun#8474 asks for it to come back. Streaming APIs (LLM token streams, deployment logs,
+realtime databases) are mostly SSE, and Node has had `EventSource` since 22.3 (behind
+`--experimental-eventsource`). `EventSource` is now a global, per the HTML spec and built on `fetch`:
+
+```ts
+const events = new EventSource("http://localhost:3000/events");
+events.onopen = () => console.log("connected");
+events.onmessage = event => console.log(event.data, event.lastEventId);
+events.addEventListener("alert", event => console.log("alert:", event.data));
+events.onerror = () => {
+  if (events.readyState === EventSource.CLOSED)
+    console.log("the server refused the stream");
+};
+events.close();
+
+// Bun extension, like `new WebSocket(url, { headers })`:
+new EventSource(url, { headers: { Authorization: `Bearer ${token}` } });
+```
+
+The request is a `GET` with `Accept: text/event-stream`. A `200` with a `text/event-stream` content
+type (parameters allowed) opens the connection; any other status or type fails it, which is the spec's
+"fail the connection": one `error` event, `readyState` `CLOSED`, no retry (a `404` is not retried every
+three seconds). A network error or the server ending the stream "reestablishes the connection": an
+`error` event with `readyState` `CONNECTING`, then a new request after the reconnection time, 3 seconds
+unless the server sent `retry: <ms>`, carrying `Last-Event-ID` when an event with an `id` has been
+received. The stream parser follows the spec's field rules: `data` lines join with `\n`, `event` sets
+the type, `id` sets the last event ID (ignored when it contains NUL, a bare `id` resets it, a block with
+only an `id` updates it without dispatching), `retry` must be ASCII digits, `:` lines are comments, a
+single space after the colon is dropped, lines end at CRLF, LF or CR, and a leading byte order mark is
+skipped. A CR that ends a chunk and the LF that starts the next count as one line ending; a UTF-8
+sequence split across chunks is decoded whole (`TextDecoder` in stream mode). `close()` aborts the
+fetch, so the server's `ReadableStream` is cancelled, and it clears the retry timer, so a closed
+`EventSource` does not keep the process alive. `MessageEvent.origin` is the origin of the response URL
+after redirects, `withCredentials` is stored and does nothing (Bun has no cookie jar), and the
+constructor throws a `SyntaxError` `DOMException` for an invalid URL or a scheme other than `http:` and
+`https:`, where browsers would fail asynchronously and retry forever. The `headers` option is the same
+extension Bun's `WebSocket` client has; `Accept` is always forced and `Last-Event-ID` from the caller
+is sent until the server supplies an id. The class is a TypeScript builtin (`src/js/internal/event_source.ts`)
+and `undici.EventSource` (previously a stub that did nothing) is the same class.
+
+The global is a custom getter that evaluates the module on first access, not an entry in the global
+object's static property table. The static table is reified in places where JavaScriptCore cannot run
+JavaScript (the debug build aborts), which is why the 2023 implementation stopped working once
+oven-sh/bun#5355 moved it into that table: its callback ran JavaScript and came back `undefined`.
+While testing, a pre-existing bug turned up and was reported
+separately rather than fixed here: a `Request` handed to a `Bun.serve` handler loses its `url` and
+`headers` once the response has completed, unless they were read inside the handler.
+
+Files: `src/js/internal/event_source.ts`, `src/jsc/bindings/ZigGlobalObject.cpp` (`getEventSourceConstructor`),
+`src/js/thirdparty/undici.js`, `packages/bun-types/globals.d.ts` (`EventSourceInit.headers`, the
+constructor type), `packages/bun-types/bun.d.ts` (drops the never-implemented `ref()`/`unref()`),
+`docs/guides/http/sse.mdx`, `docs/runtime/web-apis.mdx`, `docs/runtime/bun-apis.mdx`,
+`test/js/web/eventsource/eventsource.test.ts`, `test/integration/bun-types/fixture/globals.ts`.
+
 ## Dropped
 
 Nothing yet.

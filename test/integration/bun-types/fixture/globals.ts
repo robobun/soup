@@ -311,6 +311,26 @@ const writableStream = new WritableStream();
     headers: { "Authorization": "my key" },
   });
 }
+{
+  const events = new EventSource("http://localhost:3000/events");
+  expectType<string>(events.url);
+  expectType<boolean>(events.withCredentials);
+  events.readyState === EventSource.OPEN;
+  events.readyState === events.CLOSED;
+  events.onopen = () => {};
+  events.onmessage = event => {
+    expectType<string>(event.lastEventId);
+    event.data;
+  };
+  events.onerror = null;
+  events.addEventListener("message", event => event.data);
+  events.close();
+
+  new EventSource(new URL("http://localhost:3000/events"), {
+    withCredentials: true,
+    headers: { Authorization: "Bearer token" },
+  });
+}
 
 atob("asf");
 btoa("asdf");

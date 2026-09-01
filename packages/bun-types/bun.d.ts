@@ -511,20 +511,6 @@ declare module "bun" {
       listener: EventListenerOrEventListenerObject,
       options?: boolean | EventListenerOptions,
     ): void;
-
-    /**
-     * Keep the event loop alive while the connection is open or reconnecting
-     *
-     * Not available in browsers
-     */
-    ref(): void;
-
-    /**
-     * Do not keep the event loop alive while the connection is open or reconnecting
-     *
-     * Not available in browsers
-     */
-    unref(): void;
   }
 
   interface TransformerFlushCallback<O> {
