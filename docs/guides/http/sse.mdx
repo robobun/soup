@@ -89,3 +89,38 @@ Bun.serve({
   },
 });
 ```
+
+## Consuming an event stream with `EventSource`
+
+Bun implements the [`EventSource`](https://developer.mozilla.org/en-US/docs/Web/API/EventSource) class, so a Bun process can subscribe to an SSE endpoint the same way a browser does. Each event in the stream becomes a `MessageEvent`. Events with an `event:` field are dispatched under that name, everything else as `message`.
+
+```ts client.ts icon="/icons/typescript.svg"
+const events = new EventSource("http://localhost:3000/events");
+
+events.onopen = () => console.log("connected");
+events.onmessage = event => console.log("tick:", event.data);
+events.addEventListener("alert", event => console.log("alert:", event.data));
+
+events.onerror = () => {
+  if (events.readyState === EventSource.CLOSED) {
+    console.log("the server refused the stream");
+  } else {
+    console.log("connection lost, reconnecting");
+  }
+};
+
+// Later: stop listening and close the connection.
+events.close();
+```
+
+If the connection drops, `EventSource` fires an `error` event and reconnects after 3 seconds, or after the time the server set with a `retry:` field. The reconnection request carries the `Last-Event-ID` header with the `id:` of the last event received, so the server can resume the stream. A response with a status other than `200`, or without a `text/event-stream` content type, closes the `EventSource` for good (`readyState` is `EventSource.CLOSED`) and no further attempts are made.
+
+Browsers only send cookies with the request. In Bun, you can also pass request headers to the constructor, for example to authenticate. This is a Bun-specific extension. _It does not work in browsers._
+
+```ts
+const events = new EventSource("https://api.example.com/events", {
+  headers: { Authorization: `Bearer ${token}` }, // [!code ++]
+});
+```
+
+The headers are sent with the first request and with every reconnection.
