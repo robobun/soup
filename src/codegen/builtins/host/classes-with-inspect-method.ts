@@ -6,6 +6,7 @@ export const classesWithInspectMethod = [
   "CountQueuingStrategy",
   "CryptoKey",
   "DecompressionStream",
+  "EventSource",
   "PerformanceEntry",
   "ReadableByteStreamController",
   "ReadableStream",
