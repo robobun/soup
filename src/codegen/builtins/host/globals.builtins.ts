@@ -1667,6 +1667,8 @@ export default b.declarations(
   // Native code answers a read and takes a store, and a descriptor shows a data property (ZigGlobalObject.cpp: a CustomGetterSetter without the attribute of an accessor).
   b.static("onerror", b.property(b.any, { setter: eventHandlerAttribute(globalObject).setter })),
   b.static("onmessage", b.property(b.any, { setter: eventHandlerAttribute(globalObject).setter })),
+  // A class of the library (src/js/internal/event_source.ts) that native code loads where the global is first read.
+  b.static("EventSource", b.property(b.any)),
   b.fn("addEventListener", listenerRegistration(globalObject)),
   b.fn("removeEventListener", listenerRemoval),
 

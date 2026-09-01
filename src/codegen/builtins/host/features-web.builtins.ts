@@ -108,6 +108,12 @@ export default b.declarations(
 
   extendAll(["Url"], "Bun.pathToFileURL", "URL", "URLSearchParams"),
   extendAll(["Events"], "CloseEvent", "CustomEvent", "ErrorEvent", "Event", "MessageEvent"),
+  // src/js/internal/event_source.ts: a fetch() whose body it decodes, and the events it fires for it.
+  extendAll(
+    [...fetchFeatures, ...abortSignalFeatures, "TextDecoder", "Url"],
+    "EventSource",
+    ...nativeBindings("Cpp", "EventSourceBinding.cpp", "createEventSourceBinding"),
+  ),
   extendAll(abortSignalFeatures, "AbortSignal", "AbortController"),
   extendAll(["Headers"], "Headers"),
   extendAll(["FormData", "Bodies"], "FormData"),
