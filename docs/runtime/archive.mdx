@@ -1,9 +1,9 @@
 ---
 title: Archive
-description: Create and extract tar archives with Bun's fast native implementation
+description: Create and extract tar and zip archives with Bun's fast native implementation
 ---
 
-`Bun.Archive` is Bun's native API for tar archives. It creates archives from in-memory data, extracts archives to disk, and reads archive contents without extraction.
+`Bun.Archive` is Bun's native API for tar and zip archives. It creates archives from in-memory data, extracts archives to disk, and reads archive contents without extraction.
 
 ## Quickstart
 
@@ -27,6 +27,13 @@ const tarball = await Bun.file("package.tar.gz").bytes();
 const archive = new Bun.Archive(tarball);
 const entryCount = await archive.extract("./output");
 console.log(`Extracted ${entryCount} entries`);
+```
+
+**Create a zip file:**
+
+```ts
+const zip = new Bun.Archive({ "hello.txt": "Hello, World!" }, { format: "zip" });
+await Bun.write("hello.zip", await zip.bytes());
 ```
 
 **Read archive contents without extracting:**
@@ -113,12 +120,16 @@ const gzippedBlob = await gzipped.blob();
 
 ### From Existing Archive Data
 
-Create an archive from existing tar/tar.gz data:
+Create an archive from existing tar, tar.gz or zip data. The format is detected from the bytes:
 
 ```ts
 // From a file
 const tarball = await Bun.file("package.tar.gz").bytes();
 const archiveFromFile = new Bun.Archive(tarball);
+
+// A zip works the same way
+const zip = await Bun.file("release.zip").bytes();
+const archiveFromZip = new Bun.Archive(zip);
 ```
 
 ```ts
@@ -318,6 +329,34 @@ The `options` argument accepts:
 - No options or `undefined` - Uncompressed tar (default)
 - `{ compress: "gzip" }` - Enable gzip compression at level 6
 - `{ compress: "gzip", level: number }` - Gzip with custom level 1-12 (1 = fastest, 12 = smallest)
+- `{ format: "zip" }` - A zip file instead of a tarball, see below
+
+## Zip
+
+Pass `{ format: "zip" }` to build a zip file instead of a tarball. Each entry is deflated, which is the compression every zip tool reads. Reading needs no option: a zip is detected from its bytes, like a gzipped tarball is.
+
+```ts
+// Deflate each entry at level 6 (default)
+const zip = new Bun.Archive({ "hello.txt": "Hello, World!" }, { format: "zip" });
+await Bun.write("hello.zip", await zip.bytes());
+
+// Deflate level 1-9 (1 = fastest, 9 = smallest)
+const smallest = new Bun.Archive(files, { format: "zip", level: 9 });
+
+// Store the entries as they are, for data that is already compressed
+const photo = await Bun.file("photo.jpg").bytes();
+const stored = new Bun.Archive({ "photo.jpg": photo }, { format: "zip", compress: false });
+
+// Write straight to disk
+await Bun.Archive.write("bundle.zip", files, { format: "zip" });
+
+// Reading: extract() and files() work on a zip like on a tarball
+const archive = new Bun.Archive(await Bun.file("release.zip").bytes());
+await archive.extract("./release");
+const readme = (await archive.files("README.md")).get("README.md");
+```
+
+Entry names are written as UTF-8 and marked as such, so other tools read a non-ASCII name correctly. Entries compressed with a method bun does not ship (bzip2, LZMA, XZ, Zstandard) and encrypted entries cannot be read: `files()` and `extract()` reject. Passing `format` with existing archive data throws a `TypeError`, since that data already has a format. So does `compress: "gzip"` together with `format: "zip"`, or `compress: "deflate"` without it.
 
 ## Examples
 
@@ -404,9 +443,14 @@ type ArchiveInput =
   | ArrayBufferLike;
 
 type ArchiveOptions = {
-  /** Compression algorithm. Currently only "gzip" is supported. */
-  compress?: "gzip";
-  /** Compression level 1-12 (default 6 when gzip is enabled). */
+  /** The container built from an object: "tar" (default) or "zip". */
+  format?: "tar" | "zip";
+  /**
+   * Compression algorithm, or false for none.
+   * tar: "gzip" (whole archive) or false (default). zip: "deflate" (default, per entry) or false.
+   */
+  compress?: "gzip" | "deflate" | false;
+  /** Compression level: gzip 1-12, deflate 1-9 (default 6). */
   level?: number;
 };
 
@@ -419,8 +463,8 @@ class Archive {
   /**
    * Create an Archive from input data
    * @param data - Files to archive (as object) or existing archive data (as bytes/blob)
-   * @param options - Compression options. Uncompressed by default.
-   *                  Pass { compress: "gzip" } to enable compression.
+   * @param options - Format and compression options. An uncompressed tarball by default.
+   *                  Pass { compress: "gzip" } to gzip it, or { format: "zip" } for a zip file.
    */
   constructor(data: ArchiveInput, options?: ArchiveOptions);
 
