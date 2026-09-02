@@ -77,6 +77,7 @@ pub mod lib {
         fn archive_read_free(a: *mut Archive) -> Result;
         fn archive_read_support_format_tar(a: *mut Archive) -> Result;
         fn archive_read_support_format_gnutar(a: *mut Archive) -> Result;
+        fn archive_read_support_format_zip(a: *mut Archive) -> Result;
         fn archive_read_support_filter_gzip(a: *mut Archive) -> Result;
         fn archive_read_set_options(a: *mut Archive, opts: *const c_char) -> Result;
         fn archive_read_open_memory(a: *mut Archive, buf: *const c_void, size: usize) -> Result;
@@ -107,6 +108,7 @@ pub mod lib {
         fn archive_write_set_bytes_in_last_block(a: *mut Archive, bytes: c_int) -> Result;
         fn archive_set_error(a: *mut Archive, err: c_int, fmt: *const c_char, ...);
         fn archive_write_set_format_pax_restricted(a: *mut Archive) -> Result;
+        fn archive_write_set_format_zip(a: *mut Archive) -> Result;
         fn archive_write_add_filter_gzip(a: *mut Archive) -> Result;
         fn archive_write_set_filter_option(
             a: *mut Archive,
@@ -139,6 +141,7 @@ pub mod lib {
         fn archive_entry_symlink(e: *mut Entry) -> *const c_char;
         fn archive_entry_perm(e: *mut Entry) -> bun_sys::Mode;
         fn archive_entry_size(e: *mut Entry) -> la_int64_t;
+        fn archive_entry_size_is_set(e: *mut Entry) -> c_int;
         fn archive_entry_filetype(e: *mut Entry) -> bun_sys::Mode;
         fn archive_entry_mtime(e: *mut Entry) -> time_t;
         fn archive_entry_set_pathname(e: *mut Entry, name: *const c_char);
@@ -148,6 +151,18 @@ pub mod lib {
         fn archive_entry_set_perm(e: *mut Entry, p: bun_sys::Mode);
         fn archive_entry_set_mtime(e: *mut Entry, secs: time_t, nsecs: c_long);
     }
+
+    /// Options for a reader with the zip formats registered. `!mac-ext`
+    /// stops the seekable reader from folding `__MACOSX/._*` entries into
+    /// the file they describe, which it does on macOS only and the streamable
+    /// reader never does, so every platform lists the same entries. On
+    /// Windows, `hdrcharset` decodes an entry name without the UTF-8 flag as
+    /// UTF-8 instead of widening each byte; on POSIX the raw bytes go through
+    /// as they are, and the option would fail without iconv.
+    #[cfg(windows)]
+    pub const ZIP_READ_OPTIONS: &core::ffi::CStr = c"zip:!mac-ext,zip:hdrcharset=UTF-8";
+    #[cfg(not(windows))]
+    pub const ZIP_READ_OPTIONS: &core::ffi::CStr = c"zip:!mac-ext";
 
     /// One block from `archive_read_data_block`. `bytes` borrows libarchive's
     /// internal buffer (valid until the next read call on the owning archive).
@@ -288,6 +303,12 @@ pub mod lib {
             // SAFETY: self valid.
             unsafe { archive_read_support_format_gnutar(self.as_mut_ptr()) }
         }
+        /// Registers both zip readers: the seekable one (reads the central
+        /// directory, which `read_open_memory` allows) and the streamable one.
+        pub fn read_support_format_zip(&self) -> Result {
+            // SAFETY: self valid.
+            unsafe { archive_read_support_format_zip(self.as_mut_ptr()) }
+        }
         pub fn read_support_filter_gzip(&self) -> Result {
             // SAFETY: self valid.
             unsafe { archive_read_support_filter_gzip(self.as_mut_ptr()) }
@@ -357,9 +378,15 @@ pub mod lib {
                     result: r,
                 });
             }
-            // SAFETY: on ARCHIVE_OK, libarchive guarantees buff[0..size] is
-            // readable until the next read call on this archive.
-            let bytes = unsafe { core::slice::from_raw_parts(buff.cast::<u8>(), size) };
+            // A reader may hand back an empty block with a null pointer (the
+            // zip reader does so once a stored entry's bytes are used up).
+            let bytes = if buff.is_null() || size == 0 {
+                &[]
+            } else {
+                // SAFETY: on ARCHIVE_OK, libarchive guarantees buff[0..size] is
+                // readable until the next read call on this archive.
+                unsafe { core::slice::from_raw_parts(buff.cast::<u8>(), size) }
+            };
             Some(Block {
                 bytes,
                 offset: *offset,
@@ -417,6 +444,10 @@ pub mod lib {
         pub fn write_set_format_pax_restricted(&self) -> Result {
             // SAFETY: self valid.
             unsafe { archive_write_set_format_pax_restricted(self.as_mut_ptr()) }
+        }
+        pub fn write_set_format_zip(&self) -> Result {
+            // SAFETY: self valid.
+            unsafe { archive_write_set_format_zip(self.as_mut_ptr()) }
         }
         pub fn write_add_filter_gzip(&self) -> Result {
             // SAFETY: self valid.
@@ -479,6 +510,12 @@ pub mod lib {
         pub fn size(&self) -> i64 {
             // SAFETY: self valid.
             unsafe { archive_entry_size(self.as_mut_ptr()) }
+        }
+        /// False for an entry whose size the archive states after its data: a zip written
+        /// as a stream and read without its central directory. `size()` is 0 for it.
+        pub fn size_is_set(&self) -> bool {
+            // SAFETY: self valid.
+            unsafe { archive_entry_size_is_set(self.as_mut_ptr()) != 0 }
         }
         pub fn filetype(&self) -> u32 {
             // SAFETY: self valid.
@@ -978,13 +1015,17 @@ impl BufferReadStream {
         unsafe { &*self.buf }
     }
 
-    /// `npm` makes libarchive read the tarball the way npm's own tar reader does. See
-    /// patches/libarchive/tar-npm-compat.patch.
-    pub(crate) fn open_read(&mut self, npm: bool) -> lib::Result {
+    /// Opens the buffer as a tar or tar.gz archive, and as a zip archive as
+    /// well when `zip` is set. `npm` makes libarchive read the tarball the way
+    /// npm's own tar reader does. See patches/libarchive/tar-npm-compat.patch.
+    pub(crate) fn open_read(&mut self, npm: bool, zip: bool) -> lib::Result {
         let archive = self.archive();
 
         let _ = archive.read_support_format_tar();
         let _ = archive.read_support_format_gnutar();
+        if zip {
+            let _ = archive.read_support_format_zip();
+        }
         let _ = archive.read_support_filter_gzip();
 
         // Ignore zeroed blocks in the archive, which occurs when multiple tar archives
@@ -996,6 +1037,9 @@ impl BufferReadStream {
         } else {
             c"read_concatenated_archives"
         });
+        if zip {
+            let _ = archive.read_set_options(lib::ZIP_READ_OPTIONS);
+        }
 
         archive.read_open_memory(self.buf())
     }
@@ -1292,6 +1336,9 @@ pub mod archiver {
         pub log: bool,
         pub npm: bool,
         pub skip_symlinks: bool,
+        /// Accept a zip archive as well as a tarball. `Bun.Archive` sets this;
+        /// `bun install` only ever extracts tarballs.
+        pub zip: bool,
     }
 
     impl Default for ExtractOptions {
@@ -1302,6 +1349,7 @@ pub mod archiver {
                 log: false,
                 npm: false,
                 skip_symlinks: false,
+                zip: false,
             }
         }
     }
@@ -1339,7 +1387,7 @@ impl Archiver {
 
         // SAFETY: `file_buffer` outlives `stream` (stack-local, dropped at fn exit).
         let mut stream = unsafe { BufferReadStream::init(file_buffer) };
-        let _ = stream.open_read(false);
+        let _ = stream.open_read(false, false);
         let archive = stream.archive;
 
         // Uses the bun_sys directory-fd helpers (open_dir_absolute / open_dir_at).
@@ -1500,7 +1548,7 @@ impl Archiver {
 
         // SAFETY: `file_buffer` outlives `stream` (stack-local, dropped at fn exit).
         let mut stream = unsafe { BufferReadStream::init(file_buffer) };
-        let _ = stream.open_read(options.npm);
+        let _ = stream.open_read(options.npm, options.zip);
         let archive = stream.archive;
         let mut count: u32 = 0;
         let dir_fd = dir;
@@ -1850,7 +1898,10 @@ impl Archiver {
                                 usize::try_from(lib::Entry::opaque_ref(entry).size().max(0))
                                     .unwrap();
 
-                            if size > 0 {
+                            // A zip read as a stream (no central directory, or inside
+                            // gzip) states the size of an entry after its data. Such
+                            // an entry has no size yet and is read to its end.
+                            if size > 0 || !lib::Entry::opaque_ref(entry).size_is_set() {
                                 if let Some(ctx_) = ctx.as_deref_mut() {
                                     let h: u64 = if !ctx_.pluckers.is_empty() {
                                         hash(slice_as_bytes(path_slice))

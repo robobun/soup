@@ -1,0 +1,61 @@
+--- a/libarchive/archive_read_support_format_zip.c
++++ b/libarchive/archive_read_support_format_zip.c
+@@ -1005,6 +1005,14 @@
+ 			    "Can't allocate memory for Pathname");
+ 			return (ARCHIVE_FATAL);
+ 		}
++		/*
++		 * BUN PATCH: keep the raw bytes, as the symlink target below
++		 * and the tar reader's pax path already do when a conversion
++		 * fails. Without this the entry had no pathname at all, and
++		 * bun's "C" locale cannot represent any UTF-8 name, which is
++		 * what the name is handed on as anyway.
++		 */
++		archive_entry_copy_pathname_l(entry, h, filename_length, NULL);
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Pathname cannot be converted "
+--- a/libarchive/archive_write_set_format_zip.c
++++ b/libarchive/archive_write_set_format_zip.c
+@@ -186,6 +186,8 @@
+ #define ZIP_FLAG_AVOID_ZIP64 1
+ #define ZIP_FLAG_FORCE_ZIP64 2
+ #define ZIP_FLAG_EXPERIMENT_xl 4
++/* BUN PATCH: see the "utf8-names" option. */
++#define ZIP_FLAG_UTF8_NAMES 8
+ 	int flags;
+ #if defined(HAVE_LZMA_H) || defined(HAVE_ZLIB_H) || defined(HAVE_BZLIB_H) || defined(HAVE_ZSTD_H)
+ 	union {
+@@ -507,6 +509,21 @@
+ 			zip->flags |= ZIP_FLAG_EXPERIMENT_xl;
+ 		}
+ 		return (ARCHIVE_OK);
++	} else if (strcmp(key, "utf8-names") == 0) {
++		/*
++		 * BUN PATCH: the caller hands every pathname over as UTF-8
++		 * bytes and wants them written as they are, with the UTF-8
++		 * flag (general purpose bit 11) set on non-ASCII names.
++		 * Upstream only sets that flag when the process locale is
++		 * UTF-8 or when "hdrcharset" can convert to UTF-8, and bun
++		 * runs in the "C" locale without iconv, where neither holds.
++		 */
++		if (val == NULL || val[0] == 0) {
++			zip->flags &= ~ ZIP_FLAG_UTF8_NAMES;
++		} else {
++			zip->flags |= ZIP_FLAG_UTF8_NAMES;
++		}
++		return (ARCHIVE_OK);
+ 	} else if (strcmp(key, "fakecrc32") == 0) {
+ 		/*
+ 		 * FOR TESTING ONLY:  disable CRC calculation to speed up
+@@ -948,7 +965,9 @@
+ 
+ 	/* If filename isn't ASCII and we can use UTF-8, set the UTF-8 flag. */
+ 	if (!is_all_ascii(archive_entry_pathname(zip->entry))) {
+-		if (zip->opt_sconv != NULL) {
++		if (zip->flags & ZIP_FLAG_UTF8_NAMES) {
++			zip->entry_flags |= ZIP_ENTRY_FLAG_UTF8_NAME;
++		} else if (zip->opt_sconv != NULL) {
+ 			if (strcmp(archive_string_conversion_charset_name(
+ 					zip->opt_sconv), "UTF-8") == 0)
+ 				zip->entry_flags |= ZIP_ENTRY_FLAG_UTF8_NAME;
