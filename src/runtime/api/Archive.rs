@@ -1,4 +1,4 @@
-//! `Bun.Archive` — tar/tgz pack + extract over libarchive.
+//! `Bun.Archive` — tar/tgz/zip pack + extract over libarchive.
 
 use std::ffi::CString;
 
@@ -19,7 +19,9 @@ use bun_sys::{self, Fd, FdDirExt as _, FdExt as _, Mode};
 /// does not yet expose `FileType`, so mirror the constant locally.
 const FILETYPE_REGULAR: u32 = 0o100000;
 
-/// Compression options for the archive
+/// Compression applied to the whole archive when it is emitted (`blob()`,
+/// `bytes()`, `Archive.write`). Only a tarball takes one: a zip compresses
+/// each entry itself.
 #[derive(Clone, Copy, Default)]
 pub(crate) enum Compression {
     #[default]
@@ -31,6 +33,47 @@ pub(crate) enum Compression {
 pub(crate) struct GzipOptions {
     /// Compression level: 1 (fastest) to 12 (maximum compression). Default is 6.
     pub level: u8,
+}
+
+/// The container built from an object input.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Format {
+    #[default]
+    Tar,
+    /// Entries are deflated at `level` (1 to 9, zlib's scale), or stored
+    /// as they are when `deflate` is `None`.
+    Zip { deflate: Option<u8> },
+}
+
+impl Format {
+    fn name(self) -> &'static str {
+        match self {
+            Format::Tar => "tarball",
+            Format::Zip { .. } => "zip",
+        }
+    }
+}
+
+/// `new Archive(data, options)` / `Archive.write(path, data, options)` options.
+#[derive(Clone, Copy, Default)]
+struct Options {
+    /// `None` when the caller did not pass `format`: an object builds a
+    /// tarball, and existing archive data is read as whatever it is.
+    format: Option<Format>,
+    /// `None` when the caller did not pass `compress`, so that
+    /// `Archive.write` can fall back to the archive's own setting;
+    /// `compress: false` is `Some(Compression::None)`.
+    compress: Option<Compression>,
+}
+
+impl Options {
+    fn format(self) -> Format {
+        self.format.unwrap_or_default()
+    }
+
+    fn compress(self) -> Compression {
+        self.compress.unwrap_or_default()
+    }
 }
 
 // Hand-written JS class glue (not the `#[bun_jsc::JsClass]` derive): Archive
@@ -111,12 +154,14 @@ impl Archive {
     }
 }
 
-/// Configure archive for reading tar/tar.gz
+/// Configure archive for reading tar/tar.gz/zip
 fn configure_archive_reader(archive: &libarchive::lib::Archive) {
     let _ = archive.read_support_format_tar();
     let _ = archive.read_support_format_gnutar();
+    let _ = archive.read_support_format_zip();
     let _ = archive.read_support_filter_gzip();
     let _ = archive.read_set_options(c"read_concatenated_archives");
+    let _ = archive.read_set_options(libarchive::lib::ZIP_READ_OPTIONS);
 }
 
 /// Entry pathname as owned UTF-8 bytes. libarchive on Windows keeps a
@@ -154,9 +199,11 @@ impl Archive {
     /// - An object { [path: string]: Blob | string | ArrayBufferView | ArrayBufferLike }
     /// - A Blob, ArrayBufferView, or ArrayBufferLike (assumes it's already a valid archive)
     /// Options:
-    /// - compress: "gzip" - Enable gzip compression
-    /// - level: number (1-12) - Compression level (default 6)
-    /// When no options are provided, no compression is applied
+    /// - format: "tar" (default) or "zip" - The container built from an object
+    /// - compress: "gzip" - Enable gzip compression of a tarball;
+    ///   "deflate" (default) or false - Per-entry compression of a zip
+    /// - level: number - Compression level (1-12 for gzip, 1-9 for deflate, default 6)
+    /// When no options are provided, an uncompressed tarball is built
     // NOTE: `#[bun_jsc::host_fn]` has no `constructor` kind yet; the
     // `JsClass` derive emits a `constructor` shim that calls this directly.
     pub(crate) fn constructor(
@@ -170,29 +217,30 @@ impl Archive {
             );
         }
 
-        // Parse compression options
-        let compress = parse_compression_options(global, options_arg)?;
+        let options = parse_options(global, options_arg)?;
 
         // For Blob/Archive, ref the existing store (zero-copy)
         if let Some(blob) = blob_from_js(data_arg) {
             if let Some(store) = blob.store.get().as_ref() {
+                reject_format_for_archive_data(global, options)?;
                 return Ok(Box::new(Archive {
                     store: store.clone(),
-                    compress,
+                    compress: options.compress(),
                 }));
             }
         }
 
         // For ArrayBuffer/TypedArray, copy the data
         if let Some(array_buffer) = data_arg.as_array_buffer(global) {
+            reject_format_for_archive_data(global, options)?;
             let data: Vec<u8> = array_buffer.slice().to_vec();
-            return Ok(create_archive(data, compress));
+            return Ok(create_archive(data, options.compress()));
         }
 
-        // For plain objects, build a tarball
+        // For plain objects, build a tarball or a zip
         if data_arg.is_object() {
-            let data = build_tarball_from_object(global, data_arg)?;
-            return Ok(create_archive(data, compress));
+            let data = build_archive_from_object(global, data_arg, options.format())?;
+            return Ok(create_archive(data, options.compress()));
         }
 
         Err(global.throw_invalid_arguments(format_args!(
@@ -201,15 +249,11 @@ impl Archive {
     }
 }
 
-/// Parse compression options from JS value
-/// Returns .none if no compression specified, caller must handle defaults
-fn parse_compression_options(
-    global: &JSGlobalObject,
-    options_arg: JSValue,
-) -> JsResult<Compression> {
-    // No options provided means no compression (caller handles defaults)
+/// Parse the options object: `format`, `compress` and `level`.
+/// Returns the defaults (a tarball, no compression) when no options are given.
+fn parse_options(global: &JSGlobalObject, options_arg: JSValue) -> JsResult<Options> {
     if options_arg.is_undefined_or_null() {
-        return Ok(Compression::None);
+        return Ok(Options::default());
     }
 
     if !options_arg.is_object() {
@@ -218,45 +262,117 @@ fn parse_compression_options(
         );
     }
 
-    // Check for compress option
-    if let Some(compress_val) = options_arg.get_truthy(global, "compress")? {
-        // compress must be "gzip"
-        if !compress_val.is_string() {
+    let mut format: Option<Format> = None;
+    if let Some(format_val) = options_arg.get_truthy(global, "format")? {
+        if !format_val.is_string() {
             return Err(global.throw_invalid_arguments(format_args!(
-                "Archive: compress option must be a string"
+                "Archive: format must be \"tar\" or \"zip\""
             )));
         }
-
-        let compress_str = compress_val.to_utf8(global)?;
-
-        if compress_str.slice() != b"gzip" {
-            return Err(global.throw_invalid_arguments(format_args!(
-                "Archive: compress option must be \"gzip\""
-            )));
-        }
-
-        // Parse level option (1-12, default 6)
-        let mut level: u8 = 6;
-        if let Some(level_val) = options_arg.get_truthy(global, "level")? {
-            if !level_val.is_number() {
-                return Err(
-                    global.throw_invalid_arguments(format_args!("Archive: level must be a number"))
-                );
-            }
-            let level_num = level_val.to_int64();
-            if level_num < 1 || level_num > 12 {
+        let format_str = format_val.to_utf8(global)?;
+        format = Some(match format_str.slice() {
+            b"tar" => Format::Tar,
+            b"zip" => Format::Zip { deflate: None },
+            _ => {
                 return Err(global.throw_invalid_arguments(format_args!(
-                    "Archive: level must be between 1 and 12"
+                    "Archive: format must be \"tar\" or \"zip\""
                 )));
             }
-            level = u8::try_from(level_num).expect("int cast");
-        }
-
-        return Ok(Compression::Gzip(GzipOptions { level }));
+        });
     }
 
-    // No compress option specified in options object means no compression
-    Ok(Compression::None)
+    // `compress` names the algorithm, or is `false` for none. A tarball is
+    // gzipped as a whole; a zip deflates each entry, which is its default.
+    enum Algorithm {
+        Gzip,
+        Deflate,
+    }
+    let is_zip = matches!(format, Some(Format::Zip { .. }));
+    let algorithm = match options_arg.get(global, "compress")? {
+        None if is_zip => Some(Algorithm::Deflate),
+        None => {
+            return Ok(Options {
+                format,
+                compress: None,
+            });
+        }
+        Some(v) if v.is_null() || v == JSValue::FALSE => None,
+        Some(v) if v.is_string() => match v.to_utf8(global)?.slice() {
+            b"gzip" => Some(Algorithm::Gzip),
+            b"deflate" => Some(Algorithm::Deflate),
+            _ => {
+                return Err(global.throw_invalid_arguments(format_args!(
+                    "Archive: compress must be \"gzip\", \"deflate\" or false"
+                )));
+            }
+        },
+        Some(_) => {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "Archive: compress must be \"gzip\", \"deflate\" or false"
+            )));
+        }
+    };
+
+    let compress = match (algorithm, is_zip) {
+        (None, _) => Compression::None,
+        (Some(Algorithm::Gzip), false) => Compression::Gzip(GzipOptions {
+            level: parse_level(global, options_arg, 12, "")?,
+        }),
+        (Some(Algorithm::Gzip), true) => {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "Archive: compress \"gzip\" cannot be combined with format \"zip\""
+            )));
+        }
+        (Some(Algorithm::Deflate), true) => {
+            format = Some(Format::Zip {
+                deflate: Some(parse_level(global, options_arg, 9, " for zip")?),
+            });
+            Compression::None
+        }
+        (Some(Algorithm::Deflate), false) => {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "Archive: compress \"deflate\" requires format \"zip\""
+            )));
+        }
+    };
+
+    Ok(Options {
+        format,
+        compress: Some(compress),
+    })
+}
+
+/// `level` option: 1 to `max`, default 6.
+fn parse_level(
+    global: &JSGlobalObject,
+    options_arg: JSValue,
+    max: i64,
+    suffix: &str,
+) -> JsResult<u8> {
+    let Some(level_val) = options_arg.get_truthy(global, "level")? else {
+        return Ok(6);
+    };
+    if !level_val.is_number() {
+        return Err(global.throw_invalid_arguments(format_args!("Archive: level must be a number")));
+    }
+    let level = level_val.to_int64();
+    if level < 1 || level > max {
+        return Err(global.throw_invalid_arguments(format_args!(
+            "Archive: level must be between 1 and {max}{suffix}"
+        )));
+    }
+    Ok(u8::try_from(level).expect("int cast"))
+}
+
+/// `format` decides what is built from an object. Existing archive data
+/// already has a format, which is detected when it is read.
+fn reject_format_for_archive_data(global: &JSGlobalObject, options: Options) -> JsResult<()> {
+    if options.format.is_some() {
+        return Err(global.throw_invalid_arguments(format_args!(
+            "Archive: format can only be set when creating an archive from an object"
+        )));
+    }
+    Ok(())
 }
 
 fn create_archive(data: Vec<u8>, compress: Compression) -> Box<Archive> {
@@ -272,13 +388,18 @@ fn blob_from_js(value: JSValue) -> Option<&'static Blob> {
     value.as_class_ref::<Blob>()
 }
 
-/// Shared helper that builds tarball bytes from a JS object
-fn build_tarball_from_object(global: &JSGlobalObject, obj: JSValue) -> JsResult<Vec<u8>> {
+/// Shared helper that builds tarball or zip bytes from a JS object
+fn build_archive_from_object(
+    global: &JSGlobalObject,
+    obj: JSValue,
+    format: Format,
+) -> JsResult<Vec<u8>> {
     use libarchive::lib;
 
     let Some(js_obj) = obj.get_object() else {
         return Err(global.throw_invalid_arguments(format_args!("Expected an object")));
     };
+    let name = format.name();
 
     // Set up archive first
     let mut growing_buffer = lib::GrowingBuffer::init();
@@ -287,10 +408,39 @@ fn build_tarball_from_object(global: &JSGlobalObject, obj: JSValue) -> JsResult<
     let archive = lib::WriteArchive::new();
     let archive_ref: &lib::Archive = &archive;
 
-    if archive_ref.write_set_format_pax_restricted() != lib::Result::Ok {
-        return Err(global.throw_invalid_arguments(format_args!(
-            "Failed to create tarball: ArchiveFormatError"
-        )));
+    let format_rc = match format {
+        Format::Tar => archive_ref.write_set_format_pax_restricted(),
+        Format::Zip { deflate } => {
+            let rc = archive_ref.write_set_format_zip();
+            if rc == lib::Result::Ok {
+                // A zip ends at its end-of-central-directory record: no
+                // zero padding to the 10 KiB block size, which is tar's.
+                let _ = archive_ref.write_set_bytes_in_last_block(1);
+                // Entry names are UTF-8 (they come from JS strings), and a
+                // reader only knows that from general purpose bit 11, which
+                // libarchive keys on the process locale ("C" in bun) unless
+                // told otherwise (patches/libarchive/zip-utf8-names.patch).
+                // On Windows the writer converts the wide name through the
+                // OEM code page unless "hdrcharset" names UTF-8.
+                #[cfg(windows)]
+                const NAME_OPTIONS: &str = "zip:hdrcharset=UTF-8,zip:utf8-names";
+                #[cfg(not(windows))]
+                const NAME_OPTIONS: &str = "zip:utf8-names";
+                // libarchive's zip writer deflates through zlib; 1 to 9 is
+                // zlib's scale, and "store" leaves the entry bytes as they are.
+                let zip_options = match deflate {
+                    Some(level) => format!("{NAME_OPTIONS},zip:compression-level={level}"),
+                    None => format!("{NAME_OPTIONS},zip:compression=store"),
+                };
+                archive_ref.write_set_options(ZBox::from_vec_with_nul(zip_options.into()).as_zstr())
+            } else {
+                rc
+            }
+        }
+    };
+    if format_rc != lib::Result::Ok {
+        return Err(global
+            .throw_invalid_arguments(format_args!("Failed to create {name}: ArchiveFormatError")));
     }
 
     // `archive` is a live `archive_write_new()` handle (see `Archive::write_new`
@@ -306,7 +456,7 @@ fn build_tarball_from_object(global: &JSGlobalObject, obj: JSValue) -> JsResult<
     );
     if open_rc != 0 {
         return Err(global
-            .throw_invalid_arguments(format_args!("Failed to create tarball: ArchiveOpenError")));
+            .throw_invalid_arguments(format_args!("Failed to create {name}: ArchiveOpenError")));
     }
 
     let entry = lib::OwnedEntry::new();
@@ -331,6 +481,13 @@ fn build_tarball_from_object(global: &JSGlobalObject, obj: JSValue) -> JsResult<
 
         // Get the key as a null-terminated string
         let key_slice = key.to_utf8();
+        // A zip header holds the name length in 16 bits; libarchive truncates
+        // the length and writes the whole name, which no reader can parse.
+        if matches!(format, Format::Zip { .. }) && key_slice.slice().len() > usize::from(u16::MAX) {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "Archive: a zip entry name cannot be longer than 65535 bytes"
+            )));
+        }
         let key_str = ZBox::from_vec_with_nul(key_slice.slice().to_vec());
 
         // Get data - use view for Blob/ArrayBuffer, convert for strings
@@ -357,31 +514,31 @@ fn build_tarball_from_object(global: &JSGlobalObject, obj: JSValue) -> JsResult<
         // convert); only `Failed`/`Fatal` mean no header was produced.
         if !archive_ref.write_header(entry_ref).succeeded() {
             return Err(global.throw_invalid_arguments(format_args!(
-                "Failed to create tarball: ArchiveHeaderError"
+                "Failed to create {name}: ArchiveHeaderError"
             )));
         }
         if archive_ref.write_data(data) < 0 {
             return Err(global.throw_invalid_arguments(format_args!(
-                "Failed to create tarball: ArchiveWriteError"
+                "Failed to create {name}: ArchiveWriteError"
             )));
         }
         if archive_ref.write_finish_entry() != lib::Result::Ok {
             return Err(global.throw_invalid_arguments(format_args!(
-                "Failed to create tarball: ArchiveFinishEntryError"
+                "Failed to create {name}: ArchiveFinishEntryError"
             )));
         }
     }
 
     if archive_ref.write_close() != lib::Result::Ok {
         return Err(global
-            .throw_invalid_arguments(format_args!("Failed to create tarball: ArchiveCloseError")));
+            .throw_invalid_arguments(format_args!("Failed to create {name}: ArchiveCloseError")));
     }
 
     match growing_buffer.to_owned_slice() {
         Ok(v) => Ok(v),
         Err(_) => {
             Err(global
-                .throw_invalid_arguments(format_args!("Failed to create tarball: OutOfMemory")))
+                .throw_invalid_arguments(format_args!("Failed to create {name}: OutOfMemory")))
         }
     }
 }
@@ -409,8 +566,7 @@ fn get_entry_data<'a>(
 /// Static method: Archive.write(path, data, options?)
 /// Creates and writes an archive to disk in one operation.
 /// For Archive instances, uses the archive's compression settings unless overridden by options.
-/// Options:
-///   - gzip: { level?: number } - Override compression settings
+/// Options: the same `format`, `compress` and `level` as `new Archive()`.
 #[bun_jsc::host_fn]
 pub fn write(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
     let [path_arg, data_arg, options_arg] = callframe.arguments_as_array::<3>();
@@ -429,27 +585,25 @@ pub fn write(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue
 
     let path_slice = path_arg.to_utf8(global)?;
 
-    // Parse options for compression override
-    let options_compress = parse_compression_options(global, options_arg)?;
+    let options = parse_options(global, options_arg)?;
+    let options_compress = options.compress();
 
-    // For Archive instances, use options override or archive's compression settings
+    // For Archive instances, the archive's compression setting applies unless
+    // the options say otherwise (`compress: false` included)
     if let Some(archive) = data_arg.as_class_ref::<Archive>() {
-        let compress = if !matches!(options_compress, Compression::None) {
-            options_compress
-        } else {
-            archive.compress
-        };
+        reject_format_for_archive_data(global, options)?;
         return start_write_task(
             global,
             WriteData::Store(archive.store.clone()),
             path_slice.slice(),
-            compress,
+            options.compress.unwrap_or(archive.compress),
         );
     }
 
     // For Blobs, use store reference with options compression
     if let Some(blob) = blob_from_js(data_arg) {
         if let Some(store) = blob.store.get().as_ref() {
+            reject_format_for_archive_data(global, options)?;
             return start_write_task(
                 global,
                 WriteData::Store(store.clone()),
@@ -461,6 +615,7 @@ pub fn write(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue
 
     // For ArrayBuffer/TypedArray, copy the data with options compression
     if let Some(array_buffer) = data_arg.as_array_buffer(global) {
+        reject_format_for_archive_data(global, options)?;
         let data = array_buffer.slice().to_vec();
         return start_write_task(
             global,
@@ -470,9 +625,9 @@ pub fn write(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue
         );
     }
 
-    // For plain objects, build a tarball with options compression
+    // For plain objects, build a tarball or a zip with options compression
     if data_arg.is_object() {
-        let data = build_tarball_from_object(global, data_arg)?;
+        let data = build_archive_from_object(global, data_arg, options.format())?;
         return start_write_task(
             global,
             WriteData::Owned(data),
@@ -761,6 +916,7 @@ impl ExtractContext {
                 close_handles: true,
                 log: false,
                 npm: false,
+                zip: true,
             },
         ) {
             Ok(c) => c,
@@ -1040,8 +1196,26 @@ impl FilesContext {
         let mut entries: FileEntryList = Vec::new();
         // errdefer freeEntries(&entries) — handled by Drop on `entries`
 
+        // Scratch for the bytes past an entry's header size (see below).
+        let mut probe_buf = bun_core::vec::UninitBuf::<{ 64 * 1024 }>::uninit();
+        // SAFETY: `archive_read_data` is the only writer of `probe`; each read copies out only `probe[..read]`.
+        let probe = unsafe { probe_buf.as_bytes_mut() };
+
         let mut entry: *mut lib::Entry = core::ptr::null_mut();
-        while archive.read_next_header(&mut entry).succeeded() {
+        loop {
+            match archive.read_next_header(&mut entry) {
+                lib::Result::Ok | lib::Result::Warn => {}
+                lib::Result::Eof => break,
+                // A damaged header is an error, not the end of the listing.
+                // SAFETY: `archive` is the live `read_new()` handle opened above.
+                _ => {
+                    return Ok(if let Some(err) = Self::clone_error_string(&archive) {
+                        FilesResult::LibarchiveErr(err)
+                    } else {
+                        FilesResult::Err(FilesError::ReadError)
+                    });
+                }
+            }
             let entry_ref = lib::Entry::opaque_ref(entry);
             if entry_ref.filetype() != FILETYPE_REGULAR {
                 continue;
@@ -1066,15 +1240,42 @@ impl FilesContext {
             let size: usize = usize::try_from(entry_ref.size().max(0)).expect("int cast");
             let mtime: i64 = entry_ref.mtime();
 
-            // Read data incrementally so untrusted entry sizes don't drive allocation.
+            // Read incrementally so untrusted entry sizes don't drive
+            // allocation, and until libarchive reports the end of the entry:
+            // the header's size is only a hint, since a zip read as a stream
+            // (no central directory, or inside gzip) learns an entry's size
+            // from the data descriptor after the data. Bytes past the header's
+            // size go through `probe` so a size that is right costs no slack.
             let mut data: Vec<u8> = Vec::new();
-            while data.len() < size {
-                let to_read = (size - data.len()).min(64 * 1024);
-                data.try_reserve(to_read)
-                    .map_err(|_| bun_alloc::AllocError)?;
-                // SAFETY: `archive_read_data` only stores into the slice; the written prefix is committed below.
-                let dest = unsafe { &mut bun_core::vec::spare_bytes_mut(&mut data)[..to_read] };
-                let read = archive.read_data(dest);
+            loop {
+                let expected = size.saturating_sub(data.len());
+                let read = if expected > 0 {
+                    let to_read = expected.min(64 * 1024);
+                    data.try_reserve(to_read)
+                        .map_err(|_| bun_alloc::AllocError)?;
+                    // SAFETY: `archive_read_data` only stores into the slice; the written prefix is committed below.
+                    let dest = unsafe { &mut bun_core::vec::spare_bytes_mut(&mut data)[..to_read] };
+                    let read = archive.read_data(dest);
+                    if read > 0 {
+                        // SAFETY: `archive_read_data` returns exactly the byte count it wrote (`<= to_read`).
+                        unsafe {
+                            bun_core::vec::commit_spare(
+                                &mut data,
+                                usize::try_from(read).expect("int cast"),
+                            )
+                        };
+                    }
+                    read
+                } else {
+                    let read = archive.read_data(probe);
+                    if read > 0 {
+                        let bytes_read = usize::try_from(read).expect("int cast");
+                        data.try_reserve(bytes_read)
+                            .map_err(|_| bun_alloc::AllocError)?;
+                        data.extend_from_slice(&probe[..bytes_read]);
+                    }
+                    read
+                };
                 if read < 0 {
                     // Read error.
                     // NOTE: both `data` and `entries` drop automatically here.
@@ -1088,9 +1289,6 @@ impl FilesContext {
                 if read == 0 {
                     break;
                 }
-                let bytes_read = usize::try_from(read).expect("int cast");
-                // SAFETY: `archive_read_data` returns exactly the byte count it wrote (`<= to_read`).
-                unsafe { bun_core::vec::commit_spare(&mut data, bytes_read) };
             }
             // errdefer free(data) — handled by Drop
 
@@ -1324,7 +1522,13 @@ fn extract_to_disk_filtered(
     // SAFETY: `archive_read_data` is the only writer of `buf`; each chunk reads back only `buf[..bytes_read]`.
     let buf = unsafe { stack_buf.as_bytes_mut() };
 
-    while archive.read_next_header(&mut entry).succeeded() {
+    loop {
+        match archive.read_next_header(&mut entry) {
+            lib::Result::Ok | lib::Result::Warn => {}
+            lib::Result::Eof => break,
+            // A damaged header fails the extraction, as it does without a glob.
+            _ => return Err(crate::Error::ReadError),
+        }
         let entry_ref = lib::Entry::opaque_ref(entry);
         // Same platform split as `FilesContext::do_run`; see `entry_pathname_utf8`.
         #[cfg(not(windows))]
@@ -1375,7 +1579,6 @@ fn extract_to_disk_filtered(
                 count += 1;
             }
             bun_sys::FileKind::File => {
-                let size: usize = usize::try_from(entry_ref.size().max(0)).expect("int cast");
                 // Sanitize permissions: use entry perms masked to 0o777, or default 0o644
                 let entry_perm = entry_ref.perm();
                 let mode: Mode = if entry_perm != 0 {
@@ -1408,38 +1611,41 @@ fn extract_to_disk_filtered(
                     Err(_) => continue,
                 };
 
+                // Read to the end of the entry rather than the header's size: a
+                // zip read as a stream (no central directory, or inside gzip)
+                // only learns the size from the data descriptor after the data,
+                // and the reader verifies a stored entry's CRC on the final read.
                 let mut write_success = true;
-                if size > 0 {
-                    // Read archive data and write to file
-                    let mut remaining = size;
-                    while remaining > 0 {
-                        let to_read = remaining.min(buf.len());
-                        let read = archive.read_data(&mut buf[..to_read]);
-                        if read <= 0 {
-                            write_success = false;
-                            break;
-                        }
-                        let bytes_read: usize = usize::try_from(read).expect("int cast");
-                        // Write all bytes, handling partial writes
-                        let mut written: usize = 0;
-                        while written < bytes_read {
-                            let w = match bun_sys::write(file_fd, &buf[written..bytes_read]) {
-                                Ok(w) => w,
-                                Err(_) => {
-                                    write_success = false;
-                                    break;
-                                }
-                            };
-                            if w == 0 {
+                let mut read_failed = false;
+                loop {
+                    let read = archive.read_data(buf);
+                    if read < 0 {
+                        write_success = false;
+                        read_failed = true;
+                        break;
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                    let bytes_read: usize = usize::try_from(read).expect("int cast");
+                    // Write all bytes, handling partial writes
+                    let mut written: usize = 0;
+                    while written < bytes_read {
+                        let w = match bun_sys::write(file_fd, &buf[written..bytes_read]) {
+                            Ok(w) => w,
+                            Err(_) => {
                                 write_success = false;
                                 break;
                             }
-                            written += w;
-                        }
-                        if !write_success {
+                        };
+                        if w == 0 {
+                            write_success = false;
                             break;
                         }
-                        remaining -= bytes_read;
+                        written += w;
+                    }
+                    if !write_success {
+                        break;
                     }
                 }
                 let _ = file_fd.close();
@@ -1449,6 +1655,11 @@ fn extract_to_disk_filtered(
                 } else {
                     // Remove partial file on failure
                     let _ = bun_sys::unlinkat(dir_fd, pathname_z);
+                }
+                // An entry libarchive cannot read (an unsupported compression,
+                // a bad CRC) fails the extraction, as it does without a glob.
+                if read_failed {
+                    return Err(crate::Error::ReadError);
                 }
             }
             bun_sys::FileKind::SymLink => {

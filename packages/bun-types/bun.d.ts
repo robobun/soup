@@ -10158,15 +10158,24 @@ declare module "bun" {
   type ArchiveInput = Record<string, BlobPart> | Blob | ArrayBufferView | ArrayBufferLike;
 
   /**
-   * Compression format for archive output.
-   * Only `"gzip"` is supported.
+   * The container format an archive is built in.
+   * - `"tar"`: a tarball, optionally gzipped as a whole (`compress: "gzip"`)
+   * - `"zip"`: a zip file, each entry deflated (the default) or stored (`compress: false`)
    */
-  type ArchiveCompression = "gzip";
+  type ArchiveFormat = "tar" | "zip";
+
+  /**
+   * Compression algorithm for archive output.
+   * - `"gzip"` compresses a tarball as a whole (`.tar.gz`)
+   * - `"deflate"` compresses each entry of a zip, and is the zip default
+   */
+  type ArchiveCompression = "gzip" | "deflate";
 
   /**
    * Options for creating an Archive instance.
    *
-   * By default, archives are not compressed. Use `{ compress: "gzip" }` to enable compression.
+   * By default, an uncompressed tarball is built. Use `{ compress: "gzip" }` to gzip it,
+   * or `{ format: "zip" }` to build a zip file instead.
    *
    * @example
    * ```ts
@@ -10178,20 +10187,38 @@ declare module "bun" {
    *
    * // Specify compression level
    * new Bun.Archive(data, { compress: "gzip", level: 9 });
+   *
+   * // A zip file, entries deflated at level 6
+   * new Bun.Archive(data, { format: "zip" });
+   *
+   * // A zip file with stored (uncompressed) entries
+   * new Bun.Archive(data, { format: "zip", compress: false });
    * ```
    */
   interface ArchiveOptions {
     /**
-     * Compression algorithm to use.
-     * Only `"gzip"` is supported.
-     * If not specified, no compression is applied.
+     * The container format to build from an object: `"tar"` or `"zip"`.
+     *
+     * Only valid when the archive is created from an object. Existing archive data
+     * (a `Blob`, `TypedArray` or `ArrayBuffer`) is read as whatever it is, tar, tar.gz or zip,
+     * and passing `format` with it throws a `TypeError`.
+     *
+     * @default "tar"
      */
-    compress?: ArchiveCompression;
+    format?: ArchiveFormat;
     /**
-     * Compression level (1-12). Only applies when `compress` is set.
-     * - 1: Fastest compression, lowest ratio
-     * - 6: Default balance of speed and ratio
-     * - 12: Best compression ratio, slowest
+     * Compression algorithm to use, or `false` for none.
+     * - For a tarball: `"gzip"`, or `false` (the default) for a plain `.tar`.
+     * - For a zip: `"deflate"` (the default), or `false` to store the entries as they are.
+     *
+     * `"gzip"` with `format: "zip"`, or `"deflate"` without it, throws a `TypeError`.
+     * In `Archive.write()`, an `Archive` keeps its own setting unless `compress` is given.
+     */
+    compress?: ArchiveCompression | false;
+    /**
+     * Compression level. Only applies when compression is in effect.
+     * - gzip: 1 (fastest) to 12 (smallest)
+     * - deflate (zip): 1 (fastest) to 9 (smallest)
      *
      * @default 6
      */
@@ -10235,10 +10262,11 @@ declare module "bun" {
   }
 
   /**
-   * Create and extract tar archives, with optional gzip compression.
+   * Create and extract tar and zip archives, with optional gzip compression for tar.
    *
    * `Bun.Archive` builds an archive from in-memory data, or wraps an existing
-   * archive so you can extract it to disk or memory.
+   * archive (tar, tar.gz or zip, detected from the bytes) so you can extract it
+   * to disk or memory.
    *
    * @example
    * **Create an archive from an object:**
@@ -10259,6 +10287,13 @@ declare module "bun" {
    *
    * // Or with a specific compression level (1-12)
    * const archive = new Bun.Archive(data, { compress: "gzip", level: 9 });
+   * ```
+   *
+   * @example
+   * **Create a zip file:**
+   * ```ts
+   * const zip = new Bun.Archive({ "hello.txt": "Hello, World!" }, { format: "zip" });
+   * await Bun.write("hello.zip", await zip.bytes());
    * ```
    *
    * @example
@@ -10295,9 +10330,9 @@ declare module "bun" {
      * By default, archives are not compressed. Use `{ compress: "gzip" }` to enable compression.
      *
      * @param data - The input data for the archive:
-     *   - **Object**: Creates a new tarball with the object's keys as file paths and values as file contents
-     *   - **Blob/TypedArray/ArrayBuffer**: Wraps existing archive data (tar or tar.gz)
-     * @param options - Archive options, including compression settings
+     *   - **Object**: Creates a new tarball (or a zip with `format: "zip"`) with the object's keys as file paths and values as file contents
+     *   - **Blob/TypedArray/ArrayBuffer**: Wraps existing archive data (tar, tar.gz or zip)
+     * @param options - Archive options, including the format and compression settings
      *
      * @example
      * **From an object (creates uncompressed tarball):**
@@ -10354,6 +10389,12 @@ declare module "bun" {
      * **Write gzipped tarball:**
      * ```ts
      * await Bun.Archive.write("output.tar.gz", files, { compress: "gzip" });
+     * ```
+     *
+     * @example
+     * **Write a zip file:**
+     * ```ts
+     * await Bun.Archive.write("output.zip", files, { format: "zip" });
      * ```
      */
     static write(path: string, data: ArchiveInput | Archive, options?: ArchiveOptions): Promise<void>;

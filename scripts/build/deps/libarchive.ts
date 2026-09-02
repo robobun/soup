@@ -1,10 +1,10 @@
 /**
  * libarchive — multi-format archive reader/writer. Bun uses it for tarball
- * extraction during `bun install` (npm packages ship as tarballs) and
- * `bun pm pack`.
+ * extraction during `bun install` (npm packages ship as tarballs),
+ * `bun pm pack`, and for tar and zip in `Bun.Archive`.
  *
- * Minimal config: tar + gzip only. Every other codec backend (bz2/lzma/lz4/
- * zstd/openssl/iconv/...) is left out of config.h, so the corresponding
+ * Minimal config: tar + gzip + zip only. Every other codec backend (bz2/lzma/
+ * lz4/zstd/openssl/iconv/...) is left out of config.h, so the corresponding
  * `archive_*_support_*` calls compile to "format not supported" stubs.
  *
  * DirectBuild: cmake's configure step here was ~22s of try_compile probes
@@ -23,11 +23,12 @@ const LIBARCHIVE_COMMIT = "ded82291ab41d5e355831b96b0e1ff49e24d8939";
 
 // The unconditional list from libarchive/CMakeLists.txt, minus the read
 // formats/filters bun never registers (it only registers tar/gnutar/gzip,
-// and select-registered-only.patch stops set_format/append_filter from
-// pulling the rest in). Kept even though unused: format_empty/format_raw
-// (archive_match.c), ppmd7 (write_set_format_7zip), filter_program
+// plus zip for `Bun.Archive`, and select-registered-only.patch stops
+// set_format/append_filter from pulling the rest in). Kept even though
+// unused: format_empty/format_raw (archive_match.c), ppmd7
+// (write_set_format_7zip), filter_program
 // (append_filter_program_signature) — dead code that other kept files
-// still reference by name.
+// still reference by name. ppmd8 is the zip reader's PPMd decoder.
 // prettier-ignore
 const SOURCES = [
   "archive_acl", "archive_check_magic", "archive_cmdline", "archive_cryptor",
@@ -35,7 +36,7 @@ const SOURCES = [
   "archive_entry_link_resolver", "archive_entry_sparse", "archive_entry_stat",
   "archive_entry_strmode", "archive_entry_xattr", "archive_hmac", "archive_match",
   "archive_options", "archive_pack_dev", "archive_parse_date", "archive_pathmatch",
-  "archive_ppmd7", "archive_random", "archive_rb", "archive_read",
+  "archive_ppmd7", "archive_ppmd8", "archive_random", "archive_rb", "archive_read",
   "archive_read_add_passphrase", "archive_read_append_filter",
   "archive_read_data_into_fd", "archive_read_disk_entry_from_file",
   "archive_read_disk_posix", "archive_read_disk_set_standard_lookup",
@@ -44,7 +45,8 @@ const SOURCES = [
   "archive_read_set_format", "archive_read_set_options",
   "archive_read_support_filter_gzip", "archive_read_support_filter_program",
   "archive_read_support_format_empty", "archive_read_support_format_raw",
-  "archive_read_support_format_tar", "archive_string", "archive_string_sprintf",
+  "archive_read_support_format_tar", "archive_read_support_format_zip",
+  "archive_string", "archive_string_sprintf",
   "archive_time", "archive_util", "archive_version_details", "archive_virtual",
   "archive_write", "archive_write_disk_posix", "archive_write_disk_set_standard_lookup",
   "archive_write_open_fd", "archive_write_open_file", "archive_write_open_filename",
@@ -108,6 +110,10 @@ export const libarchive: Dependency = {
     // machinery (and its heap) are pure overhead and needless cross-thread
     // CRT-heap traffic.
     "patches/libarchive/archive_string-codepage-cache.patch",
+    // A "utf8-names" option for the zip writer: set the UTF-8 name flag on
+    // every non-ASCII entry name. Upstream keys that flag on the process
+    // locale, which is "C" in bun, so `Bun.Archive` would never set it.
+    "patches/libarchive/zip-utf8-names.patch",
   ],
 
   // zlib-ng generates zlib.h during its own build; libarchive's gzip filter
