@@ -934,6 +934,82 @@ constructor type), `packages/bun-types/bun.d.ts` (drops the never-implemented `r
 `docs/guides/http/sse.mdx`, `docs/runtime/web-apis.mdx`, `docs/runtime/bun-apis.mdx`,
 `test/js/web/eventsource/eventsource.test.ts`, `test/integration/bun-types/fixture/globals.ts`.
 
+### 2026-09-02: zip in `Bun.Archive`
+
+`Bun.Archive` could create and read tarballs, gzipped or not, and nothing else, while the archive
+format most people actually get handed is zip: release downloads, GitHub source archives, uploads
+from a browser, xlsx and docx, jars. Node has no zip support either, so every script pulls in
+`adm-zip`, `jszip` or `archiver` for a format libarchive (which bun already links for `bun install`)
+reads and writes natively (oven-sh/bun#27077 asks for exactly this). `Bun.Archive` now reads zip
+files and builds them:
+
+```ts
+// Reading needs no option: tar, tar.gz and zip are detected from the bytes
+const archive = new Bun.Archive(await Bun.file("release.zip").bytes());
+await archive.extract("./release");
+const readme = (await archive.files("README.md")).get("README.md");
+
+// Building: each entry deflated at level 6
+const zip = new Bun.Archive({ "hello.txt": "Hello" }, { format: "zip" });
+await Bun.write("hello.zip", await zip.bytes());
+
+new Bun.Archive(files, { format: "zip", level: 9 }); // deflate 1-9
+new Bun.Archive(files, { format: "zip", compress: false }); // stored, for data that is already compressed
+await Bun.Archive.write("bundle.zip", files, { format: "zip" });
+```
+
+The options grew a `format` (`"tar"`, the default, or `"zip"`), `compress` now also takes `"deflate"`
+(the zip default, per entry) and `false` (no compression, which was already what a missing `compress`
+meant for tar), and `level` is 1-9 for deflate (zlib's scale, which libarchive's zip writer uses) next
+to 1-12 for gzip (libdeflate's). A tar option on a zip, or the reverse, is a `TypeError` that says which
+values the format takes; `format` on existing archive bytes is one too, since those already have a
+format. The zip ends at its end-of-central-directory record instead of being zero-padded to the 10 KiB
+tar block, entries carry `UT` timestamps and the data descriptor every reader handles, and a file
+whose method bun does not ship (bzip2, LZMA, XZ, Zstandard; PPMd is built in) or that is encrypted
+rejects `files()` with libarchive's message (`Unsupported ZIP compression method (12: bzip)`) and
+`extract()` with `ReadError`, instead of coming back empty.
+`extract()` creates the explicit directory entries a `zip -r` archive has, symlinks with the same
+escape check as tar, Unix modes from an archive made on Unix, and applies the same path traversal
+checks as tar. A zip read as a stream (inside gzip, or with its central directory damaged) only
+learns an entry's size after the entry's data, so all three readers (`files()`, `extract()` with and
+without a glob) read every entry to its end instead of trusting the header, and a damaged entry
+header fails the call instead of ending the listing early. `__MACOSX/._*` entries are listed on every
+platform, as `unzip`, Python and Go do; libarchive folds them into the file they describe on macOS
+only. In `Archive.write()`, `compress: false` now overrides an `Archive`'s own gzip setting, where
+before it counted as "not given".
+
+Three things under the surface had to change. libarchive's zip reader was deliberately left out of
+bun's build (only tar and gzip were compiled in), so `archive_read_support_format_zip.c` and the
+PPMd8 decoder it needs are now compiled, and `Bun.Archive` registers the reader; `bun install` and
+`bun pm pack` still register tar only. The Rust binding over `archive_read_data_block` built a slice
+from whatever pointer libarchive returned, and the zip reader returns an `ARCHIVE_OK` block with a
+null pointer and zero length once a stored entry's bytes are used up (tar never does), which the
+debug build's UB check caught as a panic in `extract()`. And libarchive keys the "names are UTF-8"
+flag (general purpose bit 11) on the process locale, which is `"C"` in bun, so a zip bun wrote would
+have told Python, macOS and Windows to read `日本.txt` as CP437, and a zip another tool wrote with
+the flag set lost the name entirely on read (the conversion to the `"C"` locale fails and upstream
+leaves the entry with no pathname, where its tar reader falls back to the raw bytes). A small
+libarchive patch adds a `utf8-names` writer option and gives the zip reader the same raw-bytes
+fallback as tar; on Windows the writer and the reader additionally get `hdrcharset=UTF-8`, because
+there a name travels as a wide string and would otherwise be converted through the OEM code page on
+the way out, and widened byte by byte on the way in when the flag is missing. The tests were run on
+Linux and Windows, with zips built by hand in the test (local headers, central directory, end record)
+so the reader is checked against the real layout and not only against bun's own writer, and bun's
+zips were checked with Python's `zipfile` and `unzip -t`. Left for later: zip64 (libarchive writes
+it when an entry passes 4 GiB and reads it, but no test pins that), writing symlink entries, and
+converting between tar and zip.
+
+Two pre-existing bugs turned up on the way and were reported separately rather than fixed here:
+`new Bun.Archive({ "a.txt": Bun.file(path) })` writes an empty entry, because the builder takes the
+in-memory view of every `Blob` and a file-backed one has none, and the docs' "Create Archive from
+Directory" example does exactly that; and `Bun.write("out.tar.gz", archive)` writes the plain
+tarball whatever `compress` says, which only `archive.bytes()`, `blob()` and `Bun.Archive.write()`
+honour, while the docs promise a `.tar.gz`.
+
+Files: `src/runtime/api/Archive.rs`, `src/libarchive/lib.rs`, `scripts/build/deps/libarchive.ts`,
+`patches/libarchive/zip-utf8-names.patch`, `packages/bun-types/bun.d.ts`, `docs/runtime/archive.mdx`,
+`test/js/bun/archive.test.ts`, `test/integration/bun-types/fixture/bun.ts`.
+
 ## Dropped
 
 Nothing yet.

@@ -111,3 +111,12 @@ new Bun.Glob("**/*.ts").scan({ ignore: "node_modules/**" }) satisfies AsyncItera
 new Bun.Glob("**/*.ts").scanSync({ ignore: ["node_modules/**", "dist/**"] }) satisfies IterableIterator<string>;
 // @ts-expect-error ignore takes glob pattern strings
 new Bun.Glob("**/*.ts").scanSync({ ignore: /node_modules/ });
+
+new Bun.Archive({ "a.txt": "a" }, { format: "zip" }) satisfies Bun.Archive;
+new Bun.Archive({ "a.txt": "a" }, { format: "zip", compress: false, level: 9 }) satisfies Bun.Archive;
+new Bun.Archive({ "a.txt": "a" }, { format: "tar", compress: "gzip", level: 12 }) satisfies Bun.Archive;
+tsd.expectType(Bun.Archive.write("out.zip", { "a.txt": "a" }, { format: "zip" })).is<Promise<void>>();
+// @ts-expect-error format is "tar" or "zip"
+new Bun.Archive({ "a.txt": "a" }, { format: "rar" });
+// @ts-expect-error compress names an algorithm or is false
+new Bun.Archive({ "a.txt": "a" }, { format: "zip", compress: true });

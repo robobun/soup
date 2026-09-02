@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isWindows, tempDir } from "harness";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, rmSync, statSync } from "node:fs";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 import { join } from "path";
 
 // Minimal ustar tarball builder (pathnames must be <100 bytes). `name` accepts
@@ -55,6 +56,124 @@ function paxEntry(name: string, data: Buffer | string, index: number): Buffer {
     recordPad,
     ustarEntry(fallback, typeof data === "string" ? Buffer.from(data) : data),
   ]);
+}
+
+// Minimal pkzip builder, laid out like Info-ZIP does it: a local header and
+// the data per entry, then the central directory and the end record. `method`
+// 0 stores the data, 8 deflates it (raw DEFLATE). Sizes and the CRC are in
+// the headers, so there are no data descriptors.
+function buildZip(
+  entries: Array<{
+    name: string;
+    data?: Buffer | string;
+    method?: number;
+    stored?: Buffer;
+    flags?: number;
+    /** Unix mode, stored the way Info-ZIP does: "made by" Unix, mode in the high 16 attribute bits. */
+    mode?: number;
+  }>,
+): Uint8Array {
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+  for (const e of entries) {
+    const name = Buffer.from(e.name);
+    const raw = typeof e.data === "string" ? Buffer.from(e.data) : (e.data ?? Buffer.alloc(0));
+    const method = e.method ?? 0;
+    const stored = e.stored ?? (method === 8 ? deflateRawSync(raw) : raw);
+    const crc = Bun.hash.crc32(raw);
+    const flags = e.flags ?? 0;
+    const madeBy = e.mode === undefined ? 20 : (3 << 8) | 20;
+    const external = e.mode === undefined ? 0 : (e.mode << 16) >>> 0;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0x21, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(stored.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(madeBy, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(flags, 8);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt16LE(0, 12);
+    central.writeUInt16LE(0x21, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(stored.length, 20);
+    central.writeUInt32LE(raw.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(external, 38);
+    central.writeUInt32LE(offset, 42);
+    locals.push(local, name, stored);
+    centrals.push(central, name);
+    offset += local.length + name.length + stored.length;
+  }
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return new Uint8Array(Buffer.concat([...locals, directory, end]));
+}
+
+interface ZipDirectoryEntry {
+  name: string;
+  flags: number;
+  method: number;
+  crc32: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  localHeaderOffset: number;
+}
+
+// The central directory of a zip with no archive comment, in the order the
+// writer put the entries.
+function readZipDirectory(zip: Uint8Array): ZipDirectoryEntry[] {
+  const buf = Buffer.from(zip.buffer, zip.byteOffset, zip.byteLength);
+  const end = buf.length - 22;
+  expect(buf.readUInt32LE(end)).toBe(0x06054b50);
+  const count = buf.readUInt16LE(end + 10);
+  let p = buf.readUInt32LE(end + 16);
+  const entries: ZipDirectoryEntry[] = [];
+  for (let i = 0; i < count; i++) {
+    expect(buf.readUInt32LE(p)).toBe(0x02014b50);
+    const nameLength = buf.readUInt16LE(p + 28);
+    const extraLength = buf.readUInt16LE(p + 30);
+    const commentLength = buf.readUInt16LE(p + 32);
+    entries.push({
+      name: buf.subarray(p + 46, p + 46 + nameLength).toString("utf8"),
+      flags: buf.readUInt16LE(p + 8),
+      method: buf.readUInt16LE(p + 10),
+      crc32: buf.readUInt32LE(p + 16),
+      compressedSize: buf.readUInt32LE(p + 20),
+      uncompressedSize: buf.readUInt32LE(p + 24),
+      localHeaderOffset: buf.readUInt32LE(p + 42),
+    });
+    p += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+// An entry's bytes as stored in the zip: after its local header.
+function zipEntryData(zip: Uint8Array, entry: ZipDirectoryEntry): Buffer {
+  const buf = Buffer.from(zip.buffer, zip.byteOffset, zip.byteLength);
+  const p = entry.localHeaderOffset;
+  expect(buf.readUInt32LE(p)).toBe(0x04034b50);
+  const start = p + 30 + buf.readUInt16LE(p + 26) + buf.readUInt16LE(p + 28);
+  return buf.subarray(start, start + entry.compressedSize);
 }
 
 function buildPaxTarball(entries: Array<{ name: string; data: Buffer | string }>): Uint8Array {
@@ -1926,6 +2045,393 @@ describe("Bun.Archive", () => {
     });
   });
 
+  describe("zip", () => {
+    const files = {
+      "hello.txt": "Hello, World!",
+      "data.json": JSON.stringify({ foo: "bar" }),
+      "src/index.ts": "export const answer = 42;\n",
+      "src/lib/util.ts": "export function add(a: number, b: number) {\n  return a + b;\n}\n",
+    };
+
+    test("builds a zip whose entries are deflated", async () => {
+      const zip = await new Bun.Archive(files, { format: "zip" }).bytes();
+      // Local file header signature first, end-of-central-directory last.
+      expect(Buffer.from(zip.subarray(0, 4))).toEqual(Buffer.from("PK\x03\x04", "latin1"));
+      expect(Buffer.from(zip.subarray(-22, -18))).toEqual(Buffer.from("PK\x05\x06", "latin1"));
+
+      const directory = readZipDirectory(zip);
+      expect(directory.map(e => e.name)).toEqual(Object.keys(files));
+      for (const entry of directory) {
+        const content = Buffer.from(files[entry.name as keyof typeof files]);
+        expect(entry).toMatchObject({
+          method: 8,
+          crc32: Bun.hash.crc32(content),
+          uncompressedSize: content.length,
+        });
+        // The stored bytes are raw DEFLATE that any zip reader inflates.
+        expect(inflateRawSync(zipEntryData(zip, entry))).toEqual(content);
+      }
+    });
+
+    test("round-trips through files() and extract()", async () => {
+      const zip = await new Bun.Archive(files, { format: "zip" }).bytes();
+      expect(Buffer.from(zip.subarray(0, 2)).toString("latin1")).toBe("PK");
+      const archive = new Bun.Archive(zip);
+
+      expect(Bun.inspect(archive)).toContain("files: 4");
+      const read = await archive.files();
+      expect([...read.keys()]).toEqual(Object.keys(files));
+      for (const [name, content] of Object.entries(files)) {
+        const file = read.get(name)!;
+        expect(file).toBeInstanceOf(File);
+        expect(file.name).toBe(name);
+        expect(await file.text()).toBe(content);
+        // The writer records the time in a "UT" extra field, to the second.
+        expect(Math.abs(file.lastModified - Date.now())).toBeLessThan(60_000);
+      }
+
+      using dir = tempDir("archive-zip-roundtrip", {});
+      expect(await archive.extract(String(dir))).toBe(4);
+      for (const [name, content] of Object.entries(files)) {
+        expect(await Bun.file(join(String(dir), name)).text()).toBe(content);
+      }
+    });
+
+    test("reads a zip another tool wrote", async () => {
+      // Stored and deflated entries, an explicit directory entry, and a
+      // file in it, the way `zip -r` lays an archive out.
+      const body = Buffer.alloc(4096, "deflate me ");
+      const zip = buildZip([
+        { name: "stored.txt", data: "kept as is" },
+        { name: "packed.txt", data: body, method: 8 },
+        { name: "dir/" },
+        { name: "dir/inner.txt", data: "inside", method: 8 },
+        { name: "empty.txt" },
+      ]);
+
+      const archive = new Bun.Archive(zip);
+      expect(Bun.inspect(archive)).toContain("files: 4");
+      const read = await archive.files();
+      expect([...read.keys()]).toEqual(["stored.txt", "packed.txt", "dir/inner.txt", "empty.txt"]);
+      expect(await read.get("stored.txt")!.text()).toBe("kept as is");
+      expect(Buffer.from(await read.get("packed.txt")!.arrayBuffer())).toEqual(body);
+      expect(await read.get("dir/inner.txt")!.text()).toBe("inside");
+      expect(read.get("empty.txt")!.size).toBe(0);
+
+      using dir = tempDir("archive-zip-foreign", {});
+      // Four files and the directory entry.
+      expect(await archive.extract(String(dir))).toBe(5);
+      expect(await Bun.file(join(String(dir), "stored.txt")).text()).toBe("kept as is");
+      expect(Buffer.from(await Bun.file(join(String(dir), "packed.txt")).arrayBuffer())).toEqual(body);
+      expect(await Bun.file(join(String(dir), "dir/inner.txt")).text()).toBe("inside");
+      expect(await Bun.file(join(String(dir), "empty.txt")).text()).toBe("");
+    });
+
+    test("reads a zip.gz and keeps zip bytes as they are", async () => {
+      const zip = buildZip([{ name: "a.txt", data: "a" }]);
+      const gz = Bun.gzipSync(zip);
+      expect(await new Bun.Archive(gz).files().then(m => m.get("a.txt")!.text())).toBe("a");
+
+      const archive = new Bun.Archive(zip);
+      expect(await archive.bytes()).toEqual(zip);
+      expect(new Uint8Array(await (await archive.blob()).arrayBuffer())).toEqual(zip);
+    });
+
+    test("reads entries whose size is only known after their data", async () => {
+      // bun's writer records sizes in a data descriptor after each entry. A
+      // reader cannot seek to the central directory through gzip, so it
+      // learns each size only once it has read the data.
+      const big = Buffer.alloc(200_000, "size is known at the end\n").toString();
+      const zip = await new Bun.Archive({ ...files, "big.txt": big }, { format: "zip" }).bytes();
+      const local = Buffer.from(zip.buffer, zip.byteOffset, 30);
+      expect(local.readUInt32LE(0)).toBe(0x04034b50);
+      expect(local.readUInt16LE(6) & 0x8).toBe(0x8); // bit 3: sizes follow the data
+      expect([local.readUInt32LE(18), local.readUInt32LE(22)]).toEqual([0, 0]);
+      const gz = Bun.gzipSync(zip);
+
+      const read = await new Bun.Archive(gz).files();
+      expect([...read.keys()]).toEqual([...Object.keys(files), "big.txt"]);
+      expect(await read.get("src/lib/util.ts")!.text()).toBe(files["src/lib/util.ts"]);
+      expect(await read.get("big.txt")!.text()).toBe(big);
+
+      using dir = tempDir("archive-zip-descriptor", {});
+      expect(await new Bun.Archive(gz).extract(String(dir))).toBe(5);
+      expect(await Bun.file(join(String(dir), "hello.txt")).text()).toBe("Hello, World!");
+      expect(await Bun.file(join(String(dir), "big.txt")).text()).toBe(big);
+
+      const globbed = join(String(dir), "globbed");
+      expect(await new Bun.Archive(gz).extract(globbed, { glob: "*.txt" })).toBe(2);
+      expect(await Bun.file(join(globbed, "big.txt")).text()).toBe(big);
+    });
+
+    test("a damaged entry header fails files() and extract()", async () => {
+      const zip = buildZip([
+        { name: "first.txt", data: "first" },
+        { name: "second.txt", data: "second" },
+      ]);
+      const second = readZipDirectory(zip)[1];
+      zip[second.localHeaderOffset + 2] = 0; // "PK\x03\x04" -> "PK\x00\x04"
+
+      await expect(new Bun.Archive(zip).files()).rejects.toThrow("Damaged Zip archive");
+      using dir = tempDir("archive-zip-damaged", {});
+      await expect(new Bun.Archive(zip).extract(String(dir))).rejects.toThrow();
+      await expect(new Bun.Archive(zip).extract(String(dir), { glob: "**" })).rejects.toThrow();
+    });
+
+    test("glob filters apply to zip entries", async () => {
+      const archive = new Bun.Archive(
+        buildZip(Object.entries(files).map(([name, data]) => ({ name, data, method: 8 }))),
+      );
+      expect([...(await archive.files("src/**")).keys()]).toEqual(["src/index.ts", "src/lib/util.ts"]);
+
+      using dir = tempDir("archive-zip-glob", {});
+      expect(await archive.extract(String(dir), { glob: ["**", "!src/**"] })).toBe(2);
+      expect(readdirSync(String(dir)).sort()).toEqual(["data.json", "hello.txt"]);
+    });
+
+    test("compress: false stores entries", async () => {
+      const zip = await new Bun.Archive(files, { format: "zip", compress: false }).bytes();
+      const directory = readZipDirectory(zip);
+      expect(directory.map(e => e.name)).toEqual(Object.keys(files));
+      for (const entry of directory) {
+        const content = Buffer.from(files[entry.name as keyof typeof files]);
+        expect(entry).toMatchObject({ method: 0, compressedSize: content.length, uncompressedSize: content.length });
+        expect(zipEntryData(zip, entry)).toEqual(content);
+      }
+      const read = await new Bun.Archive(zip).files();
+      expect(await read.get("src/lib/util.ts")!.text()).toBe(files["src/lib/util.ts"]);
+    });
+
+    test("level sets the deflate level", async () => {
+      const lines: string[] = [];
+      for (let i = 0; i < 4000; i++) lines.push(`line ${i}: ${(i * 2654435761) % 1000003}`);
+      const text = lines.join("\n");
+      const fast = await new Bun.Archive({ "text.txt": text }, { format: "zip", level: 1 }).bytes();
+      const small = await new Bun.Archive({ "text.txt": text }, { format: "zip", level: 9 }).bytes();
+      const explicit = await new Bun.Archive({ "text.txt": text }, { format: "zip", compress: "deflate" }).bytes();
+      // General purpose bits 1-2 record the deflate level class: both set for
+      // levels 1-2, bit 1 for levels 8-9, neither for the default.
+      expect(readZipDirectory(fast)[0]).toMatchObject({ method: 8, flags: 0x8 | 0x6 });
+      expect(readZipDirectory(small)[0]).toMatchObject({ method: 8, flags: 0x8 | 0x2 });
+      expect(readZipDirectory(explicit)[0]).toMatchObject({ method: 8, flags: 0x8, uncompressedSize: text.length });
+      expect(small.length).toBeLessThan(fast.length);
+      expect(small.length).toBeLessThan(text.length / 2);
+      for (const zip of [fast, small, explicit]) {
+        expect(await new Bun.Archive(zip).files().then(m => m.get("text.txt")!.text())).toBe(text);
+      }
+    });
+
+    test("handles binary data and an empty zip", async () => {
+      const binary = new Uint8Array(4096);
+      for (let i = 0; i < binary.length; i++) binary[i] = (i * 7919) & 0xff;
+      const zip = await new Bun.Archive({ "blob.bin": binary, "empty.txt": "" }, { format: "zip" }).bytes();
+      const read = await new Bun.Archive(zip).files();
+      expect(new Uint8Array(await read.get("blob.bin")!.arrayBuffer())).toEqual(binary);
+      expect(read.get("empty.txt")!.size).toBe(0);
+
+      const empty = await new Bun.Archive({}, { format: "zip" }).bytes();
+      expect(empty.length).toBe(22);
+      expect(readZipDirectory(empty)).toEqual([]);
+      expect((await new Bun.Archive(empty).files()).size).toBe(0);
+    });
+
+    test("non-ASCII entry names round-trip and are flagged as UTF-8", async () => {
+      const entries: Record<string, string> = {
+        "日本.txt": "nihon",
+        "café.txt": "cafe",
+        "emoji-😀/nested-ü.txt": "nested",
+        "ascii.txt": "plain",
+      };
+      const zip = await new Bun.Archive(entries, { format: "zip" }).bytes();
+      // General purpose bit 11: the name is UTF-8, not the zip default CP437.
+      expect(readZipDirectory(zip).map(e => [e.name, (e.flags & 0x800) !== 0])).toEqual(
+        Object.keys(entries).map(name => [name, name !== "ascii.txt"]),
+      );
+
+      const read = await new Bun.Archive(zip).files();
+      expect([...read.keys()].sort()).toEqual(Object.keys(entries).sort());
+      for (const [name, content] of Object.entries(entries)) {
+        expect(await read.get(name)!.text()).toBe(content);
+      }
+
+      using dir = tempDir("archive-zip-nonascii", {});
+      expect(await new Bun.Archive(zip).extract(String(dir))).toBe(4);
+      for (const [name, content] of Object.entries(entries)) {
+        expect(await Bun.file(join(String(dir), name)).text()).toBe(content);
+      }
+    });
+
+    test("reads UTF-8 entry names another tool wrote, flagged or not", async () => {
+      // What Info-ZIP, Python and 7-Zip write for a non-ASCII name: the
+      // UTF-8 bytes with general purpose bit 11 set. Finder and older tools
+      // write the same bytes without the flag.
+      const zip = buildZip([
+        { name: "日本.txt", data: "nihon", flags: 0x800 },
+        { name: "café.txt", data: "cafe", flags: 0x800, method: 8 },
+        { name: "ünflagged.txt", data: "raw" },
+        { name: "after.txt", data: "after" },
+      ]);
+      const read = await new Bun.Archive(zip).files();
+      expect([...read.keys()]).toEqual(["日本.txt", "café.txt", "ünflagged.txt", "after.txt"]);
+      expect(await read.get("日本.txt")!.text()).toBe("nihon");
+      expect(await read.get("café.txt")!.text()).toBe("cafe");
+      expect(await read.get("ünflagged.txt")!.text()).toBe("raw");
+
+      using dir = tempDir("archive-zip-flagged", {});
+      expect(await new Bun.Archive(zip).extract(String(dir))).toBe(4);
+      expect(await Bun.file(join(String(dir), "日本.txt")).text()).toBe("nihon");
+      expect(await Bun.file(join(String(dir), "café.txt")).text()).toBe("cafe");
+      expect(await Bun.file(join(String(dir), "ünflagged.txt")).text()).toBe("raw");
+    });
+
+    test("lists __MACOSX entries like every other zip tool", async () => {
+      // libarchive folds Finder's AppleDouble entries into the file they
+      // describe on macOS only. They are ordinary entries on every platform.
+      const zip = buildZip([
+        { name: "a.txt", data: "a" },
+        { name: "__MACOSX/" },
+        { name: "__MACOSX/._a.txt", data: "resource fork" },
+      ]);
+      const read = await new Bun.Archive(zip).files();
+      expect([...read.keys()]).toEqual(["a.txt", "__MACOSX/._a.txt"]);
+      expect([...(await new Bun.Archive(zip).files(["**", "!__MACOSX/**"])).keys()]).toEqual(["a.txt"]);
+    });
+
+    test.skipIf(isWindows)("extracts symlinks, modes and empty directories from a zip", async () => {
+      const zip = buildZip([
+        { name: "target.txt", data: "target", mode: 0o100644 },
+        { name: "stored-link", data: "target.txt", mode: 0o120777 },
+        { name: "deflated-link", data: "target.txt", mode: 0o120777, method: 8 },
+        { name: "escaping-link", data: "../../outside", mode: 0o120777 },
+        { name: "exec.sh", data: "#!/bin/sh\n", mode: 0o100755 },
+        { name: "empty-dir/", mode: 0o040755 },
+      ]);
+      const archive = new Bun.Archive(zip);
+      expect([...(await archive.files()).keys()]).toEqual(["target.txt", "exec.sh"]);
+      expect(Bun.inspect(archive)).toContain("files: 2");
+
+      for (const glob of [undefined, "**"]) {
+        using dir = tempDir("archive-zip-unix", {});
+        await archive.extract(String(dir), glob ? { glob } : undefined);
+        expect(lstatSync(join(String(dir), "stored-link")).isSymbolicLink()).toBe(true);
+        expect(await Bun.file(join(String(dir), "stored-link")).text()).toBe("target");
+        expect(await Bun.file(join(String(dir), "deflated-link")).text()).toBe("target");
+        expect(existsSync(join(String(dir), "escaping-link"))).toBe(false);
+        expect(statSync(join(String(dir), "exec.sh")).mode & 0o111).toBe(0o111);
+        expect(statSync(join(String(dir), "empty-dir")).isDirectory()).toBe(true);
+      }
+    });
+
+    test("Archive.write() writes a zip", async () => {
+      using dir = tempDir("archive-zip-write", {});
+      const path = join(String(dir), "out.zip");
+      await Bun.Archive.write(path, files, { format: "zip" });
+      const zip = await Bun.file(path).bytes();
+      expect(Buffer.from(zip.subarray(0, 4))).toEqual(Buffer.from("PK\x03\x04", "latin1"));
+      expect(readZipDirectory(zip).map(e => e.name)).toEqual(Object.keys(files));
+      expect(await new Bun.Archive(zip).files().then(m => m.get("hello.txt")!.text())).toBe("Hello, World!");
+
+      // An Archive that already holds zip bytes is written as it is.
+      const copy = join(String(dir), "copy.zip");
+      await Bun.Archive.write(copy, new Bun.Archive(zip));
+      expect(await Bun.file(copy).bytes()).toEqual(zip);
+
+      // `compress: false` overrides an Archive's own gzip setting.
+      const plain = join(String(dir), "plain.tar");
+      await Bun.Archive.write(plain, new Bun.Archive(files, { compress: "gzip" }), { compress: false });
+      const tar = await Bun.file(plain).bytes();
+      expect(Buffer.from(tar.subarray(257, 262)).toString()).toBe("ustar");
+      expect([...(await new Bun.Archive(tar).files()).keys()]).toEqual(Object.keys(files));
+    });
+
+    test("rejects an entry that needs a compression bun does not have", async () => {
+      // Method 12 is bzip2. libarchive is built without it, so the entry
+      // fails to read instead of coming back empty.
+      const zip = buildZip([
+        { name: "ok.txt", data: "fine" },
+        { name: "packed.bz2.txt", data: "squeezed", method: 12, stored: Buffer.from("BZh91AY&SY") },
+      ]);
+      await expect(new Bun.Archive(zip).files()).rejects.toThrow("Unsupported ZIP compression method (12: bzip)");
+      expect([...(await new Bun.Archive(zip).files("ok.txt")).keys()]).toEqual(["ok.txt"]);
+
+      using dir = tempDir("archive-zip-unsupported", {});
+      await expect(new Bun.Archive(zip).extract(String(dir))).rejects.toThrow("ReadError");
+      using globbed = tempDir("archive-zip-unsupported-glob", {});
+      await expect(new Bun.Archive(zip).extract(String(globbed), { glob: "**" })).rejects.toThrow("ReadError");
+      expect(readdirSync(String(globbed))).toEqual(["ok.txt"]);
+    });
+
+    test("path traversal in a zip cannot escape the extraction root", async () => {
+      const zip = buildZip([
+        { name: "../escaped.txt", data: "outside" },
+        { name: "safe/../../escaped2.txt", data: "outside" },
+        { name: "safe.txt", data: "inside" },
+      ]);
+      using parent = tempDir("archive-zip-traversal", {});
+      const out = join(String(parent), "extract");
+      await new Bun.Archive(zip).extract(out);
+      expect(await Bun.file(join(out, "safe.txt")).text()).toBe("inside");
+      expect(existsSync(join(String(parent), "escaped.txt"))).toBe(false);
+      expect(existsSync(join(String(parent), "escaped2.txt"))).toBe(false);
+
+      // The glob option goes through a separate extraction loop.
+      const globbed = join(String(parent), "globbed");
+      await new Bun.Archive(zip).extract(globbed, { glob: "**" });
+      expect(await Bun.file(join(globbed, "safe.txt")).text()).toBe("inside");
+      expect(existsSync(join(String(parent), "escaped.txt"))).toBe(false);
+    });
+
+    test("validates the options", async () => {
+      const files = { "a.txt": "a" };
+      // @ts-expect-error - not a format
+      expect(() => new Bun.Archive(files, { format: "rar" })).toThrow('format must be "tar" or "zip"');
+      // @ts-expect-error - gzip wraps a tarball, a zip deflates each entry
+      expect(() => new Bun.Archive(files, { format: "zip", compress: "gzip" })).toThrow(
+        'compress "gzip" cannot be combined with format "zip"',
+      );
+      // @ts-expect-error - deflate is the zip entry compression
+      expect(() => new Bun.Archive(files, { compress: "deflate" })).toThrow('compress "deflate" requires format "zip"');
+      // @ts-expect-error - not an algorithm bun has
+      expect(() => new Bun.Archive(files, { format: "zip", compress: "zstd" })).toThrow(
+        'compress must be "gzip", "deflate" or false',
+      );
+      expect(() => new Bun.Archive(files, { format: "zip", level: 10 })).toThrow("level must be between 1 and 9");
+      expect(() => new Bun.Archive(files, { format: "tar", compress: "gzip", level: 13 })).toThrow(
+        "level must be between 1 and 12",
+      );
+      // @ts-expect-error - true names no algorithm
+      expect(() => new Bun.Archive(files, { format: "zip", compress: true })).toThrow(
+        'compress must be "gzip", "deflate" or false',
+      );
+      expect(() => new Bun.Archive({ [Buffer.alloc(65536, "n").toString()]: "x" }, { format: "zip" })).toThrow(
+        "zip entry name cannot be longer than 65535 bytes",
+      );
+
+      // Existing archive data has a format already.
+      using dir = tempDir("archive-zip-options", {});
+      const zip = await new Bun.Archive(files, { format: "zip" }).bytes();
+      for (const data of [zip, zip.buffer, new Blob([zip]), new Bun.Archive(zip)]) {
+        for (const format of ["zip", "tar"] as const) {
+          if (!(data instanceof Bun.Archive)) {
+            expect(() => new Bun.Archive(data, { format })).toThrow(
+              "format can only be set when creating an archive from an object",
+            );
+          }
+          expect(() => Bun.Archive.write(join(String(dir), "unused.zip"), data, { format })).toThrow(
+            "format can only be set when creating an archive from an object",
+          );
+        }
+      }
+      expect(readdirSync(String(dir))).toEqual([]);
+
+      // `format: "tar"` and `compress: false` spell out the defaults.
+      const plain = await new Bun.Archive(files).bytes();
+      const spelled = await new Bun.Archive(files, { format: "tar", compress: false }).bytes();
+      expect(spelled.length).toBe(plain.length);
+      expect(Buffer.from(spelled.subarray(257, 262)).toString()).toBe("ustar");
+    });
+  });
+
   describe("TypeScript types", () => {
     test("valid archive options", () => {
       const files = { "hello.txt": "Hello, World!" };
@@ -1941,6 +2447,11 @@ describe("Bun.Archive", () => {
 
       // Valid: gzip with level
       new Bun.Archive(files, { compress: "gzip", level: 9 });
+
+      // Valid: a zip, deflated by default, stored with compress: false
+      new Bun.Archive(files, { format: "zip" });
+      new Bun.Archive(files, { format: "zip", level: 9 });
+      new Bun.Archive(files, { format: "zip", compress: false });
     });
 
     test("invalid archive options throw TypeScript errors", () => {
