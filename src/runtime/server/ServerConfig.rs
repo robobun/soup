@@ -37,6 +37,11 @@ pub struct ServerConfig {
     // `deinit()` (frees the owned C strings).
     pub(crate) sni: Option<Vec<SSLConfig>>,
     pub(crate) max_request_body_size: usize,
+    /// `None` when responses are sent without a content coding.
+    pub(crate) compress: Option<super::compression::Config>,
+    /// Set when the options name `compress`. Without it, `reload()` keeps the
+    /// current setting.
+    pub(crate) has_compress: bool,
     pub(crate) development: DevelopmentOption,
     pub(crate) broadcast_console_log_from_browser_to_server_for_bake: bool,
 
@@ -85,6 +90,8 @@ impl Default for ServerConfig {
             ssl_config: None,
             sni: None,
             max_request_body_size: 1024 * 1024 * 128,
+            compress: None,
+            has_compress: false,
             development: DevelopmentOption::Development,
             broadcast_console_log_from_browser_to_server_for_bake: false,
             enable_chrome_devtools_automatic_workspace_folders: true,
@@ -275,6 +282,8 @@ impl ServerConfig {
             ssl_config: self.ssl_config.take(),
             sni: self.sni.take(),
             max_request_body_size: self.max_request_body_size,
+            compress: self.compress,
+            has_compress: self.has_compress,
             development: self.development,
             broadcast_console_log_from_browser_to_server_for_bake: self
                 .broadcast_console_log_from_browser_to_server_for_bake,
@@ -1186,6 +1195,13 @@ impl ServerConfig {
             if max_request_body_size.is_number() {
                 args.max_request_body_size = u64::try_from(max_request_body_size.to_int64().max(0))
                     .expect("int cast") as usize;
+            }
+        }
+
+        if let Some(compress) = arg.get(global, "compress")? {
+            if !compress.is_undefined() {
+                args.has_compress = true;
+                args.compress = super::compression::Config::from_js(global, compress)?;
             }
         }
 
