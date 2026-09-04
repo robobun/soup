@@ -1891,6 +1891,11 @@ where
                 .with_mut(|config| config.on_error = new_config.on_error);
         }
 
+        if new_config.has_compress {
+            self.config
+                .with_mut(|config| config.compress = new_config.compress);
+        }
+
         if let Some(mut ws) = new_config.websocket.take() {
             ws.handler
                 .flags
