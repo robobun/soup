@@ -20,6 +20,7 @@ use crate::api::js_bundle_completion_task::{BuildOwner, JSBundleCompletionTask};
 use crate::api::js_bundler::js_bundler::{self as JSBundler, Config as JSBundlerConfig};
 use crate::api::output_file_jsc::OutputFileJsc as _;
 use crate::bake::dev_server::route_bundle;
+use crate::server::compression::{self, Encoding};
 use crate::server::jsc::{JSGlobalObject, JSValue};
 use crate::server::server_config::MethodOptional;
 use crate::server::{
@@ -236,6 +237,7 @@ impl Route {
                     };
                     let pending = PendingResponse {
                         method,
+                        encoding: compression::for_request(server.config().compress, &req),
                         resp,
                         _route: self.clone(),
                         is_response_pending: Cell::new(true),
@@ -605,10 +607,11 @@ impl Route {
 
             match self.state.get() {
                 State::Html(html) => {
+                    let route = html.clone().for_encoding(pending_response.encoding);
                     if method == Method::HEAD {
-                        html.clone().on_head(resp);
+                        route.on_head(resp);
                     } else {
-                        html.clone().on(resp);
+                        route.on(resp);
                     }
                 }
                 State::Err(_log) => {
@@ -650,6 +653,9 @@ impl Drop for Route {
 /// Represents an in-flight response before the bundle has finished building.
 pub(crate) struct PendingResponse {
     method: Method,
+    /// Picked from the request's `Accept-Encoding`, which is gone once the
+    /// bundle is ready.
+    encoding: Option<Encoding>,
     resp: AnyResponse,
     is_response_pending: Cell<bool>,
     /// Keeps the route alive while this response waits on it.
