@@ -728,6 +728,39 @@ test("maxRequestBodySize: custom large value", {
   },
 });
 
+test("compress: true", {
+  compress: true,
+  port: 0,
+  fetch() {
+    return new Response("compressed when the request accepts it");
+  },
+});
+
+test("compress: encodings and threshold", {
+  compress: { encodings: ["br", "gzip"], threshold: 0 },
+  port: 0,
+  routes: {
+    "/": Response.json({ compressed: true }),
+  },
+});
+
+test(
+  "compress: unknown encoding",
+  {
+    // @ts-expect-error Not an encoding that Bun.serve can use
+    compress: { encodings: ["lz4"] },
+    port: 0,
+    fetch() {
+      return new Response("unreachable");
+    },
+  },
+  {
+    onConstructorFailure: error => {
+      expect(error.message).toContain("compress.encodings");
+    },
+  },
+);
+
 test("development: true", {
   development: true,
   port: 0,
