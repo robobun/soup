@@ -587,6 +587,33 @@ declare module "bun" {
           chromeDevToolsAutomaticWorkspaceFolders?: boolean;
         };
 
+    /**
+     * A content coding that {@link Bun.serve} can compress responses with.
+     */
+    type ContentEncoding = "zstd" | "br" | "gzip" | "deflate";
+
+    /**
+     * Options for the `compress` option of {@link Bun.serve}
+     */
+    interface CompressOptions {
+      /**
+       * The encodings the server uses, in order of preference. The server
+       * picks the one that the request's `Accept-Encoding` gives the highest
+       * `q` value. When two have the same `q` value, as they do for a browser,
+       * the one that comes first here wins.
+       *
+       * @default ["zstd", "br", "gzip"]
+       */
+      encodings?: ContentEncoding[];
+
+      /**
+       * A body smaller than this many bytes is sent as it is.
+       *
+       * @default 1024
+       */
+      threshold?: number;
+    }
+
     type HTTPMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS";
 
     type Handler<Req extends Request, S, Res> = (request: Req, server: S) => MaybePromise<Res>;
@@ -762,6 +789,31 @@ declare module "bun" {
        * @default 1024 * 1024 * 128 // 128MB
        */
       maxRequestBodySize?: number;
+
+      /**
+       * Compress response bodies with a content coding that the request's
+       * `Accept-Encoding` allows.
+       *
+       * Bodies that are in memory are compressed: strings, buffers, `Blob`s,
+       * `Response.json()`, and static `routes`. Static routes are compressed
+       * once per encoding. Files, and streams that still produce data, are
+       * sent as they are. A response that already has a `Content-Encoding`,
+       * or whose `Cache-Control` has `no-transform`, is sent as it is.
+       *
+       * A strong `ETag` becomes weak on a compressed response. A `fetch`
+       * handler that compares `If-None-Match` must allow for the `W/` prefix.
+       *
+       * @default false
+       *
+       * @example
+       * ```ts
+       * Bun.serve({
+       *   compress: true,
+       *   fetch: () => Response.json(data),
+       * });
+       * ```
+       */
+      compress?: boolean | CompressOptions;
 
       /**
        * Whether to render contextual errors with Bun's error page
@@ -956,7 +1008,8 @@ declare module "bun" {
     closeIdleConnections(): number;
 
     /**
-     * Update the `fetch` and `error` handlers without restarting the server.
+     * Update the `fetch` and `error` handlers, the `routes`, the `websocket`
+     * handlers and the `compress` option without restarting the server.
      *
      * @example
      *

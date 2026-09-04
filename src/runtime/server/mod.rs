@@ -61,6 +61,9 @@ pub(crate) use http_status_text as HTTPStatusText;
 pub(crate) mod range_request;
 pub(crate) use range_request as RangeRequest;
 
+#[path = "Compression.rs"]
+pub(crate) mod compression;
+
 #[path = "WebSocketServerContext.rs"]
 pub(crate) mod web_socket_server_context;
 pub(crate) use web_socket_server_context::{
