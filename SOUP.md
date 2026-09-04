@@ -1010,6 +1010,87 @@ Files: `src/runtime/api/Archive.rs`, `src/libarchive/lib.rs`, `scripts/build/dep
 `patches/libarchive/zip-utf8-names.patch`, `packages/bun-types/bun.d.ts`, `docs/runtime/archive.mdx`,
 `test/js/bun/archive.test.ts`, `test/integration/bun-types/fixture/bun.ts`.
 
+### 2026-09-04: response compression for `Bun.serve`
+
+`Bun.serve` sent every response uncompressed. A JSON API or an HTML page went over the wire at several
+times its compressed size, and the ways around that were a reverse proxy in front (Caddy, nginx) or a
+middleware that redoes content negotiation on top of `Bun.gzipSync`. oven-sh/bun#2726 asks for this and
+has been open since 2023, and `RequestContext` carried a comment that asked for built-in compression for
+as long. `Deno.serve` compresses by default. In bun it is opt-in, through a `compress` option:
+
+```ts
+Bun.serve({
+  compress: true,
+  routes: { "/": homepage },
+  fetch: () => Response.json(report),
+});
+
+// The encodings to use, in order of preference, and the smallest body to encode.
+Bun.serve({ compress: { encodings: ["br", "gzip"], threshold: 256 }, fetch });
+```
+
+The server uses the configured encoding that the request's `Accept-Encoding` gives the highest `q`
+value, and a tie goes to the one that comes first in the configuration. Browsers send no `q` values, so
+in practice the configured order decides. The parser follows RFC 9110 §12.5.3: a coding with `q=0` is
+refused, `*` gives its weight to every coding that the header does not name, tokens are
+case-insensitive, and `x-gzip` means `gzip`. The default order is `zstd`, `br`, `gzip`. `deflate` (the
+zlib format, which is what HTTP means by it) is available but not in the default list. The levels suit
+compression per request: zstd 3, brotli 4, gzip 6 through libdeflate. On a 38 KB JSON body zstd takes
+0.06 ms and brotli 0.2 ms, and both come out at 5 to 6% of the original. On source text the three land
+near 26%.
+
+Bodies that are in memory are compressed: strings, buffers, `Blob`s, `Response.json()`, the responses
+of `error()`, and static routes. A response goes out as it is when its body is a `Bun.file()`, a file
+route, or a `ReadableStream` that still produces data, when the body is smaller than the threshold (1024
+bytes by default) or does not get smaller, when the response already has a `Content-Encoding`, a
+`Content-Range` or status 206, when its `Cache-Control` has `no-transform`, and when its type does not
+compress. A stream whose data is already in memory, such as `blob.stream()`, is compressed like a buffer.
+Text (but not `text/event-stream`), JSON, JavaScript, XML, WebAssembly, SVG and the other `+json` and
+`+xml` types compress, and so do TrueType and OpenType fonts and BMP and ICO images. Other images, audio,
+video, archives and WOFF fonts are compressed already.
+
+A compressed response carries `Content-Encoding`, the compressed `Content-Length`, a `Vary` that
+includes `Accept-Encoding` (merged into the handler's own `Vary`), and a weak `ETag` in place of a
+strong one, because the bytes differ from the original (RFC 9110 §8.8.3). nginx does the same. Bun
+compares `If-None-Match` for static routes, where the weak form matches. A `fetch` handler that compares
+`If-None-Match` with `===` gets the weak form back from clients, so the docs tell it to drop the `W/`
+first. A response that qualifies but goes out unencoded, because the request accepts none of the
+encodings, carries the `Vary` too, so a shared cache keeps the variants apart. HEAD gets the headers
+that GET gets, compressed length included. `server.reload()` applies a `compress` option and keeps the
+current setting without one, as it does for `fetch` and `error`.
+
+A static route is compressed once per encoding, on the first request that asks for that encoding, and
+the result is kept. The encoded copy is a static route of its own, with its own body, headers and count
+of responses in flight, so backpressure, HEAD and aborted requests take the paths they always took.
+Conditional requests are evaluated on the original route. The `304` then carries the `ETag` and `Vary`
+of the response that a 200 would be, which is the weak `ETag` for a request that gets an encoded copy
+(RFC 9110 §15.4.5), and no `Content-Encoding`, since it has no content. An HTML import that `Bun.serve`
+bundles in production is a set of static routes, so its page and its JavaScript and CSS chunks are
+compressed as well. That includes the first requests, which wait for the bundle: each keeps the
+encoding picked from its `Accept-Encoding`. The files that `bun build` writes are file routes and are
+sent as they are. A route works out whether it can be compressed on its first request with `compress`
+on, so a server without the option does no extra work.
+
+Two details of the dynamic path. The encoding is picked when the request context is created, and only
+when `compress` is on, because the uWS request is gone once a handler awaits. That costs the context one
+byte. `render_metadata` negotiates after it knows the content type and before it writes headers, swaps
+the body for the encoded bytes, and keeps the original body until it returns, because a `File` body's
+name still sets `Content-Disposition`. The `Vary` and `ETag` that it replaces are removed from the
+response's headers and written again, so nothing on that path can throw.
+
+Left for later: streaming compression for `ReadableStream` bodies (server-sent events and React's
+`renderToReadableStream`), `Bun.file()` bodies and file routes, a `level` option, and precompressed
+`.br` and `.gz` files for directory routes. A pre-existing bug turned up on the way and was reported
+separately rather than fixed here: a HEAD response has no `Date` header.
+
+Files: `src/runtime/server/Compression.rs` (the option, `Accept-Encoding`, the encoders),
+`src/runtime/server/RequestContext.rs` (`negotiate_encoding`, `render_metadata`, HEAD),
+`src/runtime/server/StaticRoute.rs` (`Compressible`, `for_encoding`, 304 headers),
+`src/runtime/server/HTMLBundle.rs` (pending responses), `src/runtime/server/ServerConfig.rs`,
+`src/runtime/server/server_body.rs` (reload), `src/runtime/server/mod.rs`, `packages/bun-types/serve.d.ts`,
+`docs/runtime/http/server.mdx`, `test/js/bun/http/bun-serve-compress.test.ts`,
+`test/integration/bun-types/fixture/serve-types.test.ts`.
+
 ## Dropped
 
 Nothing yet.

@@ -267,6 +267,53 @@ Bun.serve({
 
 ---
 
+## Compression
+
+Set `compress: true` to compress response bodies. Bun picks the encoding from the request's `Accept-Encoding` header and sets `Content-Encoding`, `Content-Length` and `Vary: Accept-Encoding` on the response.
+
+```ts
+Bun.serve({
+  compress: true, // [!code ++]
+  async fetch(req) {
+    return Response.json(await loadReport());
+  },
+});
+```
+
+Bodies that are in memory are compressed: strings, `ArrayBuffer`s and typed arrays, `Blob`s, and `Response.json()`. A static route is compressed once for each encoding, on the first request that asks for it, and the result is kept. With `development` off, this includes an HTML import and its assets, when `Bun.serve` bundles them or when they are in a `--compile` executable.
+
+A response is sent as it is when:
+
+- its body is a `Bun.file()`, a file route, or a `ReadableStream` that still produces data. A stream whose data is in memory, such as `blob.stream()`, is compressed.
+- its body is smaller than `threshold` bytes (default `1024`)
+- it already has a `Content-Encoding` header
+- its `Cache-Control` header has `no-transform`
+- it has a `Content-Range` header or status `206`
+- its type does not compress well. Text, JSON, JavaScript, XML, SVG, WebAssembly, TrueType and OpenType fonts, and BMP and ICO images compress. Other images, video, audio and archives do not.
+- the encoded body is not smaller than the original
+
+The files that `bun build` writes for an HTML import are served from disk, so they are sent as they are.
+
+The server uses the encoding that the request gives the highest `q` value. Browsers send no `q` values, so they get the first encoding in `encodings` that they accept. The default order is `["zstd", "br", "gzip"]`. `"deflate"` is also available.
+
+```ts
+Bun.serve({
+  compress: {
+    encodings: ["br", "gzip"],
+    threshold: 256,
+  },
+  fetch(req) {
+    return new Response(html, { headers: { "Content-Type": "text/html" } });
+  },
+});
+```
+
+A strong `ETag` becomes weak (`W/"..."`) on a compressed response, because the bytes differ from the original. Bun compares `If-None-Match` for static routes, and the weak form matches there. A `fetch` handler that compares `If-None-Match` itself gets the weak form back from clients, so remove the `W/` prefix before it compares.
+
+`server.reload()` applies a `compress` option. Without one, it keeps the current setting. Pass `compress: false` to turn compression off.
+
+---
+
 ## export default syntax
 
 Instead of passing the server options into `Bun.serve`, you can `export default` them.
@@ -378,7 +425,7 @@ server.reload({
 });
 ```
 
-Use this for development and hot reloading. You can update only `fetch`, `error`, `routes`, and `websocket`.
+Use this for development and hot reloading. You can update only `fetch`, `error`, `routes`, `websocket`, and `compress`.
 
 ---
 

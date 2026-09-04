@@ -2132,6 +2132,10 @@ where
             self.config.on_error = new_config.on_error;
         }
 
+        if new_config.has_compress {
+            self.config.compress = new_config.compress;
+        }
+
         if let Some(mut ws) = new_config.websocket.take() {
             // `Handler::from_js` already rejected configs with no non-error
             // callback, so any `Some(ws)` is adoptable — match initial-serve

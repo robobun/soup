@@ -61,6 +61,9 @@ pub use http_status_text as HTTPStatusText;
 pub mod range_request;
 pub use range_request as RangeRequest;
 
+#[path = "Compression.rs"]
+pub mod compression;
+
 #[path = "WebSocketServerContext.rs"]
 pub mod web_socket_server_context;
 pub use web_socket_server_context::{Handler as WebSocketServerHandler, WebSocketServerContext};

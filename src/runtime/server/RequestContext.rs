@@ -9,6 +9,7 @@ use bun_http_types::Method::Method;
 use bun_jsc::JsCell;
 use bun_uws::{self as uws, WebSocketUpgradeContext};
 
+use crate::server::compression::{self, Encoding};
 use crate::server::jsc::{self, JSGlobalObject, JSValue, JsResult};
 use crate::server::{RangeRequest, ServerLike};
 use crate::webcore::{
@@ -154,6 +155,9 @@ pub struct RequestContext<
 
     pub(crate) sendfile: Cell<SendfileContext>,
     pub(crate) range: RangeRequest::Raw,
+    /// The encoding that `compress` picked from the request's
+    /// `Accept-Encoding` when the request arrived.
+    pub(crate) encoding: Option<Encoding>,
 
     pub(crate) request_body_readable_stream_ref: JsCell<readable_stream::Strong>,
     /// Owning `+1` handle into the per-VM `Body::Value` hive pool. Shared with
@@ -194,7 +198,6 @@ pub struct RequestContext<
     /// field before the value can dangle. `on_abort` reclaims the ref through
     /// it so an aborted request is torn down without waiting for GC.
     promise_cell: Cell<JSValue>,
-    // TODO: support builtin compression
 }
 
 impl<ThisServer, const SSL_ENABLED: bool, const DEBUG_MODE: bool, const MUX: bool>
@@ -1414,6 +1417,9 @@ where
         let resolved_method = method
             .or_else(|| Method::which(Self::req_method(req)))
             .unwrap_or(Method::GET);
+        // SAFETY: a non-null `server` is the live server that owns this context's pool.
+        let compress = NonNull::new(server).and_then(|s| unsafe { s.as_ref() }.config().compress);
+        let encoding = compression::for_request(compress, &Self::any_request(req));
         let slot: *mut Self = this.as_mut_ptr();
         // SAFETY: writing to MaybeUninit slot
         unsafe {
@@ -1427,6 +1433,7 @@ where
                 ),
                 defer_deinit_until_callback_completes: Cell::new(should_deinit_context),
                 range: RangeRequest::raw_from_request(&Self::any_request(req)),
+                encoding,
                 request_weakref: JsCell::new(request::WeakRef::EMPTY),
                 signal: Cell::new(None),
                 cookies: JsCell::new(None),
@@ -2612,8 +2619,15 @@ where
         match body_value {
             Body::Value::InternalBlob(_) | Body::Value::WTFStringImpl(_) => {
                 let mut blob = body_value.use_as_any_blob_allow_non_utf8_string();
-                let size = blob.size();
+                let negotiated = this.negotiate_head_encoding(response, &blob);
+                let size = negotiated
+                    .as_ref()
+                    .and_then(Negotiated::encoded_len)
+                    .unwrap_or_else(|| blob.size());
                 this.render_metadata();
+                if let Some(negotiated) = &negotiated {
+                    this.write_negotiated_headers(negotiated);
+                }
 
                 if size == crate::webcore::blob::MAX_SIZE {
                     resp.write_header_int(b"content-length", 0);
@@ -2664,8 +2678,20 @@ where
                 // (here, `blob`) may still be live across it. Nothing is written
                 // to the socket in between, so the wire output is unchanged.
                 blob.resolve_size();
-                let blob_size = blob.size.get();
+                let negotiated = this.compress_config().and_then(|_| {
+                    let mut body = AnyBlob::Blob(blob.dupe());
+                    let negotiated = this.negotiate_head_encoding(response, &body);
+                    body.detach();
+                    negotiated
+                });
+                let blob_size = negotiated
+                    .as_ref()
+                    .and_then(Negotiated::encoded_len)
+                    .unwrap_or_else(|| blob.size.get());
                 this.render_metadata();
+                if let Some(negotiated) = &negotiated {
+                    this.write_negotiated_headers(negotiated);
+                }
 
                 if blob_size == crate::webcore::blob::MAX_SIZE {
                     resp.write_header_int(b"content-length", 0);
@@ -3794,12 +3820,6 @@ where
         let mut needs_content_range = self.flags.needs_content_range()
             && (sendfile.total > 0 || sendfile.remain < blob.size());
 
-        let size = if needs_content_range {
-            sendfile.remain
-        } else {
-            blob.size()
-        };
-
         let (content_type, needs_content_type, content_type_needs_free) =
             get_content_type(response.get_init_headers_mut(), blob);
         // NOTE: `MimeType` owns a `Cow<'static, [u8]>`; Drop handles the owned case.
@@ -3808,6 +3828,32 @@ where
             // Drop of `content_type` (moved into closure capture below would
             // change borrow lifetimes); rely on natural end-of-scope drop.
         });
+
+        let mut negotiated = self.negotiate_encoding(response, blob, &content_type.value);
+        // From here on the encoded body is the one that is sent. The original
+        // lives to the end of this function, because its file name still
+        // sets `Content-Disposition` below.
+        let original = scopeguard::guard(
+            negotiated
+                .as_mut()
+                .filter(|negotiated| negotiated.encoding.is_some())
+                .map(|negotiated| {
+                    let encoded = core::mem::take(&mut negotiated.body);
+                    self.blob.replace(AnyBlob::from_owned_slice(encoded))
+                }),
+            |original| {
+                if let Some(mut original) = original {
+                    original.detach();
+                }
+            },
+        );
+
+        let size = if needs_content_range {
+            sendfile.remain
+        } else {
+            self.blob.get().size()
+        };
+
         let mut has_content_disposition = false;
         let mut has_content_range = false;
         if let Some(mut headers_) = response.swap_init_headers() {
@@ -3835,6 +3881,10 @@ where
             self.do_write_status(status);
         }
 
+        if let Some(negotiated) = &negotiated {
+            self.write_negotiated_headers(negotiated);
+        }
+
         if let Some(mut cookies) = self.cookies.replace(None) {
             let global_this = self.server().global_this();
             let resp = self.resp.get().expect("infallible: resp bound");
@@ -3844,7 +3894,7 @@ where
                 return;
             } // TODO: properly propagate exception upwards
         }
-        let blob = self.blob.get();
+        let blob = original.as_ref().unwrap_or_else(|| self.blob.get());
 
         if needs_content_type
             // do not insert the content type if it is the fallback value
@@ -3944,6 +3994,111 @@ where
         headers.fast_remove(jsc::HTTPHeaderName::TransferEncoding);
         if let Some(resp) = self.resp.get() {
             headers.to_uws_response(uws::ResponseKind::of(resp), resp.as_ptr());
+        }
+    }
+
+    /// Applies the server's `compress` option to an in-memory body. `None`
+    /// when the body does not qualify: compression is off, the body is
+    /// smaller than the threshold, the response already has a coding or a
+    /// range, or the type does not compress. A body that qualifies varies on
+    /// `Accept-Encoding`, and is encoded when the request accepts one of the
+    /// configured codings. The `Vary` and `ETag` values that this replaces
+    /// are removed from the response headers.
+    fn negotiate_encoding(
+        &self,
+        response: &Response,
+        body: &AnyBlob,
+        content_type: &[u8],
+    ) -> Option<Negotiated> {
+        let config = self.compress_config()?;
+        let size = body.size();
+        let status = response.status_code();
+        if size == 0
+            || size < config.threshold
+            || status == 206
+            || HTTPStatusText::is_null_body(status)
+            || self.flags.needs_content_range()
+            || body.needs_to_read_file()
+            || !compression::is_compressible_type(content_type)
+        {
+            return None;
+        }
+
+        let mut existing_vary = None;
+        if let Some(headers) = response.get_init_headers_mut() {
+            if headers.fast_has(jsc::HTTPHeaderName::ContentEncoding)
+                || headers.fast_has(jsc::HTTPHeaderName::ContentRange)
+            {
+                return None;
+            }
+            if headers
+                .fast_get(jsc::HTTPHeaderName::CacheControl)
+                .is_some_and(|value| compression::forbids_transform(&value.to_utf8()))
+            {
+                return None;
+            }
+            existing_vary = headers
+                .fast_get(jsc::HTTPHeaderName::Vary)
+                .map(|value| value.to_utf8().into_owned());
+        }
+        let vary = compression::vary_with_accept_encoding(existing_vary.as_deref());
+
+        let encoded = self
+            .encoding
+            .and_then(|encoding| Some((encoding, compression::encode(encoding, body.slice())?)));
+
+        let mut etag = None;
+        if let Some(headers) = response.get_init_headers_mut() {
+            if existing_vary.is_some() && vary.is_some() {
+                headers.fast_remove(jsc::HTTPHeaderName::Vary);
+            }
+            if encoded.is_some() {
+                etag = headers
+                    .fast_get(jsc::HTTPHeaderName::ETag)
+                    .and_then(|value| compression::weak_etag(&value.to_utf8()));
+                if etag.is_some() {
+                    headers.fast_remove(jsc::HTTPHeaderName::ETag);
+                }
+            }
+        }
+
+        let (encoding, body) = match encoded {
+            Some((encoding, body)) => (Some(encoding), body),
+            None => (None, Vec::new()),
+        };
+        Some(Negotiated {
+            vary,
+            encoding,
+            body,
+            etag,
+        })
+    }
+
+    fn compress_config(&self) -> Option<compression::Config> {
+        self.server.get()?;
+        self.server().config().compress
+    }
+
+    /// `negotiate_encoding` for a HEAD response. Its body is not in
+    /// `self.blob`, so the content type comes from `body`, as it would for GET.
+    fn negotiate_head_encoding(&self, response: &Response, body: &AnyBlob) -> Option<Negotiated> {
+        self.compress_config()?;
+        let (content_type, _, _) = get_content_type(response.get_init_headers_mut(), body);
+        self.negotiate_encoding(response, body, &content_type.value)
+    }
+
+    /// Writes the headers that `negotiate_encoding` decided on. Call it after
+    /// the status line.
+    fn write_negotiated_headers(&self, negotiated: &Negotiated) {
+        let Some(resp) = self.resp.get() else { return };
+        if let Some(encoding) = negotiated.encoding {
+            resp.write_header(b"content-encoding", encoding.token());
+        }
+        if let Some(vary) = &negotiated.vary {
+            resp.write_header(b"vary", vary);
+        }
+        if let Some(etag) = &negotiated.etag {
+            resp.write_header(b"etag", etag);
         }
     }
 
@@ -4588,6 +4743,24 @@ struct StreamPair<'a, ThisServer, const SSL: bool, const DBG: bool, const MUX: b
 struct HeaderResponseSizePair<'a, ThisServer, const SSL: bool, const DBG: bool, const MUX: bool> {
     pub this: &'a RequestContext<ThisServer, SSL, DBG, MUX>,
     pub(crate) size: usize,
+}
+
+/// What `compress` decided for a body that qualifies.
+struct Negotiated {
+    /// The `Vary` to send, when the response's own value does not cover
+    /// `Accept-Encoding`.
+    vary: Option<Vec<u8>>,
+    /// Set when the body was encoded. `body` then holds the encoded bytes.
+    encoding: Option<Encoding>,
+    body: Vec<u8>,
+    /// The weak form of the response's `ETag`, sent in its place.
+    etag: Option<Vec<u8>>,
+}
+
+impl Negotiated {
+    fn encoded_len(&self) -> Option<BlobSizeType> {
+        self.encoding.map(|_| self.body.len() as BlobSizeType)
+    }
 }
 
 struct HeaderResponsePair<'a, ThisServer, const SSL: bool, const DBG: bool, const MUX: bool> {

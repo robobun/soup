@@ -1,9 +1,10 @@
 //! StaticRoute stores and serves a static blob. This can be created out of a JS
 //! Response object, or from globally allocated bytes.
 
-use core::cell::Cell;
+use core::cell::{Cell, OnceCell};
 use core::mem::size_of;
 
+use bun_core::strings;
 use bun_http::headers::api::StringPointer;
 use bun_http::headers::append_etag;
 use bun_http::{Headers, Method};
@@ -14,6 +15,7 @@ use bun_http_types::MimeType::MimeType;
 use bun_jsc::HTTPHeaderName;
 use bun_uws::{AnyRequest, AnyResponse};
 
+use crate::server::compression::{self, Encoding};
 use crate::server::jsc::{JSGlobalObject, JSValue, JsResult};
 use crate::server::{AnyServer, HTTPStatusText, write_status};
 use crate::webcore::body::Value as BodyValue;
@@ -36,6 +38,53 @@ pub struct StaticRoute {
     pub(crate) cached_blob_size: u64,
     pub(crate) has_date: bool,
     pub(crate) headers: Headers,
+    /// Filled on the first request while `compress` is on. The inner `None`
+    /// means that the body is never sent with a content coding.
+    compressible: OnceCell<Option<Box<Compressible>>>,
+}
+
+/// The part of a route that the server's `compress` option uses.
+struct Compressible {
+    /// The `Vary` for responses from the route while `compress` is on.
+    /// `None` when the route's own `Vary` covers `Accept-Encoding`.
+    vary: Option<Box<[u8]>>,
+    /// Encoded copies of the route, made the first time that a request
+    /// accepts each coding. The inner `None` means that the coding does not
+    /// make the body smaller.
+    encoded: [OnceCell<Option<RefPtr<StaticRoute>>>; Encoding::COUNT],
+}
+
+impl Compressible {
+    fn for_route(blob: &AnyBlob, headers: &Headers, status_code: u16) -> Option<Box<Compressible>> {
+        if blob.size() == 0
+            || blob.needs_to_read_file()
+            || status_code == 206
+            || HTTPStatusText::is_null_body(status_code)
+            || headers.get(b"content-encoding").is_some()
+            || headers.get(b"content-range").is_some()
+            || headers
+                .get(b"cache-control")
+                .is_some_and(compression::forbids_transform)
+            || !headers
+                .get_content_type()
+                .is_some_and(compression::is_compressible_type)
+        {
+            return None;
+        }
+        Some(Box::new(Compressible {
+            vary: compression::vary_with_accept_encoding(headers.get(b"vary"))
+                .map(Vec::into_boxed_slice),
+            encoded: Default::default(),
+        }))
+    }
+
+    fn memory_cost(&self) -> usize {
+        let routes = self
+            .encoded
+            .iter()
+            .filter_map(|route| route.get()?.as_ref());
+        routes.map(|route| route.memory_cost()).sum()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +119,7 @@ impl StaticRoute {
             pending_responses: Cell::new(0),
             cached_blob_size: blob.size(),
             has_date: headers.get(b"date").is_some(),
+            compressible: OnceCell::new(),
             blob,
             headers,
             server: Cell::new(server),
@@ -128,6 +178,7 @@ impl StaticRoute {
             ref_count: Cell::new(1),
             pending_ref: Cell::new(None),
             pending_responses: Cell::new(0),
+            compressible: OnceCell::new(),
             blob: AnyBlob::Blob(duped),
             cached_blob_size: self.cached_blob_size,
             has_date: self.has_date,
@@ -138,7 +189,101 @@ impl StaticRoute {
     }
 
     pub(crate) fn memory_cost(&self) -> usize {
-        size_of::<StaticRoute>() + self.blob.memory_cost() + self.headers.memory_cost()
+        let encoded = self
+            .compressible
+            .get()
+            .and_then(Option::as_deref)
+            .map_or(0, Compressible::memory_cost);
+        size_of::<StaticRoute>() + self.blob.memory_cost() + self.headers.memory_cost() + encoded
+    }
+
+    fn compress_config(&self) -> Option<compression::Config> {
+        self.server.get()?.config().compress
+    }
+
+    fn compressible(&self) -> Option<&Compressible> {
+        self.compressible
+            .get_or_init(|| Compressible::for_route(&self.blob, &self.headers, self.status_code))
+            .as_deref()
+    }
+
+    /// The `Vary` to send in place of the route's own, or `None` to send the
+    /// headers as they are. A body smaller than the threshold is never
+    /// encoded, so then the response does not vary.
+    fn vary_for_compress(&self) -> Option<&[u8]> {
+        let config = self.compress_config()?;
+        if self.cached_blob_size < config.threshold {
+            return None;
+        }
+        self.compressible()?.vary.as_deref()
+    }
+
+    /// The route that answers `req`. See [`Self::for_encoding`].
+    fn for_request(this: ThisPtr<Self>, req: &AnyRequest) -> ThisPtr<Self> {
+        Self::for_encoding(this, compression::for_request(this.compress_config(), req))
+    }
+
+    /// The route that answers a request that `compress` picked `encoding`
+    /// for: a copy of this one with the body encoded, or this route when the
+    /// body is sent as it is. The copy is made on first use and kept.
+    pub(crate) fn for_encoding(this: ThisPtr<Self>, encoding: Option<Encoding>) -> ThisPtr<Self> {
+        let Some(encoding) = encoding else {
+            return this;
+        };
+        let Some(config) = this.compress_config() else {
+            return this;
+        };
+        if this.cached_blob_size < config.threshold {
+            return this;
+        }
+        let Some(compressible) = this.compressible() else {
+            return this;
+        };
+        match compressible.encoded[encoding as usize].get_or_init(|| this.encode(encoding)) {
+            Some(route) => route.this_ptr(),
+            None => this,
+        }
+    }
+
+    /// A copy of this route with the body encoded. The copy sends the same
+    /// status and headers, plus `Content-Encoding`, the `Vary` that includes
+    /// `Accept-Encoding`, and a weak `ETag`.
+    fn encode(&self, encoding: Encoding) -> Option<RefPtr<StaticRoute>> {
+        use bun_http_types::ETag::HeaderEntryColumns;
+        let body = compression::encode(encoding, self.blob.slice())?;
+
+        let mut headers = Headers::default();
+        let entries = self.headers.entries.slice();
+        for (name, value) in entries.items_name().iter().zip(entries.items_value()) {
+            let name = self.headers.as_str(*name);
+            if strings::eql_case_insensitive_ascii(name, b"etag", true)
+                || strings::eql_case_insensitive_ascii(name, b"vary", true)
+            {
+                continue;
+            }
+            headers.append(name, self.headers.as_str(*value));
+        }
+        headers.append(b"Content-Encoding", encoding.token());
+        let vary = self
+            .compressible()
+            .and_then(|compressible| compressible.vary.as_deref())
+            .or_else(|| self.headers.get(b"vary"));
+        if let Some(vary) = vary {
+            headers.append(b"Vary", vary);
+        }
+        if let Some(etag) = self.headers.get(b"etag") {
+            match compression::weak_etag(etag) {
+                Some(weak) => headers.append(b"ETag", &weak),
+                None => headers.append(b"ETag", etag),
+            }
+        }
+
+        Some(RefPtr::new(StaticRoute::new(
+            AnyBlob::from_owned_slice(body),
+            headers,
+            self.server.get(),
+            self.status_code,
+        )))
     }
 
     pub fn from_js(
@@ -256,8 +401,9 @@ impl StaticRoute {
         }
 
         // Continue with normal HEAD request handling
+        let route = Self::for_request(this, &req);
         req.set_yield(false);
-        Self::on_head(this, resp);
+        Self::on_head(route, resp);
     }
 
     pub(crate) fn on_head(this: ThisPtr<Self>, resp: AnyResponse) {
@@ -297,8 +443,9 @@ impl StaticRoute {
         } else {
             // For other methods, use the original behavior
             let mut req = req;
+            let route = Self::for_request(this, &req);
             req.set_yield(false);
-            Self::on(this, resp);
+            Self::on(route, resp);
         }
     }
 
@@ -311,8 +458,9 @@ impl StaticRoute {
         }
 
         // Continue with normal GET request handling
+        let route = Self::for_request(this, &req);
         req.set_yield(false);
-        Self::on(this, resp);
+        Self::on(route, resp);
     }
 
     pub(crate) fn on(this: ThisPtr<Self>, resp: AnyResponse) {
@@ -433,7 +581,10 @@ impl StaticRoute {
         }
     }
 
-    fn do_write_headers(&self, resp: AnyResponse) {
+    /// `without_content_encoding` leaves out `Content-Encoding`. A 304 or a
+    /// 412 that sends the headers of an encoded copy sets it: a response
+    /// with no content has no coding.
+    fn do_write_headers(&self, resp: AnyResponse, without_content_encoding: bool) {
         use bun_http_types::ETag::HeaderEntryColumns;
         // Date is a singleton field (RFC 9110 §6.6.1); when the snapshot already
         // carries one, suppress uWS's auto-Date so only the user's value is sent.
@@ -445,12 +596,23 @@ impl StaticRoute {
         let values: &[StringPointer] = entries.items_value();
         let buf = self.headers.buf.as_slice();
 
+        let vary = self.vary_for_compress();
+
         debug_assert_eq!(names.len(), values.len());
         for (name, value) in names.iter().zip(values) {
-            resp.write_header(
-                &buf[name.offset as usize..][..name.length as usize],
-                &buf[value.offset as usize..][..value.length as usize],
-            );
+            let name = &buf[name.offset as usize..][..name.length as usize];
+            if vary.is_some() && strings::eql_case_insensitive_ascii(name, b"vary", true) {
+                continue;
+            }
+            if without_content_encoding
+                && strings::eql_case_insensitive_ascii(name, b"content-encoding", true)
+            {
+                continue;
+            }
+            resp.write_header(name, &buf[value.offset as usize..][..value.length as usize]);
+        }
+        if let Some(vary) = vary {
+            resp.write_header(b"Vary", vary);
         }
         if !matches!(resp, AnyResponse::H3(_)) {
             if let Some(srv) = self.server.get() {
@@ -467,7 +629,7 @@ impl StaticRoute {
 
     fn render_metadata(&self, resp: AnyResponse) {
         self.do_write_status(self.status_code, resp);
-        self.do_write_headers(resp);
+        self.do_write_headers(resp, false);
     }
 
     pub(crate) fn on_with_method(this: ThisPtr<Self>, method: Method, resp: AnyResponse) {
@@ -554,7 +716,10 @@ impl StaticRoute {
             resp.timeout(server.config().idle_timeout);
         }
         this.do_write_status(status, resp);
-        this.do_write_headers(resp);
+        // A 304 carries the `ETag` and `Vary` that a 200 would carry (RFC 9110
+        // §15.4.5). For an encoded copy the `ETag` is the weak one.
+        let route = Self::for_request(this, req);
+        route.do_write_headers(resp, !core::ptr::eq(route.as_ptr(), this.as_ptr()));
         if !HTTPStatusText::is_null_body(status) {
             resp.write_header_int(b"Content-Length", 0);
         }
