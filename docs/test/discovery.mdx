@@ -73,6 +73,24 @@ describe("Math", () => {
 
 For this test, `bun test` matches the pattern against the string "Math operations should add correctly".
 
+### Rerunning the files that failed
+
+After a run with failures, `--last-failed` runs only the test files that failed in the previous run:
+
+```bash terminal icon="terminal"
+bun test
+# 3 pass, 2 fail across 12 files
+
+bun test --last-failed
+# --last-failed: running 2/12 test files
+```
+
+A file counts as failed when a test in it fails, when it throws outside of any test, or when it crashes. Bun updates the record after every run, for the files that ran: a file that fails is added, a file that passes is removed, and a file the run did not reach keeps its entry. So `--last-failed` after `--bail`, after a path filter, or after a shard still reruns the failures that did not run again. Once everything in the set passes, the next `--last-failed` has nothing to run and exits 0. A test file that was deleted is forgotten.
+
+The record is kept per project in Bun's cache directory (`$XDG_CACHE_HOME/bun`, `~/Library/Caches/bun` on macOS, otherwise `~/.bun/install/cache`), so nothing is written into the project. `--dry-run` does not change it.
+
+`--last-failed` combines with the other filters: `bun test --last-failed -t "login"` runs only the matching tests in the failed files, and `--last-failed --shard=1/2` shards the failed files.
+
 ### Changing the Root Directory
 
 By default, Bun looks for test files starting from the current working directory. Change this with the `root` option in `bunfig.toml`:
