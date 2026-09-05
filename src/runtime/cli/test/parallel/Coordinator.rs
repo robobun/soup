@@ -797,6 +797,10 @@ impl<'a> Coordinator<'a> {
                 if let Some(timings) = self.reporter.timings.as_mut().filter(|_| growth > 0) {
                     timings.record_growth(self.files[idx as usize].as_bytes(), growth);
                 }
+                self.reporter.record_file_result(
+                    self.files[idx as usize].as_bytes(),
+                    fail > 0 || unhandled > 0,
+                );
 
                 w.inflight = None;
                 self.files_done += 1;
@@ -1093,6 +1097,8 @@ impl<'a> Coordinator<'a> {
         );
         self.reporter.summary().fail += 1;
         self.reporter.summary().files += 1;
+        self.reporter
+            .record_file_result(self.files[file_idx as usize].as_bytes(), true);
         self.mark_cut_short(
             file_idx,
             bun_core::time::milli_timestamp() - dispatched_at,
