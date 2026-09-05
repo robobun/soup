@@ -555,6 +555,31 @@ pub(crate) fn hash(bytes: &[u8]) -> u64 {
     Wyhash::hash(SEED, bytes)
 }
 
+/// `<user cache dir>/<leaf>`, or `None` when no cache directory can be resolved.
+/// The cache dir is `$XDG_CACHE_HOME/bun`, `~/Library/Caches/bun` on macOS, else
+/// `~/.bun/install/cache`. The last one is also the package cache, so `leaf` must
+/// not be a valid package name (`@t@`, `@test@`).
+pub fn user_cache_dir(leaf: &[u8]) -> Option<Path> {
+    let top = FileSystem::get().top_level_dir();
+
+    let below = |dir: &[u8], subdir: &[u8]| {
+        let dir = bun_paths::portable::from_portable_rooted(dir);
+        Path::resolve(&[top, &dir, subdir, leaf])
+    };
+
+    if let Some(dir) = env_var::XDG_CACHE_HOME.get() {
+        return Some(below(dir, b"bun"));
+    }
+
+    // macOS uses ~/Library/Caches, not the install cache.
+    let cache_subdir: &[u8] = if cfg!(target_os = "macos") {
+        b"Library/Caches/bun"
+    } else {
+        b".bun/install/cache"
+    };
+    Some(below(env_var::HOME.get()?, cache_subdir))
+}
+
 /// Reads `len` bytes at `offset`, or returns `MissingData` on a short read.
 fn pread_box(file: &sys::File, len: usize, offset: u64) -> crate::CrateResult<Box<[u8]>> {
     let mut buf = Vec::with_capacity(len);
@@ -613,23 +638,7 @@ impl RuntimeTranspilerCache {
             return Some(Path::from(dir));
         }
 
-        let top = FileSystem::get().top_level_dir();
-
-        let below = |dir: &[u8], subdir: &[u8]| {
-            Path::resolve(&[top, &bun_paths::portable::from_portable_rooted(dir), subdir])
-        };
-
-        if let Some(dir) = env_var::XDG_CACHE_HOME.get() {
-            return Some(below(dir, b"bun/@t@"));
-        }
-
-        // macOS uses ~/Library/Caches, not the install cache.
-        let cache_subdir: &[u8] = if cfg!(target_os = "macos") {
-            b"Library/Caches/bun/@t@"
-        } else {
-            b".bun/install/cache/@t@"
-        };
-        Some(below(env_var::HOME.get()?, cache_subdir))
+        user_cache_dir(b"@t@")
     }
 
     pub(crate) fn from_file(

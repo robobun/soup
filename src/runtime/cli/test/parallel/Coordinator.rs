@@ -516,12 +516,15 @@ impl<'a> Coordinator<'a> {
         let Some((free, since_ms)) = self.schedule.finish(slot, idx) else {
             return;
         };
+        let failed_before = self.reporter.summary().fail;
         self.reporter.update_summary(|summary| {
             for counter in frame::counters(summary) {
                 *counter += rd.u32();
             }
         });
-        (self.reporter.jest.unhandled_errors_between_tests).update(|n| n + rd.u32());
+        let unhandled = rd.u32();
+        (self.reporter.jest.unhandled_errors_between_tests).update(|n| n + unhandled);
+        let failed = self.reporter.summary().fail > failed_before || unhandled > 0;
         let elapsed_ns = rd.u64();
         let (growth_of_worker, largest_child) = (rd.u32(), rd.u32());
         self.max_worker_peak_rss_mb = self.max_worker_peak_rss_mb.max(rd.u32());
@@ -543,6 +546,8 @@ impl<'a> Coordinator<'a> {
                 timings.record_growth(self.schedule.path(idx), growth);
             }
         }
+        self.reporter
+            .record_file_result(self.schedule.path(idx), failed);
         self.bail_out_if_due();
         self.assign_work(free);
     }
@@ -610,6 +615,8 @@ impl<'a> Coordinator<'a> {
                     }
                     let ran_ms = bun_core::time::milli_timestamp() - since_ms;
                     let message = "worker process crashed before reporting results";
+                    self.reporter
+                        .record_file_result(self.schedule.path(file), true);
                     self.count_unfinished(file, ("(worker crashed)", message), Some(ran_ms));
                     self.bail_out_if_due();
                 }
