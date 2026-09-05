@@ -91,6 +91,10 @@ pub(crate) mod test {
     #[path = "JsonReporter.rs"]
     pub(crate) mod json_reporter;
 
+    /// `bun test --last-failed`: the record of the files that failed last run.
+    #[path = "LastFailed.rs"]
+    pub(crate) mod last_failed;
+
     /// `bun test --parallel`: a coordinator hands test files to worker processes. `runner` has the entry points.
     pub(crate) mod parallel {
         #[path = "aggregate.rs"]

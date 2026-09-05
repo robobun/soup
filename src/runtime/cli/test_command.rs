@@ -6,6 +6,7 @@ use crate::cli::Command;
 use crate::cli::run_compiled;
 use crate::cli::test::changed_files_filter as ChangedFilesFilter;
 use crate::cli::test::json_reporter::JsonReporter;
+use crate::cli::test::last_failed::LastFailed;
 use crate::cli::test::parallel::runner as ParallelRunner;
 use crate::cli::test::scanner::{self, Scanner};
 use crate::cli::test::timings::Timings;
@@ -1830,6 +1831,11 @@ pub(crate) struct CommandLineReporter {
     pub(crate) timings: Cell<Option<Box<Timings>>>,
     update_timings: bool,
     is_shard: bool,
+    /// The files that failed last run; `--last-failed` runs only these.
+    /// Loaded once the file system is up, updated per file, written back at
+    /// the end. Not kept by a `--parallel` worker (the coordinator records)
+    /// or under `--dry-run` (nothing passes or fails).
+    pub(crate) last_failed: Cell<Option<Box<LastFailed>>>,
 }
 
 pub(crate) struct ReportersConfig {
@@ -2287,6 +2293,7 @@ impl CommandLineReporter {
                 this.update_summary(|summary| summary.fail += 1);
 
                 if this.summary().fail == this.jest.bail {
+                    this.with_last_failed(LastFailed::fail_current);
                     this.bail_out(VirtualMachine::get());
                 }
             }
@@ -2328,6 +2335,7 @@ impl CommandLineReporter {
         Output::flush();
         self.write_reports_if_needed();
         self.write_timings_if_needed();
+        self.write_last_failed_if_needed();
 
         vm.exit_handler.exit_code.set(1);
         vm.exit_handler
@@ -2348,6 +2356,27 @@ impl CommandLineReporter {
         {
             timings.write(self.is_shard);
         }
+    }
+
+    /// Failed tests plus errors thrown outside of any test, which also fail
+    /// the run. Compared before and after a file to tell whether it failed.
+    pub(crate) fn failure_count(&self) -> u64 {
+        u64::from(self.summary().fail) + u64::from(self.jest.unhandled_errors_between_tests.get())
+    }
+
+    fn with_last_failed(&self, f: impl FnOnce(&mut LastFailed)) {
+        (self.last_failed).with_taken(|last_failed| last_failed.as_deref_mut().map(f));
+    }
+
+    /// Records whether `abs_path` failed. A file fails when a test in it
+    /// fails, when it throws outside of any test, or when it crashes.
+    pub(crate) fn record_file_result(&self, abs_path: &[u8], failed: bool) {
+        self.with_last_failed(|last_failed| last_failed.record(abs_path, failed));
+    }
+
+    /// Called before every exit path, like the timings file.
+    pub(crate) fn write_last_failed_if_needed(&self) {
+        self.with_last_failed(LastFailed::write);
     }
 
     /// Writes the JUnit report if a JUnit reporter is active and an outfile path
@@ -2882,6 +2911,7 @@ impl TestCommand {
             ),
             update_timings: ctx.test_options.update_timings,
             is_shard: ctx.test_options.shard.is_some(),
+            last_failed: Cell::new(None),
         }));
 
         // The worker's environment already holds the coordinator's env file values, and `BUN_OPTIONS` in it can carry `--env-file`.
@@ -3137,6 +3167,9 @@ impl TestCommand {
             "{} test files are found",
             all_test_files.len()
         ));
+        if !ctx.test_options.test_worker && !ctx.test_options.dry_run {
+            reporter.last_failed.set(Some(Box::new(LastFailed::load())));
+        }
         // Snapshot the count before `test_files` mutably borrows `all_test_files`
         // so the watcher-enable check below can read it without reborrowing.
         let all_test_files_count = all_test_files.len();
@@ -3198,6 +3231,41 @@ impl TestCommand {
         } else {
             &mut all_test_files[..]
         };
+        // --last-failed: keep the files that failed last run. Before --shard
+        // so a shard of the failures is a shard of the failures.
+        if ctx.test_options.last_failed
+            && !test_files.is_empty()
+            && let Some(mut last_failed) = reporter.last_failed.take()
+        {
+            let total = test_files.len();
+            let recorded = last_failed.count();
+            let write = last_failed.select(test_files);
+            if !last_failed.has_record() {
+                pretty_error!("<r><d>--last-failed:<r> no previous run recorded, nothing to run\n");
+            } else if recorded == 0 {
+                pretty_error!("<r><d>--last-failed:<r> no failures last run, nothing to run\n");
+            } else if write == 0 {
+                pretty_error!(
+                    "<r><d>--last-failed:<r> {} file{} failed last run, none match, nothing to run\n",
+                    recorded,
+                    if recorded == 1 { "" } else { "s" }
+                );
+            } else if !run_compiled::is_second_process() {
+                pretty_error!(
+                    "<r><d>--last-failed:<r> running {}/{} test file{}\n",
+                    write,
+                    total,
+                    if total == 1 { "" } else { "s" }
+                );
+            }
+            reporter.last_failed.set(Some(last_failed));
+            Output::flush();
+            if write == 0 {
+                pass_with_no_tests_from_filter = true;
+            }
+            test_files = &mut test_files[0..write];
+        }
+
         // --shard=M/N: sort the test files for determinism, then keep only
         // every Nth file starting at M-1. This round-robin distribution
         // keeps shards roughly balanced regardless of how many files there
@@ -3758,6 +3826,7 @@ impl TestCommand {
         if !test_files.is_empty() || ctx.test_options.shard.is_some() {
             reporter.write_timings_if_needed();
         }
+        reporter.write_last_failed_if_needed();
 
         if vm.hot_reload.get() == jsc::virtual_machine::HotReload::Watch {
             vm.run_with_api_lock(|| Self::run_event_loop_for_watch(vm));
@@ -3829,6 +3898,7 @@ impl TestCommand {
                 if files.len() > 1 {
                     for (i, file_name) in files[0..files.len() - 1].iter().enumerate() {
                         let started = bun::time::milli_timestamp();
+                        let failures_before = reporter.failure_count();
                         if let Err(err) = TestCommand::run(
                             reporter,
                             vm,
@@ -3838,9 +3908,15 @@ impl TestCommand {
                                 last: isolate,
                             },
                         ) {
+                            reporter.record_file_result(file_name.as_bytes(), true);
+                            reporter.write_last_failed_if_needed();
                             handle_top_level_test_error_before_javascript_start(&err);
                         }
                         reporter.record_timing(file_name.as_bytes(), started);
+                        reporter.record_file_result(
+                            file_name.as_bytes(),
+                            reporter.failure_count() != failures_before,
+                        );
                         reporter.jest.default_timeout_override.set(u32::MAX);
                         Global::mimalloc_cleanup(false);
                         if isolate {
@@ -3857,6 +3933,7 @@ impl TestCommand {
 
                 let last = files[files.len() - 1];
                 let started = bun::time::milli_timestamp();
+                let failures_before = reporter.failure_count();
                 if let Err(err) = TestCommand::run(
                     reporter,
                     vm,
@@ -3866,9 +3943,15 @@ impl TestCommand {
                         last: true,
                     },
                 ) {
+                    reporter.record_file_result(last.as_bytes(), true);
+                    reporter.write_last_failed_if_needed();
                     handle_top_level_test_error_before_javascript_start(&err);
                 }
                 reporter.record_timing(last.as_bytes(), started);
+                reporter.record_file_result(
+                    last.as_bytes(),
+                    reporter.failure_count() != failures_before,
+                );
             }
         }
 
@@ -3991,6 +4074,7 @@ impl TestCommand {
             FileSystem::get().top_level_dir(),
             file_path,
         ));
+        reporter.with_last_failed(|last_failed| last_failed.begin_file(file_name));
         let file = reporter.jest.get_or_put_file(file_path);
 
         // In Github Actions, append a special prefix that will group
@@ -4206,6 +4290,7 @@ impl TestCommand {
                 }
 
                 if reporter.jest.bail == reporter.summary().fail {
+                    reporter.with_last_failed(LastFailed::fail_current);
                     // This never returns, so `EnteredFile`'s `Drop` doesn't run.
                     reporter.bail_out(vm);
                 }
