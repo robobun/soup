@@ -287,6 +287,10 @@ pub mod test {
     #[path = "JsonReporter.rs"]
     pub mod json_reporter;
 
+    /// `bun test --last-failed`: the record of the files that failed last run.
+    #[path = "LastFailed.rs"]
+    pub mod last_failed;
+
     /// `bun test --parallel`: process-pool coordinator/worker entry points.
     /// Thin façade re-exporting from `parallel::runner`.
     #[path = "ParallelRunner.rs"]

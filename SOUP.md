@@ -1091,6 +1091,48 @@ Files: `src/runtime/server/Compression.rs` (the option, `Accept-Encoding`, the e
 `docs/runtime/http/server.mdx`, `test/js/bun/http/bun-serve-compress.test.ts`,
 `test/integration/bun-types/fixture/serve-types.test.ts`.
 
+### 2026-09-05: `bun test --last-failed`
+
+After a run with failures, the next thing anyone does is rerun the failures. Until now that meant
+reading the file names out of the summary and typing them back as filters. `--last-failed` runs
+only the test files that failed in the previous run, the way pytest's `--lf` and Playwright's
+`--last-failed` do:
+
+```sh
+bun test
+# 3 pass, 2 fail across 12 files
+
+bun test --last-failed
+# --last-failed: running 2/12 test files
+```
+
+A file counts as failed when a test in it fails, when it throws outside of any test (at load, in a
+`describe` body, between tests), or when its `--parallel` worker crashes. Every run updates the
+record for the files it ran: a file that fails is added, a file that passes is removed, and a file
+the run did not reach keeps its entry. So `--last-failed` after `--bail`, a path filter or a shard
+still knows about the failures that were not rerun, and running `--last-failed` until everything
+passes empties the set, at which point it says so and exits 0. A deleted test file is forgotten. A
+`--bail` exit records the file it stopped in before it goes. `--dry-run` leaves the record alone,
+since nothing passes or fails, and `--parallel` workers leave the recording to the coordinator.
+The filter runs before `--shard`, so a shard of the failed files is a shard of the failed files.
+
+The record lives in Bun's user cache directory, next to the transpiler cache, as
+`@test@/last-failed-<hash of the project root>.json`, so nothing is written into the project and
+no `node_modules` is needed. The cache-directory lookup that the transpiler cache had inline
+(`$XDG_CACHE_HOME/bun`, `~/Library/Caches/bun` on macOS, else `~/.bun/install/cache`) is now a
+shared `user_cache_dir(leaf)`; the leaf is spelled so it cannot collide with a package name in the
+install cache. A project whose runs never fail never gets a record. The file is written atomically
+through a temp file and rename, like the `--timings` table.
+
+The name follows `--rerun-each`, `--only-failures` (which only changes what is printed) and the two
+tools above; Jest's `--onlyFailures` would have clashed with the existing flag.
+
+Files: `src/runtime/cli/test/LastFailed.rs`, `src/runtime/cli/test_command.rs`,
+`src/runtime/cli/test/parallel/Coordinator.rs`, `src/runtime/cli/test/parallel/runner.rs`,
+`src/runtime/cli/Arguments.rs`, `src/options_types/context.rs`, `src/runtime/cli/mod.rs`,
+`src/jsc/RuntimeTranspilerCache.rs` (`user_cache_dir`), `docs/test/discovery.mdx`,
+`test/cli/test/test-last-failed.test.ts`.
+
 ## Dropped
 
 Nothing yet.
