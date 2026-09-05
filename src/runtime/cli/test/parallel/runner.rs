@@ -223,6 +223,7 @@ pub(crate) fn run_as_coordinator(
     if let Some(code) = coord.aborted {
         coord.reporter.write_reports_if_needed();
         coord.reporter.write_timings_if_needed();
+        coord.reporter.write_last_failed_if_needed();
         Output::flush();
         Global::exit(code);
     }
