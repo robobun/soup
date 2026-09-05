@@ -616,6 +616,9 @@ pub(crate) const TEST_ONLY_PARAMS: &[ParamType] = &[
         "--changed <STR>?                 Only run test files affected by changed files according to git. Optionally pass a commit or branch to compare against."
     ),
     parse_param!(
+        "--last-failed                    Only run the test files that failed in the previous run."
+    ),
+    parse_param!(
         "--isolate                        Run each test file in a fresh global object. Leaked handles from one file cannot affect another."
     ),
     parse_param!(
@@ -1961,6 +1964,7 @@ fn parse_test_command_options(args: &clap::Args<clap::Help>, ctx: Context<'_>) {
         Global::exit(1);
     }
     ctx.test_options.dry_run = args.flag(b"--dry-run");
+    ctx.test_options.last_failed = args.flag(b"--last-failed");
     ctx.test_options.update_snapshots = args.flag(b"--update-snapshots");
     ctx.test_options.run_todo = args.flag(b"--todo");
     ctx.test_options.only = args.flag(b"--only");

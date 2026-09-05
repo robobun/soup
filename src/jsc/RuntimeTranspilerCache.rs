@@ -539,6 +539,48 @@ pub(crate) fn hash(bytes: &[u8]) -> u64 {
     Wyhash::hash(SEED, bytes)
 }
 
+/// Writes `<user cache dir>/<leaf>` into `buf` (NUL-terminated) and returns
+/// its byte length, or 0 when no cache directory can be resolved. The cache
+/// dir is `$XDG_CACHE_HOME/bun`, `~/Library/Caches/bun` on macOS, else
+/// `~/.bun/install/cache`. The last one is also the package cache, so `leaf`
+/// must not be a valid package name (`@t@`, `@test@`).
+pub fn user_cache_dir(buf: &mut PathBuffer, leaf: &[u8]) -> usize {
+    // The inline `bun_resolver::fs::FileSystem` surface only exposes
+    // `abs_buf` (no NUL-terminating `_z` variant), so go straight to the
+    // underlying joiner with the same `top_level_dir` + `Loose` platform
+    // that `absBufZ` used.
+    let top = FileSystem::instance().top_level_dir;
+
+    if let Some(dir) = env_var::XDG_CACHE_HOME.get() {
+        let parts: &[&[u8]] = &[dir, b"bun", leaf];
+        return path_handler::join_abs_string_buf_z::<platform::Loose>(top, &mut buf[..], parts)
+            .len();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // On a mac, default to ~/Library/Caches/bun/*
+        // This is different than ~/.bun/install/cache, and not configurable by the user.
+        if let Some(home) = env_var::HOME.get() {
+            let parts: &[&[u8]] = &[home, b"Library/", b"Caches/", b"bun", leaf];
+            return path_handler::join_abs_string_buf_z::<platform::Loose>(
+                top,
+                &mut buf[..],
+                parts,
+            )
+            .len();
+        }
+    }
+
+    if let Some(dir) = env_var::HOME.get() {
+        let parts: &[&[u8]] = &[dir, b".bun", b"install", b"cache", leaf];
+        return path_handler::join_abs_string_buf_z::<platform::Loose>(top, &mut buf[..], parts)
+            .len();
+    }
+
+    0
+}
+
 /// Allocate `len` bytes and fill them via `pread_all` at `offset`, returning
 /// `MissingData` on a short read.
 ///
@@ -622,48 +664,7 @@ impl RuntimeTranspilerCache {
             return len;
         }
 
-        // The inline `bun_resolver::fs::FileSystem` surface only exposes
-        // `abs_buf` (no NUL-terminating `_z` variant), so go straight to the
-        // underlying joiner with the same `top_level_dir` + `Loose` platform
-        // that `absBufZ` used.
-        let top = FileSystem::instance().top_level_dir;
-
-        if let Some(dir) = env_var::XDG_CACHE_HOME.get() {
-            let parts: &[&[u8]] = &[dir, b"bun", b"@t@"];
-            return path_handler::join_abs_string_buf_z::<platform::Loose>(
-                top,
-                &mut buf[..],
-                parts,
-            )
-            .len();
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // On a mac, default to ~/Library/Caches/bun/*
-            // This is different than ~/.bun/install/cache, and not configurable by the user.
-            if let Some(home) = env_var::HOME.get() {
-                let parts: &[&[u8]] = &[home, b"Library/", b"Caches/", b"bun", b"@t@"];
-                return path_handler::join_abs_string_buf_z::<platform::Loose>(
-                    top,
-                    &mut buf[..],
-                    parts,
-                )
-                .len();
-            }
-        }
-
-        if let Some(dir) = env_var::HOME.get() {
-            let parts: &[&[u8]] = &[dir, b".bun", b"install", b"cache", b"@t@"];
-            return path_handler::join_abs_string_buf_z::<platform::Loose>(
-                top,
-                &mut buf[..],
-                parts,
-            )
-            .len();
-        }
-
-        0
+        user_cache_dir(buf, b"@t@")
     }
 
     // Only do this at most once per-thread.

@@ -508,6 +508,10 @@ impl<'a> Coordinator<'a> {
                 }
                 self.reporter.jest.unhandled_errors_between_tests += unhandled;
                 self.record_timing(idx, w.dispatched_at);
+                self.reporter.record_file_result(
+                    self.files[idx as usize].as_bytes(),
+                    fail > 0 || unhandled > 0,
+                );
 
                 w.inflight = None;
                 self.files_done += 1;
@@ -741,6 +745,8 @@ impl<'a> Coordinator<'a> {
 
     fn mark_crashed(&mut self, file_idx: u32, elapsed_ms: i64) {
         self.crashed_files.push(file_idx);
+        self.reporter
+            .record_file_result(self.files[file_idx as usize].as_bytes(), true);
         if let Some(file) = self.test_records.get_mut(file_idx as usize) {
             file.elapsed_ns = u64::try_from(elapsed_ms).unwrap_or(0) * bun_core::time::NS_PER_MS;
         }
