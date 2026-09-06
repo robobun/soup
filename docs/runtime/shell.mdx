@@ -538,6 +538,20 @@ const last = await $`tail -n 1 app.log`.text();
 
 `tail -f` is not supported.
 
+- `sort`: sort the lines of stdin or files: `-r` reverse, `-n` numeric, `-f` ignore case, `-u` drop repeated lines, `-s` stable, `-b` ignore leading blanks, `-k F[.C][OPTS][,G[.C][OPTS]]` sort by a field (with `-t CHAR` as the field separator), `-c` check that the input is sorted, `-o FILE` write to a file (it can be the input), `-z` NUL-terminated lines
+- `uniq`: collapse adjacent repeated lines of stdin or a file: `-c` prefix each line with its count, `-d` only repeated lines, `-D` every copy of a repeated line, `-u` only lines that are not repeated, `-i` ignore case, `-f N` skip the first N fields, `-s N` skip N characters, `-w N` compare at most N characters, `-z` NUL-terminated lines; a second operand is the output file
+
+Both follow GNU coreutils: the output is the same byte for byte, `sort -n` reads a line without a number as 0, and keys compare equal under `-u` the way they do in `-k`.
+
+```ts
+await $`sort -u names.txt`;
+await $`sort -t, -k2 -n data.csv | head -n 10`;
+const top = await $`sort visitors.txt | uniq -c | sort -rn | head -n 5`.text(); // the 5 most frequent lines
+await $`sort -c versions.txt`; // exit 1 and "sort: versions.txt:3: disorder: ..." when it is not sorted
+```
+
+`sort -h`, `-V`, `-R`, `-M`, `-g` and `-m` are not supported.
+
 **Not** implemented yet, but planned:
 
 - See [Issue #9716](https://github.com/oven-sh/bun/issues/9716) for the full list.

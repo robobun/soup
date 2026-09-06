@@ -107,6 +107,8 @@ pub(crate) mod builtins {
     pub(crate) mod rm;
     #[path = "seq.rs"]
     pub(crate) mod seq;
+    #[path = "sort_uniq.rs"]
+    pub(crate) mod sort_uniq;
     #[path = "touch.rs"]
     pub(crate) mod touch;
     #[path = "true_.rs"]
