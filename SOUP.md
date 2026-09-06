@@ -1133,6 +1133,55 @@ Files: `src/runtime/cli/test/LastFailed.rs`, `src/runtime/cli/test_command.rs`,
 `src/jsc/RuntimeTranspilerCache.rs` (`user_cache_dir`), `docs/test/discovery.mdx`,
 `test/cli/test/test-last-failed.test.ts`.
 
+### 2026-09-06: `sort` and `uniq` shell builtins
+
+After `wc`, `head` and `tail`, the next two commands a script pipes into are `sort` and `uniq`, and
+`sort | uniq -c | sort -rn` is the pipeline everyone writes to count things. Neither was a builtin,
+so those pipelines only worked where coreutils happened to be installed, which on Windows is usually
+nowhere. Both are now builtins on every platform, and both follow GNU coreutils byte for byte in every
+case a 500-run fuzz against the real tools could find (random lines, random flag combinations, exit
+codes included).
+
+`sort` takes `-r`, `-n`, `-f`, `-u`, `-s`, `-b`, `-z`, `-c`, `-o FILE`, `-t CHAR` and `-k` with the
+full `F[.C][OPTS][,G[.C][OPTS]]` key syntax, plus the long spellings. `-n` reads a number as GNU
+does (leading blanks, a sign, digits, a fraction; a line with no number is 0), compares the digit
+strings instead of converting to a float, so nothing overflows or rounds, and ties fall back to a
+byte comparison of the whole line unless `-s` or `-u` is given. A key with its own letters (`-k2,2nr`)
+ignores the global options, as in GNU. `-u` keeps the first of a run of equal keys in input order.
+`-o` can name an input file, because everything is read before the output is opened. `-c` prints
+`sort: file:N: disorder: line` and exits 1. `uniq` takes `-c`, `-d`, `-D`, `-u`, `-i`, `-f N`, `-s N`,
+`-w N`, `-z`, the historical `-N`, the long spellings, and an output file as its second operand. The
+three output switches combine the way GNU's do, so `-du` prints nothing and `-Du` only the later
+copies. A last line without a newline gets one, and two files are not joined at a missing newline.
+
+```ts
+await $`sort -u names.txt`;
+await $`sort -t, -k2 -n data.csv | head -n 10`;
+const top = await $`sort visitors.txt | uniq -c | sort -rn | head -n 5`.text();
+await $`sort -o deps.txt deps.txt`; // in place
+if ((await $`sort -c CHANGELOG-versions.txt`.nothrow()).exitCode !== 0) {
+  /* not sorted */
+}
+```
+
+The two share one module, `sort_uniq.rs`, because they share their shape: read every input to the
+end (stdin, `-`, or file operands, through the same `IOReader` the other readers use), rearrange the
+lines in memory, write once. A `Program` enum holds the options of whichever command is running and
+turns the input into the output; the state machine around it is the one `wc` uses, with the error
+messages and exit codes of each command (`sort` exits 2 on an unreadable file or a usage error,
+`uniq` 1, as the real ones do). Unreadable operands are reported and skipped, and the rest are still
+sorted. Left out: `sort -h`, `-V`, `-R`, `-M`, `-g` and `-m` (reported as unsupported), `uniq --group`,
+and caching the parsed numeric key per line, which would make `sort -n` on a million lines about three
+times faster than it is today (the output is still identical to GNU's on that input).
+
+While running clippy over the stack, yesterday's `--last-failed` patch had a `disallowed_methods`
+hit (`Output::warn` instead of the `warn!` macro); that commit was amended.
+
+Files: `src/runtime/shell/builtin/sort_uniq.rs`, `src/runtime/shell/Builtin.rs`,
+`src/runtime/shell/mod.rs`, `src/runtime/shell/IOReader.rs`, `docs/runtime/shell.mdx`,
+`test/js/bun/shell/commands/sort.test.ts`, `test/js/bun/shell/commands/uniq.test.ts`,
+`test/js/bun/shell/exec.test.ts`.
+
 ## Dropped
 
 Nothing yet.

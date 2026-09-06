@@ -107,6 +107,8 @@ pub mod builtins {
     pub mod rm;
     #[path = "seq.rs"]
     pub mod seq;
+    #[path = "sort_uniq.rs"]
+    pub mod sort_uniq;
     #[path = "touch.rs"]
     pub mod touch;
     #[path = "true_.rs"]

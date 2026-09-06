@@ -196,6 +196,8 @@ shell_builtins! {
         Wc       => (wc::Wc,            "wc",       b"usage: wc [-clmw] [file ...]\n"),
         Head     => (head_tail::Head,   "head",     b"usage: head [-qv] [-n lines | -c bytes] [file ...]\n"),
         Tail     => (head_tail::Tail,   "tail",     b"usage: tail [-qv] [-n [+]lines | -c [+]bytes] [file ...]\n"),
+        Sort     => (sort_uniq::Sort,   "sort",     b"usage: sort [-bcfnrsuz] [-k field[,field]] [-t char] [-o output] [file ...]\n"),
+        Uniq     => (sort_uniq::Uniq,   "uniq",     b"usage: uniq [-cdDiuz] [-f fields] [-s chars] [-w chars] [input [output]]\n"),
     }
     posix_disabled: [Cat, Cp]
 }
