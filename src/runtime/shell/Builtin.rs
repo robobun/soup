@@ -14,7 +14,7 @@ use crate::shell::ast;
 use crate::shell::builtins::batch::Batch;
 use crate::shell::builtins::{
     basename, cat, cd, cp, dirname, echo, exit, export, head_tail, ls, mkdir, mv, pwd, rm, seq,
-    touch, wc, which, yes,
+    sort_uniq, touch, wc, which, yes,
 };
 use crate::shell::interpreter::{Interpreter, NodeId, is_pollable_from_mode, shell_openat};
 use crate::shell::io::{InKind, OutFd, OutKind};
@@ -50,6 +50,7 @@ pub(crate) enum State {
     Cat(cat::Cat),
     HeadTail(Box<head_tail::Common>),
     Mv(mv::Mv),
+    SortUniq(Box<sort_uniq::Common>),
     Wc(Box<wc::Wc>),
     Which {
         next: usize,
@@ -107,6 +108,8 @@ shell_builtins! {
     Wc       "wc"       wc::start,
     Head     "head"     head_tail::Head::start,
     Tail     "tail"     head_tail::Tail::start,
+    Sort     "sort"     sort_uniq::Sort::start,
+    Uniq     "uniq"     sort_uniq::Uniq::start,
 }
 
 impl Kind {
@@ -739,6 +742,7 @@ impl Builtin {
             (State::Batch(_), _) => Batch::on_write(interp, cmd),
             (State::Cat(_), _) => cat::Cat::on_write(interp, cmd, failed),
             (State::HeadTail(_), _) => head_tail::Common::on_write(interp, cmd, failed),
+            (State::SortUniq(_), _) => sort_uniq::Common::on_write(interp, cmd, failed),
             (State::Wc(_), _) => wc::Wc::on_write(interp, cmd, failed),
             (State::Exiting(_) | State::Which { .. } | State::Yes(_), Some(code))
             | (&State::Exiting(code), None) => Self::done(interp, cmd, code),

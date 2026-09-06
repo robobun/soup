@@ -73,6 +73,8 @@ pub(crate) mod states {
 
 #[path = "builtin"]
 pub(crate) mod builtins {
+    #[path = "arg_parser.rs"]
+    pub(crate) mod arg_parser;
     #[path = "basename.rs"]
     pub(crate) mod basename;
     #[path = "batch.rs"]
@@ -105,6 +107,8 @@ pub(crate) mod builtins {
     pub(crate) mod rm;
     #[path = "seq.rs"]
     pub(crate) mod seq;
+    #[path = "sort_uniq.rs"]
+    pub(crate) mod sort_uniq;
     #[path = "touch.rs"]
     pub(crate) mod touch;
     #[path = "wc.rs"]
