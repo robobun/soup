@@ -33,6 +33,8 @@ pub(crate) enum ReaderTag {
     Wc,
     Head,
     Tail,
+    Sort,
+    Uniq,
 }
 
 // PERF: an inline small-vec may be worth it — profile if hot.
@@ -590,6 +592,12 @@ fn dispatch_read_chunk(
         ReaderTag::Tail => crate::shell::builtins::head_tail::Tail::on_io_reader_chunk(
             interp, child.node, chunk, remove,
         ),
+        ReaderTag::Sort => crate::shell::builtins::sort_uniq::Sort::on_io_reader_chunk(
+            interp, child.node, chunk, remove,
+        ),
+        ReaderTag::Uniq => crate::shell::builtins::sort_uniq::Uniq::on_io_reader_chunk(
+            interp, child.node, chunk, remove,
+        ),
     }
 }
 
@@ -599,7 +607,9 @@ fn awaits_write(child: ChildPtr, interp: Option<bun_ptr::ParentRef<Interpreter>>
     };
     match child.tag {
         ReaderTag::Cat => crate::shell::builtins::cat::Cat::awaits_write(interp.get(), child.node),
-        ReaderTag::Wc | ReaderTag::Head | ReaderTag::Tail => false,
+        ReaderTag::Wc | ReaderTag::Head | ReaderTag::Tail | ReaderTag::Sort | ReaderTag::Uniq => {
+            false
+        }
     }
 }
 
@@ -622,6 +632,12 @@ fn dispatch_reader_done(
         }
         ReaderTag::Tail => {
             crate::shell::builtins::head_tail::Tail::on_io_reader_done(interp, child.node, err)
+        }
+        ReaderTag::Sort => {
+            crate::shell::builtins::sort_uniq::Sort::on_io_reader_done(interp, child.node, err)
+        }
+        ReaderTag::Uniq => {
+            crate::shell::builtins::sort_uniq::Uniq::on_io_reader_done(interp, child.node, err)
         }
     }
 }
