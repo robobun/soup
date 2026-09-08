@@ -1182,6 +1182,73 @@ Files: `src/runtime/shell/builtin/sort_uniq.rs`, `src/runtime/shell/Builtin.rs`,
 `test/js/bun/shell/commands/sort.test.ts`, `test/js/bun/shell/commands/uniq.test.ts`,
 `test/js/bun/shell/exec.test.ts`.
 
+### 2026-09-08: `expect.poll()`
+
+A lot of tests assert on something that becomes true a little later: a server that is still
+starting, a watcher that has not written its file yet, a queue that drains in the background, a
+subprocess that needs a moment. `bun:test` had nothing for this, so tests either sleep for a fixed
+time (slow when generous, flaky when not, and the repo's own test guide bans it) or hand-roll a retry
+loop around `expect()`. `expect.poll()` is that loop, with the matchers everyone already knows: it
+takes a callback that produces the value and returns the same matchers as `expect()`, each returning
+a promise. An attempt calls the callback, awaits it if it returns a promise, and runs the matcher.
+While the callback throws or the matcher fails, the next attempt starts `interval` ms later (50 by
+default), until one passes or `timeout` ms (1000) have gone by. The API is Vitest's `expect.poll()`,
+which Playwright has as well.
+
+```ts
+await expect.poll(() => server.requests).toHaveLength(3);
+await expect
+  .poll(async () => (await fetch(`${url}/health`)).status, { timeout: 10_000 })
+  .toBe(200);
+await expect.poll(() => readdirSync(outdir)).toContain("index.js");
+await expect.poll(() => queue.pending).not.toContain(job);
+```
+
+When the timeout runs out, the failure is the last attempt's matcher error under a line that says
+what happened, and it points at the `expect.poll()` call rather than into a timer callback:
+
+```txt
+5 |   await expect.poll(() => queue.pending, { timeout: 500 }).toHaveLength(0);
+                                                             ^
+error: expect.poll() timed out: the value did not pass within 500ms (10 attempts)
+
+expect(received).toHaveLength(expected)
+
+Expected length: 0
+Received length: 1
+```
+
+A callback that still throws at the end is reported with its last error as the `cause`, and a
+promise from the callback that never settles is given up on at the deadline instead of hanging the
+test until its own timeout, which is the one place this is stricter than Vitest (whose timeout only
+stops new attempts). The callback runs at least once, even with `timeout: 0`, and the wait between
+attempts is capped by the time remaining, so a long `interval` still gets a final attempt at the
+deadline. `.not` works, custom matchers from `expect.extend()` and the mock matchers work, and
+asymmetric matchers work inside arguments as usual. `.resolves` and `.rejects` (the value is awaited
+anyway), `toThrow()` (a throwing callback is retried) and the snapshot matchers throw a `TypeError`
+that says why. Vitest refuses the same set. The `message` option is passed through as
+`expect(value, message)`, so it replaces the `expect(received).toX()` line. For `expect.assertions(n)` a poll counts once however
+many attempts it took, which needed one bit on the native `Expect` (`counts_as_assertion`, cleared
+for retries). Fake timers would freeze the retry loop, so `expect.poll()` rejects with "needs real
+timers" while `jest.useFakeTimers()` is active rather than hanging. Making it tick in real time
+regardless, as Vitest does, needs a timer kind that the fake clock does not capture and is left for
+another day.
+
+The implementation is a small internal module (`internal/test/poll`) behind a builtin `poll` on the
+`Expect` constructor, the way `Glob.prototype.scan` is wired: a `Proxy` hands out one function per
+matcher name found on `Expect.prototype`, and the retry loop is plain `async`/`await` over
+`Bun.sleep`, with `Bun.nanoseconds()` as the clock so a mocked `Date`/`performance` cannot confuse
+it. The error object is created synchronously in the matcher call, while the test is on the stack,
+and gets its message filled in at the end, which is what makes the code frame land on the right line.
+The types map `Matchers<T>` to promise-returning signatures and drop the unsupported ones, so custom
+matcher declarations merged into `Matchers` show up on `expect.poll()` too.
+
+Files: `src/js/internal/test/poll.ts`, `src/js/builtins/Expect.ts`,
+`src/runtime/test_runner/jest.classes.ts`, `src/runtime/test_runner/expect.rs`
+(`counts_as_assertion`, `js_dont_count_as_assertion`), `src/runtime/test_runner/timers/FakeTimers.rs`,
+`src/codegen/generate-js2native.ts`, `packages/bun-types/test.d.ts`, `docs/test/writing-tests.mdx`,
+`test/js/bun/test/expect-poll.test.ts`, `test/integration/bun-types/fixture/test.ts`.
+
 ## Dropped
 
 Nothing yet.
