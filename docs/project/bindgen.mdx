@@ -614,7 +614,7 @@ is collected, make the class [`refCounted`](#refcounted).
 | `call`           | `Name(..)` without `new`, which otherwise throws. It is `fn call(..)`, with no receiver.       |
 | `internalFields` | JS values the object holds                                                                     |
 | `proto`          | properties of the prototype                                                                    |
-| `static`         | properties of the constructor: native functions and accessors without `cache`                  |
+| `static`         | properties of the constructor: native functions, accessors without `cache` and builtins        |
 | `calledFromCpp`  | [member functions of `JSName`](#calls-between-c-and-rust) that are defined in Rust             |
 | `calledFromRust` | [member functions of `JSName`](#calls-between-c-and-rust) that hand-written C++ defines        |
 

@@ -346,10 +346,7 @@ itAlways("mistakes in a schema are errors when it loads", () => {
     "forBind: a member is a function or a getter without a setter",
   );
   expect(() => b.class({ rustPath: "T", call: {} })).toThrow("call needs a constructor object: add construct");
-  // @ts-expect-error
-  expect(() => b.class({ ...constructible, static: { x: { builtin: true, length: 0 } } })).toThrow(
-    "x: a builtin is a property of the prototype",
-  );
+  b.class({ ...constructible, static: { x: { builtin: true, length: 0 } } });
   expect(() =>
     b.class({
       rustPath: "T",

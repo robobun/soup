@@ -1456,7 +1456,7 @@ export function cppSource(file: SchemaFile): string {
   for (const type of file.types) {
     if (!(type instanceof ClassType)) continue;
     for (const used of type.signatureTypes) used.getHeaders(headers);
-    if (type.builtins.length > 0) headers.add("WebCoreJSBuiltins.h");
+    if (type.builtins.length + type.staticBuiltins.length > 0) headers.add("WebCoreJSBuiltins.h");
     for (const cell of type.internalFieldClasses.values()) headers.add(cell.header);
   }
   headers.delete(`Generated${file.origin.namespace}.h`);
@@ -2242,6 +2242,7 @@ ${[
   `    readonly prototype: ${type.name};`,
   ...type.staticFunctions.map(functionMember),
   ...type.staticGetters.map(getterMember),
+  ...type.staticBuiltins.map(builtin => member(builtin.name, false, "(...args: any[]) => any")),
 ].join("\n")}
   }`
       : ""
