@@ -423,6 +423,48 @@ test("exactly two assertions", () => {
 
 `expect.assertions(count)` helps ensure all your assertions run, especially in complex async code with multiple code paths.
 
+## Polling Assertions
+
+### expect.poll()
+
+Use `expect.poll()` to assert on a value that becomes correct a little later: a server that is still starting, a file that a watcher has not written yet, a queue that drains in the background. It takes a callback that produces the value and returns the same matchers as `expect()`. The callback and the matcher run again and again until the matcher passes, instead of the test sleeping for a fixed time and hoping it was long enough.
+
+```ts title="example.test.ts" icon="/icons/typescript.svg"
+import { expect, test } from "bun:test";
+
+test("the worker drains the queue", async () => {
+  const queue = startWorker(["a", "b", "c"]);
+
+  await expect.poll(() => queue.pending).toHaveLength(0);
+  await expect.poll(() => queue.processed).toEqual(["a", "b", "c"]);
+});
+
+test("the server comes up", async () => {
+  await expect.poll(async () => (await fetch(`${url}/health`)).status, { timeout: 10_000 }).toBe(200);
+});
+```
+
+Every matcher on `expect.poll()` returns a promise, so the assertion must be awaited. An attempt calls the callback, awaits the promise if it returns one, and runs the matcher on the result. When the callback throws or rejects, or the matcher fails, the next attempt starts `interval` milliseconds later. Once `timeout` milliseconds have passed no new attempt starts, a promise from the callback that is still pending is given up on, and the assertion fails with the result of the last attempt:
+
+```txt
+error: expect.poll() timed out: the value did not pass within 1000ms (20 attempts)
+
+expect(received).toHaveLength(expected)
+
+Expected length: 0
+Received length: 1
+```
+
+The callback runs at least once, even with a `timeout` of `0`. `.not` works as usual: `await expect.poll(() => queue.pending).not.toContain(job)` passes once the job is gone. `.resolves` and `.rejects` are not available (a promise is awaited anyway), and neither are `toThrow()` (a callback that throws is retried, so catch the error and return it instead) and the snapshot matchers. `expect.poll()` needs real timers: it throws while fake timers are in use. For `expect.assertions()`, one `expect.poll()` assertion counts once, however many attempts it takes.
+
+| Option     | Default | Description                                                                                      |
+| ---------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `interval` | `50`    | Milliseconds to wait after a failed attempt before the next one                                  |
+| `timeout`  | `1000`  | Milliseconds after which no new attempt starts. Keep it below the timeout of the test itself     |
+| `message`  |         | Replaces the `expect(received).toX(expected)` line of the failure, like `expect(value, message)` |
+
+The API matches Vitest's `expect.poll()`.
+
 ## Type Testing
 
 Bun includes `expectTypeOf` for testing TypeScript types, compatible with Vitest.
@@ -567,6 +609,7 @@ Bun implements the following matchers. Full Jest compatibility is planned; see t
 | ✅     | `.any()`           |
 | ✅     | `.assertions()`    |
 | ✅     | `.hasAssertions()` |
+| ✅     | `.poll()`          |
 
 ### Not Yet Implemented
 

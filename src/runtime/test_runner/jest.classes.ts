@@ -273,6 +273,10 @@ export default [
       not: {
         getter: "getStaticNot",
       },
+      poll: {
+        builtin: "expectPollCodeGenerator",
+        length: 2,
+      },
       resolvesTo: {
         getter: "getStaticResolvesTo",
       },
