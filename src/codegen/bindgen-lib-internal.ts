@@ -3275,7 +3275,8 @@ export type Field =
   FunctionField | readonly FunctionField[] | GetterField | InternalFieldField | BuiltinField | ConstantField;
 export type StaticField =
   | Omit<FunctionField, "mutates" | "passThis" | "invalidThis" | "privateSymbol" | "name" | "calledFromCpp">
-  | Omit<GetterField, "cache" | "writable" | "passThis">;
+  | Omit<GetterField, "cache" | "writable" | "passThis">
+  | BuiltinField;
 
 export interface ConstructOptions extends Omit<SignatureOptions, "rustPath" | "returns"> {
   /** The constructor creates the object itself, with `structure.create(..)`, and returns it: it can then set internal fields. */
@@ -3611,6 +3612,7 @@ export class ClassType extends NamedType {
   readonly staticFunctions: readonly FunctionDefinition[];
   readonly staticGetters: readonly Getter[];
   readonly builtins: readonly Builtin[];
+  readonly staticBuiltins: readonly Builtin[];
   readonly constants: readonly Constant[];
   readonly calledFromCpp: readonly Method[];
   readonly calledFromRust: readonly CalledFromRustFunction[];
@@ -3730,10 +3732,7 @@ export class ClassType extends NamedType {
           !wellKnownSymbol(name) || !("internalField" in field || "getter" in field || "constant" in field),
           `${name}: only a function has an @@ key`,
         );
-        if ("builtin" in field) {
-          assert(!isStatic, `${name}: a builtin is a property of the prototype`);
-          return new Builtin(name, field.length);
-        }
+        if ("builtin" in field) return new Builtin(name, field.length);
         if ("internalField" in field) {
           assert(!isStatic, `${name}: an internalField accessor is a property of the prototype`);
           return new InternalFieldAccessor(name, field);
@@ -3780,6 +3779,7 @@ export class ClassType extends NamedType {
     this.constants = this.protoMembers.filter(member => member instanceof Constant);
     this.staticFunctions = this.staticMembers.filter(member => member instanceof FunctionDefinition);
     this.staticGetters = this.staticMembers.filter(member => member instanceof Getter);
+    this.staticBuiltins = this.staticMembers.filter(member => member instanceof Builtin);
     const { getters } = this;
     assert(this.construct || this.staticMembers.length === 0, "static members need a constructor object");
     const declaredFields = options.internalFields ?? [];

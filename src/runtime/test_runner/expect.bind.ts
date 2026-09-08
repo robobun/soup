@@ -185,6 +185,8 @@ export const Expect = b.class({
     hasAssertions: { ...js, length: 1 },
     not: { getter: ExpectStatic, capability: "heap", rustName: "static_not" },
     objectContaining: asymmetricMatchers.objectContaining,
+    /** `expect.poll(fn, options)`, in `src/js/builtins/Expect.ts` */
+    poll: { builtin: true, length: 2 },
     rejectsTo: { getter: ExpectStatic, capability: "heap", rustName: "static_rejects_to" },
     resolvesTo: { getter: ExpectStatic, capability: "heap", rustName: "static_resolves_to" },
     stringContaining: asymmetricMatchers.stringContaining,
@@ -202,6 +204,12 @@ export const applyCustomMatcher = b.fn({
   args: { args: b.any.variadic },
   returns: b.any,
   ...js,
+});
+
+/** `internal/test/poll`: a retry of an `expect.poll()` matcher does not count towards `expect.assertions()`. */
+export const dontCountAsAssertion = b.fn({
+  rustPath: "crate::test_runner::expect::dont_count_as_assertion",
+  args: { expect: Expect.otherAsNull },
 });
 
 /** What a matcher of `expect.extend()` makes when it is called on `expect` itself. */
