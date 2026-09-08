@@ -503,8 +503,9 @@ fn clear_all_timers(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSVa
     Ok(frame.this())
 }
 
+/// Also reached from `internal/test/poll` through `$newRustFunction`.
 #[bun_jsc::host_fn]
-fn is_fake_timers(_global: &JSGlobalObject, _frame: &CallFrame) -> JsResult<JSValue> {
+pub(crate) fn is_fake_timers(_global: &JSGlobalObject, _frame: &CallFrame) -> JsResult<JSValue> {
     // SAFETY: per-thread `timer::All`, live for the VM lifetime.
     let is_active = unsafe { (*timer_all()).fake_timers.is_active() };
 

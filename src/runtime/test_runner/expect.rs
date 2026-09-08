@@ -32,15 +32,18 @@ use bun_jsc::js_error_to_write_error;
 /// https://jestjs.io/docs/expect
 // To support async tests, we need to track the test ID
 // R-2 (host-fn re-entrancy): every JS-exposed method takes `&self`; the only
-// field mutated post-construction (`flags`, via the `.not`/`.resolves`/`.rejects`
-// chaining getters) is `Cell`-wrapped so the codegen shim can hand out a shared
-// `&*m_ctx` borrow without aliasing UB. `parent` and `custom_label` are
-// read-only after `call()` constructs the wrapper.
+// fields mutated post-construction (`flags`, via the `.not`/`.resolves`/`.rejects`
+// chaining getters, and `counts_as_assertion`) are `Cell`-wrapped so the codegen
+// shim can hand out a shared `&*m_ctx` borrow without aliasing UB. `parent` and
+// `custom_label` are read-only after `call()` constructs the wrapper.
 #[bun_jsc::JsClass]
 pub struct Expect {
     pub(crate) flags: Cell<Flags>,
     pub(crate) parent: Option<RefPtr<bun_test::RefData>>,
     pub(crate) custom_label: bun_core::String,
+    /// `false` for the retries of an `expect.poll()` matcher, so that a poll
+    /// counts once towards `expect.assertions()` however many attempts it takes.
+    pub(crate) counts_as_assertion: Cell<bool>,
 }
 
 
@@ -185,6 +188,7 @@ impl Expect {
     }
 
     pub(crate) fn increment_expect_call_counter(&self) {
+        if !self.counts_as_assertion.get() { return; }
         let Some(parent) = self.parent.as_ref() else { return }; // not in bun:test
         let Some(buntest_strong) = parent.bun_test() else { return }; // the test file this expect() call was for is no longer
         let buntest = buntest_strong.get();
@@ -705,6 +709,7 @@ impl Expect {
             flags: Cell::new(Flags::default()),
             custom_label,
             parent: active_execution_entry_ref,
+            counts_as_assertion: Cell::new(true),
         };
         // `JsClass::to_js` boxes `self` and hands the pointer to `${T}__create`.
         let expect_js_value = expect.to_js(global_this);
@@ -821,6 +826,20 @@ impl Expect {
         let signature = Self::get_signature("fail", "", true);
         throw!(this, global_this, signature, "\n\n{}\n", message)
     }
+}
+
+/// `internal/test/poll`: the `expect()` object passed in is a retry of an
+/// `expect.poll()` matcher and does not count towards `expect.assertions()`.
+pub(crate) fn js_dont_count_as_assertion(
+    _global: &JSGlobalObject,
+    callframe: &CallFrame,
+) -> JsResult<JSValue> {
+    if let Some(expect) = Expect::from_js(callframe.argument(0)) {
+        // SAFETY: `from_js` returned the live `m_ctx` payload of an `Expect`
+        // wrapper that the caller's argument keeps alive for this call.
+        unsafe { (*expect).counts_as_assertion.set(false) };
+    }
+    Ok(JSValue::UNDEFINED)
 }
 
 pub(crate) struct TrimResult<'a> {

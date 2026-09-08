@@ -725,7 +725,76 @@ declare module "bun:test" {
      * Ensures that a specific number of assertions are made
      */
     assertions(neededAssertions: number): void;
+
+    /**
+     * Retries an assertion on the value that `fn` returns until it passes or
+     * `timeout` milliseconds have gone by.
+     *
+     * `fn` runs again for every attempt, and a promise it returns is awaited.
+     * While `fn` throws or the matcher fails, the next attempt starts
+     * `interval` milliseconds later. Every matcher returns a promise, so the
+     * assertion must be awaited. `.resolves`, `.rejects`, `toThrow()` and the
+     * snapshot matchers are not available.
+     *
+     * @example
+     * await expect.poll(() => server.pendingRequests).toBe(0);
+     * await expect.poll(async () => (await fetch(url)).status, { timeout: 10_000 }).toBe(200);
+     * await expect.poll(() => readdirSync(outdir)).toContain("index.js");
+     *
+     * @param fn returns the value to assert on
+     * @param options `interval` and `timeout` in milliseconds, and a `message` for the failure
+     */
+    poll<T>(fn: () => T, options?: ExpectPollOptions): PollMatchers<Awaited<T>>;
   }
+
+  export interface ExpectPollOptions {
+    /**
+     * Milliseconds to wait after a failed attempt before the next one.
+     * @default 50
+     */
+    interval?: number;
+    /**
+     * Milliseconds after which no new attempt starts and the assertion fails.
+     * @default 1000
+     */
+    timeout?: number;
+    /**
+     * Shown in place of the `expect(received).toX(expected)` line when the
+     * assertion fails, like the second argument of `expect()`.
+     */
+    message?: string;
+  }
+
+  type PollExcludedMatchers =
+    | "not"
+    | "resolves"
+    | "rejects"
+    | "toThrow"
+    | "toThrowError"
+    | "toThrowErrorMatchingSnapshot"
+    | "toThrowErrorMatchingInlineSnapshot"
+    | "toMatchSnapshot"
+    | "toMatchInlineSnapshot";
+
+  /**
+   * The matchers of {@link Expect.poll `expect.poll()`}: the same as on
+   * `expect()`, except the ones that need a promise, a function that throws
+   * or a snapshot. Each returns a promise that resolves once the polled value
+   * passes, and rejects when the timeout runs out first.
+   */
+  export type PollMatchers<T> = {
+    [K in Exclude<keyof Matchers<T>, PollExcludedMatchers>]: Matchers<T>[K] extends (...args: infer A) => unknown
+      ? (...args: A) => Promise<void>
+      : never;
+  } & {
+    /**
+     * Passes once the polled value does not satisfy the matcher.
+     *
+     * @example
+     * await expect.poll(() => queue.jobs).not.toContain(job);
+     */
+    not: PollMatchers<T>;
+  };
 
   /**
    * Extend this interface with declaration merging to add type support for custom matchers.
