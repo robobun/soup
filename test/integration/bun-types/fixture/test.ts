@@ -78,6 +78,24 @@ describe("bun:test", () => {
     expect(undefined).toBeUndefined();
     expect(undefined).not.toBeDefined();
   });
+
+  test("expect.poll()", async () => {
+    expectType(expect.poll(() => 1).toBe(1)).is<Promise<void>>();
+    expectType(expect.poll(async () => "a", { interval: 10, timeout: 500, message: "m" }).toMatch(/a/)).is<
+      Promise<void>
+    >();
+    await expect.poll(() => [1, 2]).not.toContain(3);
+    await expect.poll(() => ({ a: 1 })).toMatchObject({ a: 1 });
+    await expect.poll(() => mock()).toHaveBeenCalledTimes(1);
+    // @ts-expect-error promises are unwrapped, so there is no .resolves
+    expect.poll(() => Promise.resolve(1)).resolves;
+    // @ts-expect-error a callback that throws is retried, so there is no .toThrow()
+    expect.poll(() => 1).toThrow();
+    // @ts-expect-error
+    expect.poll(() => 1).toMatchSnapshot();
+    // @ts-expect-error not a function
+    expect.poll(1);
+  });
 });
 
 test.each([1, 2, 3])("test.each", a => {
