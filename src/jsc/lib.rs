@@ -130,6 +130,8 @@ pub mod array_buffer;
 pub mod common_strings;
 #[path = "ConsoleObject.rs"]
 pub mod console_object;
+#[path = "ConsoleStyle.rs"]
+pub mod console_style;
 #[path = "Counters.rs"]
 pub mod counters;
 #[path = "DecodedJSValue.rs"]
