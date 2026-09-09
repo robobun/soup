@@ -1033,6 +1033,7 @@ dependencies = [
  "bun_collections",
  "bun_core",
  "bun_crash_handler",
+ "bun_css",
  "bun_dotenv",
  "bun_errno",
  "bun_event_loop",
