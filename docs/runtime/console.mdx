@@ -29,6 +29,37 @@ The CLI flag takes precedence over the configuration file setting.
 
 ---
 
+## Styling output with `%c`
+
+As in browsers, a `%c` directive in the first argument applies the CSS in the matching argument to
+the rest of the message. Bun renders the properties a terminal can show as ANSI escape codes:
+
+```ts
+console.log("%cReady%c in %dms", "color: green; font-weight: bold", "", 120);
+console.log("%c DEPRECATED %c use open() instead", "background-color: #c0392b; color: white", "");
+console.error("%cMissing config file", "text-decoration: underline");
+```
+
+| CSS                                             | Terminal                                    |
+| ----------------------------------------------- | ------------------------------------------- |
+| `color`                                         | foreground color                            |
+| `background-color`, `background` (a color only) | background color                            |
+| `font-weight: bold`, or `600` and up            | bold                                        |
+| `font-style: italic`                            | italic                                      |
+| `text-decoration: underline`                    | underline (also `line-through`, `overline`) |
+
+Colors accept any CSS color value (`red`, `#ff8800`, `rgb()`, `hsl()`, `lab()`, ...) and come out as
+24-bit, 256 or 16 color codes depending on what the terminal supports, the same way
+[`Bun.color(input, "ansi")`](/runtime/color) picks. Each `%c` starts again from the default style, so an
+empty string switches styling off. Styling stops at the end of the format string, so the remaining
+arguments print as usual. Other properties, and values that do not parse, are ignored.
+
+When colors are disabled (output is not a TTY, `NO_COLOR=1`, or `FORCE_COLOR=0`) the `%c` argument
+is consumed and nothing is printed for it, which is what Node.js always does. Only string arguments
+are read as CSS.
+
+---
+
 ## Reading from stdin
 
 In Bun, the `console` object is also an `AsyncIterable` that reads `process.stdin` line by line.
