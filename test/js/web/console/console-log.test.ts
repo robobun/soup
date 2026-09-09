@@ -1,5 +1,5 @@
 import { file, spawn } from "bun";
-import { expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { bunEnv, bunExe } from "harness";
 import { join } from "node:path";
 
@@ -149,4 +149,82 @@ it("console.log with SharedArrayBuffer", () => {
   expect(Bun.inspect(new SharedArrayBuffer(0))).toBe("SharedArrayBuffer(0) []");
   expect(Bun.inspect(new ArrayBuffer(3))).toBe("ArrayBuffer(3) [ 0, 0, 0 ]");
   expect(Bun.inspect(new SharedArrayBuffer(3))).toBe("SharedArrayBuffer(3) [ 0, 0, 0 ]");
+});
+
+describe.concurrent("%c", () => {
+  // FORCE_COLOR picks the color depth: 1 is 16 colors, 2 is 256, 3 is 24-bit.
+  async function run(code: string, FORCE_COLOR?: "1" | "2" | "3") {
+    await using proc = spawn({
+      cmd: [bunExe(), "-e", code],
+      env: { ...bunEnv, FORCE_COLOR },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  it("styles the rest of the message in a color terminal", async () => {
+    const { stdout, exitCode } = await run(
+      `console.log("%cbold red%c plain %cunderlined on blue", "color: red; font-weight: bold", "", "text-decoration: underline; background-color: rgb(0 0 255 / 50%)")`,
+      "3",
+    );
+    expect(stdout).toBe("\x1b[1;38;2;255;0;0mbold red\x1b[0m plain \x1b[4;48;2;0;0;255munderlined on blue\x1b[0m\n");
+    expect(exitCode).toBe(0);
+  });
+
+  it("uses the closest color the terminal can show", async () => {
+    const code = `console.log("%cx", "color: #ff0000; background: hsl(120 100% 25%)")`;
+    expect((await run(code, "3")).stdout).toBe("\x1b[38;2;255;0;0;48;2;0;128;0mx\x1b[0m\n");
+    expect((await run(code, "2")).stdout).toBe("\x1b[38;5;196;48;5;28mx\x1b[0m\n");
+    expect((await run(code, "1")).stdout).toBe("\x1b[91;42mx\x1b[0m\n");
+  });
+
+  it("only consumes its argument when colors are off", async () => {
+    const { stdout, exitCode } = await run(`console.log("%cbold%c plain", "font-weight: bold", "", "extra")`);
+    expect(stdout).toBe("bold plain extra\n");
+    expect(exitCode).toBe(0);
+  });
+
+  it("supports italic, line-through and overline, and later declarations win", async () => {
+    const { stdout } = await run(
+      `console.log("%cx", "font-style: italic; text-decoration: line-through overline; font-weight: 700; font-weight: normal; color: red; color: inherit !important")`,
+      "3",
+    );
+    expect(stdout).toBe("\x1b[3;9;53mx\x1b[0m\n");
+  });
+
+  it("ignores properties and values a terminal cannot show", async () => {
+    const { stdout } = await run(
+      `console.log("%cx%cy", "font-size: 20px; padding: 2px; color: notacolor; color: red blue; font-weight: heavy", "background: url(a;b) no-repeat; text-decoration: wavy")`,
+      "3",
+    );
+    expect(stdout).toBe("xy\n");
+  });
+
+  it("reads strings only and never calls toString()", async () => {
+    const code = `console.log("%cx", { toString() { throw new Error("toString called"); } })`;
+    for (const color of ["3", undefined] as const) {
+      const { stdout, stderr, exitCode } = await run(code, color);
+      expect(stdout).toBe("x\n");
+      expect(stderr).toBe("");
+      expect(exitCode).toBe(0);
+    }
+  });
+
+  it("puts the style back after a substitution that prints its own colors", async () => {
+    const { stdout } = await run(`console.log("%ca %o b %s c", "color: green", 1, "str")`, "3");
+    const green = "\x1b[38;2;0;128;0m";
+    expect(stdout).toStartWith(green + "a ");
+    expect(stdout).toEndWith(green + " b str c\x1b[0m\n");
+    // %s with a string prints no escape codes, so the style is not repeated for it.
+    expect(stdout.split(green)).toHaveLength(3);
+  });
+
+  it("works with console.error and resets before the remaining arguments", async () => {
+    const { stderr } = await run(`console.error("%cwarn", "color: rgb(255, 165, 0)", "tail")`, "3");
+    expect(Bun.stripANSI(stderr)).toBe("warn tail\n");
+    expect(stderr).toContain("\x1b[38;2;255;165;0mwarn\x1b[0m");
+    expect(stderr.indexOf("\x1b[0m", stderr.indexOf("warn"))).toBeLessThan(stderr.indexOf("tail"));
+  });
 });

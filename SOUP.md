@@ -1249,6 +1249,55 @@ Files: `src/js/internal/test/poll.ts`, `src/js/builtins/Expect.ts`,
 `src/codegen/generate-js2native.ts`, `packages/bun-types/test.d.ts`, `docs/test/writing-tests.mdx`,
 `test/js/bun/test/expect-poll.test.ts`, `test/integration/bun-types/fixture/test.ts`.
 
+### 2026-09-09: `%c` styling in `console.log()`
+
+In browsers, `console.log("%cDone", "color: green; font-weight: bold")` prints a bold green
+"Done". Deno does the same in a terminal. Node.js swallows the CSS argument and prints plain text,
+and so did Bun: the formatter parsed the `%c`, took its argument off the list, and hit a
+`// TODO: Implement %c`. Now, when the stream has colors on, the CSS is rendered as one SGR escape
+sequence, so the one-liner everybody tries before reaching for chalk just works, and code shared
+with the browser keeps its colors:
+
+```ts
+console.log("%cReady%c in %dms", "color: green; font-weight: bold", "", 120);
+console.log(
+  "%c DEPRECATED %c use open() instead",
+  "background-color: #c0392b; color: white",
+  "",
+);
+console.error("%cconfig file not found", "text-decoration: underline");
+```
+
+The properties a terminal can show are mapped: `color` and `background-color` (or a `background`
+that is just a color), `font-weight: bold` (or `bolder`, or 600 and up), `font-style: italic`, and
+`text-decoration`/`text-decoration-line` with `underline`, `line-through` and `overline`. Everything
+else (`font-size`, `padding`, `border`, ...) is ignored, as are values that do not parse, and
+within one `%c` a later declaration overrides an earlier one, `!important` or not, as CSS would
+have it. Color values go through the CSS parser that `Bun.color()` and the bundler use, so named
+colors, hex, `rgb()`/`hsl()`/`hwb()` in both syntaxes, `lab()`/`oklch()` and `color(display-p3 ...)`
+all work, and they come out as 24-bit, 256-color or 16-color codes depending on what the terminal
+supports (`COLORTERM`, `TERM`, `FORCE_COLOR=1/2/3`), which is the choice `Bun.color(x, "ansi")`
+already makes. `transparent`, `inherit`, `initial` and `currentcolor` select the terminal's default.
+
+Each `%c` starts from the default style rather than adding to the previous one, which is what
+browsers do, so `%c` with an empty string switches styling off. The style ends where the format
+string ends: a reset is written before the remaining arguments, the way Deno does it. A `%o`, `%O`
+or non-string `%s` substitution inside a styled run prints its own colors and resets, so the `%c`
+sequence is written again after it and the text that follows stays styled. With colors off (not a
+TTY, `NO_COLOR`, `FORCE_COLOR=0`) nothing changes: the argument is consumed and nothing is printed
+for it. Only string arguments are read as CSS; anything else clears the style instead of getting a
+`toString()` call that would only happen on a TTY.
+
+The xterm palette matching that `Bun.color()` had privately (tmux's cube-or-grey-ramp pick, and
+the 256-to-16 table) moved to `bun_core::output` next to `ColorDepth`, as `ansi_palette` plus a
+`ColorDepth::write_sgr_color()` that both callers now use; `Bun.color()`'s `ansi*` outputs are
+byte-for-byte unchanged (its 1000-case test file agrees).
+
+Files: `src/jsc/ConsoleStyle.rs` (CSS subset to SGR), `src/jsc/ConsoleObject.rs`
+(`write_with_formatting`), `src/bun_core/output.rs` (`ansi_palette`, `write_sgr_color`),
+`src/css_jsc/color_js.rs`, `src/css/values/color.rs` and `src/css/css_parser.rs` (two helpers made
+public), `src/jsc/Cargo.toml`, `docs/runtime/console.mdx`, `test/js/web/console/console-log.test.ts`.
+
 ## Dropped
 
 Nothing yet.

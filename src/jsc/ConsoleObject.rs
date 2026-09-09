@@ -8,9 +8,11 @@ use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 
 use crate as jsc;
+use crate::console_style;
 use crate::virtual_machine::VirtualMachine;
 use crate::{EventType, JSGlobalObject, JSPromise, JSValue, JsResult};
 use bun_collections::HashMap;
+use bun_core::output::ColorDepth;
 use bun_core::{EncodedSlice, String as BunString, strings};
 use bun_core::{Output, StackCheck};
 
@@ -2339,6 +2341,10 @@ pub mod formatter {
             let mut i: u32 = 0;
             let mut len: u32 = slice.len() as u32;
             let mut hit_percent = false;
+            // The escape sequence of the `%c` in effect, empty while none is. A
+            // substitution that prints its own colors ends with a reset, so the
+            // sequence is written again after it.
+            let mut style: Vec<u8> = Vec::new();
             'outer: while i < len {
                 if hit_percent {
                     i = 0;
@@ -2416,6 +2422,9 @@ pub mod formatter {
                                     failed: false,
                                     estimated_line_length: &mut self.estimated_line_length,
                                 };
+                                if !style.is_empty() && !next_value.is_string() {
+                                    writer.write_all(&style);
+                                }
                             }
                             PercentTag::I => {
                                 // 1. If Type(current) is Symbol, let converted be NaN
@@ -2568,10 +2577,31 @@ pub mod formatter {
                                     failed: false,
                                     estimated_line_length: &mut self.estimated_line_length,
                                 };
+                                if !style.is_empty() {
+                                    writer.write_all(&style);
+                                }
                             }
 
                             PercentTag::C => {
-                                // TODO: Implement %c
+                                // Browsers style the rest of the message with the CSS in
+                                // the argument. Without colors the argument is only consumed,
+                                // as in Node.js. A value that is not a string clears the style
+                                // rather than run a `toString()` that depends on being a TTY.
+                                if ENABLE_ANSI_COLORS {
+                                    if !style.is_empty() {
+                                        writer.write_all(b"\x1b[0m");
+                                        style.clear();
+                                    }
+                                    if next_value.is_string() {
+                                        let css = next_value.to_utf8(global)?;
+                                        let depth = match bun_core::output::Source::color_depth() {
+                                            ColorDepth::None => ColorDepth::C16,
+                                            depth => depth,
+                                        };
+                                        console_style::write_sgr(css.slice(), depth, &mut style);
+                                        writer.write_all(&style);
+                                    }
+                                }
                             }
 
                             PercentTag::J => {
@@ -2593,6 +2623,9 @@ pub mod formatter {
 
             if !slice.is_empty() {
                 writer.write_all(slice);
+            }
+            if !style.is_empty() {
+                writer.write_all(b"\x1b[0m");
             }
             Ok(())
         }
