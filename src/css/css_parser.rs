@@ -3401,7 +3401,7 @@ impl<'a> Parser<'a> {
         self.input.may_revert_rule = true;
     }
 
-    pub(crate) fn is_exhausted(&mut self) -> bool {
+    pub fn is_exhausted(&mut self) -> bool {
         self.expect_exhausted().is_ok()
     }
 
