@@ -98,9 +98,11 @@ impl RGBA {
         LAB::from_rgba(self)
     }
 
-    /// Convert any `CssColor` into `RGBA` by routing through `SRGB`.
+    /// Convert any `CssColor` into `RGBA` by routing through `SRGB`. `None` for
+    /// the colors that depend on context: `currentColor`, `light-dark()` and the
+    /// system colors.
     #[inline]
-    pub(crate) fn try_from_css_color(color: &CssColor) -> Option<RGBA> {
+    pub fn try_from_css_color(color: &CssColor) -> Option<RGBA> {
         Some(SRGB::try_from_css_color(color)?.into_rgba())
     }
 }
