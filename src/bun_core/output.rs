@@ -803,6 +803,110 @@ fn compute_color_depth() -> ColorDepth {
     ColorDepth::None
 }
 
+/// Nearest entries of the xterm palette for a 24-bit color, the way tmux picks
+/// them (colour.c): the 6x6x6 cube or the grey ramp, whichever is closer.
+pub mod ansi_palette {
+    const Q2C: [u32; 6] = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+
+    fn sqdist(r_: u32, g_: u32, b_: u32, r: u32, g: u32, b: u32) -> u32 {
+        let d = |a: u32, b: u32| a.abs_diff(b) * a.abs_diff(b);
+        d(r_, r) + d(g_, g) + d(b_, b)
+    }
+
+    fn to_6_cube(v: u32) -> u32 {
+        if v < 48 {
+            0
+        } else if v < 114 {
+            1
+        } else {
+            (v - 35) / 40
+        }
+    }
+
+    /// Index into the 256-color palette (`38;5;N`). Always 16 or above: the
+    /// first 16 entries depend on the terminal's theme.
+    pub fn closest_256(red: u8, green: u8, blue: u8) -> u8 {
+        let (r, g, b) = (u32::from(red), u32::from(green), u32::from(blue));
+        let (qr, qg, qb) = (to_6_cube(r), to_6_cube(g), to_6_cube(b));
+        let (cr, cg, cb) = (Q2C[qr as usize], Q2C[qg as usize], Q2C[qb as usize]);
+        let cube = (16 + 36 * qr + 6 * qg + qb) as u8;
+        if cr == r && cg == g && cb == b {
+            return cube;
+        }
+
+        let grey_avg = (r + g + b) / 3;
+        let grey_idx = if grey_avg > 238 {
+            23
+        } else {
+            grey_avg.saturating_sub(3) / 10
+        };
+        let grey = 8 + 10 * grey_idx;
+        if sqdist(grey, grey, grey, r, g, b) < sqdist(cr, cg, cb, r, g, b) {
+            (232 + grey_idx) as u8
+        } else {
+            cube
+        }
+    }
+
+    const TABLE_256: [u8; 256] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 4, 4, 4, 12, 12, 2, 6, 4, 4, 12,
+        12, 2, 2, 6, 4, 12, 12, 2, 2, 2, 6, 12, 12, 10, 10, 10, 10, 14, 12, 10, 10, 10, 10, 10, 14,
+        1, 5, 4, 4, 12, 12, 3, 8, 4, 4, 12, 12, 2, 2, 6, 4, 12, 12, 2, 2, 2, 6, 12, 12, 10, 10, 10,
+        10, 14, 12, 10, 10, 10, 10, 10, 14, 1, 1, 5, 4, 12, 12, 1, 1, 5, 4, 12, 12, 3, 3, 8, 4, 12,
+        12, 2, 2, 2, 6, 12, 12, 10, 10, 10, 10, 14, 12, 10, 10, 10, 10, 10, 14, 1, 1, 1, 5, 12, 12,
+        1, 1, 1, 5, 12, 12, 1, 1, 1, 5, 12, 12, 3, 3, 3, 7, 12, 12, 10, 10, 10, 10, 14, 12, 10, 10,
+        10, 10, 10, 14, 9, 9, 9, 9, 13, 12, 9, 9, 9, 9, 13, 12, 9, 9, 9, 9, 13, 12, 9, 9, 9, 9, 13,
+        12, 11, 11, 11, 11, 7, 12, 10, 10, 10, 10, 10, 14, 9, 9, 9, 9, 9, 13, 9, 9, 9, 9, 9, 13, 9,
+        9, 9, 9, 9, 13, 9, 9, 9, 9, 9, 13, 9, 9, 9, 9, 9, 13, 11, 11, 11, 11, 11, 15, 0, 0, 0, 0,
+        0, 0, 8, 8, 8, 8, 8, 8, 7, 7, 7, 7, 7, 7, 15, 15, 15, 15, 15, 15,
+    ];
+
+    /// Index into the 16 basic colors, `0..8` normal and `8..16` bright.
+    pub fn closest_16(red: u8, green: u8, blue: u8) -> u8 {
+        TABLE_256[closest_256(red, green, blue) as usize]
+    }
+}
+
+impl ColorDepth {
+    /// Appends the SGR parameters that select the closest color this depth can
+    /// show, for example `38;2;255;0;0`, `38;5;196` or `91` for red. The caller
+    /// adds the `\x1b[` and `m` around them. Appends nothing for `None`.
+    pub fn write_sgr_color(
+        self,
+        out: &mut Vec<u8>,
+        background: bool,
+        red: u8,
+        green: u8,
+        blue: u8,
+    ) {
+        use std::io::Write as _;
+        match self {
+            ColorDepth::None => {}
+            ColorDepth::C16 => {
+                let index = u32::from(ansi_palette::closest_16(red, green, blue));
+                let base = if index < 8 {
+                    30 + index
+                } else {
+                    90 + index - 8
+                };
+                let _ = write!(out, "{}", base + if background { 10 } else { 0 });
+            }
+            ColorDepth::C256 => {
+                let layer = if background { 48 } else { 38 };
+                let _ = write!(
+                    out,
+                    "{layer};5;{}",
+                    ansi_palette::closest_256(red, green, blue)
+                );
+            }
+            ColorDepth::C16m => {
+                let layer = if background { 48 } else { 38 };
+                let _ = write!(out, "{layer};2;{red};{green};{blue}");
+            }
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Module-level state
 // ──────────────────────────────────────────────────────────────────────────
