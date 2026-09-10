@@ -3352,6 +3352,19 @@ fn transpile_source_code_inner(
                     ..Default::default()
                 });
             }
+            // `with { type: "bytes" }`: `export default <Uint8Array of the file>`.
+            if matches!(loader, L::Bytes) {
+                return Ok(ResolvedSource {
+                    jsvalue_for_export: bytes_module_value(
+                        global_object,
+                        args.virtual_source,
+                        path.text,
+                    )?,
+                    source_url: input_specifier.create_if_different(path.text),
+                    tag: ResolvedSourceTag::ExportDefaultObject,
+                    ..Default::default()
+                });
+            }
             // SAFETY: per fn contract — `jsc_vm` is the live per-thread VM.
             let value = if !unsafe { &*jsc_vm }.origin.is_empty() {
                 // Rewrite `specifier` against `vm.origin` so
@@ -3387,6 +3400,35 @@ fn transpile_source_code_inner(
             })
         }
     }
+}
+
+/// The default export of a `bytes` module: the file's contents in a new
+/// `Uint8Array`, read from `virtual_source` when a plugin or blob supplied
+/// the module and from disk otherwise. The array adopts the buffer the file
+/// was read into.
+fn bytes_module_value(
+    global: &JSGlobalObject,
+    virtual_source: Option<&bun_ast::Source>,
+    path: &[u8],
+) -> crate::Result<JSValue> {
+    use bun_sys_jsc::ErrorJsc as _;
+    let contents: Vec<u8> = match virtual_source {
+        Some(source) => source.contents.to_vec(),
+        None => match bun_sys::File::read_from(bun_sys::Fd::cwd(), path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                let instance = err.with_path(path).to_js(global)?;
+                return Err(global.throw_value(instance).into());
+            }
+        },
+    };
+    if contents.is_empty() {
+        return Ok(bun_jsc::JSUint8Array::create_empty(global)?);
+    }
+    Ok(bun_jsc::JSUint8Array::from_bytes(
+        global,
+        contents.into_boxed_slice(),
+    )?)
 }
 
 /// Register the just-opened file
@@ -3666,6 +3708,21 @@ export default db;
             });
         }
 
+        if file.is_bytes_module() {
+            // The default export is a `Uint8Array` holding a copy of the
+            // embedded bytes: the section is shared and a `Uint8Array` is
+            // writable. Only an allocation failure can throw here.
+            let value = bun_core::handle_oom(bun_jsc::ArrayBuffer::create_uint8_array(
+                global,
+                file.contents.as_bytes(),
+            ));
+            return Some(ResolvedSource {
+                jsvalue_for_export: value,
+                tag: bun_jsc::resolved_source::Tag::ExportDefaultObject,
+                ..ResolvedSource::default()
+            });
+        }
+
         // SAFETY: `file.module_info` is a live subrange of the embedded section (set in `Graph::from_bytes`).
         let module_info = unsafe { &*file.module_info };
         let module_info_strings: &'static [u8] = bun_standalone_graph::Graph::get_ref()
@@ -3745,6 +3802,7 @@ fn force_loader_from_api_u8(api_loader: u8) -> Option<Loader> {
         20 => Some(L::Json5),
         21 => Some(L::Md),
         22 => Some(L::Xml),
+        23 => Some(L::Bytes),
         // 254 = `_none`; everything else is open-tail.
         _ => None,
     }

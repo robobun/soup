@@ -3415,6 +3415,7 @@ impl<'a> LinkerContext<'a> {
                         | Loader::Base64
                         | Loader::Dataurl
                         | Loader::Text
+                        | Loader::Bytes
                         | Loader::Bunsh => {}
                     }
                 }
