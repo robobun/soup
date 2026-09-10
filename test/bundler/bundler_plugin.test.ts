@@ -96,6 +96,30 @@ describe("bundler", () => {
       stdout: '[{"config":{"@env":"test","name":"app"}},{"feed":{"entry":["1","2"]}}]',
     },
   });
+  // A plugin can produce binary modules: typed array or string contents with the bytes loader.
+  itBundled("plugin/LoadBytesLoader", {
+    files: {
+      "/index.ts": /* ts */ `
+        import generated from "./table.gen";
+        import greeting from "./greeting.gen-text";
+        console.log(generated.constructor.name, Array.from(generated).join(","), new TextDecoder().decode(greeting));
+      `,
+      // Resolved on disk, contents replaced by the plugin.
+      "/table.gen": "placeholder",
+      "/greeting.gen-text": "placeholder",
+    },
+    plugins(builder) {
+      builder.onLoad({ filter: /\.gen$/ }, () => ({
+        contents: new Uint8Array([0, 1, 2, 254, 255]),
+        loader: "bytes",
+      }));
+      builder.onLoad({ filter: /\.gen-text$/ }, () => ({
+        contents: "h\u00e9llo",
+        loader: "bytes",
+      }));
+    },
+    run: { stdout: "Uint8Array 0,1,2,254,255 h\u00e9llo" },
+  });
 
   // Load Plugin Errors
   itBundled("plugin/LoadThrow", {

@@ -319,6 +319,32 @@ export default "Hello, world!";
 
 ---
 
+### `bytes`
+
+**Binary loader.** No extension uses it by default.
+
+Import any file with `with { type: "bytes" }` to get its contents as a `Uint8Array`. This is the [Import Bytes](https://github.com/tc39/proposal-import-bytes) proposal: the same line works in the runtime, in a bundle, and in a compiled executable, with no `fs` call and no path handling.
+
+```js
+import wasm from "./add.wasm" with { type: "bytes" };
+import font from "./Inter.ttf" with { type: "bytes" };
+
+const { instance } = await WebAssembly.instantiate(wasm);
+console.log(font.byteLength); // => 310252
+```
+
+The default export is the only export. Every import of the same file shares one `Uint8Array`, so treat it as read-only. To apply the loader by extension instead, pass `--loader .bin:bytes`, or `loader: { ".bin": "bytes" }` to `Bun.build`.
+
+In the runtime, Bun reads the file when the module is first imported. During a build, Bun inlines the contents into the bundle as base64 and decodes them once, when the module is evaluated:
+
+```js
+var wasm_default = __toBytes("AGFzbQEAAAABBwFgAn9/AX8DAgEABw...");
+```
+
+`__toBytes` uses `Uint8Array.fromBase64` where the engine has it and a small decoder elsewhere, so the output runs in every target. With `bun build --compile`, the file is [embedded in the executable](/bundler/executables#embed-binary-files-as-bytes) as it is instead, and nothing is decoded at startup.
+
+---
+
 ### `napi`
 
 **Native addon loader.** Default for `.node`.

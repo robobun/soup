@@ -50,6 +50,7 @@ pub fn loader_from_js(
             | bun_ast::Loader::Napi
             | bun_ast::Loader::Base64
             | bun_ast::Loader::Dataurl
+            | bun_ast::Loader::Bytes
             | bun_ast::Loader::Bunsh
             | bun_ast::Loader::Sqlite
             | bun_ast::Loader::SqliteEmbedded

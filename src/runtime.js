@@ -70,7 +70,9 @@ export var __toESM = (mod, isNodeMode, target) => {
 
   // A CommonJS module may legitimately set "module.exports" to null,
   // undefined, or a primitive; only objects and functions have named exports.
-  if ((mod && typeof mod === "object") || typeof mod === "function")
+  // A typed array (a "bytes" module, a Buffer) has an own property per byte
+  // and nothing to import by name: skip the getters instead of making millions.
+  if ((mod && typeof mod === "object" && !ArrayBuffer.isView(mod)) || typeof mod === "function")
     for (let key of __getOwnPropNames(mod))
       if (!__hasOwnProp.call(to, key))
         __defProp(to, key, {
@@ -341,6 +343,32 @@ export var __esm = (fn, res, err) => () => {
 export var $$typeof = /* @__PURE__ */ Symbol.for("react.element");
 
 export var __jsonParse = /* @__PURE__ */ a => JSON.parse(a);
+
+// The "bytes" loader inlines a file as base64; this decodes it once, when the
+// module is first evaluated. The table decoder (after esbuild's __toBinary) is
+// for engines without Uint8Array.fromBase64.
+export var __toBytes = /* @__PURE__ */ base64 => {
+  if (Uint8Array.fromBase64) return Uint8Array.fromBase64(base64);
+  var table = (__base64Table ??= (() => {
+    var t = new Uint8Array(128);
+    for (var i = 0; i < 64; i++) t[i < 26 ? i + 65 : i < 52 ? i + 71 : i < 62 ? i - 4 : i * 4 - 205] = i;
+    return t;
+  })());
+  var n = base64.length,
+    bytes = new Uint8Array((((n - (base64[n - 1] == "=") - (base64[n - 2] == "=")) * 3) / 4) | 0);
+  for (var i = 0, j = 0; i < n; ) {
+    var c0 = table[base64.charCodeAt(i++)],
+      c1 = table[base64.charCodeAt(i++)],
+      c2 = table[base64.charCodeAt(i++)],
+      c3 = table[base64.charCodeAt(i++)];
+    bytes[j++] = (c0 << 2) | (c1 >> 4);
+    bytes[j++] = (c1 << 4) | (c2 >> 2);
+    bytes[j++] = (c2 << 6) | c3;
+  }
+  return bytes;
+};
+/*__PURE__*/
+var __base64Table;
 
 export var __promiseAll = args => Promise.all(args);
 

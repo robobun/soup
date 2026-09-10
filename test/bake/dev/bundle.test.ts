@@ -487,6 +487,23 @@ devTest("importing html file with text loader (#18154)", {
     await c.expectMessage("<div>hello world</div>");
   },
 });
+devTest("importing bytes on the client", {
+  files: {
+    "index.html": emptyHtmlFile({
+      styles: [],
+      scripts: ["index.ts"],
+    }),
+    "index.ts": `
+      import bytes from "./data.bin" with { type: "bytes" };
+      console.log(bytes.constructor.name + " " + Array.from(bytes).join(","));
+    `,
+    "data.bin": Buffer.from([0, 1, 2, 128, 255]),
+  },
+  async test(dev) {
+    await using c = await dev.client("/", {});
+    await c.expectMessage("Uint8Array 0,1,2,128,255");
+  },
+});
 devTest("importing bun on the client", {
   files: {
     "index.html": emptyHtmlFile({
