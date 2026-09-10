@@ -378,3 +378,4 @@ Check `error.name` or use `instanceof`, not `error.message`.
 | `import()` or `require()` with a `type` that isn't written out         | Write it out: `require("./a.json", { type: "file" })`. `require()` warns (`TS100177`)    |
 | `with { type: "macro" }` on an import (`TS100053`)                     | Pass `--no-aot`                                                                          |
 | The `console.*` diagnostics channels, for the global `console`         | Replace the methods of `console`, or log through a `new console.Console()`               |
+| `with { type: "bytes" }` imports                                       | Pass `--no-aot`                                                                          |
