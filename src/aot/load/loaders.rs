@@ -71,6 +71,7 @@ define_host_numbers! {
     Json5 = 20,
     Md = 21,
     Xml = 22,
+    Bytes = 23,
 }
 
 pub(crate) fn to_host_loader(loader: Loader, path: &[u8]) -> HostLoader {
@@ -119,7 +120,8 @@ pub(crate) fn gives_data(loader: Loader) -> bool {
         | Loader::SqliteEmbedded
         | Loader::Yaml
         | Loader::Json5
-        | Loader::Xml => true,
+        | Loader::Xml
+        | Loader::Bytes => true,
     }
 }
 
@@ -143,6 +145,7 @@ pub(crate) fn reads_raw_bytes(loader: Loader) -> bool {
             | Loader::Dataurl
             | Loader::Sqlite
             | Loader::SqliteEmbedded
+            | Loader::Bytes
     )
 }
 
@@ -219,10 +222,10 @@ mod tests {
 
     #[test]
     fn host_loader_kind_rejects_unassigned_numbers() {
-        let xml = HostLoaderKind::Loader(Loader::Xml);
+        let bytes = HostLoaderKind::Loader(Loader::Bytes);
         assert_eq!(host_loader_kind(BY_NAME), Some(HostLoaderKind::ByName));
-        assert_eq!(host_loader_kind(HostLoader(22)), Some(xml));
-        for number in 23..=u8::MAX {
+        assert_eq!(host_loader_kind(HostLoader(23)), Some(bytes));
+        for number in 24..=u8::MAX {
             assert_eq!(host_loader_kind(HostLoader(number)), None);
         }
     }
