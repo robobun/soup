@@ -544,6 +544,190 @@ describe("bundler", async () => {
     }
   });
 
+  // `with { type: "bytes" }` / the `bytes` loader: the file is inlined as base64
+  // and decoded into a Uint8Array by the runtime's `__toBytes` when the module
+  // is evaluated. Buffers: `files` strings go through dedent().
+  describe("bytes loader", () => {
+    const allBytes = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+    const report = /* js */ `
+      export function report(bytes) {
+        return JSON.stringify({
+          constructor: bytes.constructor.name,
+          length: bytes.length,
+          hex: Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(""),
+        });
+      }
+    `;
+    const expected = JSON.stringify({ constructor: "Uint8Array", length: 256, hex: allBytes.toString("hex") });
+
+    for (const target of ["bun", "node", "browser"] as const) {
+      itBundled(`${target}/loader-bytes-attribute`, {
+        target,
+        files: {
+          "/entry.ts": /* js */ `
+            import bytes from "./data.bin" with { type: "bytes" };
+            import { report } from "./report";
+            console.log(report(bytes));
+          `,
+          "/report.ts": report,
+          "/data.bin": allBytes,
+        },
+        onAfterBundle(api) {
+          const js = api.readFile("/out.js");
+          expect(js).toContain(`__toBytes("${allBytes.toString("base64")}")`);
+          expect(js).not.toContain("$bunfs");
+        },
+        run: { stdout: expected },
+      });
+    }
+
+    // Engines without Uint8Array.fromBase64 take the table decoder.
+    itBundled("bun/loader-bytes-fallback-decoder", {
+      target: "bun",
+      loader: { ".bin": "bytes" },
+      files: {
+        "/entry.ts": /* js */ `
+          import { report } from "./report";
+          delete Uint8Array.fromBase64;
+          // require() evaluates the module here, after the delete.
+          const bytes = require("./data.bin");
+          const short = require("./short.bin");
+          const empty = require("./empty.bin");
+          console.log(report(bytes));
+          console.log(Array.from(short), Array.from(empty), typeof Uint8Array.fromBase64);
+        `,
+        "/report.ts": report,
+        "/data.bin": allBytes,
+        "/short.bin": Buffer.from([0xff, 0x00, 0x80, 0x7f]),
+        "/empty.bin": Buffer.alloc(0),
+      },
+      run: { stdout: `${expected}\n[ 255, 0, 128, 127 ] [] undefined` },
+    });
+
+    itBundled("bun/loader-bytes-shared-instance-and-require", {
+      target: "bun",
+      files: {
+        "/entry.ts": /* js */ `
+          import a from "./data.bin" with { type: "bytes" };
+          import { b } from "./other";
+          const c = require("./data.bin");
+          console.log(a === b, a === c, a.length);
+        `,
+        "/other.ts": /* js */ `
+          import b from "./data.bin" with { type: "bytes" };
+          export { b };
+        `,
+        "/data.bin": allBytes,
+      },
+      loader: { ".bin": "bytes" },
+      run: { stdout: "true true 256" },
+    });
+
+    // The bytes are the file's, exactly: no BOM stripping or UTF-16 decoding as for source text.
+    itBundled("bun/loader-bytes-exact-contents", {
+      target: "bun",
+      files: {
+        "/entry.ts": /* js */ `
+          import utf8Bom from "./utf8-bom.txt" with { type: "bytes" };
+          import utf16Bom from "./utf16-bom.txt" with { type: "bytes" };
+          console.log(Array.from(utf8Bom).join(","), Array.from(utf16Bom).join(","));
+        `,
+        "/utf8-bom.txt": Buffer.from([0xef, 0xbb, 0xbf, 0x68, 0x69]),
+        "/utf16-bom.txt": Buffer.from([0xff, 0xfe, 0x68, 0x00, 0x69, 0x00]),
+      },
+      run: { stdout: "239,187,191,104,105 255,254,104,0,105,0" },
+    });
+
+    // Without --splitting, import() gives the module the CommonJS shape and the
+    // namespace comes from __toESM, which must not define a getter per byte.
+    itBundled("bun/loader-bytes-dynamic-import", {
+      target: "bun",
+      files: {
+        "/entry.ts": /* js */ `
+          const ns = await import("./big.bin", { with: { type: "bytes" } });
+          console.log(JSON.stringify(Object.keys(ns)), ns.default.length, ns.default[123456]);
+        `,
+        "/big.bin": Buffer.from(Array.from({ length: 256 * 1024 }, (_, i) => (i * 7) & 0xff)),
+      },
+      run: { stdout: `["default"] 262144 ${(123456 * 7) & 0xff}` },
+    });
+
+    // A CSS url() that points at a bytes-loader file gets the same bytes as a data: URL.
+    itBundled("bun/loader-bytes-css-url", {
+      target: "browser",
+      outdir: "/out",
+      loader: { ".bin": "bytes" },
+      files: {
+        "/entry.css": /* css */ `
+          body { background: url(./dot.bin); }
+        `,
+        "/dot.bin": Buffer.from([1, 2, 3, 253, 254, 255]),
+      },
+      entryPoints: ["/entry.css"],
+      onAfterBundle(api) {
+        api
+          .expectFile("/out/entry.css")
+          .toContain(
+            `url("data:application/octet-stream;base64,${Buffer.from([1, 2, 3, 253, 254, 255]).toString("base64")}")`,
+          );
+      },
+    });
+
+    itBundled("bun/loader-bytes-unused-import-is-dropped", {
+      target: "bun",
+      files: {
+        "/entry.ts": /* js */ `
+          import bytes from "./data.bin" with { type: "bytes" };
+          console.log("no bytes here");
+        `,
+        "/data.bin": allBytes,
+      },
+      onAfterBundle(api) {
+        const js = api.readFile("/out.js");
+        expect(js).not.toContain("__toBytes");
+        expect(js).not.toContain(allBytes.toString("base64"));
+      },
+      run: { stdout: "no bytes here" },
+    });
+
+    itBundled("bun/loader-bytes-minified", {
+      target: "bun",
+      minifySyntax: true,
+      minifyIdentifiers: true,
+      minifyWhitespace: true,
+      files: {
+        "/entry.ts": /* js */ `
+          import bytes from "./data.bin" with { type: "bytes" };
+          import { report } from "./report";
+          console.log(report(bytes));
+        `,
+        "/report.ts": report,
+        "/data.bin": allBytes,
+      },
+      run: { stdout: expected },
+    });
+
+    // Dev server chunks do not link the bundler runtime; the HMR module serves
+    // `__toBytes` through the synthetic `bun:wrap` module instead.
+    itBundled("bake-dev/loader-bytes-import", {
+      format: "internal_bake_dev",
+      files: {
+        "/entry.ts": /* js */ `
+          import bytes from "./data.bin" with { type: "bytes" };
+          console.log(bytes.length);
+        `,
+        "/data.bin": allBytes,
+      },
+      onAfterBundle(api) {
+        const output = api.readFile("/out.js");
+        expect(output).toContain('"data.bin"(hmr, module, exports) {');
+        expect(output).toContain(
+          `module.exports = hmr.require("bun:wrap").__toBytes("${allBytes.toString("base64")}")`,
+        );
+      },
+    });
+  });
+
   // Lazy-export modules (JSON, TOML, CSS modules, ...) used to crash the
   // printer when bundled with the dev server's module format.
   // https://github.com/oven-sh/bun/issues/31943

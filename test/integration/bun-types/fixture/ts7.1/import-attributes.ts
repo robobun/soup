@@ -13,6 +13,11 @@ expectType(text).is<string>();
 import path from "./logo.svg" with { type: "file" };
 expectType(path).is<string>();
 
+import bytes from "./logo.svg" with { type: "bytes" };
+expectType(bytes).is<Uint8Array<ArrayBuffer>>();
+const lazyBytes = await import("./model.onnx", { with: { type: "bytes" } });
+expectType(lazyBytes.default).is<Uint8Array<ArrayBuffer>>();
+
 import md from "./notes.txt" with { type: "md" };
 expectType(md).is<string>();
 

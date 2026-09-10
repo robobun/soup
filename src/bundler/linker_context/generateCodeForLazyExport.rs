@@ -368,7 +368,7 @@ pub(crate) fn generate_code_for_lazy_export(
     let StmtData::SLazyExport(lazy) = stmt.data else {
         panic!("Internal error: expected top-level lazy export statement");
     };
-    let expr = Expr {
+    let mut expr = Expr {
         data: *lazy,
         loc: stmt.loc,
     };
@@ -378,6 +378,25 @@ pub(crate) fn generate_code_for_lazy_export(
     let calls_runtime_require = matches!(expr.data, ExprData::ECall(ref c)
         if matches!(c.target.data, ExprData::ERequireCallTarget))
         && this.options.output_format != crate::options::OutputFormat::Cjs;
+
+    // A `bytes` module that was not embedded into an executable holds its
+    // contents as a base64 string: `__toBytes` decodes it into the `Uint8Array`
+    // once, when the module is evaluated. The part that holds the call must
+    // import the helper, like `__require` above. (Dev server parses wrap the
+    // string themselves, see `decode_bytes_through_hmr_runtime`.)
+    let decodes_bytes = this.parse_graph().input_files.items_loader()[source_index as usize]
+        == bun_ast::Loader::Bytes
+        && matches!(expr.data, ExprData::EString(_));
+    if decodes_bytes {
+        expr = Expr::init(
+            E::Call {
+                target: Expr::init_identifier(this.runtime_function(b"__toBytes"), expr.loc),
+                args: bun_ast::ExprNodeList::from_slice(&[expr]),
+                ..Default::default()
+            },
+            expr.loc,
+        );
+    }
 
     match exports_kind {
         bun_ast::ExportsKind::Cjs => {
@@ -406,6 +425,14 @@ pub(crate) fn generate_code_for_lazy_export(
                     source_index,
                     Index::part(1u32),
                     b"__require",
+                    1,
+                )?;
+            }
+            if decodes_bytes {
+                this.graph.generate_runtime_symbol_import_and_use(
+                    source_index,
+                    Index::part(1u32),
+                    b"__toBytes",
                     1,
                 )?;
             }
@@ -514,6 +541,14 @@ pub(crate) fn generate_code_for_lazy_export(
                         source_index,
                         Index::part(generated.1),
                         b"__require",
+                        1,
+                    )?;
+                }
+                if decodes_bytes {
+                    this.graph.generate_runtime_symbol_import_and_use(
+                        source_index,
+                        Index::part(generated.1),
+                        b"__toBytes",
                         1,
                     )?;
                 }
