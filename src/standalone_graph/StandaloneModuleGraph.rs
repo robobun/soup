@@ -677,9 +677,16 @@ impl File {
         self.loader == Loader::Text
     }
 
+    /// A `with { type: "bytes" }` import: the file's bytes, served as a `Uint8Array` module.
+    pub fn is_bytes_module(&self) -> bool {
+        self.loader == Loader::Bytes
+    }
+
     pub fn appears_in_embedded_files_array(&self) -> bool {
-        // A text module's bytes are not the file's UTF-8.
+        // A text module's bytes are not the file's UTF-8, and both kinds are
+        // modules reached through `import`, not assets.
         !self.is_text_module()
+            && !self.is_bytes_module()
             && (self.side == FileSide::Client || !self.loader.is_javascript_like())
     }
 

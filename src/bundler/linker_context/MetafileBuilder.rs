@@ -378,6 +378,7 @@ pub(crate) fn generate(c: &mut LinkerContext, chunks: &mut [Chunk]) -> crate::Re
                         Loader::Json => Some(b"json"),
                         Loader::Toml => Some(b"toml"),
                         Loader::Text => Some(b"text"),
+                        Loader::Bytes => Some(b"bytes"),
                         _ => None,
                     };
                     if let Some(wt) = with_type {
