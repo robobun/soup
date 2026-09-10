@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "fs";
+import { readFileSync, rmSync } from "fs";
 import { bunEnv, bunExe, isWindows, tempDir } from "harness";
 import { join } from "path";
 import { BundlerTestInput, itBundled as itBundledBase } from "./expectBundled";
@@ -1298,6 +1298,73 @@ describe("bundler", () => {
     },
     run: { stdout: JSON.stringify({ server: "client sees the text", clientHasLiteral: true, clientHasBunfs: false }) },
   });
+
+  // A `with { type: "bytes" }` import in a compiled executable embeds the file
+  // as it is and the module's default export is a Uint8Array over a copy of
+  // it: no base64 in the bundle, nothing to decode at startup. `require()` and
+  // `import()` see the same module, and `Bun.embeddedFiles` lists assets only.
+  // Every byte value once, in an order no lookup table in the executable has.
+  const bytesImportData = Buffer.from(Array.from({ length: 256 }, (_, i) => (i * 167 + 13) & 0xff));
+  const bytesImportFiles = {
+    "/data.bin": bytesImportData,
+    "/empty.bin": Buffer.alloc(0),
+    "/same/data.bin": Buffer.from("same name, other directory"),
+    // Stored as it is: no BOM stripping or UTF-16 decoding as for source text.
+    "/bom.txt": Buffer.from([0xff, 0xfe, 0x68, 0x00, 0x69, 0x00]),
+    "/asset.file": "abcd",
+  };
+  const bytesImportEntry = /* js */ `
+    import data from "./data.bin" with { type: "bytes" };
+    import empty from "./empty.bin" with { type: "bytes" };
+    import other from "./same/data.bin" with { type: "bytes" };
+    import bom from "./bom.txt" with { type: "bytes" };
+    import asset from "./asset.file" with { type: "file" };
+    import { readFileSync } from "node:fs";
+
+    // No top-level await: the bytecode variant is CommonJS output.
+    async function main() {
+      for (const [name, value] of Object.entries({ data, empty, other, bom })) {
+        if (value.constructor !== Uint8Array) throw new Error(name + " is a " + value?.constructor?.name);
+        if (value.byteOffset !== 0 || value.buffer.byteLength !== value.length) throw new Error(name + " is a view");
+      }
+      if (data.length !== 256 || data.some((byte, i) => byte !== ((i * 167 + 13) & 0xff))) throw new Error("data: " + Array.from(data));
+      if (empty.length !== 0) throw new Error("empty: " + empty.length);
+      if (new TextDecoder().decode(other) !== "same name, other directory") throw new Error("other");
+      if (Array.from(bom).join(",") !== "255,254,104,0,105,0") throw new Error("bom: " + Array.from(bom));
+
+      if (require("./data.bin") !== data) throw new Error("require() gave another object");
+      if ((await import("./data.bin", { with: { type: "bytes" } })).default !== data) throw new Error("import() gave another object");
+
+      // One module, one array: a write is visible through every import of it.
+      data[0] = 123;
+      if (require("./data.bin")[0] !== 123) throw new Error("not shared");
+
+      // Bytes modules are not assets; only the file loader import is listed.
+      const embedded = Bun.embeddedFiles.map(blob => blob.name);
+      if (embedded.length !== 1 || !embedded[0].startsWith("asset-")) throw new Error("embeddedFiles: " + embedded);
+      if (readFileSync(asset, "utf8") !== "abcd") throw new Error("asset: " + asset);
+      console.log("PASS");
+    }
+    main();
+  `;
+  for (const [suffix, options] of [
+    ["", {}],
+    ["Bytecode", { bytecode: true }],
+  ] as const) {
+    itBundled(`compile/BytesImport${suffix}`, {
+      compile: true,
+      ...options,
+      loader: { ".bin": "bytes" },
+      files: { "/entry.ts": bytesImportEntry, ...bytesImportFiles },
+      onAfterBundle(api) {
+        // Embedded as it is, not inlined as base64.
+        const exe = readFileSync(api.outfile);
+        expect(exe.includes(bytesImportData)).toBe(true);
+        expect(exe.includes(bytesImportData.toString("base64"))).toBe(false);
+      },
+      run: { stdout: "PASS" },
+    });
+  }
   itBundled("compile/Utf8", {
     compile: true,
     files: {

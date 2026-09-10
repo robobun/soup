@@ -1971,7 +1971,21 @@ interface BuildArtifact extends Blob {
 }
 
 type Loader =
-  "js" | "jsx" | "ts" | "tsx" | "css" | "json" | "jsonc" | "toml" | "yaml" | "text" | "file" | "napi" | "wasm" | "html";
+  | "js"
+  | "jsx"
+  | "ts"
+  | "tsx"
+  | "css"
+  | "json"
+  | "jsonc"
+  | "toml"
+  | "yaml"
+  | "text"
+  | "bytes"
+  | "file"
+  | "napi"
+  | "wasm"
+  | "html";
 
 interface BuildOutput {
   outputs: BuildArtifact[];
