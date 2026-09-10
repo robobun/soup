@@ -359,6 +359,25 @@ import notes from "./notes.txt" with { type: "md" };
 
 During bundling, Bun inlines the rendered HTML into the bundle as a string.
 
+### `bytes`
+
+**Binary loader**. No extension uses it by default.
+
+Import any file with `with { type: "bytes" }` to get its contents as a `Uint8Array`, per the [Import Bytes](https://github.com/tc39/proposal-import-bytes) proposal. Bun reads the file when the module is first imported; every import of the same file shares one `Uint8Array`, so treat it as read-only.
+
+```ts
+import wasm from "./add.wasm" with { type: "bytes" };
+import icon from "./icon.png" with { type: "bytes" };
+
+const { instance } = await WebAssembly.instantiate(wasm);
+new Blob([icon], { type: "image/png" });
+
+// or with a dynamic import
+const { default: model } = await import("./model.onnx", { with: { type: "bytes" } });
+```
+
+To apply the loader by extension instead, use `--loader .bin:bytes` or `[loader]` in `bunfig.toml`. During bundling, Bun inlines the contents into the bundle as base64 and decodes them when the module is evaluated; `bun build --compile` embeds the file in the executable as it is.
+
 ### `napi`
 
 **Native addon loader**. Default for `.node`.
