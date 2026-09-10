@@ -770,6 +770,63 @@ pub mod parse_worker {
         )
     }
 
+    /// The dev server prints a lazy export as it is (`hmr.cjs.exports = <value>`)
+    /// instead of linking it, and its chunks cannot reach the bundler runtime,
+    /// so a `bytes` module decodes its base64 through the copy of `__toBytes`
+    /// that the HMR runtime serves as `bun:wrap`:
+    /// `hmr.require("bun:wrap").__toBytes("<base64>")`.
+    fn decode_bytes_through_hmr_runtime(ast: &mut bun_ast::Ast<'_>) {
+        let hmr = ast.wrapper_ref;
+        debug_assert!(!hmr.is_empty(), "HMR parses declare the `hmr` symbol");
+        let stmt = &ast.parts.as_slice()[1].stmts[0];
+        let loc = stmt.loc;
+        let ast::StmtData::SLazyExport(mut slot) = stmt.data else {
+            unreachable!("new_lazy_export_ast puts the lazy export in part 1");
+        };
+        let encoded = Expr { data: *slot, loc };
+        let require = Expr::init(
+            E::Dot {
+                target: Expr::init_identifier(hmr, loc),
+                name_loc: Loc::EMPTY,
+                name: b"require".into(),
+                ..Default::default()
+            },
+            loc,
+        );
+        let wrap = Expr::init(
+            E::Call {
+                target: require,
+                args: bun_ast::ExprNodeList::from_arena_slice(&[Expr::init(
+                    E::String {
+                        data: b"bun:wrap".into(),
+                        ..Default::default()
+                    },
+                    loc,
+                )]),
+                ..Default::default()
+            },
+            loc,
+        );
+        let to_bytes = Expr::init(
+            E::Dot {
+                target: wrap,
+                name_loc: Loc::EMPTY,
+                name: b"__toBytes".into(),
+                ..Default::default()
+            },
+            loc,
+        );
+        *slot = Expr::init(
+            E::Call {
+                target: to_bytes,
+                args: bun_ast::ExprNodeList::from_arena_slice(&[encoded]),
+                ..Default::default()
+            },
+            loc,
+        )
+        .data;
+    }
+
     // ───────────────────────────────────────────────────────────────────────────
     // CSS Symbol bridge — `bun_ast::Symbol` ↔ `bun_ast::Symbol`
     //
@@ -1042,6 +1099,63 @@ pub mod parse_worker {
                     None,
                     topts.compile_mode.is_standalone_html(),
                 );
+                return Ok(ast);
+            }
+            Loader::Bytes => {
+                // A standalone executable embeds the file and the module becomes
+                // `export default require("<bunfs path>")`, which the runtime
+                // answers with a `Uint8Array`. Everywhere else the bytes are
+                // inlined as base64 and the linker wraps the string in the
+                // runtime's `__toBytes` (`generate_code_for_lazy_export`).
+                let embedded = topts.compile_mode.is_executable() && topts.target.is_bun();
+                let hot_module_reloading = opts.features.hot_module_reloading;
+                // One base64 copy serves both the module (the part after the
+                // `data:` prefix) and a CSS `url()` that points at the file.
+                let mut url_for_css: &[u8] = b"";
+                let root = if embedded {
+                    require_embedded_asset(register_embedded_asset(
+                        bump,
+                        source,
+                        unique_key_prefix,
+                        unique_key_for_additional_file,
+                    ))
+                } else {
+                    let contents: &[u8] = &source.contents;
+                    let mime_type = bun_http_types::MimeType::by_extension(
+                        strings::trim_leading_char(bun_paths::extension(source.path.text), b'.'),
+                    );
+                    let prefix_len = b"data:".len() + mime_type.value.len() + b";base64,".len();
+                    let data_url: &mut [u8] = bump
+                        .alloc_slice_fill_copy(prefix_len + bun_base64::encode_len(contents), 0u8);
+                    data_url[..5].copy_from_slice(b"data:");
+                    data_url[5..5 + mime_type.value.len()].copy_from_slice(&mime_type.value);
+                    data_url[5 + mime_type.value.len()..prefix_len].copy_from_slice(b";base64,");
+                    let len =
+                        prefix_len + bun_base64::encode(&mut data_url[prefix_len..], contents);
+                    url_for_css = &data_url[..len];
+                    Expr::init(
+                        E::String {
+                            data: (&data_url[prefix_len..len]).into(),
+                            ..Default::default()
+                        },
+                        Loc { start: 0 },
+                    )
+                };
+                let mut ast = js_parser::new_lazy_export_ast(
+                    bump,
+                    &mut topts.define,
+                    opts,
+                    log,
+                    root,
+                    source,
+                    b"",
+                )?
+                .ok_or(AnyError::ParserError)?;
+                if hot_module_reloading && !embedded {
+                    decode_bytes_through_hmr_runtime(&mut ast);
+                }
+                let mut ast = JSAst::init(ast);
+                ast.url_for_css = url_for_css;
                 return Ok(ast);
             }
             Loader::Md => {
@@ -1457,6 +1571,7 @@ pub mod parse_worker {
         fs_cache: &mut bun_resolver::cache::Fs,
         bump: &Bump,
         file_path: &mut Fs::Path,
+        loader: Loader,
     ) -> core::result::Result<CacheEntry, AnyError> {
         match &task.contents_or_fd {
             ContentsOrFd::Fd { dir, file } => 'brk: {
@@ -1517,42 +1632,61 @@ pub mod parse_worker {
                     }
                 }
 
-                // Always read into the worker arena: it is pinned for the
-                // entire bundle pass (freed only via `pool.deinit()` inside
-                // `deinit_without_freeing_arena`, after `process_files_to_copy`
-                // has already deep-copied every additional-file body into its
-                // `OutputFile`). This avoids churning the global allocator with
-                // one `Vec<u8>` per file.
-                let read_arena: Option<&Bump> = Some(bump);
-                break 'brk match fs_cache.read_file_with_allocator(
-                    file_path.text,
-                    contents_dir,
-                    false,
-                    contents_file.unwrap_valid(),
-                    read_arena,
-                ) {
-                    Ok(e) => {
-                        // `bun_resolver::cache::Entry` ↔ `crate::cache::Entry`
-                        // are structurally identical twins; convert
-                        // by-variant so ownership of `Owned(Vec<u8>)` transfers.
-                        use bun_resolver::cache::Contents as RC;
-                        let contents = match e.contents {
-                            RC::Empty => crate::cache::Contents::Empty,
-                            RC::Owned(v) => crate::cache::Contents::Owned(v),
-                            RC::Arena { ptr, len } => crate::cache::Contents::Arena { ptr, len },
-                            RC::SharedBuffer { ptr, len } => {
-                                crate::cache::Contents::SharedBuffer { ptr, len }
-                            }
-                            RC::External { ptr, len } => {
-                                crate::cache::Contents::External { ptr, len }
-                            }
-                        };
-                        Ok(CacheEntry {
-                            contents,
-                            fd: e.fd,
-                            ..Default::default()
-                        })
-                    }
+                let read: core::result::Result<CacheEntry, bun_resolver::Error> =
+                    if loader == Loader::Bytes {
+                        // A bytes module is the file's exact contents. The shared
+                        // reader below strips a UTF-8 BOM and re-encodes UTF-16,
+                        // which is right for source text only.
+                        bun_sys::File::read_from(Fd::cwd(), file_path.text)
+                            .map(|contents| CacheEntry {
+                                contents: crate::cache::Contents::Owned(contents),
+                                fd: Fd::INVALID,
+                                ..Default::default()
+                            })
+                            .map_err(bun_resolver::Error::from)
+                    } else {
+                        // Always read into the worker arena: it is pinned for the
+                        // entire bundle pass (freed only via `pool.deinit()` inside
+                        // `deinit_without_freeing_arena`, after `process_files_to_copy`
+                        // has already deep-copied every additional-file body into its
+                        // `OutputFile`). This avoids churning the global allocator with
+                        // one `Vec<u8>` per file.
+                        let read_arena: Option<&Bump> = Some(bump);
+                        fs_cache
+                            .read_file_with_allocator(
+                                file_path.text,
+                                contents_dir,
+                                false,
+                                contents_file.unwrap_valid(),
+                                read_arena,
+                            )
+                            .map(|e| {
+                                // `bun_resolver::cache::Entry` ↔ `crate::cache::Entry`
+                                // are structurally identical twins; convert
+                                // by-variant so ownership of `Owned(Vec<u8>)` transfers.
+                                use bun_resolver::cache::Contents as RC;
+                                let contents = match e.contents {
+                                    RC::Empty => crate::cache::Contents::Empty,
+                                    RC::Owned(v) => crate::cache::Contents::Owned(v),
+                                    RC::Arena { ptr, len } => {
+                                        crate::cache::Contents::Arena { ptr, len }
+                                    }
+                                    RC::SharedBuffer { ptr, len } => {
+                                        crate::cache::Contents::SharedBuffer { ptr, len }
+                                    }
+                                    RC::External { ptr, len } => {
+                                        crate::cache::Contents::External { ptr, len }
+                                    }
+                                };
+                                CacheEntry {
+                                    contents,
+                                    fd: e.fd,
+                                    ..Default::default()
+                                }
+                            })
+                    };
+                break 'brk match read {
+                    Ok(entry) => Ok(entry),
                     Err(e) => {
                         let source = Source::init_empty_file(
                             // `file_path.text`
@@ -1631,7 +1765,9 @@ pub mod parse_worker {
         };
 
         if !might_have_on_parse_plugins {
-            return get_code_for_parse_task_without_plugins(task, log, fs_cache, bump, file_path);
+            return get_code_for_parse_task_without_plugins(
+                task, log, fs_cache, bump, file_path, *loader,
+            );
         }
 
         let should_continue_running = core::cell::Cell::new(1i32);
@@ -1941,6 +2077,7 @@ pub mod parse_worker {
                 this.fs_cache,
                 this.bump,
                 this.file_path,
+                result.loader,
             ) {
                 Ok(e) => e,
                 Err(e) => {
@@ -2205,6 +2342,7 @@ pub mod parse_worker {
                 self.fs_cache,
                 self.bump,
                 self.file_path,
+                *self.loader,
             )
         }
     }
