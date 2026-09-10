@@ -6623,6 +6623,7 @@ declare module "bun" {
     | "napi"
     | "wasm"
     | "text"
+    | "bytes"
     | "css"
     | "html";
 

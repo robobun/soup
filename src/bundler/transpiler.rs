@@ -1848,6 +1848,7 @@ impl<'a> Transpiler<'a> {
             | options::Loader::Napi
             | options::Loader::Base64
             | options::Loader::Dataurl
+            | options::Loader::Bytes
             | options::Loader::Bunsh
             | options::Loader::Sqlite
             | options::Loader::SqliteEmbedded
@@ -3057,6 +3058,7 @@ impl<'a> Transpiler<'a> {
             | options::Loader::Sqlite
             | options::Loader::Wasm
             | options::Loader::File
+            | options::Loader::Bytes
             | options::Loader::Napi => {
                 output_file.value = self.build_copied_file_output(file_path_text, file_path_ext)?;
             }

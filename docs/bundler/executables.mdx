@@ -790,6 +790,20 @@ console.log(notes); // the contents of notes.txt
 
 In a compiled executable the text is stored once, in the form the JavaScript engine uses for strings (one byte per character for ASCII text, UTF-16 otherwise). The runtime hands the string back without a copy, so a large text import costs its size in the binary and no extra copy on the heap. A text import is a module, not a file: `Bun.embeddedFiles` does not list it. Use `with { type: "file" }` when you need a file path instead.
 
+### Embed binary files as bytes
+
+Use `with { type: "bytes" }` when you want the contents of a file as a `Uint8Array`: a WebAssembly module, a font, an image to hash or serve, a model to load.
+
+```ts index.ts icon="/icons/typescript.svg"
+import wasm from "./add.wasm" with { type: "bytes" };
+import icon from "./icon.png" with { type: "bytes" };
+
+const { instance } = await WebAssembly.instantiate(wasm);
+console.log(icon.byteLength);
+```
+
+The file is embedded in the executable as it is, with no base64 step, and the import gives a `Uint8Array` that holds a copy of it, made when the module is first evaluated. Like a text import, a bytes import is a module and `Bun.embeddedFiles` does not list it.
+
 ### Embed SQLite databases
 
 To embed a SQLite database into the compiled executable, set `type: "sqlite"` in the import attribute and the `embed` attribute to `"true"`.

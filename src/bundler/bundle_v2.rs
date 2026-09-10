@@ -4363,34 +4363,35 @@ pub mod bv2_impl {
                     if !key.is_empty() {
                         let loader = loaders[index];
                         let target = targets[index];
-                        let mut template: options::PathTemplate = if loader == Loader::Text {
-                            // Text modules ignore `--asset-naming`: without `[hash]`
-                            // two same-named files would share one path.
-                            options::PathTemplate::ASSET.into()
-                        } else {
-                            let mut template: options::PathTemplate =
-                                if self.graph.html_imports.server_source_indices.len() != 0
-                                    && self.transpiler.options.asset_naming.is_empty()
-                                {
-                                    options::PathTemplate::ASSET_WITH_TARGET.into()
-                                } else {
-                                    options::PathTemplate::ASSET.into()
-                                };
+                        let mut template: options::PathTemplate =
+                            if matches!(loader, Loader::Text | Loader::Bytes) {
+                                // Text and bytes modules ignore `--asset-naming`: without
+                                // `[hash]` two same-named files would share one path.
+                                options::PathTemplate::ASSET.into()
+                            } else {
+                                let mut template: options::PathTemplate =
+                                    if self.graph.html_imports.server_source_indices.len() != 0
+                                        && self.transpiler.options.asset_naming.is_empty()
+                                    {
+                                        options::PathTemplate::ASSET_WITH_TARGET.into()
+                                    } else {
+                                        options::PathTemplate::ASSET.into()
+                                    };
 
-                            // SAFETY: see `self_ptr` note above — `transpiler_for_target` needs
-                            // `&mut self` only to pick between two stored `*mut Transpiler`s; it
-                            // never touches `graph.input_files`.
-                            let asset_naming = unsafe {
-                                &(*self_ptr)
-                                    .transpiler_for_target(target)
-                                    .options
-                                    .asset_naming
+                                // SAFETY: see `self_ptr` note above — `transpiler_for_target` needs
+                                // `&mut self` only to pick between two stored `*mut Transpiler`s; it
+                                // never touches `graph.input_files`.
+                                let asset_naming = unsafe {
+                                    &(*self_ptr)
+                                        .transpiler_for_target(target)
+                                        .options
+                                        .asset_naming
+                                };
+                                if !asset_naming.is_empty() {
+                                    template.data.clone_from(asset_naming);
+                                }
+                                template
                             };
-                            if !asset_naming.is_empty() {
-                                template.data.clone_from(asset_naming);
-                            }
-                            template
-                        };
 
                         {
                             let source = &sources[index];
@@ -7359,7 +7360,7 @@ pub mod bv2_impl {
                         .items_content_hash_for_additional_file_mut()[result_source_index] =
                         result.content_hash_for_additional_file;
                     if !result.unique_key_for_additional_file.is_empty()
-                        && result.loader == Loader::Text
+                        && matches!(result.loader, Loader::Text | Loader::Bytes)
                     {
                         // `process_resolve_queue` only counts `should_copy_for_bundling()`
                         // loaders, and a zero count skips `process_files_to_copy`.

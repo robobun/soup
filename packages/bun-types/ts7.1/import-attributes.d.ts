@@ -22,6 +22,15 @@ declare module "*" with { type: "text" } {
   export = text;
 }
 
+declare module "*" with { type: "bytes" } {
+  /**
+   * The contents of the file as a `Uint8Array`. `bun build` inlines them into
+   * the bundle; `bun build --compile` embeds the file in the executable.
+   */
+  var bytes: Uint8Array<ArrayBuffer>;
+  export = bytes;
+}
+
 declare module "*" with { type: "file" } {
   /**
    * The path to the file. At runtime this is the absolute path on disk. In a

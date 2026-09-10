@@ -1298,6 +1298,106 @@ Files: `src/jsc/ConsoleStyle.rs` (CSS subset to SGR), `src/jsc/ConsoleObject.rs`
 `src/css_jsc/color_js.rs`, `src/css/values/color.rs` and `src/css/css_parser.rs` (two helpers made
 public), `src/jsc/Cargo.toml`, `docs/runtime/console.mdx`, `test/js/web/console/console-log.test.ts`.
 
+### 2026-09-10: `with { type: "bytes" }` imports and the `bytes` loader
+
+Getting the bytes of a file that ships with the code took a different dance in every environment:
+`Bun.file(new URL("./model.onnx", import.meta.url)).bytes()` in Bun, `fs.readFileSync` in Node,
+`fetch` in a browser bundle, and none of them survives `bun build` moving the file, or `--compile`
+putting it inside the executable, without more glue. The TC39 [Import Bytes](https://github.com/tc39/proposal-import-bytes)
+proposal (stage 2.7) settles the syntax: `import bytes from "./photo.png" with { type: "bytes" }`
+gives a `Uint8Array`, the way `type: "json"` gives an object. Deno ships it behind a flag, esbuild
+has had the same thing as its `binary` loader for years, and in Bun the attribute silently fell
+through to the `file` loader and produced a path string (oven-sh/bun#20824). Now it is a loader of its
+own, in the runtime, in `bun build` for every target, in `bun build --compile` and in the dev server:
+
+```ts
+import wasm from "./add.wasm" with { type: "bytes" };
+import font from "./Inter.ttf" with { type: "bytes" };
+
+const { instance } = await WebAssembly.instantiate(wasm);
+console.log(font.byteLength, font instanceof Uint8Array); // 310252 true
+
+const { default: model } = await import("./model.onnx", {
+  with: { type: "bytes" },
+});
+```
+
+The default export is the only export (a named import is the usual "This loader type only supports
+the default import" error), every import of one file shares one `Uint8Array`, and the extension does
+not matter; `--loader .bin:bytes`, `[loader]` in bunfig.toml and `loader: { ".bin": "bytes" }` in
+`Bun.build` apply it by extension, and a `Bun.build` plugin can return `{ contents: uint8array,
+loader: "bytes" }` to generate binary modules. With TypeScript 7.1 the import is typed
+`Uint8Array<ArrayBuffer>` through the same `declare module "*" with { type }` table that types
+`text` and `sqlite` imports. What happens underneath depends on where the module runs:
+
+- In the runtime the file is read when the module is first imported and the array adopts the
+  buffer it was read into; `require()` works as for any other module. `bun --watch` and `--hot`
+  watch the file like any other import.
+- `bun build` inlines the contents as base64 and wraps them in a new runtime helper, so the output is
+  `var font_default = __toBytes("AAEAAA...")`, decoded once when the module is evaluated. The bytes
+  are the file's, exactly: the bundler's shared reader strips a UTF-8 byte order mark and re-encodes
+  UTF-16, which is right for source text, so bytes modules read the file themselves (the `file`
+  loader's copies go through that reader too and are not exact; reported separately). `__toBytes`
+  calls `Uint8Array.fromBase64` where the engine has it (Bun, current Node and browsers) and falls
+  back to a small table decoder (esbuild's) elsewhere, so `--target=node` output still runs on older
+  Node LTS lines and a browser bundle on last year's browsers. With `--splitting` the helper is imported across chunks like
+  any other runtime function; with `--minify` it all shrinks as usual; an unused bytes import is
+  dropped with its base64. A dynamic `import()` without `--splitting`, or a `require()`, gives the
+  module the CommonJS shape and ESM importers read it through `__toESM`, which defined one getter
+  per own property of `module.exports`, that is one per byte; it now skips typed arrays, which have
+  nothing to import by name (a CommonJS module that exports a `Buffer` benefits the same way). One
+  base64 copy serves both the module and a CSS `url()` that points at the file, which becomes a
+  `data:` URL as it does for the text loader.
+- `bun build --compile` embeds the file in the executable as it is, next to `type: "file"` assets,
+  and the module becomes `require("/$bunfs/...")`, which the module loader answers with a
+  `Uint8Array` over a copy of the section bytes. No base64 in the binary, nothing decoded at
+  startup, and `--bytecode` works since the `require` prints per output format. The copy is
+  deliberate: a `Uint8Array` is writable and the section is shared (and handed out elsewhere as
+  Latin-1 strings and `Blob`s). Once JavaScriptCore has immutable `ArrayBuffer`s, which the proposal
+  specifies anyway, this can become a zero-copy view. Like text modules, bytes modules keep their
+  `[name]-[hash]` asset path regardless of `--asset-naming` and stay out of `Bun.embeddedFiles`.
+- The dev server prints lazy-export modules itself (`hmr.cjs.exports = ...`) and its chunks never
+  link the bundler runtime, so there the parse step emits `hmr.require("bun:wrap").__toBytes("...")`
+  and the HMR runtime's synthetic `bun:wrap` module gained `__toBytes`.
+
+The loader is `Loader::Bytes = 22` (`api::Loader::bytes = 23`, `BUN_LOADER_BYTES` for native
+plugins) and joins `text` in every table that lists loaders: printer (`with { type: "bytes" }` is
+preserved by `--no-bundle`), metafile, CSS imports, `Bun.Transpiler` (rejected, there is no source
+text to produce), the parallel test runner's loader names. Like `.text`, `.file` and `.sqlite`, a
+`.bytes` extension now selects the loader of the same name. The
+bundler's lazy-export path needed no new machinery: the parse task produces the base64
+`E::String` and `generate_code_for_lazy_export` wraps it in the call and registers the runtime
+import on whichever part ends up holding it, exactly as it already does for `__require` around
+embedded `.node` and SQLite files. esbuild's `dataurl` and `base64` loaders, which Bun accepts by
+name and silently compiles to an empty module (the bundler docs even use `dataurl` in an example),
+are the obvious follow-up and would reuse all of this. While writing the plugin test a pre-existing
+bug turned up and was reported separately rather than fixed here: a `Bun.build` plugin's `onLoad`
+sees `args.loader` from the file extension and, when it returns no `loader`, the import attribute's
+loader is ignored, so `with { type: "text" }` plus a contents-only plugin fails to parse.
+
+The fork's bun-types workflow went red today for a reason outside the stack: the types fixture
+installs `@types/node@latest`, and today's release breaks eight of bun-types' own fixture checks
+upstream as well (`fs/promises` `exists`, `TextEncoderEncodeIntoResult`, `TLSSocket`, ...). One
+ninth diagnostic was soup's: the 2026-09-01 `EventSource` fixture assigned `events.onerror = null`,
+and the `undici-types` that the new `@types/node` pulls in types that handler as non-nullable. That
+commit's fixture now assigns a function; the rest clears up when upstream catches up with
+`@types/node`.
+
+Files: `src/ast/loader.rs`, `src/options_types/schema.rs`, `src/options_types/bundle_enums.rs`,
+`src/codegen/replacements.ts`, `packages/bun-native-bundler-plugin-api/bundler_plugin.h`,
+`src/runtime.js` (`__toBytes`), `src/bundler/ParseTask.rs`, `src/bundler/bundle_v2.rs`,
+`src/bundler/linker_context/generateCodeForLazyExport.rs`, `src/bundler/linker_context/MetafileBuilder.rs`,
+`src/bundler/LinkerContext.rs`, `src/bundler/transpiler.rs`, `src/bundler_jsc/options_jsc.rs`,
+`src/js_parser/p.rs`, `src/js_printer/lib.rs`, `src/runtime/jsc_hooks.rs` (`bytes_module_value`, the
+standalone-graph fetch), `src/standalone_graph/StandaloneModuleGraph.rs`, `src/runtime/bake/hmr-module.ts`,
+`src/runtime/bake/bake.private.d.ts`, `src/runtime/cli/test/parallel/runner.rs`, `packages/bun-types/bun.d.ts`,
+`packages/bun-types/ts7.1/import-attributes.d.ts`, `docs/bundler/loaders.mdx`, `docs/runtime/file-types.mdx`,
+`docs/bundler/executables.mdx`, `docs/bundler/esbuild.mdx`, `docs/bundler/index.mdx`, `docs/bundler/plugins.mdx`,
+`docs/runtime/plugins.mdx`, `test/js/bun/util/bytes-loader.test.ts`, `test/bundler/bundler_loader.test.ts`,
+`test/bundler/bundler_compile.test.ts`, `test/bundler/bundler_plugin.test.ts`, `test/bake/dev/bundle.test.ts`,
+`test/bundler/expectBundled.ts`, `test/js/bun/transpiler/transpiler-unsupported-loader.test.ts`,
+`test/integration/bun-types/fixture/ts7.1/import-attributes.ts`.
+
 ## Dropped
 
 Nothing yet.
