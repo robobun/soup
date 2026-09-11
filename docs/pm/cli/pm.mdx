@@ -26,6 +26,8 @@ bun pm pack
 
 `bun pm pack` creates a `.tgz` file containing all files that would be published to npm, following the same rules as `npm pack`.
 
+The `package.json` in the tarball is the one `bun publish` would publish: `workspace:` and `catalog:` versions are resolved, and fields such as `main`, `exports` and `bin` are replaced by their [`publishConfig`](/pm/cli/publish#publishconfig) overrides.
+
 ## Examples
 
 Basic usage:
