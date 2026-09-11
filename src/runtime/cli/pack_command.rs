@@ -17,7 +17,7 @@ use bun_parsers::json as JSON;
 // `bun_ast::Expr`. All JSON inspection in this file uses the T2 type;
 // the two T4 sinks (`js_printer::print_json`, `Publish::normalized_package`)
 // lift via `bun_ast::Expr::from(t2_expr)` at the call site.
-use bun_ast::{E, Expr, ExprData};
+use bun_ast::{E, Expr, ExprData, G};
 use bun_js_printer as js_printer;
 use bun_libarchive::lib::{Archive, Entry as ArchiveEntry, Result as ArchiveStatus};
 use bun_paths::{self as path, SEP_STR};
@@ -3325,8 +3325,79 @@ fn add_archive_entry(
     Ok(entry.clear())
 }
 
-/// Strips workspace and catalog protocols from dependency versions then
-/// returns the printed json
+/// The manifest fields a `publishConfig` entry of the same name replaces in the
+/// packed package.json. This is pnpm's list; yarn's (`type`, `main`, `module`,
+/// `browser`, `exports`, `imports`, `bin`) is a subset of it.
+const PUBLISH_CONFIG_MANIFEST_FIELDS: [&[u8]; 17] = [
+    b"bin",
+    b"type",
+    b"imports",
+    b"main",
+    b"module",
+    b"typings",
+    b"types",
+    b"exports",
+    b"browser",
+    b"esnext",
+    b"es2015",
+    b"unpkg",
+    b"umd:main",
+    b"os",
+    b"cpu",
+    b"libc",
+    b"typesVersions",
+];
+
+fn publish_config_manifest_field(property: &G::Property) -> Option<&'static [u8]> {
+    let key = property.key.as_ref()?.data.e_string()?;
+    PUBLISH_CONFIG_MANIFEST_FIELDS
+        .into_iter()
+        .find(|field| key.eql_bytes(field))
+}
+
+/// Lets a package point `main`/`exports`/`bin`/... at its sources while it is
+/// developed and at its build output once published: a `publishConfig` entry
+/// named after a manifest field replaces that field in the packed
+/// package.json. The entry moves out of `publishConfig`, and a
+/// `publishConfig` left empty is dropped.
+fn apply_publish_config_overrides(root: &Expr) -> Result<(), AllocError> {
+    let Some(mut manifest) = root.data.e_object() else {
+        return Ok(());
+    };
+    let Some(mut publish_config) = root
+        .get(b"publishConfig")
+        .and_then(|publish_config| publish_config.data.e_object())
+    else {
+        return Ok(());
+    };
+
+    let mut overridden = false;
+    for property in publish_config.properties.slice() {
+        let (Some(field), Some(value)) = (publish_config_manifest_field(property), property.value)
+        else {
+            continue;
+        };
+        manifest.put(pack_bump(), field, value)?;
+        overridden = true;
+    }
+    if !overridden {
+        return Ok(());
+    }
+
+    publish_config
+        .properties
+        .retain(|property| publish_config_manifest_field(property).is_none());
+    if publish_config.properties.is_empty() {
+        if let Some(query) = manifest.as_property(b"publishConfig") {
+            let _ = manifest.properties.remove(query.i as usize);
+        }
+    }
+
+    Ok(())
+}
+
+/// Strips workspace and catalog protocols from dependency versions, applies
+/// the `publishConfig` overrides, then returns the printed json
 fn edit_root_package_json(
     maybe_lockfile: Option<&Lockfile>,
     json: &mut WorkspacePackageJSONCache::MapEntry,
@@ -3483,6 +3554,8 @@ fn edit_root_package_json(
             }
         }
     }
+
+    apply_publish_config_overrides(&json.root)?;
 
     let has_trailing_newline = !json.source.contents.is_empty()
         && json.source.contents[json.source.contents.len() - 1] == b'\n';
