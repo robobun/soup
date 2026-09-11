@@ -1398,6 +1398,85 @@ standalone-graph fetch), `src/standalone_graph/StandaloneModuleGraph.rs`, `src/r
 `test/bundler/expectBundled.ts`, `test/js/bun/transpiler/transpiler-unsupported-loader.test.ts`,
 `test/integration/bun-types/fixture/ts7.1/import-attributes.ts`.
 
+### 2026-09-11: `publishConfig` overrides in `bun pm pack` and `bun publish`
+
+A library in a monorepo wants two different `package.json`s. While it is developed, `main`, `types`
+and `exports` should point at the TypeScript sources, so the other workspaces, the editor and
+`bun --hot` see a change without a build. Once published they have to point at `dist/`, because
+that is all the tarball contains. pnpm and yarn solve this with `publishConfig`: an entry there
+that is named after a manifest field replaces that field in the published `package.json`. bun read
+only `tag` and `access` from `publishConfig`, so a package written this way was published pointing
+at `./src/index.ts`, a file that is not even in the tarball (oven-sh/bun#19205; a community PR for it
+was closed unmerged). Now `bun pm pack` and `bun publish` apply the overrides:
+
+```json
+{
+  "name": "@acme/ui",
+  "version": "1.0.0",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "bin": "./src/cli.ts",
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+    },
+    "bin": "./dist/cli.js"
+  }
+}
+```
+
+```sh
+bun pm pack && tar -xzOf acme-ui-1.0.0.tgz package/package.json
+# {
+#   "name": "@acme/ui",
+#   "version": "1.0.0",
+#   "main": "./dist/index.js",
+#   "types": "./dist/index.d.ts",
+#   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+#   "bin": "./dist/cli.js",
+#   "files": ["dist"],
+#   "publishConfig": { "access": "public" }
+# }
+```
+
+The fields are pnpm's list, which contains yarn's: `bin`, `main`, `module`, `browser`, `exports`,
+`imports`, `type`, `types`, `typings`, `typesVersions`, `esnext`, `es2015`, `unpkg`, `umd:main`,
+`os`, `cpu` and `libc`. The semantics are pnpm's too, so a package gets the same manifest from
+either tool: the value replaces the top-level field where it stands, or is appended when there is
+none (in `publishConfig` order), the entry moves out of `publishConfig`, and a `publishConfig` that
+ends up empty is dropped. Anything else in `publishConfig` (`access`, `tag`, `registry`,
+`directory`, ...) stays put and overrides nothing, so `name`, `version`, `scripts`, `dependencies`
+and `files` cannot be swapped at publish time. A `publishConfig` that is not an object is ignored.
+The `package.json` on disk is only read.
+
+An overriding `bin` is a real `bin`: the file list is computed from the edited manifest, so
+`./dist/cli.js` above is packed even when `files` would not match it and gets its executable bit,
+and `./src/cli.ts` is no longer pulled in as a bin. The overrides are applied after `prepack` and
+`prepare` have run (they may rewrite `package.json`, and pack re-reads it), and `bun publish` builds
+the registry metadata from the same edited tree, so `versions[v].main`/`exports`/`bin` in the
+packument agree with the tarball. Publishing an existing tarball (`bun publish ./pkg.tgz`) leaves
+its `package.json` alone, as before.
+
+The implementation is one function, `apply_publish_config_overrides`, called from
+`edit_root_package_json`, which is where pack already rewrites `workspace:` and `catalog:` versions
+and whose tree both the tarball and `normalized_package` print; `published_files` runs after it.
+Not done: `publishConfig.directory` (publishing a subdirectory, with its own manifest) and
+`publishConfig.executableFiles`, which are separate features, and `bun pm diff`, whose local side
+reads `package.json` raw (it does not resolve `workspace:` either), so for a package that uses
+overrides it reports them as a `package.json` change against the registry.
+
+The fork's bun-types workflow is still red for the reason described on 2026-09-10: it installs
+`@types/node@latest`, and upstream's own pull requests fail the same checks until oven-sh/bun#42230
+(or a newer `@types/node`) lands. Nothing in the stack causes it.
+
+Files: `src/runtime/cli/pack_command.rs`, `docs/pm/cli/publish.mdx`, `docs/pm/cli/pm.mdx`,
+`docs/pm/workspaces.mdx`, `test/cli/install/bun-pack.test.ts`, `test/cli/install/bun-publish.test.ts`.
+
 ## Dropped
 
 Nothing yet.
