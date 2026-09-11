@@ -1,4 +1,5 @@
 import { file, spawn, write } from "bun";
+import { readTarball } from "bun:internal-for-testing";
 import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { exists, rm } from "fs/promises";
@@ -1350,6 +1351,79 @@ test("dist.tarball in the published manifest does not include userinfo from the 
   expect(tarball).not.toContain("@");
   expect(tarball).toBe(`http://localhost:${mock.port}/tarball-url-pkg/-/tarball-url-pkg-1.0.0.tgz`);
   expect(exitCode).toBe(0);
+});
+
+test("publishConfig manifest overrides reach the registry metadata and the tarball", async () => {
+  let captured: any = null;
+  using mock = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      if (req.method === "PUT") captured = await req.json();
+      return new Response("OK", { status: 200 });
+    },
+  });
+
+  const publishedExports = { ".": { types: "./dist/index.d.ts", default: "./dist/index.js" } };
+  using packageDir = tempDir("publish-config-overrides", {
+    "bunfig.toml": Bun.TOML.stringify({
+      install: {
+        cache: false,
+        registry: { url: `http://localhost:${mock.port}`, token: "unused" },
+      },
+    }),
+    "package.json": JSON.stringify({
+      name: "publish-config-pkg",
+      version: "1.0.0",
+      main: "./src/index.ts",
+      exports: { ".": "./src/index.ts" },
+      bin: "./src/cli.ts",
+      files: ["dist"],
+      publishConfig: {
+        tag: "next",
+        main: "./dist/index.js",
+        exports: publishedExports,
+        bin: "./dist/cli.js",
+      },
+    }),
+    "src/index.ts": "export default 1;",
+    "src/cli.ts": "#!/usr/bin/env bun\n",
+    "dist/index.js": "export default 1;",
+    "dist/index.d.ts": "declare const _default: 1; export default _default;",
+    "dist/cli.js": "#!/usr/bin/env node\n",
+  });
+
+  const { out, err, exitCode } = await publish(env, String(packageDir));
+  expect(err).not.toContain("error:");
+  expect(out).toContain(" + publish-config-pkg@1.0.0");
+  expect(exitCode).toBe(0);
+
+  // The tag is still read from publishConfig.
+  expect(captured["dist-tags"]).toEqual({ next: "1.0.0" });
+  expect(captured.versions["1.0.0"]).toMatchObject({
+    main: "./dist/index.js",
+    exports: publishedExports,
+    bin: { "publish-config-pkg": "dist/cli.js" },
+    publishConfig: { tag: "next" },
+  });
+
+  const tarballPath = join(String(packageDir), "published.tgz");
+  await write(tarballPath, Buffer.from(captured._attachments["publish-config-pkg-1.0.0.tgz"].data, "base64"));
+  const tarball = readTarball(tarballPath);
+  expect(tarball.entries.map(entry => entry.pathname)).toEqual([
+    "package/package.json",
+    "package/dist/cli.js",
+    "package/dist/index.d.ts",
+    "package/dist/index.js",
+  ]);
+  expect(JSON.parse(tarball.entries[0].contents)).toEqual({
+    name: "publish-config-pkg",
+    version: "1.0.0",
+    main: "./dist/index.js",
+    exports: publishedExports,
+    bin: "./dist/cli.js",
+    files: ["dist"],
+    publishConfig: { tag: "next" },
+  });
 });
 
 describe("--tolerate-republish", async () => {
