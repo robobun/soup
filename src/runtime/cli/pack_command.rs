@@ -5,7 +5,7 @@ use std::io::Write as _;
 use crate::cli::Command;
 use crate::cli::publish_command as Publish;
 use bun_alloc::AllocError;
-use bun_ast::{E, Expr, ExprData};
+use bun_ast::{E, Expr, ExprData, G};
 use bun_collections::StringHashMap;
 use bun_core::{Global, Output, Progress, fmt as bun_fmt};
 use bun_glob as glob;
@@ -905,7 +905,7 @@ fn add_own_package(
 
     let json = match manifest {
         Some((source, json)) => {
-            let edited = if needs_workspace_manifests(*json) {
+            let edited = if needs_workspace_manifests(*json) || has_publish_config_overrides(json) {
                 let indentation = JSON::guess_indentation(&source.contents);
                 Some(edit_root_package_json(
                     workspace_manifests,
@@ -1791,8 +1791,18 @@ pub(crate) fn pack(
         .then(|| Publish::PublishCommand::find_workspace_readme(abs_workspace_path))
         .flatten();
 
-    let (mut pack_queue, bins) =
-        published_files(&root_dir, abs_workspace_path, &json.root, bump, log_level)?;
+    // An overriding `bin` is the one that is packed, so the file list is read from a copy with the
+    // `publishConfig` overrides applied. The cached tree stays what is on disk.
+    let published_root = json.root.deep_clone(bump);
+    let published_root = published_root.map_err(|_| PackError::OutOfMemory)?;
+    apply_publish_config_overrides(&published_root)?;
+    let (mut pack_queue, bins) = published_files(
+        &root_dir,
+        abs_workspace_path,
+        &published_root,
+        bump,
+        log_level,
+    )?;
 
     let bundled_files = iterate_bundled_deps(
         &mut ctx.bundled_deps,
@@ -2764,8 +2774,90 @@ fn publish_workspace(
     }
 }
 
-/// Replaces the `workspace:` and `catalog:` specs in `root`, which was parsed from `source`, and
-/// returns the printed JSON. `bun publish` sends the edited tree to the registry.
+/// The manifest fields a `publishConfig` entry of the same name replaces in the
+/// packed package.json. This is pnpm's list; yarn's (`type`, `main`, `module`,
+/// `browser`, `exports`, `imports`, `bin`) is a subset of it.
+const PUBLISH_CONFIG_MANIFEST_FIELDS: [&[u8]; 17] = [
+    b"bin",
+    b"type",
+    b"imports",
+    b"main",
+    b"module",
+    b"typings",
+    b"types",
+    b"exports",
+    b"browser",
+    b"esnext",
+    b"es2015",
+    b"unpkg",
+    b"umd:main",
+    b"os",
+    b"cpu",
+    b"libc",
+    b"typesVersions",
+];
+
+fn publish_config_manifest_field(property: &G::Property) -> Option<&'static [u8]> {
+    let key = property.key.as_ref()?.data.e_string()?;
+    PUBLISH_CONFIG_MANIFEST_FIELDS
+        .into_iter()
+        .find(|field| key.eql_bytes(field))
+}
+
+fn has_publish_config_overrides(root: &Expr) -> bool {
+    root.get(b"publishConfig")
+        .and_then(|publish_config| publish_config.data.e_object())
+        .is_some_and(|publish_config| {
+            (publish_config.properties.slice().iter()).any(|property| {
+                property.value.is_some() && publish_config_manifest_field(property).is_some()
+            })
+        })
+}
+
+/// Lets a package point `main`/`exports`/`bin`/... at its sources while it is
+/// developed and at its build output once published: a `publishConfig` entry
+/// named after a manifest field replaces that field in the packed
+/// package.json. The entry moves out of `publishConfig`, and a
+/// `publishConfig` left empty is dropped.
+fn apply_publish_config_overrides(root: &Expr) -> Result<(), AllocError> {
+    let Some(mut manifest) = root.data.e_object() else {
+        return Ok(());
+    };
+    let Some(mut publish_config) = root
+        .get(b"publishConfig")
+        .and_then(|publish_config| publish_config.data.e_object())
+    else {
+        return Ok(());
+    };
+
+    let mut overridden = false;
+    for property in publish_config.properties.slice() {
+        let (Some(field), Some(value)) = (publish_config_manifest_field(property), property.value)
+        else {
+            continue;
+        };
+        manifest.put(pack_bump(), field, value)?;
+        overridden = true;
+    }
+    if !overridden {
+        return Ok(());
+    }
+
+    publish_config
+        .properties
+        .retain(|property| publish_config_manifest_field(property).is_none());
+    if publish_config.properties.is_empty() {
+        if let Some(query) = manifest.as_property(b"publishConfig") {
+            let _ = manifest.properties.remove(query.i as usize);
+        }
+    }
+
+    Ok(())
+}
+
+/// Replaces the `workspace:` and `catalog:` specs in `root`, which was parsed from `source`, applies
+/// the `publishConfig` overrides, and returns the printed JSON. `bun publish` sends the edited tree
+/// to the registry.
 fn edit_root_package_json(
     workspace_manifests: Option<&WorkspaceManifests>,
     package_dir: &[u8],
@@ -2816,6 +2908,8 @@ fn edit_root_package_json(
             Default::default(),
         ));
     });
+
+    apply_publish_config_overrides(&root)?;
 
     let mut buffer_writer = js_printer::BufferWriter::init();
     let contents = &source.contents;
