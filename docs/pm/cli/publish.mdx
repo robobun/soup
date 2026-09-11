@@ -126,6 +126,59 @@ bun publish --otp 123456
   other automated workflows.
 </Note>
 
+## `publishConfig`
+
+Besides `access` and `tag`, the `publishConfig` field of `package.json` can replace parts of the manifest that is published. A package in a monorepo can point `main`, `types` and `exports` at its TypeScript sources, so the other workspaces and the editor see changes without a build, and at the build output for everyone who installs it from the registry.
+
+```json package.json icon="file-json"
+{
+  "name": "@acme/ui",
+  "version": "1.0.0",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}
+```
+
+`bun publish` and `bun pm pack` put this `package.json` in the tarball, and `bun publish` sends the same fields to the registry:
+
+```json package.json icon="file-json"
+{
+  "name": "@acme/ui",
+  "version": "1.0.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  }
+}
+```
+
+The fields that can be overridden are `bin`, `main`, `module`, `browser`, `exports`, `imports`, `type`, `types`, `typings`, `typesVersions`, `esnext`, `es2015`, `unpkg`, `umd:main`, `os`, `cpu` and `libc`. This is the set pnpm overrides, and Yarn supports a subset of it. Each entry replaces the top-level field of the same name, or is added when there is none, and moves out of `publishConfig`. A `publishConfig` with nothing left in it is removed. Everything else in `publishConfig` stays where it is and overrides nothing.
+
+An overriding `bin` is also the one that decides which files are packed as executables. The `package.json` in your project is not modified.
+
 ---
 
 <Publish />

@@ -2081,6 +2081,233 @@ describe.concurrent("bins", () => {
   });
 });
 
+describe.concurrent("publishConfig", () => {
+  // The package.json inside the tarball, which is what gets installed.
+  function packedManifest(tarballPath: string) {
+    const tarball = readTarball(tarballPath);
+    expect(tarball.entries[0].pathname).toBe("package/package.json");
+    return JSON.parse(tarball.entries[0].contents);
+  }
+
+  // Every field a publishConfig entry of the same name replaces.
+  const overridableFields = [
+    "bin",
+    "type",
+    "imports",
+    "main",
+    "module",
+    "typings",
+    "types",
+    "exports",
+    "browser",
+    "esnext",
+    "es2015",
+    "unpkg",
+    "umd:main",
+    "os",
+    "cpu",
+    "libc",
+    "typesVersions",
+  ];
+
+  test("manifest fields in publishConfig replace the top-level ones", async () => {
+    const publishedExports = {
+      ".": { types: "./dist/index.d.ts", import: "./dist/index.js", require: "./dist/index.cjs" },
+    };
+    const packageJson = {
+      name: "pack-publish-config",
+      version: "1.0.0",
+      main: "./src/index.ts",
+      types: "./src/index.ts",
+      exports: { ".": "./src/index.ts", "./*": "./src/*.ts" },
+      files: ["dist"],
+      publishConfig: {
+        access: "public",
+        main: "./dist/index.cjs",
+        module: "./dist/index.js",
+        types: "./dist/index.d.ts",
+        exports: publishedExports,
+        tag: "next",
+      },
+      license: "MIT",
+    };
+    using dir = tempDir("pack-publish-config", {
+      "package.json": JSON.stringify(packageJson, null, 2) + "\n",
+      "src/index.ts": "export default 1;",
+      "dist/index.js": "export default 1;",
+      "dist/index.cjs": "module.exports = 1;",
+      "dist/index.d.ts": "declare const _default: 1; export default _default;",
+    });
+
+    const { err, exitCode } = await runPack(dir);
+    expect(err).toBe("");
+    expect(exitCode).toBe(0);
+
+    const tarballPath = join(dir, "pack-publish-config-1.0.0.tgz");
+    expect(tarballEntries(tarballPath)).toEqual([
+      "package/package.json",
+      "package/dist/index.cjs",
+      "package/dist/index.d.ts",
+      "package/dist/index.js",
+    ]);
+
+    // A replaced field keeps its place, a new one goes last, and publishConfig keeps what did
+    // not move. Object.entries() makes toEqual() compare the order of the keys as well.
+    expect(Object.entries(packedManifest(tarballPath))).toEqual(
+      Object.entries({
+        name: "pack-publish-config",
+        version: "1.0.0",
+        main: "./dist/index.cjs",
+        types: "./dist/index.d.ts",
+        exports: publishedExports,
+        files: ["dist"],
+        publishConfig: { access: "public", tag: "next" },
+        license: "MIT",
+        module: "./dist/index.js",
+      }),
+    );
+
+    // The package.json in the project is only read.
+    expect(await Bun.file(join(dir, "package.json")).json()).toEqual(packageJson);
+  });
+
+  test("every overridable field moves, and an emptied publishConfig is removed", async () => {
+    const development = Object.fromEntries(overridableFields.map(field => [field, `development-${field}`]));
+    const published = Object.fromEntries(overridableFields.map(field => [field, `published-${field}`]));
+    using dir = tempDir("pack-publish-config-all", {
+      "package.json": JSON.stringify({
+        name: "pack-publish-config-all",
+        version: "1.0.0",
+        ...development,
+        publishConfig: published,
+      }),
+    });
+
+    const { err, exitCode } = await runPack(dir);
+    expect(err).toBe("");
+    expect(exitCode).toBe(0);
+
+    const manifest = packedManifest(join(dir, "pack-publish-config-all-1.0.0.tgz"));
+    expect(Object.entries(manifest)).toEqual(
+      Object.entries({ name: "pack-publish-config-all", version: "1.0.0", ...published }),
+    );
+  });
+
+  test("fields that are not overridable stay in publishConfig", async () => {
+    const packageJson = {
+      name: "pack-publish-config-other",
+      version: "1.0.0",
+      scripts: { build: "tsc" },
+      dependencies: { "is-number": "^7.0.0" },
+      files: ["index.js"],
+      publishConfig: {
+        name: "another-name",
+        version: "2.0.0",
+        private: true,
+        scripts: {},
+        dependencies: {},
+        files: ["src"],
+        registry: "http://localhost:4873/",
+        directory: "dist",
+        executableFiles: ["./index.js"],
+      },
+    };
+    using dir = tempDir("pack-publish-config-other", {
+      "package.json": JSON.stringify(packageJson),
+      "index.js": indexJs,
+      "src/index.ts": indexJs,
+    });
+
+    const { err, exitCode } = await runPack(dir);
+    expect(err).toBe("");
+    expect(exitCode).toBe(0);
+
+    const tarballPath = join(dir, "pack-publish-config-other-1.0.0.tgz");
+    expect(tarballEntries(tarballPath)).toEqual(["package/package.json", "package/index.js"]);
+    expect(Object.entries(packedManifest(tarballPath))).toEqual(Object.entries(packageJson));
+  });
+
+  test("an overriding bin is the one that is packed and made executable", async () => {
+    using dir = tempDir("pack-publish-config-bin", {
+      "package.json": JSON.stringify({
+        name: "pack-publish-config-bin",
+        version: "1.0.0",
+        bin: "./src/cli.ts",
+        files: ["lib"],
+        publishConfig: { bin: { "pack-publish-config-bin": "./build/cli.js" } },
+      }),
+      "src/cli.ts": "#!/usr/bin/env bun\n",
+      "build/cli.js": "#!/usr/bin/env node\n",
+      "lib/index.js": indexJs,
+    });
+
+    const { err, exitCode } = await runPack(dir);
+    expect(err).toBe("");
+    expect(exitCode).toBe(0);
+
+    const tarball = readTarball(join(dir, "pack-publish-config-bin-1.0.0.tgz"));
+    // build/cli.js is outside "files" and src/cli.ts is no longer a bin of the published package.
+    expect(entryNames(tarball)).toEqual(["package/package.json", "package/build/cli.js", "package/lib/index.js"]);
+    expect(tarball.entries[1].perm & 0o755).toBe(0o755);
+    expect(JSON.parse(tarball.entries[0].contents)).toEqual({
+      name: "pack-publish-config-bin",
+      version: "1.0.0",
+      bin: { "pack-publish-config-bin": "./build/cli.js" },
+      files: ["lib"],
+    });
+  });
+
+  test("a publishConfig written by prepack is applied", async () => {
+    const prepack = `const fs = require("fs");
+  const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  pkg.publishConfig = { main: "./dist/index.js" };
+  fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));`;
+    const scripts = { prepack: `${bunExe()} prepack.js` };
+    using dir = tempDir("pack-publish-config-prepack", {
+      "package.json": JSON.stringify({
+        name: "pack-publish-config-prepack",
+        version: "1.0.0",
+        main: "./src/index.ts",
+        files: ["dist"],
+        scripts,
+      }),
+      "prepack.js": prepack,
+      "dist/index.js": indexJs,
+    });
+
+    const { stderr, exitCode } = await runPack(dir);
+    expect(stderr).toBe(`$ ${bunExe()} prepack.js\n`);
+    expect(exitCode).toBe(0);
+
+    expect(packedManifest(join(dir, "pack-publish-config-prepack-1.0.0.tgz"))).toEqual({
+      name: "pack-publish-config-prepack",
+      version: "1.0.0",
+      main: "./dist/index.js",
+      files: ["dist"],
+      scripts,
+    });
+  });
+
+  test.each([
+    ["a string", "public"],
+    ["an array", ["main"]],
+    ["null", null],
+    ["an empty object", {}],
+  ])("publishConfig that is %s is left alone", async (_, publishConfig) => {
+    const packageJson = { name: "pack-publish-config-shape", version: "1.0.0", main: "./index.js", publishConfig };
+    using dir = tempDir("pack-publish-config-shape", {
+      "package.json": JSON.stringify(packageJson),
+      "index.js": indexJs,
+    });
+
+    const { err, exitCode } = await runPack(dir);
+    expect(err).toBe("");
+    expect(exitCode).toBe(0);
+
+    expect(packedManifest(join(dir, "pack-publish-config-shape-1.0.0.tgz"))).toEqual(packageJson);
+  });
+});
+
 test.concurrent("unicode", async () => {
   using dir = tempDir("pack-unicode", {
     "package.json": JSON.stringify({ name: "pack-unicode", version: "1.1.1" }),

@@ -90,6 +90,8 @@ A specific version takes precedence over the package's `package.json` version:
 "workspace:1.0.2" -> "1.0.2" // Even if current version is 1.0.1
 ```
 
+A workspace can also point `main`, `types`, `exports` or `bin` at its source files, so that the other workspaces use it without a build step, and list the build output under [`publishConfig`](/pm/cli/publish#publishconfig). `bun publish` and `bun pm pack` put the `publishConfig` values in the published `package.json`.
+
 Workspaces have a few major benefits.
 
 - **Split code into logical parts.** If one package relies on another, add it as a dependency in `package.json`. If package `b` depends on `a`, `bun install` installs your local `packages/a` directory into `node_modules` instead of downloading it from the npm registry.
