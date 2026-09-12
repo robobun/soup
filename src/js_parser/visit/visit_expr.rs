@@ -2105,6 +2105,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             if is_macro_ref
                 || matches!(e_.target.data, Data::ERequireCallTarget)
                 || matches!(e_.target.data, Data::ERequireResolveCallTarget)
+                || matches!(e_.target.data, Data::ESpecial(E::Special::ImportMetaGlob))
             {
                 p.options.ignore_dce_annotations = true;
                 p.should_fold_typescript_constant_expressions = true;
@@ -2267,6 +2268,10 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                         };
                         return;
                     }
+                }
+                E::Special::ImportMetaGlob => {
+                    *e = p.expand_import_meta_glob(&e_, expr.loc);
+                    return;
                 }
                 _ => {}
             }

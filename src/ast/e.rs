@@ -251,6 +251,10 @@ pub enum Special {
     /// Prints the resolved specifier string for an import record
     /// (an `ImportRecord` index).
     ResolvedSpecifierString(u32),
+    /// `import.meta.glob` as a call target. The visitor replaces the whole
+    /// call with an object literal, so this only reaches the printer when the
+    /// call could not be expanded (and an error was logged).
+    ImportMetaGlob,
 }
 
 pub struct Call {
