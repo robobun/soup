@@ -3441,6 +3441,17 @@ pub(crate) mod __gated_printer {
                             true,
                         );
                     }
+                    E::Special::ImportMetaGlob => {
+                        self.print_expr(
+                            Expr {
+                                data: ExprData::EImportMeta(E::ImportMeta {}),
+                                loc: expr.loc,
+                            },
+                            Level::Postfix,
+                            in_flags,
+                        );
+                        self.print(b".glob");
+                    }
                 },
                 ExprData::ECommonjsExportIdentifier(id) => {
                     self.print_commonjs_export_identifier(*id, expr.loc, false);
