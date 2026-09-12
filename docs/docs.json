@@ -76,6 +76,7 @@
             "pages": [
               "/runtime/file-types",
               "/runtime/module-resolution",
+              "/runtime/glob-imports",
               "/runtime/jsx",
               "/runtime/auto-install",
               "/runtime/plugins",

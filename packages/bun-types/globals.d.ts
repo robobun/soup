@@ -1391,6 +1391,42 @@ interface ImportMeta {
    */
   main: boolean;
 
+  /**
+   * Import every file that matches a glob pattern, the way
+   * [Vite's `import.meta.glob`](https://vite.dev/guide/features.html#glob-import)
+   * does. The patterns are matched against the file system when the file is
+   * transpiled (or bundled), and the call is replaced with an object that
+   * maps each matched path to a function that imports it.
+   *
+   * Patterns start with `./` or `../` (relative to this file) or with `/`
+   * (relative to the project root). A pattern that starts with `!` removes
+   * matches. The arguments must be literals.
+   *
+   * @example
+   * ```ts
+   * const pages = import.meta.glob("./pages/*.tsx");
+   *
+   * // is the same as
+   * const pages = {
+   *   "./pages/about.tsx": () => import("./pages/about.tsx"),
+   *   "./pages/home.tsx": () => import("./pages/home.tsx"),
+   * };
+   *
+   * const { default: Home } = await pages["./pages/home.tsx"]();
+   * ```
+   *
+   * @example
+   * ```ts
+   * // import statements instead of import(), and only the default export
+   * const locales = import.meta.glob<Record<string, string>>("./locales/*.json", {
+   *   eager: true,
+   *   import: "default",
+   * });
+   * locales["./locales/en.json"].hello;
+   * ```
+   */
+  glob: Bun.ImportGlobFunction;
+
   /** Alias of `import.meta.dir`. Exists for Node.js compatibility */
   dirname: string;
 

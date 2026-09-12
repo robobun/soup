@@ -1477,6 +1477,100 @@ The fork's bun-types workflow is still red for the reason described on 2026-09-1
 Files: `src/runtime/cli/pack_command.rs`, `docs/pm/cli/publish.mdx`, `docs/pm/cli/pm.mdx`,
 `docs/pm/workspaces.mdx`, `test/cli/install/bun-pack.test.ts`, `test/cli/install/bun-publish.test.ts`.
 
+### 2026-09-12: `import.meta.glob()`
+
+Picking up a directory of pages, routes, locales, migrations or plugins without keeping a list of
+them by hand is what Vite's [`import.meta.glob`](https://vite.dev/guide/features.html#glob-import)
+is for, and code written against it is one of the first things that breaks when a Vite project is
+run or bundled with Bun. oven-sh/bun#6060 has asked for it since 2023. RiskyMH implemented most of
+it in Zig (oven-sh/bun#21459, everything but `eager`), and that pull request was closed in June only
+because the Rust rewrite removed every file it touched. This redoes it against the Rust parser,
+adds `eager`, and follows Vite's rules for keys and options closely enough that the Vite docs
+describe it:
+
+```ts
+const pages = import.meta.glob("./pages/*.tsx");
+// { "./pages/about.tsx": () => import("./pages/about.tsx"),
+//   "./pages/home.tsx": () => import("./pages/home.tsx") }
+const { default: Home } = await pages["./pages/home.tsx"]();
+
+const locales = import.meta.glob<Record<string, string>>("./locales/*.json", {
+  eager: true, // import statements instead of import()
+  import: "default", // one export instead of the namespace
+});
+locales["./locales/fr.json"].hello;
+
+const queries = import.meta.glob(["./sql/**/*.sql", "!**/*.draft.sql"], {
+  with: { type: "text" }, // import attributes for every import
+  import: "default",
+  eager: true,
+}); // { "./sql/users/by-id.sql": "select ..." }
+```
+
+It works the same in `bun run`, `bun test`, `bun build` (plain, `--splitting`, `--format=cjs`,
+`--minify`, `--compile`) and the dev server, because it happens in one place: the parser's visit
+pass. `import.meta.glob` as a call target becomes a new `E::Special::ImportMetaGlob`, the way
+`import.meta.hot.accept` already does, and `e_call` replaces the whole call with an object literal
+once the arguments have been visited and constant-folded (so a template literal or `"./a/" + "*"`
+is fine, a variable is an error, and a call in dead code is never expanded). Everything after that
+sees ordinary imports:
+
+- Lazy entries go through `transpose_import`, the function behind every hand-written
+  `import("...")`, so import records, `with { type }` loaders, chunk splitting and the bundler's
+  dynamic-import tree shaking need nothing new. With `import: "name"` the entry is
+  `async () => (await import("./a.ts")).name` and the parser records the same bookkeeping that
+  expression gets when a person writes it, so `bun build` keeps only that export of each matched
+  module, split chunks included.
+- Eager entries queue `import * as __bun_glob_0_0 from` (or `import { name as __bun_glob_0_0 }`)
+  statements that are emitted as one part ahead of the user's code, next to the JSX and runtime
+  auto-imports. `ImportScanner` then treats them as it treats written imports: TypeScript's
+  unused-import pass, named-import records for the linker, and the dev server's conversion to
+  `hmr.imports` all apply, and an eager `import: "name"` tree-shakes like `import { name }`.
+
+The matching itself is `bun_glob`'s walker, run from the importing file's directory (or `base`), so
+directory names full of glob metacharacters (`pages/[id]/`) never enter a pattern. The rules are
+Vite's: patterns start with `./` or `../` (relative to the file) or with `/` or `**` (relative to
+the project root, which is the directory bun was started in), anything else is an error so that
+package names and tsconfig aliases stay available; `!` patterns remove matches; keys are sorted,
+`/`-separated, relative to the file unless some pattern is rooted, in which case all of them start
+with `/`; the specifiers always stay relative to the file; the importing file never matches itself;
+dotfiles and `node_modules` are skipped unless `exhaustive: true`; `base` moves where relative
+patterns match and what the keys are relative to; `query` (string or object of literals) is
+appended to every specifier. `with` is Bun's addition, since import attributes are how Bun selects
+loaders, and the deprecated `as` option is rejected with a message that says what to write instead.
+Options have to be literals, unknown ones are errors (a typo in `eager` should not silently turn
+into lazy loading), and every error points into the call.
+
+Two things needed care. A file whose output depends on the directory listing must not come out of
+the runtime transpiler cache, which now covers files from 4 KiB up: the parser clears the cache key
+for any file that expands a glob (as it does for macros), and the cache version is bumped so entries
+written by a bun that left the call alone are not read back. And the call is only expanded in
+modules that are files on disk: `Bun.Transpiler` input and plugin-made virtual modules have no
+directory to match in, so there the call is left exactly as written.
+
+Not done: noticing added or removed files in `--watch`, `--hot` and the dev server. Editing a
+matched file reloads like any import, but a new file is only matched the next time the importing
+file is transpiled. The dev server already sees the directory change and logs "nothing to bundle",
+which is where a list of globbed directories per module would hook in. Patterns also cannot use
+tsconfig path aliases, which Vite resolves through its plugin pipeline. While testing `query`, a gap
+in `bun build` turned up and was reported separately: specifiers with a query string
+(`./icon.svg?raw`, `./x.ts?v=1`) resolve in the runtime but not in the bundler, so there `query`
+only works through a plugin's `onResolve` (one of the tests does exactly that) and `with` is the
+portable spelling.
+
+The fork's bun-types workflow is red for the reason described on 2026-09-10, as is upstream's on
+main: the types test installs `@types/node@latest` and oven-sh/bun#42230 is still open. The new
+fixture lines add no diagnostics to that run.
+
+Files: `src/js_parser/import_meta_glob.rs` (new), `src/js_parser/fold.rs`, `src/js_parser/visit/visit_expr.rs`,
+`src/js_parser/p.rs`, `src/js_parser/parse/parse_entry.rs`, `src/js_parser/scan/scan_side_effects.rs`,
+`src/js_parser/lib.rs`, `src/js_parser/Cargo.toml`, `Cargo.lock`, `src/ast/e.rs`, `src/js_printer/lib.rs`,
+`src/react_compiler/lowering/build_hir/expr.rs`, `src/jsc/RuntimeTranspilerCache.rs`,
+`packages/bun-types/bun.d.ts`, `packages/bun-types/globals.d.ts`, `docs/runtime/glob-imports.mdx` (new),
+`docs/runtime/module-resolution.mdx`, `docs/docs.json`, `test/js/bun/resolve/import-meta-glob.test.ts`,
+`test/bundler/bundler_import_meta_glob.test.ts`, `test/bake/dev/bundle.test.ts`,
+`test/integration/bun-types/fixture/globals.ts`.
+
 ## Dropped
 
 Nothing yet.

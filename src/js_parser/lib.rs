@@ -16,6 +16,7 @@ pub use parser::*;
 pub mod lexer;
 
 pub(crate) mod fold;
+mod import_meta_glob;
 pub mod lower;
 pub mod p;
 pub mod parse;

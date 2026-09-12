@@ -546,6 +546,57 @@ devTest("import.meta.main", {
     await c.expectMessage(false);
   },
 });
+devTest("import.meta.glob", {
+  files: {
+    "index.html": emptyHtmlFile({
+      styles: [],
+      scripts: ["index.ts"],
+    }),
+    "index.ts": `
+      const eager = import.meta.glob("./pages/*.ts", { eager: true, import: "default" });
+      const lazy = import.meta.glob("./pages/*.ts");
+      lazy["./pages/home.ts"]().then(home => console.log(JSON.stringify({ eager, lazy: home.default })));
+    `,
+    "pages/about.ts": `export default "about";`,
+    "pages/home.ts": `export default "home";`,
+  },
+  async test(dev) {
+    await using c = await dev.client("/");
+    await c.expectMessage(
+      JSON.stringify({ eager: { "./pages/about.ts": "about", "./pages/home.ts": "home" }, lazy: "home" }),
+    );
+
+    // The matched files are ordinary imports of index.ts.
+    await c.expectReload(async () => {
+      await dev.write("pages/home.ts", `export default "home, edited";`);
+    });
+    await c.expectMessage(
+      JSON.stringify({
+        eager: { "./pages/about.ts": "about", "./pages/home.ts": "home, edited" },
+        lazy: "home, edited",
+      }),
+    );
+
+    // A new file is matched the next time index.ts is bundled.
+    await Bun.write(dev.join("pages/contact.ts"), `export default "contact";`);
+    await c.expectReload(async () => {
+      await dev.write(
+        "index.ts",
+        `
+          const eager = import.meta.glob("./pages/*.ts", { eager: true, import: "default" });
+          console.log(JSON.stringify(eager));
+        `,
+      );
+    });
+    await c.expectMessage(
+      JSON.stringify({
+        "./pages/about.ts": "about",
+        "./pages/contact.ts": "contact",
+        "./pages/home.ts": "home, edited",
+      }),
+    );
+  },
+});
 devTest("commonjs forms", {
   timeoutMultiplier: 2,
   files: {
