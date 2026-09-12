@@ -299,6 +299,13 @@ pub struct P<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> {
     pub(crate) has_classic_runtime_warned: bool,
     pub(crate) macro_call_count: MacroCallCountType,
 
+    /// `import.meta.glob()` calls expanded so far. What they expand to depends
+    /// on the files on disk, not just on this source.
+    pub(crate) import_meta_glob_count: u32,
+    /// The `import` statements `import.meta.glob(..., { eager: true })` calls
+    /// stand for, emitted as one part ahead of the user's code.
+    pub(crate) import_meta_glob_stmts: Vec<Stmt>,
+
     pub(crate) hoisted_ref_for_sloppy_mode_block_fn: RefRefMap,
 
     // Used for forcing CommonJS
@@ -9825,6 +9832,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             in_branch_condition: false,
             has_classic_runtime_warned: false,
             macro_call_count: 0,
+            import_meta_glob_count: 0,
+            import_meta_glob_stmts: Vec::new(),
             hoisted_ref_for_sloppy_mode_block_fn: Default::default(),
             has_with_scope: false,
             has_top_level_function_merged_with_var: false,

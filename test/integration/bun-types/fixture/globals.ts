@@ -360,6 +360,27 @@ new Error("asdf", {
   cause: new Error("asdf"),
 });
 
+// import.meta.glob
+expectType<Record<string, () => Promise<unknown>>>(import.meta.glob("./*.ts"));
+expectType<Record<string, () => Promise<unknown>>>(import.meta.glob(["./*.ts", "!./globals.ts"], { eager: false }));
+expectType<Record<string, unknown>>(import.meta.glob("./*.ts", { eager: true }));
+expectType<Record<string, () => Promise<{ default: number }>>>(import.meta.glob<{ default: number }>("./*.ts"));
+expectType<Record<string, number>>(import.meta.glob<number>("./*.ts", { eager: true, import: "default" }));
+expectType<Record<string, string>>(
+  import.meta.glob<true, string>("./*.txt", {
+    eager: true,
+    import: "default",
+    with: { type: "text" },
+    base: "../",
+    query: { v: 1, raw: true },
+    exhaustive: true,
+  }),
+);
+// @ts-expect-error patterns are strings
+import.meta.glob(1);
+// @ts-expect-error unknown option
+import.meta.glob("./*.ts", { lazy: true });
+
 // @ts-expect-error this interface is defined top level in globals.d.ts so we
 // are making sure that .d.ts is a module and that anything top level doesn't
 // leak to userland
