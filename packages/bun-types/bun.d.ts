@@ -9717,6 +9717,96 @@ declare module "bun" {
     match(str: string): boolean;
   }
 
+  /**
+   * Options for {@link ImportMeta.glob | `import.meta.glob()`}. Every option
+   * has to be written as a literal, because the call is expanded when the
+   * file is transpiled or bundled, not when it runs.
+   */
+  interface ImportGlobOptions<Eager extends boolean> {
+    /**
+     * Import the matched modules with `import` statements instead of handing
+     * out `() => import()` loaders.
+     *
+     * @default false
+     *
+     * @example
+     * ```ts
+     * const pages = import.meta.glob("./pages/*.tsx", { eager: true });
+     *
+     * // is the same as
+     * import * as __bun_glob_0_0 from "./pages/about.tsx";
+     * import * as __bun_glob_0_1 from "./pages/home.tsx";
+     * const pages = {
+     *   "./pages/about.tsx": __bun_glob_0_0,
+     *   "./pages/home.tsx": __bun_glob_0_1,
+     * };
+     * ```
+     */
+    eager?: Eager;
+    /**
+     * Take one export of each module instead of its namespace. `"default"`
+     * is the default export. The bundler drops the other exports when nothing
+     * else uses them.
+     *
+     * @example
+     * ```ts
+     * const routes = import.meta.glob("./routes/*.ts", { import: "default" });
+     * const handler = await routes["./routes/users.ts"]();
+     * ```
+     */
+    import?: "default" | "*" | (string & {});
+    /**
+     * Import attributes for every generated import. `type` selects the
+     * loader, as it does on an `import` statement.
+     *
+     * @example
+     * ```ts
+     * const queries = import.meta.glob("./queries/*.sql", {
+     *   with: { type: "text" },
+     *   import: "default",
+     *   eager: true,
+     * }); // { "./queries/users.sql": "select ..." }
+     * ```
+     */
+    with?: Record<string, string>;
+    /**
+     * A query string to append to every specifier, as a string (`"?raw"`)
+     * or as an object of literal values. The runtime ignores it when it
+     * looks up the file; `bun build` resolves such specifiers only through
+     * a plugin.
+     */
+    query?: string | Record<string, string | number | boolean>;
+    /**
+     * The directory relative patterns are matched in, and that the keys of
+     * the result are relative to. Relative to the importing file, or to the
+     * project root when it starts with `/`.
+     *
+     * @example
+     * ```ts
+     * const icons = import.meta.glob("./*.svg", { base: "../assets/icons" });
+     * // { "./arrow.svg": () => import("../assets/icons/arrow.svg") }
+     * ```
+     */
+    base?: string;
+    /**
+     * Also match dotfiles and look inside `node_modules` and dot
+     * directories, all of which are skipped by default.
+     *
+     * @default false
+     */
+    exhaustive?: boolean;
+  }
+
+  /** The type of {@link ImportMeta.glob | `import.meta.glob`}. */
+  interface ImportGlobFunction {
+    <Eager extends boolean = false, T = unknown>(
+      pattern: string | string[],
+      options?: ImportGlobOptions<Eager>,
+    ): (Eager extends true ? true : false) extends true ? Record<string, T> : Record<string, () => Promise<T>>;
+    <T>(pattern: string | string[], options?: ImportGlobOptions<false>): Record<string, () => Promise<T>>;
+    <T>(pattern: string | string[], options: ImportGlobOptions<true>): Record<string, T>;
+  }
+
   namespace Image {
     /**
      * Stable `error.code` values set on rejections from `Bun.Image` terminals.
