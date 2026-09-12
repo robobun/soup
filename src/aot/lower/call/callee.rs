@@ -8,7 +8,7 @@ use bun_sema::check::spans::skip_trivia;
 use bun_sema::fold::{Constant, Decision, TreeNode, push_children};
 use bun_sema::hir::{
     BinOp, Call, Chain, ExprFlags, ExprId, ExprKind, FnBody, FnId, FnKind, IdList, MemberKey,
-    PropKind, UnOp, end_of_expr, start_of,
+    NodeData, PropKind, UnOp, end_of_expr, start_of,
 };
 use bun_sema::import_sites::{ImportSiteKind, find_module_printed_as_require};
 use rustc_hash::FxHashMap;
@@ -17,6 +17,7 @@ use smallvec::{SmallVec, smallvec};
 use super::Callee;
 use crate::builtins::Resolved;
 use crate::builtins::id::BuiltinId;
+use crate::diagnostic_codes::Code;
 use crate::ir::{BlockId, StringId, ValueId};
 use crate::lower::member::{self, KeyConversion, PropertyName};
 use crate::lower::operator::needs_parentheses;
@@ -165,6 +166,24 @@ impl FunctionLowering<'_, '_, '_, '_, '_> {
         Callee::without_key(self.finish_callee(access, function, expected), this, name)
     }
 
+    // Bun's bundler replaces a call of `import.meta.glob()` with the files it matches, and it does not build this program.
+    fn report_import_meta_glob(&mut self, access: ExprId, object: ExprId, member_key: MemberKey) {
+        let MemberKey::Name(name) = member_key else {
+            return;
+        };
+        let hir = self.file.hir;
+        let object = hir.skip_type_assertions(object);
+        if !matches!(hir[object].kind, ExprKind::ImportMeta)
+            || self.file.queries.atom_bytes(name) != b"glob"
+        {
+            return;
+        }
+        let span = self.file.span_of(NodeData::Expr(access));
+        self.file
+            .diagnostics
+            .report(Code::UnsupportedOption, span, &[b"import.meta.glob()"]);
+    }
+
     fn lower_member_callee(
         &mut self,
         access: ExprId,
@@ -174,6 +193,7 @@ impl FunctionLowering<'_, '_, '_, '_, '_> {
         expected: Option<BuiltinId>,
     ) -> Callee {
         let hir = self.file.hir;
+        self.report_import_meta_glob(access, object, member_key);
         let name = self.file.find_callee_name(access);
         if let Some(builtin) = find_locked_builtin(self.file, access) {
             let this = self.lower_expression(object);

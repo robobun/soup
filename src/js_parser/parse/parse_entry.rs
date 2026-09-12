@@ -2468,6 +2468,10 @@ impl<'a> Parser<'a> {
             )?;
         }
 
+        if !p.import_meta_glob_stmts.is_empty() {
+            p.generate_import_meta_glob_part(&mut before)?;
+        }
+
         if !before.is_empty() || !after.is_empty() {
             // Single up-front reserve; the inner
             // reserve() calls in prepend_from / append become no-ops.
@@ -2482,9 +2486,10 @@ impl<'a> Parser<'a> {
         #[cfg(not(target_arch = "wasm32"))]
         if bun_core::feature_flags::RUNTIME_TRANSPILER_CACHE {
             if let Some(cache) = p.options.features.runtime_transpiler_cache_mut() {
-                if p.macro_call_count != 0 {
+                if p.macro_call_count != 0 || p.import_meta_glob_count != 0 {
                     // disable this for:
                     // - macros
+                    // - import.meta.glob(), which reads the file system
                     cache.input_hash = None;
                 } else {
                     cache.exports_kind = exports_kind;
