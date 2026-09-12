@@ -614,6 +614,16 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool, const SEMA: bool>
                         });
                     }
 
+                    if name == b"glob"
+                        && identifier_opts.is_call_target()
+                        && p.can_expand_import_meta_glob()
+                    {
+                        return Some(Expr {
+                            data: js_ast::ExprData::ESpecial(E::Special::ImportMetaGlob),
+                            loc,
+                        });
+                    }
+
                     // Inline import.meta properties for Bake
                     if p.options.framework.is_some()
                         || (p.options.bundle

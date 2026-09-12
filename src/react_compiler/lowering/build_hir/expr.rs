@@ -341,7 +341,8 @@ pub(crate) fn lower_expression(
             | E::Special::HotDisabled
             | E::Special::HotData
             | E::Special::HotAccept
-            | E::Special::HotAcceptVisited => Err(todo_err("ESpecial", loc)),
+            | E::Special::HotAcceptVisited
+            | E::Special::ImportMetaGlob => Err(todo_err("ESpecial", loc)),
         },
 
         Data::EMissing(_) => Err(todo_err("EMissing", loc)),

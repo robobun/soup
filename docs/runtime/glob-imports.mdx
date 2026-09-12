@@ -1,0 +1,136 @@
+---
+title: Glob imports
+description: Import every file that matches a pattern with import.meta.glob()
+---
+
+`import.meta.glob()` imports all the files that match a glob pattern, with the API that [Vite](https://vite.dev/guide/features.html#glob-import) introduced. It is the usual way to pick up a directory of pages, routes, locales, migrations or plugins without keeping a list of them by hand.
+
+```ts index.ts icon="/icons/typescript.svg"
+const pages = import.meta.glob("./pages/*.tsx");
+
+for (const [path, load] of Object.entries(pages)) {
+  const page = await load();
+  console.log(path, page.default);
+}
+```
+
+The call is expanded when the file is transpiled, so by the time the code runs it is a plain object literal. The example above is the same as writing:
+
+```ts index.ts icon="/icons/typescript.svg"
+const pages = {
+  "./pages/about.tsx": () => import("./pages/about.tsx"),
+  "./pages/home.tsx": () => import("./pages/home.tsx"),
+};
+```
+
+This works the same way in `bun run`, `bun test`, [`bun build`](/bundler) (where every matched module becomes part of the bundle, or its own chunk with `--splitting`), single-file executables and the [dev server](/bundler/fullstack). Nothing is imported until a loader function is called.
+
+Because the expansion happens ahead of time, **the arguments have to be literals**: a string or an array of strings for the patterns, and an object literal for the options. Constant expressions such as template literals without substitutions or `"./a/" + "*.ts"` are fine. A variable is an error.
+
+## Patterns
+
+| Pattern starts with | Matched from                      | Keys look like        |
+| ------------------- | --------------------------------- | --------------------- |
+| `./` or `../`       | the directory of the current file | `./pages/home.tsx`    |
+| `/`                 | the project root                  | `/src/pages/home.tsx` |
+| `**`                | the project root, at any depth    | `/src/pages/home.tsx` |
+| `!`                 | removes matches of the rest       |                       |
+
+The project root is the directory `bun` was started in. Anything else (a bare `pages/*.tsx`, a package name, a `tsconfig.json` path alias) is an error, so that those spellings stay available.
+
+The syntax is the one [`Bun.Glob`](/runtime/glob) supports: `*`, `**`, `?`, `[a-z]`, `{a,b}`. Pass an array to combine patterns, and start a pattern with `!` to leave files out:
+
+```ts
+const modules = import.meta.glob(["./routes/**/*.ts", "!**/*.test.ts", "!./routes/internal/**"]);
+```
+
+The keys are sorted, always use `/`, and are relative to the current file unless one of the patterns is matched from the root, in which case all of them start with `/`. The values always import by a path relative to the current file. The file that contains the call never matches itself. Files and directories whose name starts with a `.`, and everything under `node_modules`, are skipped unless [`exhaustive`](#exhaustive) is set. A pattern that matches nothing, or that points into a directory that does not exist, gives `{}`.
+
+## Options
+
+### `eager`
+
+With `eager: true` the modules are imported with `import` statements instead of `import()`, and the object holds the modules themselves:
+
+```ts
+const pages = import.meta.glob("./pages/*.tsx", { eager: true });
+
+// is the same as
+import * as __bun_glob_0_0 from "./pages/about.tsx";
+import * as __bun_glob_0_1 from "./pages/home.tsx";
+const pages = {
+  "./pages/about.tsx": __bun_glob_0_0,
+  "./pages/home.tsx": __bun_glob_0_1,
+};
+```
+
+As with any `import` statement, the modules are evaluated before the file that imports them, wherever in the file the call is.
+
+### `import`
+
+`import` takes one export of every module instead of the namespace object. Use `"default"` for the default export.
+
+```ts
+const routes = import.meta.glob("./routes/*.ts", { import: "default" });
+const handler = await routes["./routes/users.ts"](); // the default export of users.ts
+
+const titles = import.meta.glob("./posts/*.mdx", { import: "title", eager: true });
+// { "./posts/hello.mdx": "Hello", ... }
+```
+
+When bundling, the other exports of those modules are tree-shaken away if nothing else uses them, for lazy and eager imports alike.
+
+### `with`
+
+`with` adds [import attributes](/runtime/file-types) to every import. `type` picks the loader, as it does on an `import` statement, which makes it the way to read matched files as text, or as anything else Bun has a loader for:
+
+```ts
+const queries = import.meta.glob("./queries/*.sql", {
+  with: { type: "text" },
+  import: "default",
+  eager: true,
+});
+// { "./queries/users.sql": "select * from users ...", ... }
+```
+
+### `query`
+
+`query` appends a query string to every specifier. It can be a string, with or without the leading `?`, or an object of string, number and boolean literals.
+
+```ts
+import.meta.glob("./workers/*.ts", { query: "?v=2" }); // () => import("./workers/a.ts?v=2")
+import.meta.glob("./workers/*.ts", { query: { v: 2, inline: true } }); // "./workers/a.ts?v=2&inline=true"
+```
+
+Bun's runtime ignores the query string when it looks up the file (except for `?raw`, which loads the file as text), and a module imported with a different query string is a different instance. `bun build` only resolves specifiers that have a query string through a [plugin](/bundler/plugins), so prefer `with` there.
+
+### `base`
+
+`base` changes the directory that relative patterns are matched in, and that the keys are relative to. It is itself relative to the current file, or to the project root when it starts with `/`.
+
+```ts
+const icons = import.meta.glob("./*.svg", { base: "../assets/icons", with: { type: "file" } });
+// { "./arrow.svg": () => import("../assets/icons/arrow.svg", { with: { type: "file" } }) }
+```
+
+### `exhaustive`
+
+`exhaustive: true` also matches dotfiles, and looks inside dot directories and `node_modules`.
+
+## TypeScript
+
+The result is typed as `Record<string, () => Promise<unknown>>`, or `Record<string, unknown>` when `eager` is `true`. Pass the type of the modules (or of the export that `import` selects) as a type argument:
+
+```ts
+type Page = { default: () => JSX.Element; title: string };
+
+const pages = import.meta.glob<Page>("./pages/*.tsx");
+const titles = import.meta.glob<string>("./pages/*.tsx", { import: "title", eager: true });
+```
+
+## Good to know
+
+- `import.meta.glob` is not a function that exists at runtime: `typeof import.meta.glob` is `"undefined"`, and only direct calls are expanded. In a module that is not a file on disk (the input of `Bun.Transpiler`, a virtual module from a plugin) the call is left as it is.
+- The files are matched when the importing file is transpiled. With `--watch`, `--hot` and the dev server, editing a matched file reloads as it does for any import, but a file that is added or removed is only noticed the next time the importing file itself is transpiled again.
+- `bun build` follows the matched files like any other import, so they are bundled (and with `--compile`, embedded). Nothing is read from disk at runtime.
+- Vite's deprecated `as` option is not supported. Use `with: { type: "text" }` and `import: "default"` where Vite code says `as: "raw"`.
