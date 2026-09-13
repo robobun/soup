@@ -1,11 +1,12 @@
 import axios from "axios";
 import type { Server } from "bun";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isASAN, tls as tlsCert } from "harness";
+import { bunEnv, bunExe, isASAN, isWindows, tempDir, tls as tlsCert } from "harness";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { once } from "node:events";
 import http from "node:http";
 import net from "node:net";
+import { join } from "node:path";
 import tls from "node:tls";
 async function createProxyServer(is_tls: boolean) {
   const serverArgs = [];
@@ -2417,7 +2418,7 @@ describe("http_proxy env var scheme is case-insensitive", () => {
 
   // An unrecognized scheme must still be rejected loudly instead of silently
   // going direct.
-  test.concurrent("socks5:// is still rejected with UnsupportedProxyProtocol", async () => {
+  test.concurrent("socks4:// is still rejected with UnsupportedProxyProtocol", async () => {
     using origin = Bun.serve({ port: 0, fetch: () => new Response("origin") });
     await using proc = Bun.spawn({
       cmd: [
@@ -2430,7 +2431,7 @@ describe("http_proxy env var scheme is case-insensitive", () => {
         NO_PROXY: undefined,
         no_proxy: undefined,
         HTTP_PROXY: undefined,
-        http_proxy: "socks5://127.0.0.1:1",
+        http_proxy: "socks4://127.0.0.1:1",
         HTTPS_PROXY: undefined,
         https_proxy: undefined,
       },
@@ -2442,4 +2443,797 @@ describe("http_proxy env var scheme is case-insensitive", () => {
     expect(stdout.trim()).toBe("ERR UnsupportedProxyProtocol");
     expect(exitCode).toBe(0);
   });
+});
+
+// https://github.com/oven-sh/bun/issues/16812
+type Socks5Request = {
+  methods: number[];
+  atyp: number;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+};
+
+/**
+ * A SOCKS5 server (RFC 1928, CONNECT only, optional RFC 1929 username/password)
+ * that records what every client asked for. Like a real one, it refuses a
+ * message whose version, command or reserved byte is wrong.
+ */
+async function createSocks5Server(
+  options: {
+    /** Require these credentials instead of accepting "no authentication". */
+    auth?: { username: string; password: string };
+    /** Accept none of the methods the client offers. */
+    refuseMethods?: boolean;
+    /** Answer every CONNECT with this REP code instead of connecting. */
+    reply?: number;
+    /** Address type of BND.ADDR in the success reply. */
+    bindAtyp?: 1 | 3 | 4;
+    /** Write replies this many bytes at a time. */
+    chunkSize?: number;
+    /** What to do once the greeting has been read, instead of answering it. */
+    afterGreeting?: "nothing" | "close";
+  } = {},
+) {
+  const requests: Socks5Request[] = [];
+  const greeted = Promise.withResolvers<void>();
+  const sockets = new Set<net.Socket>();
+
+  const server = net.createServer(client => {
+    sockets.add(client);
+    client.setNoDelay(true);
+    client.on("error", () => {});
+    client.on("close", () => sockets.delete(client));
+
+    let buffered = Buffer.alloc(0);
+    let step: "greeting" | "auth" | "request" | "connected" = "greeting";
+    let methods: number[] = [];
+    let username: string | undefined;
+    let password: string | undefined;
+
+    // Replies are tiny and the client sends nothing until it has a whole one,
+    // so these writes never overlap.
+    async function reply(bytes: number[]) {
+      const buf = Buffer.from(bytes);
+      const size = options.chunkSize ?? buf.length;
+      for (let i = 0; i < buf.length; i += size) {
+        await new Promise(resolve => client.write(buf.subarray(i, i + size), resolve));
+        if (options.chunkSize) await new Promise(resolve => setImmediate(resolve));
+      }
+    }
+    const refuse = (bytes: number[]) => reply(bytes).then(() => client.end());
+
+    function onData(chunk: Buffer) {
+      buffered = Buffer.concat([buffered, chunk]);
+      if (step === "greeting") {
+        if (buffered.length < 2 || buffered.length < 2 + buffered[1]) return;
+        if (buffered[0] !== 0x05) return client.destroy();
+        methods = [...buffered.subarray(2, 2 + buffered[1])];
+        buffered = buffered.subarray(2 + buffered[1]);
+        greeted.resolve();
+        if (options.afterGreeting === "nothing") return;
+        if (options.afterGreeting === "close") return client.end();
+        if (options.refuseMethods || (options.auth && !methods.includes(0x02))) return refuse([0x05, 0xff]);
+        if (options.auth) {
+          step = "auth";
+          reply([0x05, 0x02]);
+        } else {
+          step = "request";
+          reply([0x05, 0x00]);
+        }
+      }
+      if (step === "auth") {
+        if (buffered.length < 2) return;
+        const ulen = buffered[1];
+        if (buffered.length < 3 + ulen) return;
+        const plen = buffered[2 + ulen];
+        if (buffered.length < 3 + ulen + plen) return;
+        username = buffered.subarray(2, 2 + ulen).toString();
+        password = buffered.subarray(3 + ulen, 3 + ulen + plen).toString();
+        const version = buffered[0];
+        buffered = buffered.subarray(3 + ulen + plen);
+        if (version !== 0x01 || username !== options.auth!.username || password !== options.auth!.password) {
+          return refuse([0x01, 0x01]);
+        }
+        step = "request";
+        reply([0x01, 0x00]);
+      }
+      if (step === "request") {
+        if (buffered.length < 5) return;
+        const [version, command, reserved, atyp] = buffered;
+        const addressLength = atyp === 1 ? 4 : atyp === 4 ? 16 : 1 + buffered[4];
+        if (buffered.length < 4 + addressLength + 2) return;
+        const address = buffered.subarray(4, 4 + addressLength);
+        const host =
+          atyp === 1
+            ? address.join(".")
+            : atyp === 4
+              ? Array.from({ length: 8 }, (_, i) => address.readUInt16BE(i * 2).toString(16)).join(":")
+              : address.subarray(1).toString();
+        const port = buffered.readUInt16BE(4 + addressLength);
+        const rest = buffered.subarray(4 + addressLength + 2);
+        step = "connected";
+        client.off("data", onData);
+        // What the client sends next is for the origin. Hold it until pipe() resumes the stream.
+        client.pause();
+
+        const failure = (rep: number) => refuse([0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        if (version !== 0x05 || command !== 0x01 || reserved !== 0x00) return failure(0x07);
+        requests.push({ methods, atyp, host, port, username, password });
+        if (options.reply) return failure(options.reply);
+
+        const bound =
+          options.bindAtyp === 3
+            ? [0x03, 9, ...Buffer.from("localhost")]
+            : options.bindAtyp === 4
+              ? [0x04, ...new Array(15).fill(0), 1]
+              : [0x01, 127, 0, 0, 1];
+        const upstream = net.connect(port, host, async () => {
+          await reply([0x05, 0x00, 0x00, ...bound, port >> 8, port & 0xff]);
+          if (rest.length) upstream.write(rest);
+          client.pipe(upstream);
+          upstream.pipe(client);
+          client.on("close", () => upstream.end());
+        });
+        upstream.on("error", () => failure(0x05));
+      }
+    }
+    client.on("data", onData);
+  });
+
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = server.address() as net.AddressInfo;
+  return {
+    port,
+    requests,
+    /** Resolves once a client's greeting has been read. */
+    greeted: greeted.promise,
+    url: (scheme = "socks5", userinfo = "") => `${scheme}://${userinfo && userinfo + "@"}127.0.0.1:${port}`,
+    [Symbol.dispose]() {
+      for (const socket of sockets) socket.destroy();
+      server.close();
+    },
+  };
+}
+
+/** An origin that reports what it received. */
+function createEchoOrigin(useTLS: boolean) {
+  return Bun.serve({
+    port: 0,
+    tls: useTLS ? tlsCert : undefined,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === "/redirect") {
+        return Response.redirect(url.searchParams.get("to")!, 302);
+      }
+      return Response.json({
+        method: req.method,
+        path: url.pathname + url.search,
+        host: req.headers.get("host"),
+        proxyAuthorization: req.headers.get("proxy-authorization"),
+        xProxyOnly: req.headers.get("x-proxy-only"),
+        xOrigin: req.headers.get("x-origin"),
+        body: await req.text(),
+      });
+    },
+  });
+}
+
+describe.concurrent("socks5 proxy", () => {
+  const tlsOptions = { ca: tlsCert.cert, rejectUnauthorized: false };
+  const cleanProxyEnv = {
+    ...bunEnv,
+    NO_PROXY: undefined,
+    no_proxy: undefined,
+    HTTP_PROXY: undefined,
+    http_proxy: undefined,
+    HTTPS_PROXY: undefined,
+    https_proxy: undefined,
+  };
+
+  for (const scheme of ["socks5", "socks5h"]) {
+    for (const targetTLS of [false, true]) {
+      test(`${scheme}:// proxy -> ${targetTLS ? "https" : "http"} origin`, async () => {
+        using socks = await createSocks5Server();
+        using origin = createEchoOrigin(targetTLS);
+
+        const get = await fetch(`${origin.url.origin}/hello?a=1`, { proxy: socks.url(scheme), tls: tlsOptions });
+        expect(get.status).toBe(200);
+        // The origin gets an ordinary origin-form request, whatever the proxy.
+        expect(await get.json()).toEqual({
+          method: "GET",
+          path: "/hello?a=1",
+          host: origin.url.host,
+          proxyAuthorization: null,
+          xProxyOnly: null,
+          xOrigin: null,
+          body: "",
+        });
+
+        const post = await fetch(`${origin.url.origin}/post`, {
+          method: "POST",
+          body: "Hello, World",
+          proxy: socks.url(scheme),
+          tls: tlsOptions,
+        });
+        expect(await post.json()).toMatchObject({ method: "POST", path: "/post", body: "Hello, World" });
+
+        // The hostname goes to the proxy as a domain name (ATYP 3) for it to resolve.
+        expect(socks.requests[0]).toEqual({
+          methods: [0x00],
+          atyp: 3,
+          host: "localhost",
+          port: origin.port,
+          username: undefined,
+          password: undefined,
+        });
+      });
+    }
+  }
+
+  test("keeps the tunnel to an https origin alive, and opens one connection per request to an http origin", async () => {
+    using socks = await createSocks5Server();
+    using httpOrigin = createEchoOrigin(false);
+    using httpsOrigin = createEchoOrigin(true);
+
+    for (const path of ["/a", "/b", "/c"]) {
+      const res = await fetch(httpsOrigin.url.origin + path, { proxy: socks.url(), tls: tlsOptions });
+      expect(await res.json()).toMatchObject({ path });
+    }
+    expect(socks.requests.map(r => r.port)).toEqual([httpsOrigin.port]);
+
+    for (const path of ["/a", "/b", "/c"]) {
+      const res = await fetch(httpOrigin.url.origin + path, { proxy: socks.url() });
+      expect(await res.json()).toMatchObject({ path });
+    }
+    expect(socks.requests.map(r => r.port)).toEqual([
+      httpsOrigin.port,
+      httpOrigin.port,
+      httpOrigin.port,
+      httpOrigin.port,
+    ]);
+  });
+
+  test("does not share a tunnel between different credentials", async () => {
+    using socks = await createSocks5Server();
+    using origin = createEchoOrigin(true);
+    const request = (userinfo: string, headers?: Record<string, string>) =>
+      fetch(origin.url.href, { proxy: { url: socks.url("socks5", userinfo), headers }, tls: tlsOptions }).then(res =>
+        res.text(),
+      );
+
+    await request("alice:secret");
+    await request("alice:secret");
+    await request("bob:secret");
+    // SOCKS authenticates with the URL's credentials whatever proxy.headers says.
+    await request("alice:secret", { "Proxy-Authorization": "Basic eDp5" });
+    await request("bob:secret", { "Proxy-Authorization": "Basic eDp5" });
+    // Not valid percent-encoding, so sent as written.
+    await request("carol:100%zz");
+    await request("dave:100%zz");
+
+    expect(socks.requests.map(r => r.methods)).toEqual(new Array(6).fill([0x00, 0x02]));
+  });
+
+  test("sends an IPv4 literal as an address, not a name", async () => {
+    using socks = await createSocks5Server();
+    using origin = createEchoOrigin(false);
+    const res = await fetch(`http://127.0.0.1:${origin.port}/ip`, { proxy: socks.url() });
+    expect(await res.json()).toMatchObject({ path: "/ip", host: `127.0.0.1:${origin.port}` });
+    expect(socks.requests).toEqual([
+      { methods: [0x00], atyp: 1, host: "127.0.0.1", port: origin.port, username: undefined, password: undefined },
+    ]);
+  });
+
+  test("sends an IPv6 literal as an address, without its brackets", async () => {
+    using socks = await createSocks5Server({ reply: 0x05 });
+    await expect(fetch("http://[::1]:8080/", { proxy: socks.url() })).rejects.toMatchObject({
+      code: "SocksProxyConnectionRefused",
+    });
+    expect(socks.requests).toEqual([
+      { methods: [0x00], atyp: 4, host: "0:0:0:0:0:0:0:1", port: 8080, username: undefined, password: undefined },
+    ]);
+  });
+
+  for (const targetTLS of [false, true]) {
+    test(`proxy.headers go nowhere: a SOCKS proxy is sent no HTTP (${targetTLS ? "https" : "http"} origin)`, async () => {
+      using socks = await createSocks5Server();
+      using origin = createEchoOrigin(targetTLS);
+      const res = await fetch(`${origin.url.origin}/object`, {
+        proxy: { url: socks.url(), headers: { "X-Proxy-Only": "1", "Proxy-Authorization": "Basic eDp5" } },
+        headers: { "X-Origin": "1" },
+        tls: tlsOptions,
+      });
+      expect(await res.json()).toMatchObject({
+        path: "/object",
+        proxyAuthorization: null,
+        xProxyOnly: null,
+        xOrigin: "1",
+      });
+    });
+
+    test(`authenticates with the username and password of the proxy URL (${targetTLS ? "https" : "http"} origin)`, async () => {
+      using socks = await createSocks5Server({ auth: { username: "us@r", password: "p:ss/w0rd" } });
+      using origin = createEchoOrigin(targetTLS);
+      const res = await fetch(`${origin.url.origin}/auth`, {
+        // Percent-encoded in the URL, decoded on the wire.
+        proxy: socks.url("socks5", "us%40r:p%3Ass%2Fw0rd"),
+        tls: tlsOptions,
+      });
+      expect(await res.json()).toMatchObject({ path: "/auth", proxyAuthorization: null });
+      expect(socks.requests).toEqual([
+        {
+          methods: [0x00, 0x02],
+          atyp: 3,
+          host: "localhost",
+          port: origin.port,
+          username: "us@r",
+          password: "p:ss/w0rd",
+        },
+      ]);
+    });
+  }
+
+  test("offers the credentials and carries on when the proxy does not want them", async () => {
+    using socks = await createSocks5Server();
+    using origin = createEchoOrigin(false);
+    const res = await fetch(`${origin.url.origin}/open`, { proxy: socks.url("socks5", "user:pass") });
+    expect(await res.json()).toMatchObject({ path: "/open" });
+    expect(socks.requests).toEqual([
+      {
+        methods: [0x00, 0x02],
+        atyp: 3,
+        host: "localhost",
+        port: origin.port,
+        username: undefined,
+        password: undefined,
+      },
+    ]);
+  });
+
+  test("rejects with SocksProxyAuthenticationFailed when the proxy refuses the credentials", async () => {
+    using socks = await createSocks5Server({ auth: { username: "user", password: "right" } });
+    using origin = createEchoOrigin(false);
+    await expect(fetch(origin.url.href, { proxy: socks.url("socks5", "user:wrong") })).rejects.toMatchObject({
+      code: "SocksProxyAuthenticationFailed",
+      message: "The SOCKS proxy rejected the username and password.",
+    });
+    expect(socks.requests).toEqual([]);
+  });
+
+  test("rejects with SocksProxyAuthenticationRequired when the proxy accepts no offered method", async () => {
+    using origin = createEchoOrigin(false);
+    {
+      // It wants credentials and the URL has none.
+      using socks = await createSocks5Server({ auth: { username: "user", password: "right" } });
+      await expect(fetch(origin.url.href, { proxy: socks.url() })).rejects.toMatchObject({
+        code: "SocksProxyAuthenticationRequired",
+      });
+    }
+    {
+      // It wants something else altogether, GSSAPI for example.
+      using socks = await createSocks5Server({ refuseMethods: true });
+      await expect(fetch(origin.url.href, { proxy: socks.url("socks5", "user:pass") })).rejects.toMatchObject({
+        code: "SocksProxyAuthenticationRequired",
+      });
+    }
+  });
+
+  test.each([
+    [0x01, "SocksProxyGeneralFailure"],
+    [0x02, "SocksProxyConnectionNotAllowed"],
+    [0x03, "SocksProxyNetworkUnreachable"],
+    [0x04, "SocksProxyHostUnreachable"],
+    [0x05, "SocksProxyConnectionRefused"],
+    [0x06, "SocksProxyTTLExpired"],
+    [0x07, "SocksProxyCommandNotSupported"],
+    [0x08, "SocksProxyAddressTypeNotSupported"],
+    [0x5a, "SocksProxyGeneralFailure"],
+  ])("maps reply code %d to %s", async (reply, code) => {
+    using socks = await createSocks5Server({ reply });
+    for (const url of ["http://example.invalid/", "https://example.invalid/"]) {
+      await expect(fetch(url, { proxy: socks.url() })).rejects.toMatchObject({ code });
+    }
+    // The name was never looked up locally: both requests reached the proxy.
+    expect(socks.requests.map(r => [r.host, r.port])).toEqual([
+      ["example.invalid", 80],
+      ["example.invalid", 443],
+    ]);
+  });
+
+  test("rejects with SocksProxyInvalidResponse when the proxy is not a SOCKS5 server", async () => {
+    const server = net.createServer(socket => {
+      socket.on("error", () => {});
+      socket.once("data", () => socket.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      const { port } = server.address() as net.AddressInfo;
+      await expect(fetch("http://example.invalid/", { proxy: `socks5://127.0.0.1:${port}` })).rejects.toMatchObject({
+        code: "SocksProxyInvalidResponse",
+      });
+    } finally {
+      server.close();
+    }
+  });
+
+  test("rejects with ECONNRESET when the proxy hangs up mid-negotiation", async () => {
+    using socks = await createSocks5Server({ afterGreeting: "close" });
+    await expect(fetch("http://example.invalid/", { proxy: socks.url() })).rejects.toMatchObject({
+      code: "ECONNRESET",
+    });
+  });
+
+  test("rejects with SocksProxyFieldTooLong for what SOCKS5 has no room for", async () => {
+    using socks = await createSocks5Server();
+    const long = Buffer.alloc(256, "a").toString();
+    for (const [url, userinfo] of [
+      ["http://example.invalid/", `${long}:password`],
+      ["http://example.invalid/", `username:${long}`],
+      [`http://${long}.invalid/`, ""],
+      [`https://${long}.invalid/`, ""],
+    ]) {
+      await expect(fetch(url, { proxy: socks.url("socks5", userinfo) })).rejects.toMatchObject({
+        code: "SocksProxyFieldTooLong",
+      });
+    }
+    expect(socks.requests).toEqual([]);
+  });
+
+  for (const bindAtyp of [1, 3, 4] as const) {
+    test(`reads a reply that arrives one byte at a time (bound address type ${bindAtyp})`, async () => {
+      using socks = await createSocks5Server({
+        chunkSize: 1,
+        bindAtyp,
+        auth: { username: "user", password: "pass" },
+      });
+      using httpOrigin = createEchoOrigin(false);
+      using httpsOrigin = createEchoOrigin(true);
+      for (const origin of [httpOrigin, httpsOrigin]) {
+        const res = await fetch(`${origin.url.origin}/slow`, {
+          method: "POST",
+          body: "body",
+          proxy: socks.url("socks5", "user:pass"),
+          tls: tlsOptions,
+        });
+        expect(await res.json()).toMatchObject({ method: "POST", path: "/slow", body: "body" });
+      }
+    });
+  }
+
+  test("negotiates again with the proxy for every redirect hop", async () => {
+    using socks = await createSocks5Server();
+    using first = createEchoOrigin(false);
+    using second = createEchoOrigin(true);
+    using third = createEchoOrigin(false);
+
+    const hop3 = `${third.url.origin}/done`;
+    const hop2 = `${second.url.origin}/redirect?to=${encodeURIComponent(hop3)}`;
+    const res = await fetch(`${first.url.origin}/redirect?to=${encodeURIComponent(hop2)}`, {
+      proxy: socks.url(),
+      tls: tlsOptions,
+    });
+    expect(res.url).toBe(hop3);
+    expect(await res.json()).toMatchObject({ path: "/done", host: third.url.host });
+    expect(socks.requests.map(r => r.port)).toEqual([first.port, second.port, third.port]);
+  });
+
+  test("verifies the origin's certificate, not the proxy's address, inside the tunnel", async () => {
+    using socks = await createSocks5Server();
+    using origin = createEchoOrigin(true);
+
+    // The harness certificate is self-signed, so it only verifies with `ca`.
+    const trusted = await fetch(`${origin.url.origin}/trusted`, { proxy: socks.url(), tls: { ca: tlsCert.cert } });
+    expect(await trusted.json()).toMatchObject({ path: "/trusted" });
+
+    const verified: string[] = [];
+    const pinned = await fetch(`${origin.url.origin}/pinned`, {
+      proxy: socks.url(),
+      keepalive: false,
+      tls: {
+        ca: tlsCert.cert,
+        checkServerIdentity(hostname: string) {
+          verified.push(hostname);
+          return undefined;
+        },
+      },
+    });
+    expect(await pinned.json()).toMatchObject({ path: "/pinned" });
+    expect(verified).toEqual(["localhost"]);
+
+    await expect(
+      fetch(`${origin.url.origin}/rejected`, {
+        proxy: socks.url(),
+        keepalive: false,
+        tls: { ca: tlsCert.cert, checkServerIdentity: () => new Error("pinned") },
+      }),
+    ).rejects.toThrow("pinned");
+  });
+
+  test("rejects an origin certificate it cannot verify before sending the request", async () => {
+    using socks = await createSocks5Server();
+    let requests = 0;
+    using origin = Bun.serve({
+      port: 0,
+      tls: tlsCert,
+      fetch() {
+        requests++;
+        return new Response("unreachable");
+      },
+    });
+    const error = await fetch(origin.url.href, { proxy: socks.url(), keepalive: false }).then(
+      res => `resolved ${res.status}`,
+      err => String(err.code),
+    );
+    expect(error).toMatch(/SELF_SIGNED|UNABLE_TO_VERIFY|CERT/);
+    // The proxy did its part. It is the TLS handshake inside the tunnel that failed.
+    expect(socks.requests.map(r => r.port)).toEqual([origin.port]);
+    expect(requests).toBe(0);
+  });
+
+  for (const targetTLS of [false, true]) {
+    test(`uploads and downloads a large body (${targetTLS ? "https" : "http"} origin)`, async () => {
+      using socks = await createSocks5Server();
+      using origin = Bun.serve({
+        port: 0,
+        tls: targetTLS ? tlsCert : undefined,
+        async fetch(req) {
+          return new Response(await req.arrayBuffer());
+        },
+      });
+      const payload = Buffer.alloc(4 * 1024 * 1024, "soup");
+      const bytes = await fetch(origin.url.href, {
+        method: "POST",
+        body: payload,
+        proxy: socks.url(),
+        tls: tlsOptions,
+      });
+      expect(Bun.hash(await bytes.bytes())).toBe(Bun.hash(payload));
+
+      const streamed = await fetch(origin.url.href, {
+        method: "POST",
+        body: new ReadableStream({
+          start(controller) {
+            for (let i = 0; i < 4; i++) controller.enqueue(payload.subarray(0, 64 * 1024));
+            controller.close();
+          },
+        }),
+        proxy: socks.url(),
+        tls: tlsOptions,
+      });
+      expect((await streamed.bytes()).byteLength).toBe(4 * 64 * 1024);
+    });
+  }
+
+  test("many requests at once", async () => {
+    using socks = await createSocks5Server({ auth: { username: "user", password: "pass" } });
+    using httpOrigin = createEchoOrigin(false);
+    using httpsOrigin = createEchoOrigin(true);
+    const paths = Array.from({ length: 32 }, (_, i) => `${(i % 2 ? httpOrigin : httpsOrigin).url.origin}/n/${i}`);
+    const results = await Promise.all(
+      paths.map(async url => {
+        const res = await fetch(url, { proxy: socks.url("socks5", "user:pass"), tls: tlsOptions });
+        return (await res.json()).path;
+      }),
+    );
+    expect(results).toEqual(paths.map(url => new URL(url).pathname));
+  });
+
+  test("an abort during the negotiation rejects the fetch", async () => {
+    using socks = await createSocks5Server({ afterGreeting: "nothing" });
+    const controller = new AbortController();
+    const pending = fetch("http://example.invalid/", { proxy: socks.url(), signal: controller.signal });
+    await socks.greeted;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("verbose: true shows the negotiation and the request that follows it", async () => {
+    using socks = await createSocks5Server();
+    using origin = createEchoOrigin(true);
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const res = await fetch(${JSON.stringify(origin.url.origin + "/verbose")}, {
+          proxy: ${JSON.stringify(socks.url())},
+          tls: { rejectUnauthorized: false },
+          verbose: true,
+        });
+        console.log(res.status);`,
+      ],
+      env: cleanProxyEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stderr.split("\n");
+    const negotiation = lines.indexOf(`> SOCKS5 CONNECT localhost:${origin.port}`);
+    expect(negotiation).toBe(0);
+    expect(lines.indexOf("< SOCKS5 succeeded")).toBe(negotiation + 1);
+    // The request that went through the tunnel is printed too, after the negotiation.
+    expect(lines.findIndex(line => line.endsWith(` HTTP/1.1 GET ${origin.url.origin}/verbose`))).toBeGreaterThan(
+      negotiation + 1,
+    );
+    expect(lines).toContain("< 200 OK");
+    expect(stdout).toBe("200\n");
+    expect(exitCode).toBe(0);
+  });
+
+  test("HTTP_PROXY and HTTPS_PROXY accept a socks5:// URL", async () => {
+    using socks = await createSocks5Server();
+    using httpOrigin = createEchoOrigin(false);
+    using httpsOrigin = createEchoOrigin(true);
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `for (const url of ${JSON.stringify([httpOrigin.url.origin + "/env", httpsOrigin.url.origin + "/env"])}) {
+          const res = await fetch(url, { tls: { rejectUnauthorized: false } });
+          console.log(res.status, (await res.json()).path);
+        }`,
+      ],
+      env: { ...cleanProxyEnv, HTTP_PROXY: socks.url("SOCKS5"), HTTPS_PROXY: socks.url("socks5h") },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("200 /env\n200 /env\n");
+    expect(socks.requests.map(r => [r.host, r.port])).toEqual([
+      ["localhost", httpOrigin.port],
+      ["localhost", httpsOrigin.port],
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a redirect from a socks5:// HTTP_PROXY to an http:// HTTPS_PROXY changes protocol with it", async () => {
+    using socks = await createSocks5Server();
+    using httpOrigin = createEchoOrigin(false);
+    using httpsOrigin = createEchoOrigin(true);
+    const connects: string[] = [];
+    const connectProxy = net.createServer(client => {
+      client.on("error", () => {});
+      client.once("data", data => {
+        const [method, target] = data.toString("latin1").split(" ");
+        connects.push(`${method} ${target}`);
+        const [host, port] = target.split(":");
+        const upstream = net.connect(Number(port), host, () => {
+          client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          client.pipe(upstream);
+          upstream.pipe(client);
+        });
+        upstream.on("error", () => client.destroy());
+        client.on("close", () => upstream.destroy());
+      });
+    });
+    connectProxy.listen(0, "127.0.0.1");
+    await once(connectProxy, "listening");
+    try {
+      const final = `${httpsOrigin.url.origin}/final`;
+      await using proc = Bun.spawn({
+        cmd: [
+          bunExe(),
+          "-e",
+          `const res = await fetch(${JSON.stringify(`${httpOrigin.url.origin}/redirect?to=${encodeURIComponent(final)}`)}, {
+            tls: { rejectUnauthorized: false },
+          });
+          console.log(res.status, res.url, (await res.json()).path);`,
+        ],
+        env: {
+          ...cleanProxyEnv,
+          HTTP_PROXY: socks.url(),
+          HTTPS_PROXY: `http://127.0.0.1:${(connectProxy.address() as net.AddressInfo).port}`,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout).toBe(`200 ${final} /final\n`);
+      expect(socks.requests.map(r => r.port)).toEqual([httpOrigin.port]);
+      expect(connects).toEqual([`CONNECT localhost:${httpsOrigin.port}`]);
+      expect(exitCode).toBe(0);
+    } finally {
+      connectProxy.close();
+    }
+  });
+
+  test.skipIf(isWindows)("a unix socket is dialed directly whatever HTTP_PROXY says", async () => {
+    using socks = await createSocks5Server();
+    using dir = tempDir("socks5-unix", {});
+    const unix = join(String(dir), "origin.sock");
+    using origin = Bun.serve({ unix, fetch: req => new Response(new URL(req.url).pathname) });
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const res = await fetch("http://localhost/unix", { unix: ${JSON.stringify(unix)} });
+        console.log(res.status, await res.text());`,
+      ],
+      env: { ...cleanProxyEnv, HTTP_PROXY: socks.url() },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("200 /unix\n");
+    expect(socks.requests).toEqual([]);
+    expect(exitCode).toBe(0);
+  });
+
+  for (const registryTLS of [false, true]) {
+    test(`bun install goes through the socks5:// proxy in ${registryTLS ? "HTTPS_PROXY" : "HTTP_PROXY"}`, async () => {
+      using socks = await createSocks5Server();
+      const tarball = (name: string) =>
+        new Bun.Archive(
+          {
+            "package/package.json": JSON.stringify({ name, version: "1.0.0" }),
+            "package/index.js": `module.exports = '${name} through socks';\n`,
+          },
+          { compress: "gzip" },
+        ).bytes();
+      const tarballs = { "soup-a": await tarball("soup-a"), "soup-b": await tarball("soup-b") };
+      using registry = Bun.serve({
+        port: 0,
+        tls: registryTLS ? tlsCert : undefined,
+        fetch(req) {
+          const name = new URL(req.url).pathname.split("/")[1] as keyof typeof tarballs;
+          if (!(name in tarballs)) return new Response("not found", { status: 404 });
+          if (req.url.endsWith(".tgz")) return new Response(tarballs[name]);
+          return Response.json({
+            name,
+            "dist-tags": { latest: "1.0.0" },
+            versions: {
+              "1.0.0": {
+                name,
+                version: "1.0.0",
+                dist: { tarball: `${registry.url.origin}/${name}/-/${name}-1.0.0.tgz` },
+              },
+            },
+          });
+        },
+      });
+      using dir = tempDir("socks5-install", {
+        "package.json": JSON.stringify({ name: "app", version: "0.0.0" }),
+      });
+
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "add", "soup-a", "soup-b", "--registry", registry.url.origin + "/"],
+        cwd: String(dir),
+        env: {
+          ...cleanProxyEnv,
+          [registryTLS ? "HTTPS_PROXY" : "HTTP_PROXY"]: socks.url(),
+          // The registry's certificate is self-signed. (--cafile does not reach
+          // a proxy tunnel's TLS, with any kind of proxy.)
+          NODE_TLS_REJECT_UNAUTHORIZED: "0",
+          BUN_INSTALL_CACHE_DIR: join(String(dir), ".cache"),
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).not.toContain("error:");
+      expect(stdout).toContain("installed soup-a@1.0.0");
+      expect(stdout).toContain("installed soup-b@1.0.0");
+      for (const name of ["soup-a", "soup-b"]) {
+        expect(await Bun.file(join(String(dir), "node_modules", name, "index.js")).text()).toBe(
+          `module.exports = '${name} through socks';\n`,
+        );
+      }
+      // Two manifests and two tarballs, all through the proxy. Tunnels to the
+      // https registry are kept alive, so they take fewer connections than requests.
+      expect(socks.requests.every(r => r.host === "localhost" && r.port === registry.port)).toBe(true);
+      if (registryTLS) {
+        expect(socks.requests.length).toBeGreaterThanOrEqual(1);
+        expect(socks.requests.length).toBeLessThan(4);
+      } else {
+        expect(socks.requests.length).toBe(4);
+      }
+      expect(exitCode).toBe(0);
+    });
+  }
 });

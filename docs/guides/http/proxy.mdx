@@ -4,7 +4,7 @@ sidebarTitle: Proxy HTTP requests using fetch()
 mode: center
 ---
 
-In Bun, `fetch` supports sending requests through an HTTP or HTTPS proxy. Use it on corporate networks or when a request must come from a specific IP address.
+In Bun, `fetch` supports sending requests through an HTTP, HTTPS or SOCKS5 proxy. Use it on corporate networks or when a request must come from a specific IP address.
 
 ```ts proxy.ts icon="/icons/typescript.svg"
 await fetch("https://example.com", {
@@ -15,7 +15,7 @@ await fetch("https://example.com", {
 
 ---
 
-The `proxy` option can be a URL string, a `URL` instance, or an object with `url` (a string or a `URL`) and optional `headers`. The URL can include the username and password if the proxy requires authentication. It can be `http://` or `https://`.
+The `proxy` option can be a URL string, a `URL` instance, or an object with `url` (a string or a `URL`) and optional `headers`. The URL can include the username and password if the proxy requires authentication. It can be `http://`, `https://`, `socks5://` or `socks5h://`.
 
 ---
 
@@ -41,10 +41,57 @@ If you provide a `Proxy-Authorization` header, it overrides any credentials in t
 
 ---
 
+## SOCKS5 proxies
+
+A `socks5://` URL sends the request through a SOCKS5 proxy, such as the one `ssh -D 1080 host` opens or a local Tor client. The port defaults to `1080`.
+
+```ts socks.ts icon="/icons/typescript.svg"
+await fetch("https://example.com", {
+  proxy: "socks5://127.0.0.1:1080",
+});
+
+// Username/password authentication (RFC 1929). Percent-encode special characters.
+await fetch("https://example.com", {
+  proxy: "socks5://username:p%40ssword@proxy.example.com:1080",
+});
+```
+
+Bun sends the target's hostname to the proxy and the proxy resolves it, so names that only the proxy's network knows (or `.onion` addresses) work and no DNS query leaves your machine. This is what curl calls `socks5h://`; Bun accepts that spelling too and treats both the same. A URL with an IP address is sent as that address.
+
+For an `https://` URL the TLS handshake happens with the target through the proxy: the proxy only sees encrypted bytes, and the `tls` options of `fetch` apply to the target's certificate as usual. A SOCKS proxy is not sent any HTTP, so `proxy.headers` and `Proxy-Authorization` do not apply to it.
+
+A connection is only ever reused for the same proxy, target and credentials. Requests whose proxy URLs have different usernames or passwords never share one, which is what Tor's stream isolation relies on.
+
+If the proxy cannot open the connection, `fetch` rejects with an error whose `code` says why:
+
+| `code`                                                               | Meaning                                                                                                            |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `SocksProxyAuthenticationRequired`                                   | The proxy accepted none of the authentication methods Bun offered: usually it wants credentials the URL lacks      |
+| `SocksProxyAuthenticationFailed`                                     | The proxy rejected the username and password                                                                       |
+| `SocksProxyConnectionRefused`                                        | The target refused the proxy's connection                                                                          |
+| `SocksProxyHostUnreachable`, `SocksProxyNetworkUnreachable`          | The proxy cannot reach the target (most proxies also answer this for a name they cannot resolve)                   |
+| `SocksProxyConnectionNotAllowed`                                     | The proxy's rules forbid the connection                                                                            |
+| `SocksProxyTTLExpired`                                               | The proxy's connection attempt timed out                                                                           |
+| `SocksProxyGeneralFailure`                                           | The proxy reported a failure without a more specific reason                                                        |
+| `SocksProxyCommandNotSupported`, `SocksProxyAddressTypeNotSupported` | The proxy does not implement `CONNECT` or the target's address type                                                |
+| `SocksProxyFieldTooLong`                                             | The username, password or hostname is longer than the 255 bytes SOCKS5 has room for; nothing was sent to the proxy |
+| `SocksProxyInvalidResponse`                                          | The server at the proxy URL does not speak SOCKS5                                                                  |
+
+SOCKS4 (`socks4://`, `socks4a://`) is not supported, and `WebSocket`'s `proxy` option only accepts HTTP proxies.
+
+---
+
 ## Environment variables
 
 To use the same proxy for all requests, set the `$HTTP_PROXY` and `$HTTPS_PROXY` environment variables to the proxy URL. Bun uses `$HTTP_PROXY` only for requests to `http://` URLs and `$HTTPS_PROXY` only for requests to `https://` URLs, so set both to proxy every request.
 
 ```sh terminal icon="terminal"
 HTTP_PROXY=https://username:password@proxy.example.com:8080 HTTPS_PROXY=https://username:password@proxy.example.com:8080 bun run index.ts
+```
+
+The variables accept `socks5://` URLs as well, and `bun install` reads them too, so packages can be installed through an SSH tunnel:
+
+```sh terminal icon="terminal"
+ssh -N -D 1080 bastion.example.com &
+HTTP_PROXY=socks5://127.0.0.1:1080 HTTPS_PROXY=socks5://127.0.0.1:1080 bun install
 ```

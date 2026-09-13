@@ -420,6 +420,12 @@ impl<'a> URL<'a> {
     pub fn is_http(&self) -> bool {
         strings::eql_case_insensitive_ascii(self.protocol, b"http", true)
     }
+    /// `socks5:` or `socks5h:`. Both let the proxy resolve the target's name.
+    #[inline]
+    pub fn is_socks5(&self) -> bool {
+        strings::eql_case_insensitive_ascii(self.protocol, b"socks5", true)
+            || strings::eql_case_insensitive_ascii(self.protocol, b"socks5h", true)
+    }
 
     pub fn display_hostname(&self) -> &[u8] {
         if !self.hostname.is_empty() {
@@ -488,7 +494,13 @@ impl<'a> URL<'a> {
     }
 
     pub(crate) fn get_default_port(&self) -> u16 {
-        if self.is_https() { 443u16 } else { 80u16 }
+        if self.is_https() {
+            443u16
+        } else if self.is_socks5() {
+            1080u16
+        } else {
+            80u16
+        }
     }
 
     pub fn is_ip_address(&self) -> bool {

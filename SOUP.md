@@ -1571,6 +1571,88 @@ Files: `src/js_parser/import_meta_glob.rs` (new), `src/js_parser/fold.rs`, `src/
 `test/bundler/bundler_import_meta_glob.test.ts`, `test/bake/dev/bundle.test.ts`,
 `test/integration/bun-types/fixture/globals.ts`.
 
+### 2026-09-13: SOCKS5 proxies for `fetch()` and `bun install`
+
+`fetch`'s `proxy` option and the `HTTP_PROXY`/`HTTPS_PROXY` variables took `http://` and `https://`
+proxies and nothing else: a `socks5://` URL failed every request with `UnsupportedProxyProtocol`. That
+leaves out the proxy `ssh -D` opens, a local Tor client, and a good share of corporate and scraping
+setups. It cannot be fixed from userland either, because the HTTP client owns the socket: node's proxy
+agents do not apply to Bun's `fetch`, and the packages written to fill the gap reimplement HTTP on top
+of `Bun.connect` and lose everything else `fetch` does. oven-sh/bun#16812 (42 upvotes, open since
+January 2025) links two older requests for the same thing, and its thread is people trading those
+workarounds. Now the URL just works, in the option and in the environment, for `fetch`, `node:http`
+(which sits on the same client) and `bun install`:
+
+```ts
+await fetch("https://example.com", { proxy: "socks5://127.0.0.1:1080" });
+
+// RFC 1929 username/password, percent-decoded from the URL
+await fetch("http://intranet.corp/", {
+  proxy: "socks5://build:s3cr%40t@bastion.example.com",
+});
+```
+
+```sh
+ssh -N -D 1080 bastion.example.com &
+HTTP_PROXY=socks5://127.0.0.1:1080 HTTPS_PROXY=socks5://127.0.0.1:1080 bun install
+```
+
+The hostname always goes to the proxy as a name (an IP literal as an address), so the proxy resolves
+it: names only its network knows and `.onion` addresses work, and no DNS query leaves the machine.
+That is what curl calls `socks5h://`; both spellings are accepted and mean the same, as in Go's
+`net/http`. The port defaults to 1080. Twelve new `error.code` values say why a proxy did not connect
+(`SocksProxyConnectionRefused`, `SocksProxyHostUnreachable`, `SocksProxyAuthenticationFailed`,
+`SocksProxyInvalidResponse` when the URL points at something that is not a SOCKS5 server, ...), each
+with a one-line message, and `verbose: true` prints the negotiation.
+
+The protocol lives in `src/http/socks5.rs` as a `Handshake` that does no I/O: it is built with the
+three messages it may have to send (greeting, username/password, CONNECT), is fed whatever the socket
+read, buffers a partial reply, and says "need more", "established" (with any bytes that followed the
+reply) or which error. A reply whose first byte cannot start a SOCKS message is rejected at once, so
+an HTTP server on the proxy port fails fast instead of waiting for a timeout, and at most 262 bytes are
+ever buffered. `HTTPClient` drives it from three hooks, all gated on the proxy URL's scheme so that
+nothing changes for other requests: `on_writable` starts the negotiation on a fresh connection instead
+of writing the request (the request stage parks at `ProxyHandshake`, where a CONNECT proxy's does),
+`on_data` feeds replies in, and `send_initial_request_payload` writes an ordinary origin-form request
+once the socket is a pipe to the origin. For an `https://` target the end of the negotiation is where
+a `200` to `CONNECT` leaves an HTTP proxy's socket, so it starts the same `ProxyTunnel`: the TLS
+handshake with the origin, certificate verification against the origin's name, `checkServerIdentity`
+and the `tls` options all run inside it unchanged, and so does keep-alive, since the pool already
+files a tunnel under proxy, target and credentials.
+
+Pooling is where the care went. A socket that has been through a SOCKS CONNECT reaches one target,
+but the pool files a tunnel-less socket under the address it was dialed at, which is the proxy's. So a
+plain `http://` request through SOCKS is neither taken from the pool (it could be handed a socket to
+an HTTP proxy listening on the same port, which "mixed port" proxies do) nor parked there: each one
+opens its own connection through the proxy. A redirect renegotiates for every hop, and may change
+proxy kind on the way when `HTTP_PROXY` and `HTTPS_PROXY` differ. The tunnel pool key hashes the
+scheme and the URL's raw username and password, not the `Proxy-Authorization` value it is built from
+for HTTP proxies: a self-review showed that one goes missing when `proxy.headers` carries its own or
+when the userinfo is not valid percent-encoding, and two SOCKS identities must never share a
+connection, because Tor hands out circuits per credential. A `unix:` socket request ignores a SOCKS
+proxy from the environment, as it in effect ignores any other. The timer follows the client's rule
+that reads do not extend a deadline: each message the proxy has to answer gets one window, and the TLS
+handshake inside the tunnel gets a fresh one.
+
+Not done: SOCKS4/4a (still `UnsupportedProxyProtocol`), GSSAPI, `ALL_PROXY`, resolving the name
+locally for `socks5://` the way curl does, keep-alive for `http://` origins (a pool key with the target
+in it would do), and `WebSocket`'s `proxy` option, which has its own client. Three older bugs turned up
+while testing and were reported separately rather than fixed here: a proxy URL with a username and no
+password (`http://user@host:8080`, the usual shape of a Tor isolation token) is parsed as the hostname
+`user@host`; `bun install --cafile`/`--ca` does not reach the TLS handshake inside any proxy tunnel, so
+a private registry behind a proxy fails certificate verification (the install test here uses
+`NODE_TLS_REJECT_UNAUTHORIZED=0` for that reason); and `verbose: true` has lost the `>` in front of
+request lines.
+
+The fork's bun-types workflow should be green again with this push: a newer `@types/node` ended the
+breakage described on 2026-09-10, and the types test passes locally on the rebased stack.
+
+Files: `src/http/socks5.rs` (new), `src/http/lib.rs`, `src/http/HTTPThread.rs`, `src/http/InternalState.rs`,
+`src/http/error.rs`, `src/url/lib.rs` (`is_socks5`, default port), `src/runtime/webcore/fetch/FetchTasklet.rs`
+(error messages), `packages/bun-types/globals.d.ts`, `docs/guides/http/proxy.mdx`,
+`docs/runtime/networking/fetch.mdx`, `test/js/bun/http/proxy.test.ts` (43 tests against an in-process
+SOCKS5 server), `test/js/bun/http/proxy-stress-errors.test.ts`, `test/integration/bun-types/fixture/fetch.ts`.
+
 ## Dropped
 
 Nothing yet.
