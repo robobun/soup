@@ -9319,7 +9319,8 @@ declare module "bun" {
         /**
          * Custom headers to send to the proxy server.
          * These headers are sent in the CONNECT request (for HTTPS targets)
-         * or in the proxy request (for HTTP targets).
+         * or in the proxy request (for HTTP targets). A SOCKS5 proxy is not
+         * sent any HTTP, so it never receives them.
          */
         headers?: HeadersInit | undefined;
         /**

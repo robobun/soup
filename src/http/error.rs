@@ -104,6 +104,8 @@ pub enum Error {
     #[error("TLSHandshakeFailed")]
     TLSHandshakeFailed,
     #[error(transparent)]
+    Socks(#[from] crate::socks5::SocksError),
+    #[error(transparent)]
     Cert(#[from] CertError),
     #[error(transparent)]
     Alloc(#[from] bun_alloc::AllocError),
@@ -317,6 +319,7 @@ impl Error {
             Self::UnsupportedProxyProtocol => "UnsupportedProxyProtocol",
             Self::ProxyConnectFailed => "ProxyConnectFailed",
             Self::TLSHandshakeFailed => "TLSHandshakeFailed",
+            Self::Socks(e) => <&'static str>::from(e),
             Self::Cert(e) => <&'static str>::from(e),
             Self::Alloc(_) => "OutOfMemory",
             Self::Hpack(e) => <&'static str>::from(e),
