@@ -414,7 +414,7 @@ impl HttpThread {
         Self::dial(self.context::<IS_SSL>(), client)
     }
 
-    /// Open the connection for `client` on `ctx`: unix path, HTTP proxy, or direct.
+    /// Open the connection for `client` on `ctx`: unix path, HTTP or SOCKS5 proxy, or direct.
     fn dial<const IS_SSL: bool>(ctx: &mut NewHttpContext<IS_SSL>, mut client: InFlightRequest) {
         client.connected_url = client
             .http_proxy
@@ -426,7 +426,7 @@ impl HttpThread {
         if let Some(url) = &client.http_proxy {
             if !url.href.is_empty() {
                 // https://github.com/oven-sh/bun/issues/11343
-                if url.protocol.is_empty() || url.has_http_like_protocol() {
+                if url.protocol.is_empty() || url.has_http_like_protocol() || url.is_socks5() {
                     let port = url.get_port_auto();
                     return ctx.connect(client, port);
                 }
