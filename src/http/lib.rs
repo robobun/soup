@@ -43,6 +43,7 @@ pub mod send_file;
 pub mod session_cache;
 #[path = "Signals.rs"]
 pub mod signals;
+pub mod socks5;
 #[path = "ThreadSafeStreamBuffer.rs"]
 pub mod thread_safe_stream_buffer;
 #[path = "websocket.rs"]
@@ -63,6 +64,7 @@ pub use internal_state::InternalState;
 pub use proxy_tunnel::ProxyTunnel;
 pub use send_file::SendFile;
 pub use signals::Signals;
+pub use socks5::SocksError;
 pub use thread_safe_stream_buffer::ThreadSafeStreamBuffer;
 #[path = "ssl_config.rs"]
 pub mod ssl_config;
@@ -2290,8 +2292,30 @@ impl<'a> HTTPClient<'a> {
         ))
     }
 
+    /// Whether this request's connection is made to a SOCKS5 proxy. A unix
+    /// socket is dialed directly even when the environment names a proxy.
+    pub(crate) fn has_socks_proxy(&self) -> bool {
+        self.unix_socket_path.is_empty()
+            && self
+                .http_proxy
+                .as_ref()
+                .is_some_and(|proxy| proxy.is_socks5())
+    }
+
     pub(crate) fn is_keep_alive_possible(&self) -> bool {
         if FeatureFlags::ENABLE_KEEPALIVE {
+            // A connection negotiated through a SOCKS proxy reaches one target,
+            // while the pool files a tunnel-less socket under the proxy's own
+            // address. So it is neither taken from the pool (which may hold a
+            // socket to an HTTP proxy listening on the same port) nor parked
+            // there. `socks` is checked as well as the URL because a redirect
+            // has already moved `url` on when it releases the socket.
+            if self.proxy_tunnel.is_none()
+                && (self.state.socks.is_established()
+                    || (self.has_socks_proxy() && !self.url.is_https()))
+            {
+                return false;
+            }
             // check state
             if self.state.flags.allow_keepalive
                 && !self.flags.disable_keepalive
@@ -2319,6 +2343,22 @@ impl<'a> HTTPClient<'a> {
         let mut combined: u64 = 0;
         let mut any = false;
         let mut name_lower_buf = [0u8; 256];
+
+        // SOCKS authenticates with the proxy URL's userinfo whatever
+        // `proxy_headers` holds, and proxies such as Tor give each identity
+        // its own circuit. The scheme is part of the key because one port can
+        // speak both SOCKS5 and HTTP CONNECT.
+        if self.has_socks_proxy() {
+            if let Some(proxy) = &self.http_proxy {
+                let mut h = Wyhash::init(0);
+                h.update(b"socks5:");
+                h.update(&proxy.username.len().to_le_bytes());
+                h.update(proxy.username);
+                h.update(proxy.password);
+                combined = h.final_();
+                any = true;
+            }
+        }
 
         let mut user_provided_auth = false;
         if let Some(hdrs) = &self.proxy_headers {
@@ -3032,7 +3072,9 @@ impl<'a> HTTPClient<'a> {
 
         let request = self.build_request(self.body_len_for_send());
 
-        if self.http_proxy.is_some() {
+        // Past a SOCKS negotiation the socket is a pipe to the origin itself,
+        // which gets an ordinary origin-form request.
+        if self.http_proxy.is_some() && !self.state.socks.is_established() {
             if self.url.is_https() {
                 bun_core::scoped_log!(fetch, "start proxy tunneling (https proxy)");
                 // DO the tunneling!
@@ -3362,6 +3404,16 @@ impl<'a> HTTPClient<'a> {
             return;
         }
 
+        // A fresh connection to a SOCKS proxy negotiates before anything else
+        // is written. A pooled one arrives with its tunnel attached.
+        if self.has_socks_proxy()
+            && self.proxy_tunnel.is_none()
+            && !self.state.socks.is_established()
+        {
+            self.write_socks_handshake::<IS_SSL>(socket);
+            return;
+        }
+
         match self.state.request_stage {
             RequestStage::Pending | RequestStage::Headers | RequestStage::Opened => {
                 bun_core::scoped_log!(fetch, "sendInitialRequestPayload");
@@ -3575,6 +3627,22 @@ impl<'a> HTTPClient<'a> {
                     self.state.request_sent_len += amount;
                     let has_sent_headers = self.state.request_sent_len >= headers_len;
 
+                    // A CONNECT proxy's request is printed when the CONNECT
+                    // goes out. A SOCKS proxy got no HTTP to hang that on.
+                    if has_sent_headers
+                        && self.verbose != HTTPVerboseLevel::None
+                        && self.state.socks.is_established()
+                    {
+                        print_request(
+                            Protocol::Http1_1,
+                            &request,
+                            self.url.href,
+                            !self.flags.reject_unauthorized,
+                            self.request_body(),
+                            self.verbose == HTTPVerboseLevel::Curl,
+                        );
+                    }
+
                     if has_sent_headers && !self.request_body().is_empty() {
                         self.state.request_body = bun_ptr::RawSlice::new(
                             &self.state.request_body.slice()
@@ -3667,17 +3735,125 @@ impl<'a> HTTPClient<'a> {
         bun_core::scoped_log!(fetch, "startProxyHandshake");
         // if we have options we pass them (ca, reject_unauthorized, etc) otherwise use the default
         let ssl_options = self.tls_props.clone();
-        // The sole caller (`handle_on_data_headers`) has already moved
-        // `response_message_buffer` into a local, so the CONNECT envelope is
-        // gone from `self` and `start_payload` borrows that caller local (or
-        // `incoming_data`), which outlives this call; the #30381 split-envelope
-        // hazard is handled there. ProxyTunnel::start has synchronous failure
+        // `handle_on_data_headers` has already moved `response_message_buffer`
+        // into a local, so the CONNECT envelope is gone from `self` and
+        // `start_payload` borrows that caller local (or `incoming_data`), which
+        // outlives this call; the #30381 split-envelope hazard is handled
+        // there. The other caller, `on_socks_data`, never fills that buffer and
+        // passes a `Vec` it owns. ProxyTunnel::start has synchronous failure
         // paths (SSLWrapper init error, or a handshake-traffic error that
         // synchronously fires on_close) that call close_and_fail -> fail -> the
         // result callback, which can free the AsyncHTTP that embeds `*self`.
         debug_assert!(self.state.response_message_buffer.list.capacity() == 0);
         ProxyTunnel::start::<IS_SSL>(self, socket, ssl_options.as_deref(), start_payload);
         // Must not reference `self` past this point — see comment above.
+    }
+
+    /// Begin the SOCKS5 negotiation, or write the rest of a message the socket
+    /// only took part of. `on_writable` lands here until the proxy has
+    /// connected to the target.
+    fn write_socks_handshake<const IS_SSL: bool>(&mut self, socket: HttpSocket<IS_SSL>) {
+        if !self.state.socks.is_pending() {
+            let Some(proxy) = self.http_proxy.as_ref() else {
+                return;
+            };
+            bun_core::scoped_log!(fetch, "start SOCKS5 negotiation");
+            if self.verbose != HTTPVerboseLevel::None {
+                // `>` as an argument: in the format string it would read as
+                // the end of a colour tag.
+                bun_core::pretty_errorln!(
+                    "{} {}:{}",
+                    "> SOCKS5 CONNECT",
+                    BStr::new(self.url.hostname),
+                    self.url.get_port_auto(),
+                );
+                Output::flush();
+            }
+            // Userinfo that is not valid percent-encoding is sent as written.
+            let username = bun_url::PercentEncoding::decode_alloc(proxy.username)
+                .unwrap_or_else(|_| proxy.username.into());
+            let password = bun_url::PercentEncoding::decode_alloc(proxy.password)
+                .unwrap_or_else(|_| proxy.password.into());
+            let handshake = match socks5::Handshake::new(
+                &username,
+                &password,
+                self.url.hostname,
+                self.url.get_port_auto(),
+            ) {
+                Ok(handshake) => handshake,
+                Err(err) => {
+                    self.close_and_fail::<IS_SSL>(err.into(), socket);
+                    return;
+                }
+            };
+            self.state.socks = socks5::Negotiation::Pending(Box::new(handshake));
+            // Same as after a CONNECT is written: nothing more goes out until
+            // the proxy has answered.
+            self.state.request_stage = RequestStage::ProxyHandshake;
+        }
+
+        // Reads do not extend the deadline (see [`IDLE_TIMEOUT_SECONDS`]):
+        // each message the proxy has to answer gets one window.
+        let has_unsent = matches!(
+            &self.state.socks,
+            socks5::Negotiation::Pending(handshake) if !handshake.unsent().is_empty()
+        );
+        if !has_unsent {
+            return;
+        }
+        self.set_timeout(&socket);
+        let socks5::Negotiation::Pending(handshake) = &mut self.state.socks else {
+            return;
+        };
+        match write_to_socket::<IS_SSL>(socket, handshake.unsent()) {
+            Ok(amount) => handshake.did_send(amount),
+            Err(err) => self.close_and_fail::<IS_SSL>(err, socket),
+        }
+    }
+
+    fn on_socks_data<const IS_SSL: bool>(
+        &mut self,
+        incoming_data: &[u8],
+        socket: HttpSocket<IS_SSL>,
+    ) {
+        let socks5::Negotiation::Pending(handshake) = &mut self.state.socks else {
+            return;
+        };
+        let rest = match handshake.receive(incoming_data) {
+            Err(err) => {
+                self.close_and_fail::<IS_SSL>(err.into(), socket);
+                return;
+            }
+            Ok(socks5::Progress::NeedMore) => {
+                self.write_socks_handshake::<IS_SSL>(socket);
+                return;
+            }
+            Ok(socks5::Progress::Established { rest }) => rest,
+        };
+        bun_core::scoped_log!(fetch, "SOCKS5 proxy connected to the target");
+        self.state.socks = socks5::Negotiation::Established;
+        if self.verbose != HTTPVerboseLevel::None {
+            bun_core::pretty_errorln!("{}", "< SOCKS5 succeeded\n");
+            Output::flush();
+        }
+
+        if self.url.is_https() {
+            // Where a `200` to CONNECT leaves an HTTP proxy's socket: TLS with
+            // the origin runs inside it, `rest` being the first bytes of that.
+            self.flags.proxy_tunneling = true;
+            self.set_timeout(&socket);
+            self.start_proxy_handshake::<IS_SSL>(socket, &rest);
+            // `start_proxy_handshake` can free `self`.
+            return;
+        }
+
+        // An HTTP origin has nothing to say before it is asked.
+        if !rest.is_empty() {
+            self.close_and_fail::<IS_SSL>(crate::Error::UnexpectedData, socket);
+            return;
+        }
+        self.state.request_stage = RequestStage::Opened;
+        self.on_writable::<true, IS_SSL>(socket);
     }
 
     pub(crate) fn handle_on_data_headers<const IS_SSL: bool>(
@@ -3907,6 +4083,11 @@ impl<'a> HTTPClient<'a> {
         bun_core::scoped_log!(fetch, "onData {}", incoming_data.len());
         if self.signals.get(signals::Field::Aborted) {
             self.close_and_abort::<IS_SSL>(socket);
+            return;
+        }
+
+        if self.state.socks.is_pending() {
+            self.on_socks_data::<IS_SSL>(incoming_data, socket);
             return;
         }
 

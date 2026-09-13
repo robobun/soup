@@ -2100,6 +2100,11 @@ interface BunFetchRequestInit extends RequestInit {
    * If a `Proxy-Authorization` header is provided in `proxy.headers`, it takes
    * precedence over credentials parsed from the proxy URL.
    *
+   * The URL can be `http://`, `https://`, `socks5://` or `socks5h://`. A SOCKS5
+   * proxy (port 1080 by default) resolves the request's hostname itself, and a
+   * username and password in the URL are sent as SOCKS5 username/password
+   * authentication. `proxy.headers` do not apply to a SOCKS5 proxy.
+   *
    * Not part of the Fetch API specification.
    *
    * @example
@@ -2107,6 +2112,11 @@ interface BunFetchRequestInit extends RequestInit {
    * // String format
    * const response = await fetch("http://example.com", {
    *  proxy: "https://username:password@127.0.0.1:8080"
+   * });
+   *
+   * // SOCKS5 proxy, for example `ssh -D 1080 host` or Tor
+   * const response = await fetch("https://example.com", {
+   *  proxy: "socks5://127.0.0.1:1080"
    * });
    *
    * // Object format with custom headers sent to the proxy

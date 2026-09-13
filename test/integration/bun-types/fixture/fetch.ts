@@ -252,6 +252,7 @@ if (typeof process !== "undefined") {
   // String proxy URL is valid
   fetch("https://example.com", { proxy: "http://proxy.example.com:8080" });
   fetch("https://example.com", { proxy: "https://user:pass@proxy.example.com:8080" });
+  fetch("https://example.com", { proxy: "socks5://user:pass@127.0.0.1:1080" });
 }
 
 {

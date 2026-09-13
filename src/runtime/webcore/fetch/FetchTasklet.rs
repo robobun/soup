@@ -1430,6 +1430,7 @@ impl FetchTasklet {
             http::Error::RedirectURLInvalid => BunString::create_format(format_args!(
                 "{code}: Redirect URL in Location header is invalid."
             )),
+            http::Error::Socks(err) => BunString::static_(err.message()),
 
             http::Error::Cert(http::CertError::UNABLE_TO_GET_ISSUER_CERT) => {
                 BunString::static_("unable to get issuer certificate")

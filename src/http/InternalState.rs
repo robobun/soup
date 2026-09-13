@@ -67,6 +67,8 @@ pub struct InternalState<'a> {
     pub(crate) request_stage: HTTPStage,
     pub(crate) response_stage: HTTPStage,
     pub(crate) certificate_info: Option<CertificateInfo>,
+    /// Where this connection is in its `socks5://` proxy negotiation.
+    pub(crate) socks: crate::socks5::Negotiation,
 }
 
 // Struct-of-bools so the
@@ -144,6 +146,7 @@ impl Default for InternalState<'_> {
             request_stage: HTTPStage::Pending,
             response_stage: HTTPStage::Pending,
             certificate_info: None,
+            socks: crate::socks5::Negotiation::None,
         }
     }
 }
