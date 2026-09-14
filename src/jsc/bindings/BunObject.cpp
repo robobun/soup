@@ -363,6 +363,12 @@ static JSValue createBunSQLConstructor(VM& vm, Zig::GlobalObject* globalObject)
     return sqlValue;
 }
 
+static JSValue createBunJWT(VM& vm, Zig::GlobalObject* globalObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    RELEASE_AND_RETURN(scope, BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalJwt, "Bun.JWT"));
+}
+
 JSValue constructBunFetchObject(VM& vm, JSObject* bunObject)
 {
     JSFunction* fetchFn = JSFunction::create(vm, bunObject->globalObject(), 1, "fetch"_s, JSC::removableFunction<Bun::Feature::Fetch, JSC::RemovedFeatureStub::Throw, Bun::Bindgen::Generated::Fetch::jsFetch>(), ImplementationVisibility::Public, NoIntrinsic);
@@ -455,6 +461,7 @@ static JSValue constructBunSQLObject(VM& vm, JSObject* bunObject)
         return Bun::createRemovedSQLFunction(bunObject->globalObject(), "SQL"_s, 0, true);
     return checkedBunObjectValue(vm, bunObject, createBunSQLConstructor);
 }
+static JSValue constructBunJWTObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunJWT); }
 
 static JSValue constructDNSObject(VM& vm, JSObject* bunObject)
 {
@@ -1056,6 +1063,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     S3Client                                       Bun::Bindgen::Generated::S3Client::getS3ClientConstructor           DontDelete|PropertyCallback
     s3                                             BunObject_lazyPropCb_wrap_s3                                        DontDelete|PropertyCallback
     CSRF                                           Bun::Bindgen::Generated::CsrfJsc::createCSRF                        DontDelete|PropertyCallback
+    JWT                                            constructBunJWTObject                                               DontDelete|PropertyCallback
     allocUnsafe                                    Bun::Bindgen::Generated::BunObject::jsAllocUnsafe                   DontDelete|Function 1
     argv                                           BunObject_lazyPropCb_wrap_argv                                      DontDelete|PropertyCallback
     build                                          Bun::Bindgen::Generated::JSBundler::jsBuild                         DontDelete|Function 1

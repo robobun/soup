@@ -155,6 +155,7 @@
             "icon": "wrench",
             "pages": [
               "/runtime/csrf",
+              "/runtime/jwt",
               "/runtime/secrets",
               "/runtime/console",
               "/runtime/toml",
