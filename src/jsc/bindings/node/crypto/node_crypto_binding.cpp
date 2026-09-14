@@ -26,6 +26,7 @@
 #include "JSCipher.h"
 #include "CryptoHkdf.h"
 #include "JSKeyObject.h"
+#include "JSKeyObjectConstructor.h"
 #include "JSSecretKeyObject.h"
 #include "JSPublicKeyObject.h"
 #include "JSPrivateKeyObject.h"
@@ -367,6 +368,8 @@ __attribute__((minsize)) JSValue createNodeCryptoBinding(Zig::GlobalObject* glob
 
     obj->putDirect(vm, PropertyName(Identifier::fromString(vm, "KeyObject"_s)),
         globalObject->m_JSKeyObjectClassStructure.constructor(globalObject));
+    obj->putDirect(vm, PropertyName(Identifier::fromString(vm, "keyObjectFromCryptoKey"_s)),
+        JSFunction::create(vm, globalObject, 1, "keyObjectFromCryptoKey"_s, jsKeyObjectFromCryptoKeyInternal, ImplementationVisibility::Public, NoIntrinsic), 0);
 
     obj->putDirect(vm, PropertyName(Identifier::fromString(vm, "publicEncrypt"_s)),
         JSFunction::create(vm, globalObject, 2, "publicEncrypt"_s, jsPublicEncrypt, ImplementationVisibility::Public, NoIntrinsic), 0);
