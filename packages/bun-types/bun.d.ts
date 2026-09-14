@@ -3157,6 +3157,318 @@ declare module "bun" {
   }
 
   /**
+   * Sign, verify and decode JSON Web Tokens (RFC 7519).
+   *
+   * @example
+   * ```ts
+   * const secret = process.env.JWT_SECRET!;
+   * const token = Bun.JWT.sign({ sub: "user_123" }, secret, { expiresIn: "2h" });
+   *
+   * try {
+   *   const { sub } = Bun.JWT.verify(token, secret);
+   * } catch (error) {
+   *   if (error.code === "ERR_JWT_EXPIRED") {
+   *     // ask the client to refresh
+   *   }
+   * }
+   * ```
+   *
+   * @category Security
+   */
+  namespace JWT {
+    /**
+     * The signature algorithms of RFC 7518 and RFC 8037.
+     *
+     * - `HS256`, `HS384`, `HS512`: HMAC with a shared secret
+     * - `RS256`, `RS384`, `RS512`: RSASSA-PKCS1-v1_5
+     * - `PS256`, `PS384`, `PS512`: RSASSA-PSS
+     * - `ES256`, `ES384`, `ES512`: ECDSA with the P-256, P-384 and P-521 curves
+     * - `EdDSA`: Ed25519. `Ed25519` is the name RFC 9864 gives the same algorithm.
+     *
+     * Unsigned tokens (`none`) are not supported.
+     */
+    type Algorithm =
+      | "HS256"
+      | "HS384"
+      | "HS512"
+      | "RS256"
+      | "RS384"
+      | "RS512"
+      | "PS256"
+      | "PS384"
+      | "PS512"
+      | "ES256"
+      | "ES384"
+      | "ES512"
+      | "EdDSA"
+      | "Ed25519";
+
+    /**
+     * A key to sign or verify with.
+     *
+     * - A `string` or bytes without a `-----BEGIN` header are a shared secret
+     *   for the `HS*` algorithms.
+     * - A `string` or bytes with a `-----BEGIN` header are a PEM-encoded private
+     *   key, public key or certificate, and are never used as a secret.
+     * - A `KeyObject` from `node:crypto`, a WebCrypto `CryptoKey`, or a JSON Web
+     *   Key object (`{ kty: "EC", crv: "P-256", x, y }`, as found in a JWKS).
+     *
+     * Signing needs a secret or a private key. Verifying takes a secret, a public
+     * key or a private key. RSA keys must be at least 2048 bits.
+     */
+    type Key =
+      | string
+      | NodeJS.TypedArray
+      | DataView
+      | ArrayBufferLike
+      | import("node:crypto").KeyObject
+      | CryptoKey
+      | JsonWebKey;
+
+    /**
+     * A JSON Web Key (RFC 7517): what `keyObject.export({ format: "jwk" })` and
+     * `crypto.subtle.exportKey("jwk", key)` return, and what the `keys` of a
+     * JWKS document are.
+     */
+    interface JsonWebKey {
+      /** `"oct"` (a shared secret), `"RSA"`, `"EC"` or `"OKP"` (Ed25519) */
+      kty?: string;
+      /** When present, the only algorithm the key is used with. */
+      alg?: string;
+      /** When present, it has to be `"sig"`. */
+      use?: string;
+      kid?: string;
+      /** When present, it has to include `"sign"` to sign with the key and `"verify"` to verify with it. */
+      key_ops?: string[];
+      ext?: boolean;
+      crv?: string;
+      x?: string;
+      y?: string;
+      d?: string;
+      n?: string;
+      e?: string;
+      p?: string;
+      q?: string;
+      dp?: string;
+      dq?: string;
+      qi?: string;
+      k?: string;
+      x5c?: string[];
+      x5t?: string;
+      "x5t#S256"?: string;
+      x5u?: string;
+    }
+
+    /**
+     * The claims of a token. The registered claims of RFC 7519 are typed, any
+     * other claim is allowed.
+     */
+    interface Payload {
+      /** Issuer */
+      iss?: string;
+      /** Subject */
+      sub?: string;
+      /** Audience */
+      aud?: string | string[];
+      /** Expiration time, in seconds since the Unix epoch */
+      exp?: number;
+      /** Not before, in seconds since the Unix epoch */
+      nbf?: number;
+      /** Issued at, in seconds since the Unix epoch */
+      iat?: number;
+      /** JWT ID */
+      jti?: string;
+      [claim: string]: unknown;
+    }
+
+    /**
+     * The JOSE header of a token. `alg` is one of the supported algorithms in
+     * what {@link verify} returns, and whatever the token says in what
+     * {@link decode} returns.
+     */
+    interface Header<A extends string = Algorithm> {
+      alg: A;
+      typ?: string;
+      kid?: string;
+      cty?: string;
+      [parameter: string]: unknown;
+    }
+
+    /**
+     * The options of {@link sign}. Only the object's own properties are read,
+     * and one that is not an option throws `ERR_INVALID_ARG_VALUE`, it is not
+     * ignored.
+     */
+    interface SignOptions {
+      /**
+       * The signature algorithm. By default it follows from the key: `HS256`
+       * for a secret, `RS256` for an RSA key, `ES256`, `ES384` or `ES512` for
+       * an EC key depending on its curve, `EdDSA` for an Ed25519 key, and for a
+       * `CryptoKey` or a JSON Web Key with an `alg`, the algorithm the key names.
+       */
+      algorithm?: Algorithm;
+      /**
+       * Sets `exp` this long after `iat`. A number is in seconds, a string
+       * needs a unit: `"30s"`, `"15m"`, `"2h"`, `"7d"`, `"1 week"`, `"1y"`.
+       */
+      expiresIn?: number | string;
+      /**
+       * Sets `nbf` this long after `iat`. Same format as {@link expiresIn}.
+       */
+      notBefore?: number | string;
+      /** Sets the `iss` claim. */
+      issuer?: string;
+      /** Sets the `sub` claim. */
+      subject?: string;
+      /** Sets the `aud` claim. */
+      audience?: string | string[];
+      /** Sets the `jti` claim. */
+      jwtId?: string;
+      /** Sets the `kid` header parameter. */
+      keyId?: string;
+      /**
+       * `iat` is set to the current time unless the payload already has one.
+       * Pass `true` to leave it out.
+       *
+       * @default false
+       */
+      noTimestamp?: boolean;
+      /**
+       * Extra header parameters, merged over `{ alg, typ: "JWT" }`. `alg`
+       * cannot be changed here.
+       */
+      header?: Partial<Header>;
+    }
+
+    /**
+     * The options of {@link verify}. Only the object's own properties are
+     * read, and one that is not an option throws `ERR_INVALID_ARG_VALUE`: a
+     * misspelt check (`jwtid`, `audiance`) would otherwise be a check that is
+     * silently not made.
+     */
+    interface VerifyOptions {
+      /**
+       * The algorithms to accept. By default, the ones the key can be used
+       * with: a secret accepts `HS256`, `HS384` and `HS512`; an RSA key accepts
+       * `RS*` and `PS*`; an EC key accepts the one `ES*` algorithm of its
+       * curve; an Ed25519 key accepts `EdDSA`; a `CryptoKey` or a JSON Web Key
+       * with an `alg` accepts the algorithm it names. A token whose `alg` does
+       * not fit the key is rejected whatever this option says.
+       */
+      algorithms?: Algorithm[];
+      /** The `iss` claim has to be this value, or one of these values. */
+      issuer?: string | string[];
+      /** The `sub` claim has to be this value. */
+      subject?: string;
+      /** The `aud` claim has to be, or contain, this value or one of these values. */
+      audience?: string | string[];
+      /** The `jti` claim has to be this value. */
+      jwtId?: string;
+      /** Claims that have to be present, for example `["exp", "sub"]`. */
+      requiredClaims?: string[];
+      /**
+       * How much the clocks of the issuer and the verifier may differ when
+       * checking `exp`, `nbf` and `maxAge`. A number is in seconds, a string
+       * needs a unit (`"30s"`).
+       *
+       * @default 0
+       */
+      clockTolerance?: number | string;
+      /**
+       * Reject tokens whose `iat` is further in the past than this, tokens
+       * whose `iat` is in the future by more than `clockTolerance`, and tokens
+       * without an `iat`. A number is in seconds, a string needs a unit (`"1h"`).
+       */
+      maxAge?: number | string;
+      /**
+       * The time to check `exp`, `nbf` and `maxAge` against.
+       *
+       * @default new Date()
+       */
+      currentDate?: Date;
+      /**
+       * Accept a token whose `exp` is in the past.
+       *
+       * @default false
+       */
+      ignoreExpiration?: boolean;
+      /**
+       * Accept a token whose `nbf` is in the future.
+       *
+       * @default false
+       */
+      ignoreNotBefore?: boolean;
+      /**
+       * Return `{ header, payload, signature }` instead of the payload.
+       *
+       * @default false
+       */
+      complete?: boolean;
+    }
+
+    interface Decoded<T = Payload, A extends string = Algorithm> {
+      header: Header<A>;
+      payload: T;
+      /** The signature, base64url-encoded as it is in the token. */
+      signature: string;
+    }
+
+    /**
+     * Sign `payload` and return the token.
+     *
+     * @param payload The claims, as a plain object. `iat` is added unless it is already there or `noTimestamp` is set.
+     * @param key A shared secret or a private key
+     *
+     * @example
+     * ```ts
+     * Bun.JWT.sign({ sub: "user_123", role: "admin" }, secret, { expiresIn: "15m", issuer: "https://example.com" });
+     * Bun.JWT.sign({ sub: "user_123" }, await Bun.file("private.pem").text()); // ES256, RS256 or EdDSA, depending on the key
+     * ```
+     */
+    function sign(payload: object, key: Key, options?: SignOptions): string;
+
+    /**
+     * Check the signature and the claims of `token` and return its payload.
+     *
+     * Throws an error with one of these codes when the token is not acceptable:
+     *
+     * - `ERR_JWT_INVALID`: not a JWT
+     * - `ERR_JWT_ALGORITHM_NOT_ALLOWED`: signed with an algorithm that is not in `algorithms`, does not fit the key, or is not supported
+     * - `ERR_JWT_SIGNATURE_VERIFICATION_FAILED`: the signature does not match
+     * - `ERR_JWT_EXPIRED`: `exp` has passed, or `iat` is older than `maxAge` (`error.expiredAt` is a `Date`)
+     * - `ERR_JWT_NOT_ACTIVE`: `nbf` is in the future (`error.date` is a `Date`)
+     * - `ERR_JWT_CLAIM_VALIDATION_FAILED`: a claim is missing, malformed or does not match (`error.claim` names it)
+     *
+     * The signature is checked before any claim is looked at.
+     *
+     * @param token The token
+     * @param key The shared secret, or the public key of the issuer
+     *
+     * @example
+     * ```ts
+     * const payload = Bun.JWT.verify(token, publicKey, {
+     *   algorithms: ["ES256"],
+     *   issuer: "https://example.com",
+     *   audience: "api",
+     * });
+     * ```
+     */
+    function verify<T = Payload>(token: string, key: Key, options?: VerifyOptions & { complete?: false }): T;
+    function verify<T = Payload>(token: string, key: Key, options: VerifyOptions & { complete: true }): Decoded<T>;
+    function verify<T = Payload>(token: string, key: Key, options?: VerifyOptions): T | Decoded<T>;
+
+    /**
+     * Parse `token` without checking its signature or its claims.
+     *
+     * Nothing in the result can be trusted. Use it to look at a token, or to
+     * read the `kid` header and pick the key to pass to {@link verify}.
+     *
+     * @throws `ERR_JWT_INVALID` when `token` is not a JWT
+     */
+    function decode<T = Payload>(token: string): Decoded<T, Algorithm | (string & {})>;
+  }
+
+  /**
    *   Use macros as regular imports.
    *   @example
    *   ```
