@@ -77,7 +77,7 @@ JSC_DEFINE_HOST_FUNCTION(constructKeyObject, (JSC::JSGlobalObject * lexicalGloba
     return ERR::INVALID_ARG_TYPE(scope, lexicalGlobalObject, "handle"_s, "object"_s, handleValue);
 }
 
-JSC_DEFINE_HOST_FUNCTION(jsKeyObjectConstructor_from, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+static EncodedJSValue keyObjectFromCryptoKey(JSGlobalObject* lexicalGlobalObject, CallFrame* callFrame, bool warnIfNonExtractable)
 {
     VM& vm = lexicalGlobalObject->vm();
     ThrowScope scope = DECLARE_THROW_SCOPE(vm);
@@ -93,7 +93,7 @@ JSC_DEFINE_HOST_FUNCTION(jsKeyObjectConstructor_from, (JSGlobalObject * lexicalG
 
     WebCore::CryptoKey& wrappedKey = cryptoKey->wrapped();
 
-    if (!wrappedKey.extractable()) {
+    if (warnIfNonExtractable && !wrappedKey.extractable()) {
         // DEP0204: KeyObject.from() with a non-extractable CryptoKey still works but is
         // deprecated. Warned at most once per realm, like Node.
         if (!globalObject->hasWarnedNonExtractableCryptoKeyDeprecation) {
@@ -138,6 +138,18 @@ JSC_DEFINE_HOST_FUNCTION(jsKeyObjectConstructor_from, (JSGlobalObject * lexicalG
 
     // Should not be reached
     RELEASE_AND_RETURN(scope, JSValue::encode(jsUndefined()));
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsKeyObjectConstructor_from, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    return keyObjectFromCryptoKey(lexicalGlobalObject, callFrame, true);
+}
+
+// For Bun APIs that accept a CryptoKey and keep the KeyObject to themselves. DEP0204 is about
+// `KeyObject.from()` handing the key material of a non-extractable key to user code.
+JSC_DEFINE_HOST_FUNCTION(jsKeyObjectFromCryptoKeyInternal, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    return keyObjectFromCryptoKey(lexicalGlobalObject, callFrame, false);
 }
 
 } // namespace Bun
