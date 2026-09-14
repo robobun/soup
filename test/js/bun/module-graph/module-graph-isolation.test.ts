@@ -3882,6 +3882,7 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
         "JSON5",
         "JSONC",
         "JSONL",
+        "JWT",
         "MD4",
         "MD5",
         "SHA1",

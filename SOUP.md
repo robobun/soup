@@ -1666,6 +1666,113 @@ Files: `src/http/socks5.rs` (new), `src/http/lib.rs`, `src/http/HTTPThread.rs`, 
 `docs/runtime/networking/fetch.mdx`, `test/js/bun/http/proxy.test.ts` (43 tests against an in-process
 SOCKS5 server), `test/js/bun/http/proxy-stress-errors.test.ts`, `test/integration/bun-types/fixture/fetch.ts`.
 
+### 2026-09-14: `Bun.JWT`
+
+Bun has the pieces of an authenticated HTTP service built in (`Bun.serve`, `Bun.password`,
+`Bun.CSRF`, `Bun.Cookie`, `Bun.secrets`, the SQL and Redis clients), and then every one of those
+services installs `jsonwebtoken` or `jose` to issue and check its tokens. oven-sh/bun#27727 asks for
+the missing piece. `Bun.JWT` is three synchronous functions next to `Bun.CSRF`: `sign`, `verify` and
+`decode`, for JWTs in the JWS compact form with every signature algorithm in common use (`HS256/384/512`,
+`RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `EdDSA`, plus RFC 9864's name `Ed25519`).
+
+```ts
+const token = Bun.JWT.sign({ sub: "user_123" }, secret, { expiresIn: "2h" });
+const { sub } = Bun.JWT.verify(token, secret);
+
+// Asymmetric: the algorithm follows from the key (here ES256, RS256 or EdDSA).
+const privateKey = await Bun.file("private.pem").text();
+const signed = Bun.JWT.sign({ sub: "user_123" }, privateKey, {
+  issuer: "https://auth.example.com",
+  audience: "api",
+  keyId: "2026-01",
+});
+try {
+  Bun.JWT.verify(signed, publicKey, {
+    issuer: "https://auth.example.com",
+    audience: "api",
+    maxAge: "1h",
+  });
+} catch (error) {
+  error.code; // "ERR_JWT_EXPIRED", "ERR_JWT_CLAIM_VALIDATION_FAILED", ...
+}
+
+// A JWKS: read the unverified header to pick the key, then verify with it.
+const { kid } = Bun.JWT.decode(signed).header;
+const key = jwks.keys.find(key => key.kid === kid);
+Bun.JWT.verify(signed, key);
+```
+
+A key can be a secret (string or bytes), a PEM string or the bytes of a PEM file (PKCS#8, PKCS#1,
+SEC1, SPKI, X.509 certificates), a `KeyObject`, a `CryptoKey` (non-extractable ones included) or a
+JSON Web Key object as served by a JWKS endpoint. The option names are `jsonwebtoken`'s where it has
+them (`expiresIn`, `notBefore`, `issuer`, `audience`, `subject`, `algorithms`, `clockTolerance`,
+`maxAge`, `ignoreExpiration`, `complete`, ...) so that switching is mostly a find and replace, with
+`jose`'s `requiredClaims` and `currentDate` added. The ones that differ (`jwtid`, `keyid`,
+`clockTimestamp`) are errors that name the option that was meant, as is any other unknown name.
+Failures are `JWTError`s with a `code` from `ErrorCode.ts`, and `expiredAt`, `date` or `claim` where
+that helps.
+
+The part that needed thought is what a verifier must never do, because the header that names the
+algorithm is written by whoever made the token:
+
+- The kind of key decides which algorithms are acceptable, not the token. A secret verifies `HS*` only,
+  an RSA key `RS*`/`PS*`, an EC key the one `ES*` of its curve, an Ed25519 key `EdDSA`. A `CryptoKey`,
+  or a JWK with an `alg`, verifies exactly the algorithm it names. `algorithms` can narrow that, never
+  widen it.
+- A string or buffer with a `-----BEGIN` header anywhere in it is parsed as PEM or refused. It is never
+  an HMAC secret, which closes the classic confusion attack (an `HS256` token signed with the text of
+  the RSA public key) for every way of passing the key. A secret `KeyObject` is the explicit way out.
+- `none` does not exist, a `crit` header is refused (RFC 7515 4.1.11), five-part tokens are reported
+  as unsupported JWE, and segments must be valid UTF-8 JSON objects in canonical, unpadded base64url.
+  Canonical means the unused bits of the last character are zero: otherwise one signed token has up to
+  16 spellings that all verify, enough to walk past a deny list keyed on the token string.
+- RSA keys under 2048 bits are refused for signing and verifying (RFC 7518 3.3), an empty secret is
+  refused however it is passed, ECDSA signatures must have the exact P1363 length, HMACs are compared
+  in constant time.
+- A JWK's `use`, `alg` and `key_ops` are respected. JWKs are plain objects, so the cache remembers the
+  members an entry was made from: one that is rotated or restricted in place (`Object.assign(jwk, next)`,
+  `jwk.alg = "RS256"`) does not keep verifying as what it used to be.
+- The signature is checked before the payload is parsed. Options are the object's own properties, read
+  exactly once onto an object without a prototype: an accessor cannot show validation one value and use
+  another, and a polluted `Object.prototype` (`ignoreExpiration = true`) cannot switch a check off. A
+  name that is not an option throws instead of being a check that is silently not made (`{ jwtid }`,
+  `{ audiance }`, a singular `algorithm`). `requiredClaims` looks at own properties, so
+  `["constructor"]` is not satisfied by every object.
+- Error messages never contain the key: the generic `ERR_INVALID_ARG_VALUE` would have printed it.
+- A duration string needs a unit. `jsonwebtoken` reads `"60"` as milliseconds and `60` as seconds;
+  here `"60"` is an error, and so is anything that overflows to `Infinity` (JSON would write
+  `"exp": null`).
+- `sign` takes a plain object. A `Map`, a `Date`, a class instance with hidden fields or a promise
+  that was not awaited would otherwise be signed as `{}` or as whatever it happens to contain.
+
+About half of that list comes out of a review pass that attacked the first version (algorithm confusion
+through every key form, signature malleability, the key caches, mutation testing of the test file). The
+signature and algorithm rules held; the empty `oct` secret, the identity-keyed JWK cache, `key_ops`, the
+non-canonical base64url, the ignored option names, the inherited `requiredClaims` and options, and the
+overflowing durations were found there, and each now has a test that fails without its fix.
+
+It is a builtin TypeScript module (`internal/jwt`, loaded the first time `Bun.JWT` is touched) over
+native primitives: `Bun.CryptoHasher` for HMAC, the `node:crypto` binding's one-shot `sign`/`verify`
+and key parsers for the rest, taken from the binding directly so that neither loading nor patching
+`node:crypto` matters, and only built when the first asymmetric key shows up. Parsed PEM strings, JWKs, `KeyObject`s and `CryptoKey`s are cached (a `WeakMap`,
+and a 16-entry map for strings), since parsing a key costs about what verifying with it does. One C++
+change: `KeyObject.from()` warns (DEP0204) for non-extractable `CryptoKey`s and passing a `CryptoKey`
+to `crypto.sign` warns too (DEP0203), so the body of `KeyObject.from()` moved into a helper and the
+binding gained an internal entry without the warning. The `KeyObject` is used inside the module and
+never returned (code that patches `KeyObject.prototype` can still see it, as it can call `KeyObject.from()`).
+
+Checked against the examples of RFC 7515 (A.1 to A.4) and RFC 8037 (A.4), and both ways against
+`jsonwebtoken` for the seven algorithms it shares. Not done: JWE, an async key resolver (JWKS
+fetching and caching is a `fetch` and a `find`), `ES256K` and `Ed448` (BoringSSL has neither), and a
+native fast path. I did not benchmark it and make no speed claim. If it turns out to matter, the HS256
+path is small enough to move to Rust without changing the API.
+
+Files: `src/js/internal/jwt.ts` (new), `src/jsc/bindings/BunObject.cpp`, `src/jsc/bindings/ErrorCode.ts`
+(seven `ERR_JWT_*` codes), `src/jsc/bindings/node/crypto/JSKeyObjectConstructor.cpp`, `.h`,
+`src/jsc/bindings/node/crypto/node_crypto_binding.cpp`, `packages/bun-types/bun.d.ts`,
+`docs/runtime/jwt.mdx` (new), `docs/runtime/bun-apis.mdx`, `docs/docs.json`,
+`test/js/bun/jwt/jwt.test.ts` (new), `test/integration/bun-types/fixture/jwt.ts` (new).
+
 ## Dropped
 
 Nothing yet.
