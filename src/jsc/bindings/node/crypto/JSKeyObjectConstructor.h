@@ -8,6 +8,7 @@ namespace Bun {
 
 JSC_DECLARE_HOST_FUNCTION(callKeyObject);
 JSC_DECLARE_HOST_FUNCTION(constructKeyObject);
+JSC_DECLARE_HOST_FUNCTION(jsKeyObjectFromCryptoKeyInternal);
 
 class JSKeyObjectConstructor final : public JSC::InternalFunction {
 public:

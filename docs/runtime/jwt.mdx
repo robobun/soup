@@ -1,0 +1,234 @@
+---
+title: JSON Web Tokens
+description: Sign, verify and decode JWTs with Bun's built-in API
+---
+
+`Bun.JWT` signs, verifies and decodes [JSON Web Tokens](https://datatracker.ietf.org/doc/html/rfc7519). It is synchronous, needs no dependencies, and uses Bun's native HMAC, RSA, ECDSA and Ed25519 implementations.
+
+```ts title="jwt.ts" icon="/icons/typescript.svg"
+const secret = process.env.JWT_SECRET!;
+
+const token = Bun.JWT.sign({ sub: "user_123", role: "admin" }, secret, { expiresIn: "2h" });
+// "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyXzEyMyIsInJvbGUiOiJhZG1pbiIsImlhdCI6..."
+
+const payload = Bun.JWT.verify(token, secret);
+// { sub: "user_123", role: "admin", iat: 1767225600, exp: 1767232800 }
+```
+
+`verify()` throws when the token is malformed, its signature does not match, or a claim such as `exp` does not hold. Each error has a `code` that says which.
+
+---
+
+## Algorithms
+
+| Algorithm                 | Signature                           | Key                              |
+| ------------------------- | ----------------------------------- | -------------------------------- |
+| `HS256`, `HS384`, `HS512` | HMAC with SHA-256, SHA-384, SHA-512 | A shared secret                  |
+| `RS256`, `RS384`, `RS512` | RSASSA-PKCS1-v1_5                   | An RSA key of at least 2048 bits |
+| `PS256`, `PS384`, `PS512` | RSASSA-PSS                          | An RSA key of at least 2048 bits |
+| `ES256`, `ES384`, `ES512` | ECDSA                               | An EC key on P-256, P-384, P-521 |
+| `EdDSA` (alias `Ed25519`) | Ed25519                             | An Ed25519 key                   |
+
+Unsigned tokens (`"alg": "none"`) and encrypted tokens (JWE) are not supported.
+
+## Keys
+
+Every function takes the key as its second argument, in any of these forms:
+
+- **A shared secret** for the `HS*` algorithms: a `string` (used as UTF-8) or bytes (`Buffer`, `Uint8Array`, `ArrayBuffer`, ...).
+- **A PEM string**, or the bytes of a PEM file: PKCS#8, PKCS#1 and SEC1 private keys, SPKI and PKCS#1 public keys, and X.509 certificates. Anything that contains a `-----BEGIN` header is read as PEM and is never used as a shared secret.
+- **A [`KeyObject`](https://nodejs.org/api/crypto.html#class-keyobject)** from `node:crypto`.
+- **A [`CryptoKey`](https://developer.mozilla.org/en-US/docs/Web/API/CryptoKey)** from `crypto.subtle`. It can only be used with the algorithm it was created for, and needs the `sign` or `verify` usage. It does not have to be extractable.
+- **A JSON Web Key** object such as `{ kty: "EC", crv: "P-256", x: "...", y: "..." }`, which is what a JWKS endpoint serves. What the key says about its use is respected: an `alg` member restricts the key to that algorithm, a `use` member has to be `"sig"`, and a `key_ops` member has to include `"sign"` to sign and `"verify"` to verify.
+
+`sign()` needs a secret or a private key. `verify()` takes a secret, a public key, or a private key (which contains the public one). A secret cannot be empty, whichever way it is passed.
+
+```ts title="keys.ts" icon="/icons/typescript.svg"
+import { generateKeyPairSync } from "node:crypto";
+
+// PEM files
+const token = Bun.JWT.sign({ sub: "user_123" }, await Bun.file("private.pem").text());
+Bun.JWT.verify(token, await Bun.file("public.pem").text());
+
+// KeyObject
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+Bun.JWT.verify(Bun.JWT.sign({ sub: "user_123" }, privateKey), publicKey);
+
+// CryptoKey
+const key = await crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+Bun.JWT.verify(Bun.JWT.sign({ sub: "user_123" }, key), key);
+```
+
+PEM strings, `KeyObject`s, `CryptoKey`s and JSON Web Keys are parsed once and remembered, so passing the same key on every request costs nothing extra. A JSON Web Key is an object that can change: when one of its members does, the key is parsed again, so a key that is replaced or restricted in place never keeps verifying as what it used to be.
+
+---
+
+## `Bun.JWT.sign()`
+
+Sign a payload and return the token.
+
+```ts title="sign.ts" icon="/icons/typescript.svg"
+const token = Bun.JWT.sign({ sub: "user_123" }, secret, {
+  expiresIn: "15m",
+  issuer: "https://auth.example.com",
+  audience: "api",
+});
+```
+
+**Parameters:**
+
+- `payload` (object, required): the claims, as a plain object. A `Map`, a `Date`, a class instance or a promise that was not awaited is an error. `iat` (issued at) is set to the current time unless the payload already has one. The object is not modified.
+- `key` (required): a shared secret or a private key, see [Keys](#keys).
+- `options` (object, optional):
+
+| Option        | Type                 | Description                                                                                                                                                                                                                          |
+| ------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `algorithm`   | `string`             | The signature algorithm. By default it follows from the key: `HS256` for a secret, `RS256` for an RSA key, `ES256`/`ES384`/`ES512` for an EC key depending on its curve, `EdDSA` for an Ed25519 key, or the algorithm the key names. |
+| `expiresIn`   | `number \| string`   | Sets `exp` this long after `iat`. A number is in seconds. A string needs a unit: `"30s"`, `"15m"`, `"2h"`, `"7d"`, `"1 week"`, `"1y"`.                                                                                               |
+| `notBefore`   | `number \| string`   | Sets `nbf` this long after `iat`. Same format as `expiresIn`.                                                                                                                                                                        |
+| `issuer`      | `string`             | Sets the `iss` claim.                                                                                                                                                                                                                |
+| `subject`     | `string`             | Sets the `sub` claim.                                                                                                                                                                                                                |
+| `audience`    | `string \| string[]` | Sets the `aud` claim.                                                                                                                                                                                                                |
+| `jwtId`       | `string`             | Sets the `jti` claim.                                                                                                                                                                                                                |
+| `keyId`       | `string`             | Sets the `kid` header parameter, which tells the verifier which key to use.                                                                                                                                                          |
+| `noTimestamp` | `boolean`            | Do not add `iat`.                                                                                                                                                                                                                    |
+| `header`      | `object`             | Extra header parameters, merged over `{ alg, typ: "JWT" }`.                                                                                                                                                                          |
+
+An option that sets a claim throws if the payload already has that claim, so nothing is overwritten silently. A duration string without a unit (`"60"`) is rejected because libraries disagree on whether it means seconds or milliseconds. A name that is not in this table is an error too, it is not ignored: `jsonwebtoken`'s `keyid` and `jwtid` are `keyId` and `jwtId` here.
+
+**Returns:** `string`
+
+---
+
+## `Bun.JWT.verify()`
+
+Check the signature and the claims of a token and return its payload.
+
+```ts title="verify.ts" icon="/icons/typescript.svg"
+try {
+  const payload = Bun.JWT.verify(token, publicKey, {
+    algorithms: ["ES256"],
+    issuer: "https://auth.example.com",
+    audience: "api",
+  });
+  console.log(payload.sub);
+} catch (error) {
+  if (error.code === "ERR_JWT_EXPIRED") {
+    console.log("expired at", error.expiredAt);
+  }
+}
+```
+
+**Parameters:**
+
+- `token` (string, required)
+- `key` (required): the shared secret, or the public key of the issuer, see [Keys](#keys).
+- `options` (object, optional):
+
+| Option             | Type                 | Description                                                                                                                                                                             |
+| ------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `algorithms`       | `string[]`           | The algorithms to accept. By default, the ones the key can be used with (see below).                                                                                                    |
+| `issuer`           | `string \| string[]` | `iss` has to be this value, or one of these values.                                                                                                                                     |
+| `subject`          | `string`             | `sub` has to be this value.                                                                                                                                                             |
+| `audience`         | `string \| string[]` | `aud` has to be, or contain, this value or one of these values.                                                                                                                         |
+| `jwtId`            | `string`             | `jti` has to be this value.                                                                                                                                                             |
+| `requiredClaims`   | `string[]`           | Claims that have to be present, for example `["exp", "sub"]`.                                                                                                                           |
+| `maxAge`           | `number \| string`   | Reject tokens whose `iat` is further in the past than this, tokens whose `iat` is in the future by more than `clockTolerance`, and tokens without an `iat`. Same format as `expiresIn`. |
+| `clockTolerance`   | `number \| string`   | How much the clocks of the issuer and the verifier may differ when checking `exp`, `nbf` and `maxAge`. Defaults to `0`.                                                                 |
+| `currentDate`      | `Date`               | The time to check against. Defaults to now.                                                                                                                                             |
+| `ignoreExpiration` | `boolean`            | Accept a token whose `exp` has passed.                                                                                                                                                  |
+| `ignoreNotBefore`  | `boolean`            | Accept a token whose `nbf` is in the future.                                                                                                                                            |
+| `complete`         | `boolean`            | Return `{ header, payload, signature }` instead of the payload.                                                                                                                         |
+
+`exp` and `nbf` are always checked when the token has them. A token without `exp` never expires: add `requiredClaims: ["exp"]` or `maxAge` if that is not what you want.
+
+Only the own properties of the options object are read, so neither a polluted `Object.prototype` nor an inherited default can switch a check off. A name that is not in this table throws `ERR_INVALID_ARG_VALUE`. A check that is misspelt would otherwise be a check that is silently not made: `{ jwtid: id }` (the spelling of `jsonwebtoken`), `{ audiance: "api" }` or `{ algorithm: "ES256" }` do not pass every token, they are errors that name the option that was meant.
+
+**Returns:** the payload, or `{ header, payload, signature }` with `complete: true`.
+
+### Which algorithms a key accepts
+
+The token's header says which algorithm it was signed with, and that header is written by whoever made the token. `verify()` therefore never lets the header pick how the key is used:
+
+- A shared secret only verifies `HS256`, `HS384` and `HS512`.
+- An RSA key only verifies `RS*` and `PS*`, an EC key only the one `ES*` algorithm of its curve, an Ed25519 key only `EdDSA`.
+- A `CryptoKey`, or a JSON Web Key with an `alg`, only verifies the algorithm it names.
+- A PEM key is never used as an HMAC secret, so a token cannot claim `HS256` and be checked against the text of a public key.
+- `"alg": "none"` is always rejected.
+
+`algorithms` narrows this further. Set it when you know what the issuer uses.
+
+### Errors
+
+| `error.code`                            | Meaning                                                                                                                    |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `ERR_JWT_INVALID`                       | Not a JWT: wrong number of parts, base64url that is invalid or not canonical, invalid JSON, a `crit` header, or a JWE.     |
+| `ERR_JWT_ALGORITHM_NOT_ALLOWED`         | Signed with an algorithm that is not in `algorithms`, does not fit the key, or is not supported.                           |
+| `ERR_JWT_SIGNATURE_VERIFICATION_FAILED` | The signature does not match.                                                                                              |
+| `ERR_JWT_EXPIRED`                       | `exp` has passed, or `iat` is older than `maxAge`. `error.expiredAt` is a `Date`.                                          |
+| `ERR_JWT_NOT_ACTIVE`                    | `nbf` is in the future. `error.date` is a `Date`.                                                                          |
+| `ERR_JWT_CLAIM_VALIDATION_FAILED`       | A claim is missing, is not of the right type, or does not match. `error.claim` is its name.                                |
+| `ERR_JWT_INVALID_KEY`                   | A `TypeError`: the key cannot be read, or cannot be used for this (signing with a public key, an RSA key under 2048 bits). |
+
+The errors of the first six rows have `name: "JWTError"`. The signature is checked before the payload is parsed, and no claim is looked at until the signature is known to be good.
+
+Base64url is canonical when the bits of its last character that do not belong to a byte are zero, which is what every encoder writes. A token whose signature is spelt any other way is refused, so a signed token has exactly one spelling and a deny list or a replay cache that is keyed on the token string cannot be sidestepped by respelling it.
+
+---
+
+## `Bun.JWT.decode()`
+
+Parse a token **without verifying it**.
+
+```ts title="decode.ts" icon="/icons/typescript.svg"
+const { header, payload, signature } = Bun.JWT.decode(token);
+// header:    { alg: "ES256", typ: "JWT", kid: "2026-01" }
+// payload:   { sub: "user_123", iat: 1767225600 }
+// signature: "MEUCIQ..." (base64url)
+```
+
+Nothing in the result can be trusted, anyone can write a token that decodes to anything. Use it to inspect a token, or to read the `kid` header and choose the key to verify with:
+
+```ts title="jwks.ts" icon="/icons/typescript.svg"
+const { keys } = await fetch("https://auth.example.com/.well-known/jwks.json").then(res => res.json());
+
+function authenticate(token: string) {
+  const { kid } = Bun.JWT.decode(token).header;
+  const key = keys.find(key => key.kid === kid);
+  if (!key) throw new Error("unknown signing key");
+  return Bun.JWT.verify(token, key, { issuer: "https://auth.example.com", audience: "api" });
+}
+```
+
+---
+
+## Using with `Bun.serve()`
+
+```ts title="server.ts" icon="/icons/typescript.svg"
+const secret = process.env.JWT_SECRET!;
+
+Bun.serve({
+  routes: {
+    "/login": {
+      async POST(req) {
+        const { username, password } = await req.json();
+        const user = await findUser(username);
+        if (!user || !(await Bun.password.verify(password, user.passwordHash))) {
+          return new Response("Invalid credentials", { status: 401 });
+        }
+        const token = Bun.JWT.sign({ sub: user.id }, secret, { expiresIn: "1h" });
+        return Response.json({ token });
+      },
+    },
+    "/me": req => {
+      const token = req.headers.get("authorization")?.replace(/^Bearer /, "");
+      try {
+        const { sub } = Bun.JWT.verify(token ?? "", secret, { algorithms: ["HS256"], requiredClaims: ["sub", "exp"] });
+        return Response.json({ id: sub });
+      } catch {
+        return new Response("Unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+      }
+    },
+  },
+});
+```

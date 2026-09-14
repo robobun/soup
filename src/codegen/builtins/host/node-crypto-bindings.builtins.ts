@@ -25,6 +25,7 @@ export default b.declarations(
       "checkPrimeSync",
       "hkdf",
       "hkdfSync",
+      "keyObjectFromCryptoKey",
       "publicEncrypt",
       "publicDecrypt",
       "privateEncrypt",
