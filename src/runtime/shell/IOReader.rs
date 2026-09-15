@@ -80,6 +80,9 @@ struct State {
     /// Backref so async read callbacks can drive `Yield::run`. See
     /// `IOWriter::interp`.
     interp: Option<bun_ptr::ParentRef<Interpreter>>,
+    /// Set by [`IOReader::end_for_readers`]: the script was killed, and a
+    /// listener that turns to this input later finds it at its end as well.
+    ended: bool,
 }
 
 pub(crate) struct IOReader {
@@ -169,6 +172,7 @@ impl IOReader {
                 self_weak: std::rc::Weak::clone(w),
                 read_guards: Vec::new(),
                 interp: None,
+                ended: false,
             }),
         });
         // NOTE: set the parent backref after Rc allocation so the
@@ -227,6 +231,9 @@ impl IOReader {
     /// Idempotent function to start the reading. The caller's trampoline is on the stack,
     /// so a failure to start is returned as a continuation (see `finish_listeners`).
     pub(crate) fn start(&self) -> Yield {
+        if self.state().ended {
+            return self.end_for_readers();
+        }
         #[cfg(windows)]
         if self.state().reached_eof {
             return self.finish_listeners(None);
@@ -364,6 +371,27 @@ impl IOReader {
         if let Some(idx) = s.readers.iter().position(|r| *r == reader) {
             s.readers.swap_remove(idx);
         }
+    }
+
+    /// The script was killed: every listener sees the end of the input now, as
+    /// if the fd had reached EOF, and finishes the way it does then. So does a
+    /// listener that only [`start`](Self::start)s afterwards. With no listener
+    /// left the read loop stops at its next chunk, so whatever else the fd
+    /// delivers stays unread. The last listener's `Yield` is handed back for
+    /// the caller's trampoline; the others are run here.
+    pub(crate) fn end_for_readers(&self) -> Yield {
+        let _keepalive = self.keepalive();
+        let s = self.state();
+        s.ended = true;
+        let mut readers: Vec<ChildPtr> = core::mem::take(&mut s.readers);
+        let interp = s.interp;
+        let Some(last) = readers.pop() else {
+            return Yield::suspended();
+        };
+        for r in readers {
+            self.run_yield(dispatch_reader_done(r, None, interp));
+        }
+        dispatch_reader_done(last, None, interp)
     }
 
     /// The `BufferedReader.onReadChunk` hook.

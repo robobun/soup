@@ -251,6 +251,8 @@ export default b.declarations(
     evictIsolationSourceProviderCache: changesNothing(b.undefined),
     inherits: asksCellForItsClass,
     internalRequire: b.otherwiseBy(b.compiled("builtins/CommonJS", "internalRequire")),
+    // ZigGlobalObject.cpp isAbortSignal: the same question about one class.
+    isAbortSignal: asksCellForItsClass,
     isHiddenFromRequireCache: asksRegistry(b.union(b.bool, b.undefined)),
     loadEsmIntoCjs: b.otherwiseBy(b.compiled("builtins/CommonJS", "loadEsmIntoCjs")),
     makeAbortError: makesAbortError,

@@ -8,6 +8,7 @@ export const ShellInterpreter = b.class({
   estimatedSize: true,
   internalFields: ["resolve", "reject", "jsobjs"],
   proto: {
+    kill: { args: { signal: b.any }, capability: "js", throws: true, rustName: "kill_from_js" },
     run: { capability: "js", throws: true, rustName: "run_from_js" },
   },
 });
