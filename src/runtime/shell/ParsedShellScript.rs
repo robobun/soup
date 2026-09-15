@@ -9,7 +9,7 @@ use bun_jsc::{
 };
 
 use super::env_map::EnvMap;
-use super::interpreter::ShellArgs;
+use super::interpreter::{ShellArgs, kill_signal_from_js};
 use super::shell_body::shell_cmd_from_js;
 use super::{EnvStr, Interpreter};
 
@@ -20,6 +20,10 @@ pub(crate) struct ParsedShellScript {
     pub(crate) export_env: JsCell<Option<EnvMap>>,
     pub(crate) quiet: Cell<bool>,
     pub(crate) cwd: JsCell<Option<BunString>>,
+    /// `.killSignal()`: what `.kill()`, `.signal()` and `.timeout()` send.
+    pub(crate) kill_signal: Cell<bun_sys::SignalCode>,
+    /// `.kill()` before the script ran: it will finish as killed without running.
+    pub(crate) killed_by: Cell<Option<bun_sys::SignalCode>>,
     /// Read-only after construction (set once before the JS wrapper exists).
     pub(crate) estimated_size_for_gc: usize,
 }
@@ -31,6 +35,8 @@ impl Default for ParsedShellScript {
             export_env: JsCell::new(None),
             quiet: Cell::new(false),
             cwd: JsCell::new(None),
+            kill_signal: Cell::new(bun_sys::SignalCode::DEFAULT),
+            killed_by: Cell::new(None),
             estimated_size_for_gc: 0,
         }
     }
@@ -72,6 +78,30 @@ impl ParsedShellScript {
 
     pub(crate) fn set_quiet(&self, quiet: bool) {
         self.quiet.set(quiet);
+    }
+
+    pub(crate) fn set_kill_signal(
+        &self,
+        cx: &mut JsScope<'_>,
+        signal: JsLocal<'_>,
+    ) -> JsResult<()> {
+        let signal = kill_signal_from_js(signal.to_js(), cx.global())?;
+        self.kill_signal.set(signal);
+        Ok(())
+    }
+
+    /// `ShellPromise.kill()` on a script that has not started.
+    pub(crate) fn kill(&self, cx: &mut JsScope<'_>, signal: JsLocal<'_>) -> JsResult<()> {
+        let signal = signal.to_js();
+        let signal = if signal.is_undefined_or_null() {
+            self.kill_signal.get()
+        } else {
+            kill_signal_from_js(signal, cx.global())?
+        };
+        if self.killed_by.get().is_none() {
+            self.killed_by.set(Some(signal));
+        }
+        Ok(())
     }
 
     pub(crate) fn set_env(&self, cx: &mut JsScope<'_>, env: JsLocal<'_>) -> JsResult<()> {

@@ -202,6 +202,94 @@ declare module "bun" {
        * By default, this is configured to `true`.
        */
       throws(shouldThrow: boolean): this;
+
+      /**
+       * Start the script now, without waiting for it to finish. Otherwise it
+       * starts once it is awaited, or once an output method like `.text()` is called.
+       *
+       * @example
+       * ```ts
+       * const server = $`bun run dev`.nothrow().run();
+       * // ...
+       * server.kill();
+       * await server;
+       * ```
+       */
+      run(): this;
+
+      /**
+       * Stop the script, whatever the signal is. `signal` is sent to every
+       * process the script is running, nothing else is started (the rest of a
+       * `;`, `&&` or `||` list, the other branch of an `if`, ...), and
+       * builtins that are waiting for input see it end.
+       *
+       * The promise settles once those processes have exited, as for any
+       * other exit code: the script's exit code is 128 plus the signal number
+       * (143 for `SIGTERM`), so it rejects with a {@link ShellError} unless
+       * {@link nothrow} was called. `stdout` and `stderr` hold what was
+       * written until then.
+       *
+       * On a script that has not started, nothing will run. On a script that
+       * has finished, nothing happens. Only the first signal decides the exit
+       * code; a later call, with `"SIGKILL"` say, reaches what ignored it.
+       *
+       * Signals go to the processes the shell started, not to their own
+       * children.
+       *
+       * @param signal A signal name or number. Defaults to what {@link killSignal} set, or `"SIGTERM"`.
+       *
+       * @example
+       * ```ts
+       * const ping = $`ping bun.com`.nothrow();
+       * process.on("SIGINT", () => ping.kill());
+       * const { exitCode } = await ping; // 143 after Ctrl+C
+       * ```
+       */
+      kill(signal?: number | NodeJS.Signals): void;
+
+      /**
+       * Set the signal that {@link kill} sends by default, and that
+       * {@link signal} and {@link timeout} send. Defaults to `"SIGTERM"`.
+       *
+       * @example
+       * ```ts
+       * await $`bun run build`.timeout(60_000).killSignal("SIGKILL");
+       * ```
+       */
+      killSignal(signal: number | NodeJS.Signals): this;
+
+      /**
+       * Kill the script when `signal` is aborted, as {@link kill} does. If it
+       * is already aborted, nothing runs.
+       *
+       * The promise does not reject with the signal's `reason`. It settles as
+       * it does after `kill()`, with the output so far and exit code 143.
+       *
+       * @example
+       * ```ts
+       * const controller = new AbortController();
+       * const result = $`bun test`.nothrow().signal(controller.signal);
+       * controller.abort();
+       * (await result).exitCode; // 143
+       * ```
+       */
+      signal(signal: AbortSignal): this;
+
+      /**
+       * Kill the script, as {@link kill} does, if it is still running `ms`
+       * milliseconds after it started.
+       *
+       * @example
+       * ```ts
+       * try {
+       *   await $`curl ${url}`.timeout(5000);
+       * } catch (error) {
+       *   error.exitCode; // 143 when it timed out
+       *   error.stderr; // what curl printed until then
+       * }
+       * ```
+       */
+      timeout(ms: number): this;
     }
 
     /**
