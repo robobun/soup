@@ -600,8 +600,8 @@ impl Expansion {
         // Child is a Script (command substitution). Its captured stdout lives
         // in the duped `ShellExecEnv` it owns; read it before deinit.
         debug_assert!(matches!(interp.node(child).kind(), StateKind::Script));
-        if interp.failed() {
-            // The script failed: the rest of the word is not expanded.
+        if interp.stopping() {
+            // The script failed or was killed: the rest of the word is not expanded.
             {
                 let me = interp.as_expansion_mut(this);
                 me.state = ExpansionState::Done;

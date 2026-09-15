@@ -69,6 +69,9 @@ struct State {
     /// Backref so async read callbacks can drive `Yield::run`. See
     /// `IOWriter::interp`.
     interp: Option<bun_ptr::ParentRef<Interpreter>>,
+    /// Set by [`IOReader::end_for_readers`]: the script was killed, and a
+    /// listener that turns to this input later finds it at its end as well.
+    ended: bool,
 }
 
 pub struct IOReader {
@@ -157,6 +160,7 @@ impl IOReader {
                 self_weak: std::sync::Weak::clone(w),
                 read_guards: Vec::new(),
                 interp: None,
+                ended: false,
             }),
         });
         // NOTE: set the parent backref after Arc allocation so the
@@ -219,6 +223,9 @@ impl IOReader {
 
     /// Idempotent function to start the reading.
     pub(crate) fn start(&self) -> Yield {
+        if self.state().ended {
+            return self.end_for_readers();
+        }
         #[cfg(not(windows))]
         {
             let fd = self.state().fd;
@@ -341,6 +348,27 @@ impl IOReader {
         }
     }
 
+    /// The script was killed: every listener sees the end of the input now, as
+    /// if the fd had reached EOF, and finishes the way it does then. So does a
+    /// listener that only [`start`](Self::start)s afterwards. With no listener
+    /// left the read loop stops at its next chunk, so whatever else the fd
+    /// delivers stays unread. The last listener's `Yield` is handed back for
+    /// the caller's trampoline; the others are run here.
+    pub(crate) fn end_for_readers(&self) -> Yield {
+        let _keepalive = self.keepalive();
+        let s = self.state();
+        s.ended = true;
+        let mut readers: Vec<ChildPtr> = core::mem::take(&mut s.readers);
+        let interp = s.interp;
+        let Some(last) = readers.pop() else {
+            return Yield::suspended();
+        };
+        for r in readers {
+            self.run_yield(dispatch_reader_done(r, None, interp));
+        }
+        dispatch_reader_done(last, None, interp)
+    }
+
     /// The `BufferedReader.onReadChunk` hook.
     fn on_read_chunk_cb(&self, chunk: &[u8], has_more: bun_io::ReadState) -> bool {
         // `dispatch_read_chunk` → `Cat::on_io_reader_chunk` may drop the last
@@ -402,8 +430,10 @@ impl IOReader {
         self.set_reading(false);
         let s = self.state();
         s.raw_err = Some(err.clone());
-        // NOTE: reshaped for borrowck — copy out before dispatching.
-        let readers: Vec<ChildPtr> = s.readers.clone();
+        // The error ends every listener, and none of them unregisters itself:
+        // an entry left behind would name a node that is freed and reused by
+        // the time the next listener (or a kill) walks the list.
+        let readers: Vec<ChildPtr> = core::mem::take(&mut s.readers);
         let interp = s.interp;
         for r in readers {
             // Re-derive a fresh SystemError per callee (see
@@ -421,7 +451,8 @@ impl IOReader {
         let _keepalive = self.keepalive();
         self.set_reading(false);
         let s = self.state();
-        let readers: Vec<ChildPtr> = s.readers.clone();
+        // As in `on_reader_error`: EOF is the last thing a listener hears.
+        let readers: Vec<ChildPtr> = core::mem::take(&mut s.readers);
         let interp = s.interp;
         // `SystemError` isn't `Clone` yet, so we keep the source `sys::Error`
         // (which IS `Clone`) and re-derive a fresh `SystemError` per callee —
