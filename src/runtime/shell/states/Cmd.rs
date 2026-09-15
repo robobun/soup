@@ -235,13 +235,13 @@ impl Cmd {
                 this,
                 <&'static str>::from(&interp.as_cmd(this).state)
             );
-            if interp.failed()
+            if interp.stopping()
                 && !matches!(
                     interp.as_cmd(this).state,
                     CmdState::WaitingWriteErr | CmdState::Done
                 )
             {
-                // The script failed: expand nothing more and do not spawn.
+                // The script failed or was killed: expand nothing more and do not spawn.
                 let me = interp.as_cmd_mut(this);
                 me.exit_code = Some(1);
                 me.state = CmdState::Done;
@@ -891,8 +891,8 @@ impl Cmd {
         Self::deinit(interp, this);
     }
 
-    /// The script failed: stop the subprocess. Its exit finishes the Cmd through `on_exit`.
-    pub(crate) fn kill_subprocess(interp: &Interpreter, this: NodeId) {
+    /// The script failed or was killed: signal the subprocess. Its exit finishes the Cmd through `on_exit`.
+    pub(crate) fn kill_subprocess(interp: &Interpreter, this: NodeId, signal: bun_sys::SignalCode) {
         let Exec::Subproc(sub) = &interp.as_cmd(this).exec else {
             return;
         };
@@ -902,7 +902,46 @@ impl Cmd {
         // SAFETY: `child` was set by `spawn_async` from a
         // `heap::alloc(ShellSubprocess)` and stays valid until `deinit`
         // reclaims the box. Single-threaded.
-        let _ = unsafe { (*sub.child).try_kill(bun_core::SignalCode::SIGKILL as i32) };
+        let _ = unsafe { (*sub.child).try_kill(i32::from(signal.0)) };
+    }
+
+    /// The script was killed after this Cmd's process had exited, while the Cmd
+    /// still waits for its stdout or stderr: see
+    /// [`ShellSubprocess::close_pipes_after_kill`]. A process that exits after
+    /// the kill gets there from `on_process_exit`.
+    pub(crate) fn stop_waiting_for_pipes(interp: &Interpreter, this: NodeId) {
+        // The borrow of the Cmd ends here: the close below comes back to it.
+        let child = {
+            let me = interp.as_cmd(this);
+            let Exec::Subproc(sub) = &me.exec else {
+                return;
+            };
+            if sub.child.is_null() || me.exit_code.is_none() || me.has_finished() {
+                return;
+            }
+            sub.child
+        };
+        // SAFETY: `child` is the live subprocess this Cmd owns until `deinit`,
+        // unborrowed; `kill()` runs from JS, outside any reader callback.
+        unsafe {
+            if (*child).has_exited() {
+                ShellSubprocess::close_pipes_after_kill(child);
+            }
+        }
+    }
+
+    /// The `IOReader` a running builtin has for its stdin, if it is one.
+    pub(crate) fn builtin_stdin(
+        interp: &Interpreter,
+        this: NodeId,
+    ) -> Option<std::sync::Arc<crate::shell::io_reader::IOReader>> {
+        match &interp.as_cmd(this).exec {
+            Exec::Builtin(builtin) => match &builtin.stdin {
+                crate::shell::builtin::BuiltinInput::Fd(reader) => Some(reader.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub(crate) fn deinit(interp: &Interpreter, this: NodeId) {

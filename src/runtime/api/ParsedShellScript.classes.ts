@@ -25,6 +25,14 @@ export default [
         fn: "setQuiet",
         length: 1,
       },
+      setKillSignal: {
+        fn: "setKillSignal",
+        length: 1,
+      },
+      kill: {
+        fn: "kill",
+        length: 1,
+      },
     },
   }),
 ];

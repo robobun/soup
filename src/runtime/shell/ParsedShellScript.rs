@@ -9,7 +9,7 @@ use bun_jsc::{
 };
 
 use super::env_map::EnvMap;
-use super::interpreter::ShellArgs;
+use super::interpreter::{ShellArgs, kill_signal_from_js};
 use super::shell_body::shell_cmd_from_js;
 use super::{EnvStr, Interpreter};
 
@@ -29,6 +29,10 @@ pub(crate) struct ParsedShellScript {
     pub(crate) export_env: JsCell<Option<EnvMap>>,
     pub(crate) quiet: Cell<bool>,
     pub(crate) cwd: JsCell<Option<BunString>>,
+    /// `.killSignal()`: what `.kill()`, `.signal()` and `.timeout()` send.
+    pub(crate) kill_signal: Cell<bun_sys::SignalCode>,
+    /// `.kill()` before the script ran: it will finish as killed without running.
+    pub(crate) killed_by: Cell<Option<bun_sys::SignalCode>>,
     /// Self-wrapper backref. `.classes.ts` has `finalize: true`, so the weak arm is
     /// sound: the codegen finalizer drops this Box (and the `JsRef`) at sweep.
     /// Read-only after construction.
@@ -45,6 +49,8 @@ impl Default for ParsedShellScript {
             export_env: JsCell::new(None),
             quiet: Cell::new(false),
             cwd: JsCell::new(None),
+            kill_signal: Cell::new(bun_sys::SignalCode::DEFAULT),
+            killed_by: Cell::new(None),
             this_jsvalue: JsRef::empty(),
             estimated_size_for_gc: 0,
         }
@@ -119,6 +125,32 @@ impl ParsedShellScript {
     ) -> JsResult<JSValue> {
         let arg = callframe.argument(0);
         self.quiet.set(arg.to_boolean());
+        Ok(JSValue::UNDEFINED)
+    }
+
+    #[bun_jsc::host_fn(method)]
+    pub(crate) fn set_kill_signal(
+        &self,
+        global: &JSGlobalObject,
+        callframe: &CallFrame,
+    ) -> JsResult<JSValue> {
+        let signal = kill_signal_from_js(callframe.argument(0), global)?;
+        self.kill_signal.set(signal);
+        Ok(JSValue::UNDEFINED)
+    }
+
+    /// `ShellPromise.kill()` on a script that has not started.
+    #[bun_jsc::host_fn(method)]
+    pub(crate) fn kill(&self, global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+        let signal = callframe.argument(0);
+        let signal = if signal.is_undefined_or_null() {
+            self.kill_signal.get()
+        } else {
+            kill_signal_from_js(signal, global)?
+        };
+        if self.killed_by.get().is_none() {
+            self.killed_by.set(Some(signal));
+        }
         Ok(JSValue::UNDEFINED)
     }
 

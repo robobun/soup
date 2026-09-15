@@ -305,6 +305,11 @@ pub(crate) struct Interpreter {
 
     pub(crate) flags: Cell<InterpreterFlags>,
     pub(crate) exit_code: Cell<Option<ExitCode>>,
+    /// What [`Interpreter::kill`] sends when JS names no signal (`.killSignal()`).
+    pub(crate) default_kill_signal: Cell<bun_sys::SignalCode>,
+    /// Set by the first [`Interpreter::kill`]: the script winds down and exits
+    /// with 128 + this signal.
+    pub(crate) killed_by: Cell<Option<bun_sys::SignalCode>>,
     pub(crate) this_jsvalue: Cell<crate::jsc::JSValue>,
     pub(crate) cleanup_state: Cell<CleanupState>,
     pub(crate) estimated_size_for_gc: Cell<usize>,
@@ -586,6 +591,8 @@ impl Interpreter {
             // Starts at `None` so `async_cmd_done` only finishes once
             // `on_root_child_done` has recorded the real exit code.
             exit_code: Cell::new(None),
+            default_kill_signal: Cell::new(bun_sys::SignalCode::DEFAULT),
+            killed_by: Cell::new(None),
             this_jsvalue: Cell::new(crate::jsc::JSValue::ZERO),
             cleanup_state: Cell::new(CleanupState::NeedsFullCleanup),
             estimated_size_for_gc: Cell::new(0),
@@ -934,10 +941,10 @@ impl Interpreter {
         }
     }
 
-    /// A sequencing state stops early: Ctrl+C cut the member short, or the script failed.
+    /// A sequencing state stops early: Ctrl+C cut the member short, or the script is winding down.
     pub(crate) fn interrupted(&self, id: NodeId) -> bool {
         self.context_stopped()
-            || self.failed()
+            || self.stopping()
             || self.node(id).base().is_some_and(|b| b.interrupted)
     }
 
@@ -1269,6 +1276,8 @@ impl Interpreter {
         use crate::jsc::JSValue;
         use crate::jsc::generated::JSShellInterpreter;
 
+        // What ran last may have caught the signal, or have been a builtin.
+        let exit_code = self.killed_exit_code().unwrap_or(exit_code);
         log!(
             "Interpreter(0x{:x}) finish {}",
             std::ptr::from_ref(self) as usize,
@@ -1369,6 +1378,94 @@ impl Interpreter {
         self.flags.get().failed()
     }
 
+    /// The script is winding down (`fail` or `kill`): nothing more is expanded,
+    /// spawned or sequenced, and what is in flight finishes on its own.
+    #[inline]
+    pub(crate) fn stopping(&self) -> bool {
+        self.failed() || self.killed_by.get().is_some()
+    }
+
+    /// The exit code of a killed script, as if the shell had died of the signal.
+    pub(crate) fn killed_exit_code(&self) -> Option<ExitCode> {
+        self.killed_by
+            .get()
+            .map(|signal| ExitCode::from(signal.to_exit_code()))
+    }
+
+    /// `ShellPromise.kill()`: send `signal` to every subprocess and stop the
+    /// script. Only the first call decides the exit code; a later one (say
+    /// SIGKILL after a SIGTERM that was ignored) signals what is still running.
+    /// Before `run()` it only marks the script, which then finishes at once.
+    pub(crate) fn kill(&self, signal: bun_sys::SignalCode) {
+        // The promise is already settled, by `finish` or by `fail`.
+        if self.failed() || self.cleanup_state.get() == CleanupState::RuntimeCleaned {
+            return;
+        }
+        log!(
+            "Interpreter(0x{:x}) kill {}",
+            std::ptr::from_ref(self) as usize,
+            signal.0
+        );
+        if self.killed_by.get().is_none() {
+            self.killed_by.set(Some(signal));
+        }
+        if !self.has_pending_activity() {
+            return;
+        }
+        // What the builtins read from: the script's own stdin (a terminal,
+        // say, on which a builtin would wait forever) and the pipes between
+        // pipeline members, which a descendant of a killed member can keep
+        // open. Collected first, because what follows frees nodes.
+        let mut inputs: Vec<std::sync::Arc<crate::shell::io_reader::IOReader>> = Vec::new();
+        if let crate::shell::io::InKind::Fd(stdin) = &self.root_io.get().stdin {
+            inputs.push(stdin.clone());
+        }
+        let node_count = self.nodes.get().len();
+        for i in 0..node_count {
+            let cmd = NodeId(i as u32);
+            if !matches!(self.node(cmd).kind(), StateKind::Cmd) {
+                continue;
+            }
+            Cmd::kill_subprocess(self, cmd, signal);
+            if let Some(stdin) = Cmd::builtin_stdin(self, cmd) {
+                if !inputs.iter().any(|r| std::sync::Arc::ptr_eq(r, &stdin)) {
+                    inputs.push(stdin);
+                }
+            }
+        }
+        // From here on the script can run to its end at any step (`finish`
+        // settles the promise), so every node is looked at afresh. The arena
+        // does not shrink.
+        let mut i = 0;
+        while i < self.nodes.get().len() {
+            let cmd = NodeId(i as u32);
+            i += 1;
+            if matches!(self.node(cmd).kind(), StateKind::Cmd) {
+                Cmd::stop_waiting_for_pipes(self, cmd);
+            }
+        }
+        // To a builtin, its input ends here.
+        for input in inputs {
+            input.end_for_readers().run(self);
+        }
+    }
+
+    /// `ShellInterpreter.prototype.kill(signal?)`.
+    pub(crate) fn kill_from_js(
+        &self,
+        global_this: &crate::jsc::JSGlobalObject,
+        callframe: &crate::jsc::CallFrame,
+    ) -> crate::jsc::JsResult<crate::jsc::JSValue> {
+        let signal = callframe.argument(0);
+        let signal = if signal.is_undefined_or_null() {
+            self.default_kill_signal.get()
+        } else {
+            kill_signal_from_js(signal, global_this)?
+        };
+        self.kill(signal);
+        Ok(crate::jsc::JSValue::UNDEFINED)
+    }
+
     /// Node `id` threw and holds nothing in flight: kill the subprocesses, wind the tree down, then reject (the rejection runs JS, so it comes last).
     pub(crate) fn fail(&self, id: NodeId) -> Yield {
         let rejection = self.take_failure();
@@ -1377,7 +1474,7 @@ impl Interpreter {
             for i in 0..node_count {
                 let cmd = NodeId(i as u32);
                 if matches!(self.node(cmd).kind(), StateKind::Cmd) {
-                    Cmd::kill_subprocess(self, cmd);
+                    Cmd::kill_subprocess(self, cmd, bun_sys::SignalCode::SIGKILL);
                 }
             }
         }
@@ -1455,6 +1552,13 @@ impl Interpreter {
             "Interpreter(0x{:x}) runFromJS",
             std::ptr::from_ref(self) as usize
         );
+
+        // `kill()` came first: nothing runs, and `finish` reports the signal.
+        if self.killed_by.get().is_some() {
+            Self::incr_pending_activity_flag(&self.has_pending_activity);
+            self.finish(0).run(self);
+            return Ok(crate::jsc::JSValue::UNDEFINED);
+        }
 
         if let Err(e) = self.setup_io_before_run() {
             self.deref_root_shell_and_io_if_needed(true);
@@ -1787,6 +1891,21 @@ pub(crate) fn throw_shell_err(
             e.throw_js(global.expect("JS event loop requires a JSGlobalObject"))
         }
     }
+}
+
+/// The signal argument of `.kill()` / `.killSignal()`: a name or a number, as
+/// for `Subprocess.kill()`, except that 0 (which only probes) is refused.
+pub(crate) fn kill_signal_from_js(
+    value: crate::jsc::JSValue,
+    global: &crate::jsc::JSGlobalObject,
+) -> crate::jsc::JsResult<bun_sys::SignalCode> {
+    let signal = bun_sys_jsc::signal_code_jsc::from_js(value, global)?;
+    if signal.0 == 0 {
+        return Err(global.throw_invalid_arguments(format_args!(
+            "Invalid signal: must be a signal name or a number from 1 to 31"
+        )));
+    }
+    Ok(signal)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -3064,6 +3183,8 @@ pub(crate) fn create_shell_interpreter(
     }
 
     let (shargs, jsobjs, quiet, cwd, export_env) = parsed_shell_script.take(global);
+    let kill_signal = parsed_shell_script.kill_signal.get();
+    let killed_by = parsed_shell_script.killed_by.get();
 
     let cwd_slice = cwd.as_ref().map(|c| c.to_utf8());
 
@@ -3094,6 +3215,8 @@ pub(crate) fn create_shell_interpreter(
     let js_value = unsafe {
         let it = &*interpreter;
         it.update_flags(|f| f.set_quiet(quiet));
+        it.default_kill_signal.set(kill_signal);
+        it.killed_by.set(killed_by);
         it.global_this
             .set(std::ptr::from_ref::<crate::jsc::JSGlobalObject>(global).cast_mut());
         it.estimated_size_for_gc
