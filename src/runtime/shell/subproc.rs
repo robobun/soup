@@ -704,8 +704,40 @@ impl ShellSubprocess {
         let cmd = handle.interp.as_cmd_mut(handle.id);
         cmd.base.interrupted |= interrupted;
         let y = cmd.on_exit(code.into());
-        // May free `*this`.
+        let waits_for_pipes = !cmd.has_finished();
+        // May free `*this`, unless the Cmd still waits for its pipes.
         y.run(&handle.interp);
+        if waits_for_pipes && handle.interp.killed_by.get().is_some() {
+            // SAFETY: the Cmd has not finished, so it still owns `*this`; no
+            // borrow of it is live and this is not a reader callback.
+            unsafe { Self::close_pipes_after_kill(this) };
+        }
+    }
+
+    /// The script was killed and the process is gone, but a descendant that the
+    /// signal did not reach can still hold the write end of its stdout or
+    /// stderr. Take what is in the pipes now and stop waiting for the rest, like
+    /// `Subprocess` after a timeout. Closing the last reader finishes the Cmd,
+    /// which frees `*this`.
+    ///
+    /// # Safety
+    /// `this` must be live and unborrowed, outside any reader callback.
+    pub(crate) unsafe fn close_pipes_after_kill(this: *mut Self) {
+        // Cloned up front: `*this` may be gone once the first reader is closed.
+        // SAFETY: caller contract; the borrows end with the clones.
+        let pipes = unsafe { [&(*this).stdout, &(*this).stderr] }.map(|slot| match slot {
+            Readable::Pipe(pipe) => Some(Rc::clone(pipe)),
+            _ => None,
+        });
+        // `pipe` keeps the reader alive across the callbacks both calls can dispatch.
+        for pipe in pipes.into_iter().flatten() {
+            if matches!(pipe.state, PipeReaderState::Pending) {
+                pipe.read(None);
+            }
+            if matches!(pipe.state, PipeReaderState::Pending) {
+                pipe.on_read_result(pipe.reader.close());
+            }
+        }
     }
 }
 

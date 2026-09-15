@@ -124,6 +124,70 @@ await $`something-that-may-fail`; // No exception thrown
 
 ---
 
+## Timeouts and cancellation
+
+`.timeout(ms)` kills a command that is still running after `ms` milliseconds. `.signal(abortSignal)` kills it when an `AbortSignal` is aborted.
+
+```js
+import { $ } from "bun";
+
+try {
+  await $`curl ${url}`.timeout(5000);
+} catch (err) {
+  console.log(err.exitCode); // 143 if it timed out
+  console.log(err.stderr.toString()); // what curl printed until then
+}
+
+const controller = new AbortController();
+const tests = $`bun test`.nothrow().signal(controller.signal);
+controller.abort(); // for example from a "Cancel" button
+const { exitCode } = await tests; // 143
+
+// Both come before the output helpers.
+const head = await $`git rev-parse HEAD`.timeout(1000).text();
+```
+
+`.kill(signal?)` does the same thing directly. A command starts once it is awaited, so keep the promise to have something to call it on, or start the command right away with `.run()`:
+
+```js
+import { $ } from "bun";
+
+const server = $`bun run dev`.nothrow().run();
+// ...
+server.kill();
+await server;
+
+// Wait for Ctrl+C, then wait for the command to stop.
+const ping = $`ping bun.com`.nothrow();
+process.on("SIGINT", () => ping.kill());
+await ping;
+```
+
+All three stop the whole script, not only one command:
+
+- Every process the script is running gets the signal: each member of a pipeline, command substitutions, subshells.
+- Nothing else starts. In `` $`sleep 10; echo done` `` the `echo` does not run, nor does the other side of `&&` and `||` or the other branch of an `if`.
+- Builtins that are waiting for input see it end, whether that is the script's stdin or a pipe from another command, and `yes` stops. A builtin that is in the middle of work on the file system, such as `rm -rf` or `cp -r`, finishes that first.
+
+The promise settles once those processes have exited, the way it does for any other exit code. The exit code is 128 plus the number of the signal, as in other shells: `143` for `SIGTERM`, `137` for `SIGKILL`. So the promise rejects with a `ShellError` unless `.nothrow()` was called, and `stdout` and `stderr` hold everything written up to that point. A command that is killed before it started runs nothing. Killing one that has finished does nothing.
+
+The signal is `SIGTERM` unless `.kill()` is given another one, by name or by number. `.killSignal(signal)` changes it for `.timeout()` and `.signal()`, and a second `.kill()` can follow up on a process that ignored the first one:
+
+```js
+import { $ } from "bun";
+
+await $`bun run build`.timeout(60_000).killSignal("SIGKILL");
+
+const job = $`./ignores-sigterm.sh`.nothrow().run();
+job.kill();
+job.kill("SIGKILL");
+await job; // exit code 143: the first signal decides it
+```
+
+Whatever the signal is, `.kill()` ends the script: it is not a way to send `SIGUSR1` or `SIGSTOP` to a command that should go on running. Signals go to the processes the shell started, not to processes those have started themselves. The promise does not wait for such a process even if it still holds the command's stdout or stderr open. On Windows, `SIGTERM`, `SIGKILL`, `SIGINT` and `SIGQUIT` all terminate the process at once, and other signals cannot be sent.
+
+---
+
 ## Redirection
 
 Redirect a command's _input_ or _output_ with the typical Bash operators:

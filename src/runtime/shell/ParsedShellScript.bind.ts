@@ -8,8 +8,10 @@ export const ParsedShellScript = b.class({
   estimatedSize: true,
   internalFields: ["jsobjs"],
   proto: {
+    kill: { args: { signal: b.any }, capability: "js", throws: true },
     setCwd: { args: { cwd: b.string.loose }, capability: "js", throws: true },
     setEnv: { args: { env: b.any }, capability: "js", throws: true },
+    setKillSignal: { args: { signal: b.any }, capability: "js", throws: true },
     setQuiet: { args: { quiet: b.bool.loose } },
   },
 });
