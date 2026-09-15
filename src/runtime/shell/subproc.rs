@@ -940,8 +940,42 @@ impl ShellSubprocess {
         let cmd = unsafe { handle.cmd_mut() };
         cmd.base.interrupted |= interrupted;
         let y = cmd.on_exit(code.into());
-        // May free `*this`.
+        let waits_for_pipes = !cmd.has_finished();
+        // May free `*this`, unless the Cmd still waits for its pipes.
         y.run(&handle.interp);
+        if waits_for_pipes && handle.interp.killed_by.get().is_some() {
+            // SAFETY: the Cmd has not finished, so it still owns `*this`; no
+            // borrow of it is live and this is not a reader callback.
+            unsafe { Self::close_pipes_after_kill(this) };
+        }
+    }
+
+    /// The script was killed and the process is gone, but a descendant that the
+    /// signal did not reach can still hold the write end of its stdout or
+    /// stderr. Take what is in the pipes now and stop waiting for the rest, like
+    /// `Subprocess` after a timeout. Closing the last reader finishes the Cmd,
+    /// which frees `*this`.
+    ///
+    /// # Safety
+    /// `this` must be live and unborrowed, outside any reader callback.
+    pub(crate) unsafe fn close_pipes_after_kill(this: *mut Self) {
+        // Cloned up front: `*this` may be gone once the first reader is closed.
+        // SAFETY: caller contract; the borrows end with the clones.
+        let pipes = unsafe { [&(*this).stdout, &(*this).stderr] }.map(|slot| match slot {
+            Readable::Pipe(pipe) => Some(Arc::clone(pipe)),
+            _ => None,
+        });
+        for pipe in pipes.into_iter().flatten() {
+            let p = arc_as_mut_ptr(&pipe);
+            // SAFETY: see `arc_as_mut_ptr` — single-threaded shell; `pipe` keeps
+            // the reader alive across the callbacks both calls can dispatch.
+            unsafe {
+                (*p).read_all();
+                if matches!((*p).state, PipeReaderState::Pending) {
+                    (*p).reader.close();
+                }
+            }
+        }
     }
 }
 

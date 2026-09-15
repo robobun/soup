@@ -19,6 +19,10 @@ export default [
         fn: "runFromJS",
         length: 0,
       },
+      kill: {
+        fn: "killFromJS",
+        length: 1,
+      },
     },
   }),
 ];
