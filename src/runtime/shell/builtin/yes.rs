@@ -88,6 +88,9 @@ impl Yes {
     /// Write 4 chunks then bounce to the event loop so we don't hog the main
     /// thread.
     fn write_no_io_loop(interp: &Interpreter, cmd: NodeId) -> Yield {
+        if interp.stopping() {
+            return Self::stop(interp, cmd);
+        }
         // Split-borrow the Cmd so the tiled buffer (in `impl_`) and `stdout`
         // are accessible simultaneously — the buffer is written zero-copy,
         // which matters for `yes` throughput.
@@ -168,8 +171,17 @@ impl Yes {
         if Self::state_mut(interp, cmd).state == State::WaitingWriteErr {
             return Builtin::done(interp, cmd, 1);
         }
+        if interp.stopping() {
+            return Self::stop(interp, cmd);
+        }
         debug_assert!(Builtin::of(interp, cmd).stdout.needs_io().is_some());
         Self::enqueue_chunk(interp, cmd, OutputNeedsIOSafeGuard::OutputNeedsIo)
+    }
+
+    /// The script failed or was killed: `yes` has no end of its own. Between two
+    /// chunks nothing of it is in flight.
+    fn stop(interp: &Interpreter, cmd: NodeId) -> Yield {
+        Builtin::done(interp, cmd, interp.killed_exit_code().unwrap_or(1))
     }
 
     /// Split-borrow `&mut Builtin` into `(&mut stdout, &mut Yes)`; the fields

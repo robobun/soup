@@ -109,6 +109,12 @@ export function createBunShellTemplateFunction(createShellInterpreter_, createPa
     #throws: boolean = true;
     #resolve: (code: number, stdout: Buffer, stderr: Buffer) => void;
     #reject: (error: unknown) => void;
+    // Set while the script runs, so that `kill()` can reach it.
+    #interp: $ZigGeneratedClasses.ShellInterpreter | undefined = undefined;
+    #signal: AbortSignal | undefined = undefined;
+    #timeout: number | undefined = undefined;
+    #timer: Timer | undefined = undefined;
+    #onAbort: (() => void) | undefined = undefined;
 
     constructor(args: $ZigGeneratedClasses.ParsedShellScript, throws: boolean) {
       // Create the error immediately so it captures the stacktrace at the point
@@ -120,6 +126,7 @@ export function createBunShellTemplateFunction(createShellInterpreter_, createPa
 
       super((res, rej) => {
         resolve = (code, stdout, stderr) => {
+          this.#settled();
           const out = new ShellOutput(stdout, stderr, code);
           if (this.#throws && code !== 0) {
             potentialError!.initialize(out, code);
@@ -133,6 +140,7 @@ export function createBunShellTemplateFunction(createShellInterpreter_, createPa
         };
         // Only for a JS error raised by the interpreter itself; exit codes go through `resolve`.
         reject = error => {
+          this.#settled();
           potentialError = undefined;
           rej(error);
         };
@@ -172,14 +180,79 @@ export function createBunShellTemplateFunction(createShellInterpreter_, createPa
 
         // `then()` calls this, so a setup failure must reject, not throw.
         try {
+          const signal = this.#signal;
+          // Aborted already: mark the script killed, so that it finishes without running anything.
+          if (signal?.aborted) this.#args!.kill();
           let interp = createShellInterpreter(this.#resolve, this.#reject, this.#args!);
           this.#args = undefined;
+          this.#interp = interp;
+          if (signal && !signal.aborted) {
+            signal.addEventListener("abort", (this.#onAbort = () => this.#kill()), { once: true });
+          }
+          const timeout = this.#timeout;
+          if (timeout !== undefined) {
+            // The running script keeps the process alive, not the timer.
+            this.#timer = setTimeout(() => this.#kill(), timeout).unref();
+          }
           interp.run();
         } catch (e) {
           this.#args = undefined;
           this.#reject(e);
         }
       }
+    }
+
+    // The promise is settled: nothing is left to kill.
+    #settled() {
+      this.#interp = undefined;
+      const onAbort = this.#onAbort;
+      if (onAbort) {
+        this.#onAbort = undefined;
+        this.#signal!.removeEventListener("abort", onAbort);
+      }
+      this.#signal = undefined;
+      const timer = this.#timer;
+      if (timer !== undefined) {
+        this.#timer = undefined;
+        clearTimeout(timer);
+      }
+    }
+
+    // Not started: it will not run. Running: its processes get the signal. Settled: nothing to do.
+    #kill(signal?: number | NodeJS.Signals) {
+      (this.#args ?? this.#interp)?.kill(signal);
+    }
+
+    kill(signal?: number | NodeJS.Signals): void {
+      this.#kill(signal);
+    }
+
+    killSignal(signal: number | NodeJS.Signals): this {
+      this.#throwIfRunning();
+      this.#args!.setKillSignal(signal);
+      return this;
+    }
+
+    signal(signal: AbortSignal): this {
+      this.#throwIfRunning();
+      if (!$isAbortSignal(signal)) {
+        throw $ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+      }
+      this.#signal = signal;
+      return this;
+    }
+
+    timeout(ms: number): this {
+      this.#throwIfRunning();
+      if (typeof ms !== "number") {
+        throw $ERR_INVALID_ARG_TYPE("ms", "number", ms);
+      }
+      // A timer cannot wait longer than 2 ** 31 - 1 ms.
+      if (!(ms >= 0 && ms <= 2147483647)) {
+        throw $ERR_OUT_OF_RANGE("ms", ">= 0 && <= 2147483647", ms);
+      }
+      this.#timeout = ms;
+      return this;
     }
 
     #quiet(isQuiet: boolean = true): this {
