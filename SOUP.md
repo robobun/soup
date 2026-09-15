@@ -1773,6 +1773,102 @@ Files: `src/js/internal/jwt.ts` (new), `src/jsc/bindings/BunObject.cpp`, `src/js
 `docs/runtime/jwt.mdx` (new), `docs/runtime/bun-apis.mdx`, `docs/docs.json`,
 `test/js/bun/jwt/jwt.test.ts` (new), `test/integration/bun-types/fixture/jwt.ts` (new).
 
+### 2026-09-15: `.kill()`, `.signal()` and `.timeout()` for `$`
+
+A `$` command could not be stopped. `ShellPromise` had no `kill()`, no pid, no `AbortSignal` and no
+timeout, so a dev server, a `ping`, a hung `curl` or a test run started from the shell ran until it
+felt like ending, and the usual advice in oven-sh/bun#11868 (open since June 2024) is to give up the
+template literal and use `Bun.spawn`. oven-sh/bun#18247 asks for the `AbortSignal` form of the same
+thing; tools that run user commands (an agent's shell tool, a task runner, a test harness) need it to
+cancel work. Now there are three ways in, all of which do the same thing:
+
+```ts
+await $`curl ${url}`.timeout(5000); // kill it if it is still running after 5 s
+
+const controller = new AbortController();
+const tests = $`bun test`.nothrow().signal(controller.signal);
+cancelButton.onclick = () => controller.abort();
+(await tests).exitCode; // 143 when cancelled
+
+const server = $`bun run dev`.nothrow().run(); // start now, await later
+server.kill(); // or .kill("SIGKILL"), .kill(9)
+await server;
+
+await $`bun run build`.timeout(60_000).killSignal("SIGKILL");
+```
+
+They stop the script, not one command. Every process it is running gets the signal (each member of a
+pipeline, command substitutions, subshells, the condition of an `if`), nothing else starts (the rest
+of a `;`, `&&` or `||` list, the other branch), builtins that are waiting for input see it end, and
+`yes`, the one builtin with no end of its own, stops. The promise then settles the way it does for any
+other exit code, with 128 plus the signal number (143 for `SIGTERM`, 137 for `SIGKILL`, on Windows
+too): a `ShellError` unless `.nothrow()` was called, and `stdout`/`stderr` hold what was written until
+then, which is what one wants to see of a command that hung. That is `Bun.spawn`'s model (`signal`,
+`timeout`, `killSignal`, `proc.kill()`, none of which reject with an `AbortError`) rather than
+`fetch`'s, and it is what #18247 proposed. The code is forced rather than taken from whatever ran
+last, so a process that catches `SIGTERM` and exits 0, or a pipeline whose last member is a builtin,
+cannot make a cancelled script look like a success. A script killed before it started runs nothing (an
+already aborted signal counts), one that has finished ignores it, and only the first signal decides
+the exit code, so `kill()` and then `kill("SIGKILL")` for whatever ignored the first one still reports 143. The signal argument is parsed by the code behind `Subprocess.kill()`; 0 is refused.
+
+Most of the machinery was there. Upstream recently taught the interpreter to wind a script down after
+a JS error (`Interpreter::fail`: kill the subprocesses, let the tree finish, start nothing new), and
+`kill` is that path with a signal of the caller's choice and a normal settlement at the end. A new
+`stopping()` (failed or killed) replaces `failed()` at the six places that decide whether to go on.
+What was new:
+
+- The exit code is replaced in `finish()`, the one place every ending goes through.
+- Input of builtins. `IOReader::end_for_readers()` hands every listener the EOF callback it would get
+  anyway, so `cat`, `wc`, `head`, `sort` and friends finish through their ordinary end-of-input path
+  instead of each growing a cancel path. `kill` does that for the script's own stdin (a terminal never
+  ends) and for the stdin of every running builtin (a pipe from a killed member can be held open by
+  that member's children). The reader remembers it, so a builtin that only turns to stdin later
+  (`head file -`) finds it ended too.
+- Grandchildren. Signals go to the processes the shell started, and `sh -c "sleep 100; ..."` leaves
+  a `sleep` behind that still holds the stdout pipe, so the promise would only settle when that
+  exits. After a kill, a process that exits (or had exited already) has its pipes read once more and
+  closed instead of waited for, which is what `Subprocess` does after its own `timeout`.
+- Kill-before-run lives on `ParsedShellScript` (where `cwd`, `env` and `quiet` already wait for the
+  interpreter to exist), so JS never has to turn a signal name into a number.
+
+A review pass over the first version (two readers, one on lifetimes, one on the state machine) found
+four holes, all in the two middle points above: a builtin that had read stdin to its end stayed
+registered on the reader, so the kill dispatched EOF to a node that had been freed and reused
+(a panic); a process that had exited before the kill never had its pipes closed; a builtin downstream
+of a pipe held by a grandchild was not ended; and the `head file -` case. Each has a test now, and a
+160-round stress run (32 script shapes, random kill delays, quiet and not, one and two signals) comes
+back clean in the ASAN build with stdin closed and with stdin open. The first hole is older than this
+feature: `on_reader_done_cb` and `on_reader_error` never dropped their listeners, so in soup
+`` $`sort; wc -l` `` with an empty stdin panicked ("not sort or uniq"), and in upstream
+`` $`cat; (cat)` `` does with the builtin `cat` that Windows has by default. EOF and errors now take
+the listener list with them, which fixes both.
+
+`.run()` has existed all along but was not in the types or the docs; it is now, since "start now,
+await later" is how one gets something to call `kill()` on.
+
+Not done: signalling a process group (a grandchild survives, as it does with `child_process`), an
+escalation timer from `SIGTERM` to `SIGKILL`, cancelling a builtin in the middle of file system work
+(`rm -rf`, `cp -r` and `ls -R` finish first) or one that is blocked writing into a pipe nobody reads,
+a `killed` or `signalCode` field on the result (compare `exitCode` with 143), and defaults on `$`
+itself. Three older bugs turned up while testing and were reported rather than fixed here:
+`` $`yes > /dev/null` `` never returns to the event loop, because every write to a file completes
+synchronously and `yes` immediately queues the next one, so no JS runs and nothing can kill it (the
+test for `yes` writes to a pipe for that reason); `` $`ls -R bigdir | true` `` never settles, kill or
+no kill; and the `cat; (cat)` panic above, for upstream to fix on its own schedule.
+
+One repair to an older soup patch: `shell-pipe-read-fault.test.ts` injects faults into the pipes of
+`head -c 64 /dev/zero`, which stopped being a subprocess when `head` became a builtin on 2026-08-26,
+so four of its tests had been failing since. The fixtures now name the system's `head` by path; that
+change is folded into the `head`/`tail` commit.
+
+Files: `src/js/builtins/shell.ts`, `src/runtime/shell/interpreter.rs` (`kill`, `stopping`,
+`killed_exit_code`), `src/runtime/shell/ParsedShellScript.rs`, `src/runtime/shell/subproc.rs`
+(`close_pipes_after_kill`), `src/runtime/shell/IOReader.rs` (`end_for_readers`, listeners dropped at
+EOF), `src/runtime/shell/builtin/yes.rs`, `src/runtime/shell/states/{Cmd,Pipeline,Expansion,CondExpr}.rs`,
+`src/runtime/api/Shell.classes.ts`, `src/runtime/api/ParsedShellScript.classes.ts`,
+`packages/bun-types/shell.d.ts`, `docs/runtime/shell.mdx`, `test/js/bun/shell/kill.test.ts` (new),
+`test/integration/bun-types/fixture/index.ts`.
+
 ## Dropped
 
 Nothing yet.
