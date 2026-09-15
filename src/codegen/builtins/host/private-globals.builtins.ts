@@ -139,6 +139,8 @@ export default b.declarations(
     // `require` hands an ES module to it.
     esmLoadSync: b.otherwiseBy(b.hostCall),
     inherits: asksCellForItsClass,
+    // ZigGlobalObject.cpp isAbortSignal: the same question about one class.
+    isAbortSignal: asksCellForItsClass,
     makeAbortError: makesAbortError,
     makeErrorWithCode: makesErrorWithCode,
     peekPromiseSettledValue: looksAtPromise(
