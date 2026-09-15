@@ -41,6 +41,9 @@ impl Yes {
         let State::Yes(yes) = &mut Builtin::of_mut(interp, cmd).state else {
             return Yield::suspended();
         };
+        if interp.stopping() {
+            return Self::stop(interp, cmd);
+        }
         let (chunk, task) = (yes.chunk.as_slice(), &raw mut yes.task);
         for _ in 0..4 {
             match Builtin::sink(interp, cmd, IoKind::Stdout) {
@@ -56,6 +59,12 @@ impl Yes {
         // SAFETY: boxed, and only the callback can finish the command. No `&mut` spans the call, which can re-enter.
         unsafe { YesTask::enqueue(task) };
         Yield::suspended()
+    }
+
+    /// The script failed or was killed: `yes` has no end of its own. Between two
+    /// chunks nothing of it is in flight.
+    fn stop(interp: &Interpreter, cmd: NodeId) -> Yield {
+        Builtin::done(interp, cmd, interp.killed_exit_code().unwrap_or(1))
     }
 }
 

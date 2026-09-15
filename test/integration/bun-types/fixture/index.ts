@@ -472,3 +472,17 @@ controller.signal.addEventListener("abort", event => {
 controller.signal.removeEventListener("abort", event => {
   expectType(event).is<Event>();
 });
+
+expectType(
+  myShellPromise.timeout(1000).signal(controller.signal).killSignal("SIGKILL").killSignal(9),
+).is<Bun.$.ShellPromise>();
+expectType(myShellPromise.run()).is<Bun.$.ShellPromise>();
+expectType(myShellPromise.kill()).is<void>();
+expectType(myShellPromise.kill("SIGINT")).is<void>();
+expectType(myShellPromise.kill(15)).is<void>();
+// @ts-expect-error
+myShellPromise.kill("SIGNOPE");
+// @ts-expect-error
+myShellPromise.signal(controller);
+// @ts-expect-error
+myShellPromise.timeout("1s");

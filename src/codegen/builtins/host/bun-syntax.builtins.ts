@@ -22,6 +22,7 @@ const privateGlobalFunctions = [
   "evaluateCommonJSModule",
   "evictIsolationSourceProviderCache",
   "internalRequire",
+  "isAbortSignal",
   "isHiddenFromRequireCache",
   "requireCacheCompiledEntry",
   "requireCacheDidDelete",
