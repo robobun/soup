@@ -1861,6 +1861,110 @@ EOF), `src/runtime/shell/builtin/yes.rs`, `src/runtime/shell/states/{Cmd,Pipelin
 `packages/bun-types/shell.d.ts`, `docs/runtime/shell.mdx`, `test/js/bun/shell/kill.test.ts` (new),
 `test/integration/bun-types/fixture/index.ts`.
 
+### 2026-09-16: `/* v8 ignore next */` and friends for `bun test --coverage`
+
+`bun test --coverage` had no way to say "this code is not worth a test". A branch for a platform the
+CI never runs on, a `never` guard, the `process.exit()` in a logger: each one is an uncovered line
+forever, which makes `coverageThreshold = 1.0` unusable and is the reason several people in
+oven-sh/bun#7662 (32 upvotes, open since December 2023) give for staying on Vitest or Jest. Every other
+coverage tool reads comment hints, and the maintainer's answer in the thread was that a first version
+that works by lines would be fine. That is what this is, and it reads the hints that c8, Vitest and
+Node.js already read, so code that moves over keeps working:
+
+```ts
+export function parse(input: string) {
+  /* v8 ignore next 3 */
+  if (typeof input !== "string") {
+    throw new TypeError("input must be a string");
+  }
+  return input.trim();
+}
+
+log(error); /* v8 ignore next */ // after code: this line only
+
+/* v8 ignore start */
+export enum Color {
+  Red, // the function an enum compiles to leaves the report too
+  Green,
+}
+/* v8 ignore stop */
+
+export class Shape {
+  /* v8 ignore next */
+  async debug() {
+    // the whole method, and the functions in it, whether it ran or not
+  }
+}
+
+/* v8 ignore file */
+```
+
+`c8`, `istanbul` and `node:coverage` work in place of `v8`, `/* node:coverage disable */` and
+`enable` are `start` and `stop`, `// v8 ignore next` works as a line comment, and text after the hint
+(a reason, `next: why`, the `-- @preserve` other transpilers need) is fine. The rules are those of
+v8-to-istanbul, which c8 and Vitest's v8 provider are built on: the line of the hint and the next N
+when the comment stands alone, only its own line when it follows code, `start` without `stop` runs to
+the end of the file. One thing differs on purpose. c8 counts an ignored line as covered; here it
+leaves the report (no `DA` record, not in `LF`/`LH`, its functions not in `FNF`), which is what
+istanbul does and keeps `lcov.info` and the text table in agreement.
+
+The one rule that goes beyond lines: a function that starts on an ignored line is ignored as a
+whole, with its body and the functions inside it. Bun's report only knows lines and functions, and it
+already treats a function that never ran as a unit (its whole span is marked uncovered in one go), so
+the function is the natural thing for `ignore next` to take, and it is what everyone who writes
+`/* istanbul ignore next */` above a method expects. Finding the line a function starts on was the
+hard part, and a review pass found two ways the first version got it wrong:
+
+- JSC's range for a method starts at `async`, `get`, `set`, `*` or `[`, none of which has a source
+  mapping of its own, and on an indented line the mapping before them is a filler that repeats the
+  position of the last token of the line above. So `async ignored() {}` resolved to the last line of
+  the previous method, and ignoring one method could quietly drop its neighbour. The start line is
+  now the first mapping at or after the function's first token (the key or the name), and a mapping
+  before it is only the fallback.
+- JSC also lists the module itself as a function, and so is the function Bun wraps a CommonJS module
+  in. Neither has a line of its own, so a hint on line 1 made them "start" on the first statement
+  and took the whole file out of the report. Ranges that span the whole source are never ignored as
+  functions.
+
+A never-called function that is ignored also no longer marks its span as uncovered before it is
+removed, because that span can reach into the method above it for the reason in the first point.
+
+Hints are read from the file on disk when the report is written, not in the parser: comments do not
+survive transpiling, the transpiler cache can skip the parser altogether, and `--parallel` workers
+write their own reports. The one function both the serial runner and the workers report through
+(`for_each_coverage_report`) reads the file, and the coordinator merges reports that already have the
+lines removed. A file without the words `ignore` or `node:coverage` costs two SIMD scans. A source
+with fewer lines than the report (a plugin's output) gets no hints, and neither does anything when
+`coverageIgnoreSourcemaps` is set, since the report then counts lines of transpiled code.
+
+Not done: `ignore if` / `ignore else` and istanbul's "next syntax node" reading of `ignore next` (an
+`if` that spans several lines needs `next N` or `start`/`stop`; both would need the parser), a bunfig
+switch to turn hints off, and telling a hint in a string literal from one in a comment (c8 and Node
+do not either). While testing, the report turned out to misattribute lines around functions that
+never ran (the last line of one is reported as covered, a one-line one entirely, and a never-called
+`async` or getter method marks the last line of the method above it as uncovered). Upstream already
+has open PRs that rework line attribution (oven-sh/bun#41528, oven-sh/bun#38282), so that was left
+alone, and the tests here only assert what does not depend on it.
+
+Two notes on the rebase. Upstream rewrote fetch's proxy handling the day before
+(oven-sh/bun#42692: `ALL_PROXY`, `NO_PROXY` grammar, `proxy: false`, `Bun.FetchSession`), which
+conflicted with the SOCKS5 patch in six files. The resolution keeps upstream's code and adds one
+thing: upstream ignores a `socks5://` value in `ALL_PROXY` because its client cannot speak SOCKS, and
+here it can, so `ALL_PROXY=socks5://127.0.0.1:1080` now works for `fetch` and `bun install` (with a
+test; `socks4://` is still left alone). And upstream now builds with LLVM 23.1.1 and Rust
+nightly-2026-09-15, which is what this stack was built and tested with.
+
+The fork's bun-types workflow will be red with this push, and it is not this stack's doing: since
+2026-09-15 20:36 UTC the registry's `latest` tag of `@types/node` points at 22.20.3, whose typings the
+augmentations in bun-types do not fit, so 10 of the 21 tests in `bun-types.test.ts` fail on a clean
+checkout of upstream main too, with the same diagnostics. It should go green again on its own once
+the tag moves back to the 26.x line, as it did after 2026-09-10.
+
+Files: `src/sourcemap_jsc/CodeCoverage.rs` (`ignore_hints`, `Report::ignore_lines`,
+`original_start_line`, `is_whole_source`), `src/runtime/cli/test_command.rs`
+(`coverage::ignore_hints_for`), `docs/test/code-coverage.mdx`, `docs/test/configuration.mdx`,
+`test/cli/test/coverage.test.ts`.
+
 ## Dropped
 
 Nothing yet.
