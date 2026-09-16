@@ -26,6 +26,7 @@ use bun_sys::{self, Fd, File};
 bun_output::declare_scope!(bun_test, hidden);
 
 mod coverage {
+    pub(super) use bun_sourcemap_jsc::code_coverage::ignore_hints::{self, IgnoreHints};
     pub(super) use bun_sourcemap_jsc::code_coverage::{
         ByteRangeMapping, Fraction, Report as CodeCoverageReport, lcov, text,
     };
@@ -51,6 +52,20 @@ mod coverage {
         opts.ignore_patterns
             .iter()
             .any(|pattern| bun_glob::r#match(pattern, relative_path).matches())
+    }
+
+    /// The `/* v8 ignore next */` hints of the file at `source_url`. They are
+    /// comments, so only the file on disk has them. Without a source map the
+    /// report counts lines of the transpiled code, which hints cannot name.
+    pub(super) fn ignore_hints_for(
+        opts: &bun_options_types::code_coverage_options::CodeCoverageOptions,
+        source_url: &[u8],
+    ) -> Option<IgnoreHints> {
+        if opts.ignore_sourcemap {
+            return None;
+        }
+        let source = bun_sys::File::read_from(bun_sys::Fd::cwd(), source_url).ok()?;
+        bun_core::handle_oom(ignore_hints::scan(&source))
     }
 }
 use coverage::{ByteRangeMapping, CodeCoverageReport, Fraction};
@@ -1556,9 +1571,18 @@ impl CommandLineReporter {
         index_sort::sort_slice_by(&mut byte_ranges, coverage::is_less_than_cmp);
 
         for entry in byte_ranges {
-            if let Some(report) =
-                CodeCoverageReport::generate(vm.global(), entry, opts.ignore_sourcemap)
-            {
+            let hints = coverage::ignore_hints_for(opts, entry.source_url.slice());
+            let ignored_lines = match &hints {
+                Some(coverage::IgnoreHints::File) => continue,
+                Some(coverage::IgnoreHints::Lines(lines)) => Some(lines),
+                None => None,
+            };
+            if let Some(report) = CodeCoverageReport::generate(
+                vm.global(),
+                entry,
+                opts.ignore_sourcemap,
+                ignored_lines,
+            ) {
                 each(report);
             }
         }

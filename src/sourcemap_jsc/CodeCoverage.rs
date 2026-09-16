@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 use bun_ast::Loc;
 use bun_collections::VecExt;
-use bun_collections::bit_set::DynamicBitSet;
+use bun_collections::bit_set::{DynamicBitSet, Range};
 use bun_core::{self, Utf8Bytes};
 use bun_jsc::{JSGlobalObject, JSValue, VM, bun_string_jsc};
 use bun_sourcemap::{
@@ -98,10 +98,90 @@ impl<'a> Report<'a> {
         }
     }
 
+    /// Leave the `ignored` lines out of the report. A function that starts on
+    /// one is left out as a whole, with its lines and the functions in it.
+    ///
+    /// `function_lines` (the line each function starts on, `u32::MAX` when
+    /// that is not known, and its last line) and `stmt_first_lines` are
+    /// indexed in step with `functions` and `stmts`.
+    fn ignore_lines(
+        &mut self,
+        ignored: &Bitset,
+        function_lines: &[(u32, u32)],
+        stmt_first_lines: &[u32],
+    ) -> Result<(), bun_alloc::AllocError> {
+        let line_count = self.line_hits.len();
+        let mut lines = ignored.clone()?;
+        lines.resize(line_count, false)?;
+        let mut ignored_functions: Vec<ByteRange> = Vec::new();
+        for (function, &(first, last)) in self.functions.iter().zip(function_lines) {
+            let range = Range {
+                start: first as usize,
+                end: (last as usize + 1).min(line_count),
+            };
+            if range.start < range.end && ignored.is_set(range.start) {
+                lines.set_range_value(range, true);
+                ignored_functions.push(*function);
+            }
+        }
+
+        let functions = self.functions.clone();
+        Self::remove_ranges(
+            &mut self.functions,
+            &mut self.functions_which_have_executed,
+            |i| {
+                ignored_functions
+                    .iter()
+                    .any(|outer| outer.start <= functions[i].start && functions[i].end <= outer.end)
+            },
+        )?;
+        Self::remove_ranges(&mut self.stmts, &mut self.stmts_which_have_executed, |i| {
+            lines.is_set_allow_out_of_bound(stmt_first_lines[i] as usize, false)
+        })?;
+
+        self.executable_lines
+            .unmanaged
+            .set_exclude(&lines.unmanaged);
+        self.lines_which_have_executed
+            .unmanaged
+            .set_exclude(&lines.unmanaged);
+        let mut iter = lines.iterator::<true, true>();
+        while let Some(line) = iter.next() {
+            self.line_hits[line] = 0;
+        }
+        Ok(())
+    }
+
+    fn remove_ranges(
+        ranges: &mut Vec<ByteRange>,
+        executed: &mut Bitset,
+        remove: impl Fn(usize) -> bool,
+    ) -> Result<(), bun_alloc::AllocError> {
+        let mut kept_executed = Bitset::init_empty(ranges.len())?;
+        let mut kept = 0;
+        for i in 0..ranges.len() {
+            if remove(i) {
+                continue;
+            }
+            if executed.is_set(i) {
+                kept_executed.set(kept);
+            }
+            ranges[kept] = ranges[i];
+            kept += 1;
+        }
+        ranges.truncate(kept);
+        kept_executed.resize(kept, false)?;
+        *executed = kept_executed;
+        Ok(())
+    }
+
+    /// `ignored_lines` are zero-based lines of the original source to leave
+    /// out of the report (see [`ignore_hints`]).
     pub fn generate(
         global_this: &JSGlobalObject,
         byte_range_mapping: &'a ByteRangeMapping,
         ignore_sourcemap_: bool,
+        ignored_lines: Option<&Bitset>,
     ) -> Option<Report<'a>> {
         bun_jsc::mark_binding();
         // Use the raw `*mut VM` accessor instead of narrowing through `&VM` and
@@ -114,6 +194,7 @@ impl<'a> Report<'a> {
         let mut generator = Generator {
             result: &mut result,
             byte_range_mapping,
+            ignored_lines,
         };
 
         // SAFETY: `vm` is the live `*mut VM` owning `global_this`; Generator and the
@@ -561,6 +642,191 @@ pub mod lcov {
     }
 }
 
+/// Comments in a source file that leave code out of its coverage report:
+///
+/// ```js
+/// /* v8 ignore next */         // this line and the next one
+/// /* v8 ignore next 3 */       // this line and the next three
+/// foo(); /* v8 ignore next */  // after code: this line only
+/// /* v8 ignore start */ ... /* v8 ignore stop */
+/// /* v8 ignore file */
+/// ```
+///
+/// `c8`, `istanbul` and `node:coverage` are read in place of `v8`, and
+/// `node:coverage disable` / `enable` as `start` / `stop`. These are the rules
+/// of v8-to-istanbul (c8, Vitest) and of Node's own coverage: hints count
+/// lines, not syntax nodes, and are found in the text of a line, so one
+/// written inside a string literal counts as well.
+pub mod ignore_hints {
+    use super::*;
+    use bun_core::strings;
+
+    pub enum IgnoreHints {
+        /// `ignore file`: the file is left out of the report.
+        File,
+        /// One bit per line of the source, set for the lines to leave out.
+        Lines(Bitset),
+    }
+
+    #[derive(Clone, Copy)]
+    enum Hint {
+        /// The line of the hint and this many after it.
+        Next(u32),
+        Start,
+        Stop,
+        File,
+    }
+
+    pub fn scan(source: &[u8]) -> Result<Option<IgnoreHints>, bun_alloc::AllocError> {
+        // Every hint has one of these words, and most files have neither.
+        let mut offsets: Vec<usize> = Vec::new();
+        for word in [&b"ignore"[..], b"node:coverage"] {
+            let mut from = 0;
+            while let Some(i) = strings::index_of(&source[from..], word) {
+                offsets.push(from + i);
+                from += i + word.len();
+            }
+        }
+        if offsets.is_empty() {
+            return Ok(None);
+        }
+        offsets.sort_unstable();
+
+        // The same line numbers as the ones in the source map.
+        let mut table = LineOffsetTable::generate(source, 0)?;
+        let line_starts = table.items_byte_offset_to_start_of_line().to_vec();
+        table.drop_elements();
+        let line_count = line_starts.len();
+        let mut lines = Bitset::init_empty(line_count)?;
+        let mut ignore = |start: usize, end: usize| {
+            lines.set_range_value(
+                Range {
+                    start,
+                    end: end.min(line_count),
+                },
+                true,
+            );
+        };
+
+        let mut any = false;
+        let mut region_start: Option<usize> = None;
+        let mut previous_line = usize::MAX;
+        for offset in offsets {
+            let line = line_starts
+                .partition_point(|&start| start as usize <= offset)
+                .saturating_sub(1);
+            if line == previous_line {
+                continue;
+            }
+            previous_line = line;
+            let end = line_starts
+                .get(line + 1)
+                .map_or(source.len(), |&next| next as usize);
+            let Some(hint) = parse_line(&source[line_starts[line] as usize..end]) else {
+                continue;
+            };
+            match hint {
+                Hint::File => return Ok(Some(IgnoreHints::File)),
+                Hint::Next(count) => {
+                    ignore(line, line.saturating_add(count as usize).saturating_add(1));
+                    any = true;
+                }
+                Hint::Start => {
+                    region_start.get_or_insert(line);
+                }
+                Hint::Stop => {
+                    if let Some(start) = region_start.take() {
+                        ignore(start, line + 1);
+                        any = true;
+                    }
+                }
+            }
+        }
+        if let Some(start) = region_start {
+            ignore(start, line_count);
+            any = true;
+        }
+        Ok(any.then_some(IgnoreHints::Lines(lines)))
+    }
+
+    /// The hint of a comment that opens and closes on this line, if there is
+    /// one. Every `/*` and `//` is tried, as what comes before it may be a
+    /// string: `fetch("http://host"); /* v8 ignore next */`.
+    fn parse_line(line: &[u8]) -> Option<Hint> {
+        let mut from = 0;
+        while let Some(i) = strings::index_of_char_usize(&line[from..], b'/') {
+            let slash = from + i;
+            from = slash + 1;
+            let comment = match line.get(slash + 1) {
+                Some(b'*') => match strings::index_of(&line[slash + 2..], b"*/") {
+                    Some(close) => &line[slash + 2..slash + 2 + close],
+                    None => continue,
+                },
+                Some(b'/') => &line[slash + 2..],
+                _ => continue,
+            };
+            if let Some(hint) = parse_comment(comment) {
+                return Some(match hint {
+                    Hint::Next(_) if has_word(&line[..slash]) => Hint::Next(0),
+                    hint => hint,
+                });
+            }
+        }
+        None
+    }
+
+    /// `comment` is the text between the delimiters.
+    fn parse_comment(comment: &[u8]) -> Option<Hint> {
+        // `/* istanbul ignore next: the reason */`
+        let is = |word: &[u8], keyword: &[u8]| {
+            word.strip_prefix(keyword)
+                .is_some_and(|rest| !has_word(rest))
+        };
+        let mut words = strings::tokenize_any(comment, b" \t\r\n*");
+        let tool = words.next()?;
+        if !matches!(tool, b"v8" | b"c8" | b"istanbul" | b"node:coverage") {
+            return None;
+        }
+        let verb = words.next()?;
+        if tool == b"node:coverage" && is(verb, b"disable") {
+            return Some(Hint::Start);
+        }
+        if tool == b"node:coverage" && is(verb, b"enable") {
+            return Some(Hint::Stop);
+        }
+        if verb != b"ignore" {
+            return None;
+        }
+        let what = words.next()?;
+        if is(what, b"next") {
+            return Some(Hint::Next(words.next().and_then(parse_count).unwrap_or(1)));
+        }
+        if is(what, b"start") {
+            return Some(Hint::Start);
+        }
+        if is(what, b"stop") {
+            return Some(Hint::Stop);
+        }
+        is(what, b"file").then_some(Hint::File)
+    }
+
+    /// Whether there is code in `text`, as opposed to blanks and punctuation.
+    fn has_word(text: &[u8]) -> bool {
+        text.iter().any(|&c| c.is_ascii_alphanumeric() || c == b'_')
+    }
+
+    fn parse_count(word: &[u8]) -> Option<u32> {
+        if !word.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(word.iter().fold(0u32, |count, &digit| {
+            count
+                .saturating_mul(10)
+                .saturating_add(u32::from(digit - b'0'))
+        }))
+    }
+}
+
 unsafe extern "C" {
     fn CodeCoverage__withBlocksAndFunctions(
         vm: *mut VM,
@@ -574,6 +840,7 @@ unsafe extern "C" {
 struct Generator<'a, 'r> {
     byte_range_mapping: &'a ByteRangeMapping,
     result: &'r mut Option<Report<'a>>,
+    ignored_lines: Option<&'r Bitset>,
 }
 
 impl Generator<'_, '_> {
@@ -605,7 +872,12 @@ impl Generator<'_, '_> {
 
         *this.result = this
             .byte_range_mapping
-            .generate_report_from_blocks(blocks, function_blocks, ignore_sourcemap)
+            .generate_report_from_blocks(
+                blocks,
+                function_blocks,
+                ignore_sourcemap,
+                this.ignored_lines,
+            )
             .ok();
     }
 }
@@ -621,6 +893,7 @@ pub struct BasicBlockRange {
 
 pub struct ByteRangeMapping {
     pub(crate) line_offset_table: line_offset_table::List,
+    pub(crate) source_len: usize,
     pub(crate) source_id: i32,
     pub source_url: Utf8Bytes<'static>,
 }
@@ -684,6 +957,7 @@ impl ByteRangeMapping {
         blocks: &[BasicBlockRange],
         function_blocks: &[BasicBlockRange],
         ignore_sourcemap: bool,
+        ignored_lines: Option<&Bitset>,
     ) -> Result<Report<'_>, bun_alloc::AllocError> {
         let source_url = self.source_url.slice();
         let line_starts = self.line_offset_table.items_byte_offset_to_start_of_line();
@@ -709,10 +983,20 @@ impl ByteRangeMapping {
         let mut stmts: Vec<ByteRange> = Vec::new();
         stmts.reserve_exact(blocks.len());
 
+        // Only filled when there are lines to ignore, for `Report::ignore_lines`.
+        let mut function_lines: Vec<(u32, u32)> = Vec::new();
+        let mut stmt_first_lines: Vec<u32> = Vec::new();
+        // A source with fewer lines than the report is not the one the report
+        // numbers its lines by (a plugin's output, a file edited since it ran).
+        let has_every_line =
+            |lines: &&Bitset, line_count: u32| lines.bit_length() >= line_count as usize;
+        let mut ignored_lines = ignored_lines;
+
         let line_count: u32;
 
         if ignore_sourcemap || parsed_mappings_.is_none() {
             line_count = line_starts.len() as u32;
+            ignored_lines = ignored_lines.filter(|lines| has_every_line(lines, line_count));
             executable_lines = Bitset::init_empty(line_count as usize)?;
             lines_which_have_executed = Bitset::init_empty(line_count as usize)?;
             line_hits = vec![0u32; line_count as usize];
@@ -763,6 +1047,9 @@ impl ByteRangeMapping {
                     }
 
                     stmts.push(ByteRange::of(min, max));
+                    if ignored_lines.is_some() {
+                        stmt_first_lines.push(min_line);
+                    }
                 }
             }
 
@@ -814,9 +1101,18 @@ impl ByteRangeMapping {
                     functions_which_have_executed.set(functions.len());
                 }
                 functions.push(ByteRange::of(min, max));
+                if ignored_lines.is_some() {
+                    let start_line = if self.is_whole_source(min, max) {
+                        u32::MAX
+                    } else {
+                        min_line
+                    };
+                    function_lines.push((start_line, max_line));
+                }
             }
         } else if let Some(parsed_mapping) = parsed_mappings_.as_deref() {
             line_count = (parsed_mapping.input_line_count as u32) + 1;
+            ignored_lines = ignored_lines.filter(|lines| has_every_line(lines, line_count));
             executable_lines = Bitset::init_empty(line_count as usize)?;
             lines_which_have_executed = Bitset::init_empty(line_count as usize)?;
             line_hits = vec![0u32; line_count as usize];
@@ -899,6 +1195,9 @@ impl ByteRangeMapping {
                         stmts_which_have_executed.set(stmts.len());
                     }
                     stmts.push(ByteRange::of(min, max));
+                    if ignored_lines.is_some() {
+                        stmt_first_lines.push(min_line);
+                    }
                 }
             }
 
@@ -972,9 +1271,23 @@ impl ByteRangeMapping {
 
                 let did_fn_execute = function.execution_count > 0 || function.has_executed;
 
+                let mut is_ignored = false;
+                if let Some(ignored) = ignored_lines {
+                    let start_line = if self.is_whole_source(min, max) {
+                        u32::MAX
+                    } else {
+                        Self::original_start_line(parsed_mapping, line_starts, min)
+                            .unwrap_or(u32::MAX)
+                    };
+                    is_ignored = ignored.is_set_allow_out_of_bound(start_line as usize, false);
+                    function_lines.push((start_line, max_line));
+                }
+
                 // only mark the lines as executable if the function has not executed
                 // functions that have executed have non-executable lines in them and thats fine.
-                if !did_fn_execute {
+                // `min_line` can be a line above the function, which an ignored
+                // function must leave as it is.
+                if !did_fn_execute && !is_ignored {
                     let end = max_line.min(line_count);
                     for line in min_line..end {
                         executable_lines.set(line as usize);
@@ -995,7 +1308,7 @@ impl ByteRangeMapping {
         functions_which_have_executed.resize(functions.len(), false)?;
         stmts_which_have_executed.resize(stmts.len(), false)?;
 
-        Ok(Report {
+        let mut report = Report {
             source_url: Cow::Borrowed(source_url),
             functions,
             executable_lines,
@@ -1004,7 +1317,52 @@ impl ByteRangeMapping {
             stmts,
             functions_which_have_executed,
             stmts_which_have_executed,
-        })
+        };
+        if let Some(ignored) = ignored_lines {
+            report.ignore_lines(ignored, &function_lines, &stmt_first_lines)?;
+        }
+        Ok(report)
+    }
+
+    /// JSC lists the module itself (bytes `0..=len - 1`) and the function Bun
+    /// wraps a CommonJS module in (`1..=len - 4`) among the functions of a
+    /// source. Neither starts on a line of its own, so a hint never ignores
+    /// one of them as a function.
+    fn is_whole_source(&self, start: usize, end: usize) -> bool {
+        start <= 1 && end + 4 >= self.source_len
+    }
+
+    /// The line of the original source that the function whose first token is
+    /// at byte `start` of the generated code starts on. `async`, `get`, `set`,
+    /// `*` and `[` have no mapping of their own, and on an indented line the
+    /// mapping before them repeats the position of the last token of the line
+    /// above. So the first mapping at or after `start` is asked first (the
+    /// key or the name), and one before it on the line is the fallback.
+    fn original_start_line(
+        parsed_mapping: &ParsedSourceMap,
+        line_starts: &[u32],
+        start: usize,
+    ) -> Option<u32> {
+        const LONGEST_PREFIX: i32 = "export default async function* ".len() as i32;
+
+        let line = line_starts
+            .partition_point(|&line_start| line_start as usize <= start)
+            .checked_sub(1)?;
+        let start_column = i32::try_from(start - line_starts[line] as usize).ok()?;
+        let line = Ordinal::from_zero_based(i32::try_from(line).ok()?);
+        let mut found: Option<bun_sourcemap::Mapping> = None;
+        for column in start_column..start_column.saturating_add(LONGEST_PREFIX) {
+            let Some(mapping) = parsed_mapping.find_mapping(line, Ordinal::from_zero_based(column))
+            else {
+                continue;
+            };
+            if mapping.generated.columns.zero_based() >= start_column {
+                found = Some(mapping);
+                break;
+            }
+            found.get_or_insert(mapping);
+        }
+        u32::try_from(found?.original.lines.zero_based()).ok()
     }
 
     pub(crate) fn compute(
@@ -1015,6 +1373,7 @@ impl ByteRangeMapping {
         ByteRangeMapping {
             line_offset_table: LineOffsetTable::generate(source_contents, 0)
                 .unwrap_or_else(|_| bun_alloc::out_of_memory()),
+            source_len: source_contents.len(),
             source_id,
             source_url,
         }
@@ -1079,10 +1438,11 @@ extern "C" fn ByteRangeMapping__findExecutedLines(
     if function_blocks.len() > 1 {
         function_blocks = &function_blocks[1..];
     }
-    let report = match this.generate_report_from_blocks(blocks, function_blocks, ignore_sourcemap) {
-        Ok(r) => r,
-        Err(_) => return global_this.throw_out_of_memory_value(),
-    };
+    let report =
+        match this.generate_report_from_blocks(blocks, function_blocks, ignore_sourcemap, None) {
+            Ok(r) => r,
+            Err(_) => return global_this.throw_out_of_memory_value(),
+        };
 
     let thresholds = Fraction::default();
 

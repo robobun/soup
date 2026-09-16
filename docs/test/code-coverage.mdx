@@ -194,6 +194,51 @@ coveragePathIgnorePatterns = [
 ]
 ```
 
+## Ignoring Code with Comments
+
+Some code is not worth a test: a branch for a platform your CI does not run on, a guard that TypeScript already enforces, debug output. A comment leaves such code out of the report. It then counts neither as covered nor as uncovered, so `coverageThreshold` can stay where it is.
+
+```ts title="parse.ts" icon="/icons/typescript.svg"
+export function parse(input: string) {
+  /* v8 ignore next 3 */
+  if (typeof input !== "string") {
+    throw new TypeError("input must be a string");
+  }
+  return input.trim();
+}
+```
+
+| Comment                                            | What it ignores                                              |
+| -------------------------------------------------- | ------------------------------------------------------------ |
+| `/* v8 ignore next */`                             | The next line                                                |
+| `/* v8 ignore next 3 */`                           | The next 3 lines                                             |
+| `code(); /* v8 ignore next */`                     | After code on the same line: that line                       |
+| `/* v8 ignore start */` ... `/* v8 ignore stop */` | Every line from `start` to `stop`, or to the end of the file |
+| `/* v8 ignore file */`                             | The whole file, which is left out of the report              |
+
+A function that starts on an ignored line is ignored as a whole, together with the functions inside it, and no longer counts towards `% Funcs`:
+
+```ts title="shape.ts" icon="/icons/typescript.svg"
+export class Shape {
+  /* v8 ignore next */
+  debug() {
+    // Nothing in here is in the report, whether debug() ran or not.
+    console.log(this);
+  }
+}
+```
+
+Bun reads the same hints as the other tools that report coverage without instrumenting the code:
+
+- `c8`, `istanbul` and `node:coverage` work in place of `v8`.
+- `/* node:coverage disable */` and `/* node:coverage enable */` work like `start` and `stop`.
+- A line comment works too: `// v8 ignore next`.
+- Text after the hint is fine, be it a reason or the `-- @preserve` that keeps the comment alive in other transpilers.
+
+Like c8 and Node.js, Bun counts lines here, not syntax. `/* istanbul ignore next */` in front of an `if` that spans several lines ignores only the first of them, so use `next 3` or `start` and `stop` there. `ignore if` and `ignore else` are not supported.
+
+Bun reads the hints from the text of the source file when it writes the report. A hint inside a string literal therefore counts too, a block comment must close on the line it opens on, and code that a plugin generates cannot carry hints. Hints are not read when `coverageIgnoreSourcemaps` is set.
+
 ## Sourcemaps
 
 Bun transpiles all files by default, generating an internal source map that maps lines of your original source code onto Bun's internal representation. To make coverage reports ignore this source map, set `test.coverageIgnoreSourcemaps` to `true`. You rarely want this outside of advanced use cases.
