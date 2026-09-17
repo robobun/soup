@@ -1,3 +1,4 @@
+use core::cmp::Ordering;
 use core::fmt;
 use std::sync::OnceLock;
 
@@ -6,8 +7,10 @@ use bun_alloc::AllocError;
 use bun_core::ZBox;
 use bun_core::strings;
 use bun_semver::string::Buf as StringBuf;
+use bun_semver::{SlicedString, Version, query};
+use bun_url::PercentEncoding;
 
-use crate::dependency as Dependency;
+use crate::dependency::{self as Dependency, TagExt as _};
 use crate::hosted_git_info;
 use crate::install::{self as Install};
 use crate::resolution::fmt_store_url;
@@ -222,6 +225,133 @@ pub(crate) fn is_safe_resolved_tag(resolved: &[u8]) -> bool {
         && resolved
             .iter()
             .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// `#semver:<range>`: npm, pnpm and yarn resolve such a git dependency to the highest
+/// version tag of the repository that satisfies the range.
+pub(crate) fn is_semver_committish(committish: &[u8]) -> bool {
+    committish.starts_with(b"semver:")
+}
+
+/// The range of a `semver:` committish. Percent-decoded: `semver:%5E1.2.3` is how a
+/// URL spells `^1.2.3`.
+pub(crate) fn semver_range(committish: &[u8]) -> Option<Box<[u8]>> {
+    let range = committish.strip_prefix(b"semver:")?;
+    Some(PercentEncoding::decode_alloc(range).unwrap_or_else(|_| Box::from(range)))
+}
+
+/// The version a tag names, read the way pnpm and pacote read one: `1.2.3` or `v1.2.3`,
+/// optionally with a prerelease or build suffix. `latest`, `v1.2` and `pkg@1.2.3` name none.
+/// `Version::parse` stops quietly at a byte it does not know and reads a number it cannot
+/// hold as 0, so the whole tag is checked here first.
+fn version_of_tag(tag: &[u8]) -> Option<&[u8]> {
+    // node-semver's MAX_SAFE_COMPONENT_LENGTH
+    const MAX_DIGITS: usize = 16;
+
+    let version = tag.strip_prefix(b"v").unwrap_or(tag);
+    let mut rest = version;
+    for component in 0..3 {
+        let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 || digits > MAX_DIGITS {
+            return None;
+        }
+        rest = &rest[digits..];
+        if component < 2 {
+            rest = rest.strip_prefix(b".")?;
+        }
+    }
+    let valid_suffix = match rest {
+        [] => true,
+        [b'-' | b'+', identifiers @ ..] => {
+            !identifiers.is_empty()
+                && identifiers
+                    .iter()
+                    .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'+' | b'.'))
+        }
+        _ => false,
+    };
+    valid_suffix.then_some(version)
+}
+
+/// Whether `range` is something `query::parse` should see. It takes any text (`nightly`
+/// parses to no comparator at all, `vnext` to one that every version satisfies), so what
+/// is not a range by the rule that tells `"pkg": "^1.2.3"` from `"pkg": "nightly"` is
+/// turned away first. `:` is npm's `::path:` attribute separator, which is not supported.
+/// An empty range stands for every release.
+fn is_version_range(range: &[u8]) -> bool {
+    range.is_empty()
+        || (Dependency::Tag::infer(range) == Dependency::Tag::Npm
+            && !strings::contains_char(range, b':'))
+}
+
+/// The commit of the highest version tag that satisfies `range`, out of `git ls-remote
+/// --tags` output: one `<sha>\trefs/tags/<tag>` line per tag, an annotated tag followed
+/// by a `<tag>^{}` line with the commit it points to. Nothing satisfies a range that is
+/// not one.
+pub(crate) fn max_satisfying_tag<'a>(ls_remote: &'a [u8], range: &[u8]) -> Option<&'a [u8]> {
+    let range = strings::trim(range, b" \t");
+    if !is_version_range(range) {
+        return None;
+    }
+    let group = bun_core::handle_oom(query::parse(range, SlicedString::init(range, range)));
+    if group.is_empty() && !range.is_empty() {
+        return None;
+    }
+    let exact = group.get_exact_version();
+
+    struct Best<'a> {
+        version: Version,
+        literal: &'a [u8],
+        tag: &'a [u8],
+        commit: &'a [u8],
+    }
+    let mut best: Option<Best<'a>> = None;
+    for line in strings::split(ls_remote, b"\n") {
+        let Some((commit, name)) = strings::split_once_char(strings::trim(line, b"\r"), b'\t')
+        else {
+            continue;
+        };
+        let Some(tag) = name.strip_prefix(b"refs/tags/") else {
+            continue;
+        };
+        if commit.is_empty() || !commit.iter().all(u8::is_ascii_hexdigit) {
+            continue;
+        }
+        if let Some(annotated) = tag.strip_suffix(b"^{}") {
+            if let Some(best) = &mut best {
+                if best.tag == annotated {
+                    best.commit = commit;
+                }
+            }
+            continue;
+        }
+        let Some(literal) = version_of_tag(tag) else {
+            continue;
+        };
+        let parsed = Version::parse(SlicedString::init(literal, literal));
+        if !parsed.valid {
+            continue;
+        }
+        let version = parsed.version.min();
+        let satisfies = match exact {
+            Some(exact) => version.eql(exact),
+            None => group.satisfies(version, range, literal),
+        };
+        if satisfies
+            && best.as_ref().is_none_or(|best| {
+                version.order(best.version, literal, best.literal) == Ordering::Greater
+            })
+        {
+            best = Some(Best {
+                version,
+                literal,
+                tag,
+                commit,
+            });
+        }
+    }
+
+    best.map(|best| best.commit)
 }
 
 /// Install-tier `Repository` behaviour: parsing, formatting, clone URL forms.

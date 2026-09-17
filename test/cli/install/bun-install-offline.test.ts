@@ -229,6 +229,13 @@ it("--offline reports an uncached tarball-URL / github dependency once, and skip
   expect(r.err).not.toContain("TarballFailedToDownload");
   expect(r.code).not.toBe(0);
 
+  // a `#semver:` range has to ask the repository for its tags first, which --offline cannot do
+  const range = await newProject({ gh: "github:nobody-xyz/nothing#semver:^1.0.0" });
+  const r1 = await install(range, ["--offline"]);
+  expect(r1.err).toContain('error: --offline: the version tags of "gh" cannot be listed');
+  expect(r1.err).not.toContain("git failed");
+  expect(r1.code).not.toBe(0);
+
   const opt = mkdtemp();
   await writeFile(
     join(opt, "bunfig.toml"),
@@ -241,7 +248,11 @@ it("--offline reports an uncached tarball-URL / github dependency once, and skip
     JSON.stringify({
       name: "app",
       version: "1.0.0",
-      optionalDependencies: { dep: `${root_url}/never-fetched-1.0.0.tgz`, gh: "github:nobody-xyz/nothing#deadbeef" },
+      optionalDependencies: {
+        dep: `${root_url}/never-fetched-1.0.0.tgz`,
+        gh: "github:nobody-xyz/nothing#deadbeef",
+        range: "github:nobody-xyz/nothing#semver:^1.0.0",
+      },
     }),
   );
   const r2 = await install(opt, ["--offline"]);
