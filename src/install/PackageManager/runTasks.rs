@@ -16,7 +16,7 @@ use crate::retry_timer;
 use crate::tarball_stream::TarballStream;
 use bun_install::{
     DependencyID, ExtractTarball, INVALID_PACKAGE_ID, NetworkTask, PackageID, PackageManifestError,
-    Repository,
+    Repository, RepositoryExt as _,
 };
 // Import the *module* under the `Task` name so `Task::Id` resolves as a path.
 use super::{
@@ -1571,6 +1571,31 @@ fn run_tasks_erased(
                     }
                     if cb.has_on_package_manifest_error {
                         (cb.on_package_manifest_error)(extract_ctx, name, err, url);
+                    } else if let Some(range) =
+                        crate::repository::semver_range(commit.committish.slice())
+                    {
+                        // Like a tarball that fails to download, this only fails the install
+                        // when a required dependency waits for it.
+                        if matches!(err, crate::Error::NoMatchingVersion) {
+                            add_error_or_warning(
+                                manager.log_mut(),
+                                is_required,
+                                format_args!(
+                                    "no version tag satisfying \"{}\" found for \"{}\" (but repository exists)",
+                                    bun_core::fmt::escape_control_chars(&range),
+                                    bun_core::fmt::for_terminal(bstr::BStr::new(name)),
+                                ),
+                            );
+                        } else {
+                            add_error_or_warning(
+                                manager.log_mut(),
+                                is_required,
+                                format_args!(
+                                    "failed to list the version tags of \"{}\"",
+                                    bun_core::fmt::for_terminal(bstr::BStr::new(name)),
+                                ),
+                            );
+                        }
                     } else {
                         add_error_or_warning(
                             manager.log_mut(),
@@ -1879,6 +1904,28 @@ pub(crate) fn alloc_github_url_for_ref(
         // repo might be empty if dep is https://github.com/... style
         if !repo.is_empty() { "/" } else { "" },
         bstr::BStr::new(committish),
+    )
+    .expect("unreachable");
+    out
+}
+
+/// `repository` as a git remote, for the `git ls-remote` that lists its tags.
+/// `GITHUB_SERVER_URL` names the host, as on an Actions runner of GitHub Enterprise Server.
+pub(crate) fn alloc_github_remote_url(this: &PackageManager, repository: &Repository) -> Vec<u8> {
+    let mut github_server_url: &[u8] = b"https://github.com";
+    if let Some(url) = this.env().get(b"GITHUB_SERVER_URL") {
+        if !url.is_empty() {
+            github_server_url = url;
+        }
+    }
+
+    let mut out = Vec::new();
+    write!(
+        &mut out,
+        "{}/{}/{}.git",
+        bstr::BStr::new(strings::without_trailing_slash(github_server_url)),
+        bstr::BStr::new(this.lockfile.str(&repository.owner)),
+        bstr::BStr::new(this.lockfile.str(&repository.repo)),
     )
     .expect("unreachable");
     out
@@ -2298,8 +2345,17 @@ impl PackageManager {
     }
 
     pub(crate) fn alloc_github_url(&self, repository: &Repository) -> Vec<u8> {
-        let committish = self.lockfile.str(&repository.committish);
+        let mut committish = self.lockfile.str(&repository.committish);
+        // A `semver:` range is not a ref the API knows. Once the dependency is resolved,
+        // `resolved` has the commit.
+        if crate::repository::is_semver_committish(committish) && !repository.resolved.is_empty() {
+            committish = repository.resolved_commit(self.lockfile.buffers.string_bytes.as_slice());
+        }
         alloc_github_url_for_ref(self, repository, committish)
+    }
+    #[inline]
+    pub(crate) fn alloc_github_remote_url(&self, repository: &Repository) -> Vec<u8> {
+        alloc_github_remote_url(self, repository)
     }
 }
 
