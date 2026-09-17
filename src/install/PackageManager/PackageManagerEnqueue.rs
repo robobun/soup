@@ -2233,8 +2233,13 @@ fn bind_row_without_manifest(
                             return Ok(());
                         }
 
-                        let task =
-                            enqueue_git_commit(this, commit_id, clone_id, alias, dep.committish);
+                        let task = enqueue_git_commit(
+                            this,
+                            commit_id,
+                            Task::GitCommitSource::Clone(clone_id),
+                            alias,
+                            dep.committish,
+                        );
                         this.enqueue_git_task(task);
                         return Ok(());
                     }
@@ -2404,8 +2409,67 @@ fn bind_row_without_manifest(
                 return Ok(());
             }
 
-            let github_url =
-                (res.tag == ResolutionTag::Github).then(|| this.alloc_github_url(res.github()));
+            let github_url = match res.tag {
+                ResolutionTag::Github => {
+                    let dep = res.github();
+                    // The tarball API takes a ref, which a `semver:` range is not: a `git ls-remote`
+                    // task finds the commit of the highest version tag in the range first.
+                    // `run_tasks` fills `git_commits` and re-enters here.
+                    let committish = this.lockfile.str(&dep.committish);
+                    Some(if crate::repository::is_semver_committish(committish) {
+                        let remote = this.alloc_github_remote_url(dep);
+                        let commit_id = Task::Id::for_git_commit(&remote, committish);
+                        match this.git_commits.get(&commit_id) {
+                            Some(commit) => run_tasks::alloc_github_url_for_ref(this, dep, commit),
+                            None => {
+                                wait_for_remote_task(this, commit_id, waiter());
+
+                                if dependency.behavior.is_peer() && !install_peer {
+                                    this.peer_dependencies.write_item(id)?;
+                                    return Ok(());
+                                }
+
+                                let is_required = dependency.behavior.is_required();
+                                if this.has_created_network_task(commit_id, is_required) {
+                                    return Ok(());
+                                }
+
+                                if this.options.offline == OfflineMode::Offline {
+                                    if is_required {
+                                        this.mark_network_task_failed(commit_id);
+                                        let alias = this.lockfile.str(&dependency.name);
+                                        this.log_mut().add_error_fmt(
+                                            None,
+                                            bun_ast::Loc::EMPTY,
+                                            format_args!(
+                                                "--offline: the version tags of \"{}\" cannot be listed",
+                                                bun_fmt::for_terminal(bstr::BStr::new(alias))
+                                            ),
+                                        );
+                                    } else {
+                                        // let a later required edge on the same range report it
+                                        let _ = this.network_dedupe_map.remove(&commit_id);
+                                    }
+                                    return Ok(());
+                                }
+
+                                let task = enqueue_git_commit(
+                                    this,
+                                    commit_id,
+                                    Task::GitCommitSource::Remote(stored_string(&remote)),
+                                    dependency.name,
+                                    dep.committish,
+                                );
+                                this.enqueue_git_task(task);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        this.alloc_github_url(dep)
+                    })
+                }
+                _ => None,
+            };
             let task_id = Task::Id::for_tarball(match (&github_url, res.tag) {
                 (Some(url), _) => url,
                 (None, ResolutionTag::LocalTarball) => this.lockfile.str(res.local_tarball()),
@@ -2798,17 +2862,18 @@ fn enqueue_git_clone(
     Task::Task::create(this, task_id, job)
 }
 
-/// `git log`: resolves `committish` in the bare repository of `clone_id`.
+/// `git log`: resolves `committish` in the bare repository of a clone. A `semver:` committish
+/// is resolved from the tags instead, of the remote when there is no clone.
 fn enqueue_git_commit(
     this: &mut PackageManager,
     task_id: Task::Id,
-    clone_id: Task::Id,
+    source: Task::GitCommitSource,
     name: SemverString,
     committish: SemverString,
 ) -> NonNull<Task::Task> {
     let job = Task::Job::GitCommit {
         request: Task::GitCommitRequest {
-            clone_id,
+            source,
             name: stored_string(this.lockfile.str(&name)),
             committish: stored_string(this.lockfile.str(&committish)),
         },

@@ -27,7 +27,10 @@ use crate::install::{ExtractData, ExtractDataJson};
 use crate::package_manager::directories::CacheDirectory;
 use crate::package_manager::{INBOX, THREAD_POOL};
 use crate::package_manager_task::{self as Task, Job};
-use crate::repository::{GitEnv, Repository, RepositoryExt as _, is_safe_resolved_tag};
+use crate::repository::{
+    GitEnv, Repository, RepositoryExt as _, is_safe_resolved_tag, is_semver_committish,
+    max_satisfying_tag, semver_range,
+};
 use crate::{Error, PackageManager};
 
 impl PackageManager {
@@ -80,6 +83,8 @@ enum Step {
     Clone { url: Vec<u8>, replaces: bool },
     /// `git log -1 <committish>` (commit task).
     Log,
+    /// `git ls-remote --tags <repository>` (commit task of a `semver:` committish).
+    Tags,
     /// `git ls-tree -r -z <resolved>` in the bare repository (checkout task). Holds the
     /// `--git-dir=<path>` argument that names that repository.
     ListTree(Vec<u8>),
@@ -1013,7 +1018,24 @@ impl GitSubprocess {
     fn begin_commit(self: &RefPtr<Self>) -> Result<(), Error> {
         let req = self.task().request_git_commit();
         let committish = req.committish.slice().to_vec();
-        let git_dir = self.git_dir_arg(req.clone_id);
+        if is_semver_committish(&committish) {
+            // The tags of the bare clone, or of the remote when there is no clone.
+            let repository = match &req.source {
+                Task::GitCommitSource::Clone(clone_id) => {
+                    let folder_name = bare_repo_folder_name(*clone_id);
+                    bun_paths::Path::resolve(&[&self.cache_dir.path, &folder_name])
+                        .as_bytes()
+                        .to_vec()
+                }
+                Task::GitCommitSource::Remote(url) => url.slice().to_vec(),
+            };
+            self.step.set(Step::Tags);
+            return self.spawn(&[b"ls-remote", b"--tags", b"--", &repository]);
+        }
+        let Task::GitCommitSource::Clone(clone_id) = req.source else {
+            unreachable!("only a `semver:` committish is looked up without a clone");
+        };
+        let git_dir = self.git_dir_arg(clone_id);
         self.step.set(Step::Log);
         if committish.is_empty() || committish == b"HEAD" {
             // Prints the first of the two refs that resolves. The fetched `origin/HEAD` comes first
@@ -1304,7 +1326,12 @@ impl GitSubprocess {
         ) && matches!(status, Status::Exited(exit) if exit.code == 1);
         // `Fetch` and `Clone` report later, because they hold on to git's output until the last URL
         // has failed.
-        if !ok && matches!(step, Step::Log | Step::ListTree(_) | Step::Checkout(_)) {
+        if !ok
+            && matches!(
+                step,
+                Step::Log | Step::Tags | Step::ListTree(_) | Step::Checkout(_)
+            )
+        {
             self.report_failure(status, stderr);
         }
         let name = for_terminal(BStr::new(&self.name));
@@ -1379,6 +1406,21 @@ impl GitSubprocess {
                 let commit = strings::trim(stdout, b" \t\r\n");
                 // With `--ignore-missing`, git prints nothing and exits with 0 if no HEAD resolves.
                 self.finish_commit((ok && !commit.is_empty()).then(|| commit.to_vec()));
+            }
+            Step::Tags => {
+                let task = self.task();
+                let found = ok
+                    .then(|| {
+                        let committish = task.request_git_commit().committish.slice();
+                        let range = semver_range(committish).unwrap_or_default();
+                        max_satisfying_tag(stdout, &range).map(<[u8]>::to_vec)
+                    })
+                    .flatten();
+                if ok && found.is_none() {
+                    // `run_tasks` tells this from tags that could not be listed.
+                    task.err = Some(Error::NoMatchingVersion);
+                }
+                self.finish_commit(found);
             }
             Step::ListTree(git_dir) => {
                 if ok {
