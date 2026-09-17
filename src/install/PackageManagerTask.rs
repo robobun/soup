@@ -576,8 +576,9 @@ pub struct GitCloneRequest {
 }
 
 pub struct GitCommitRequest {
-    /// The clone task whose bare repository is searched.
-    pub(crate) clone_id: Id,
+    /// The clone task whose bare repository is searched. `None` asks the remote at `url`
+    /// instead: a `github:` dependency is downloaded as a tarball and never cloned.
+    pub(crate) clone_id: Option<Id>,
     pub(crate) name: StringOrTinyString,
     pub(crate) url: StringOrTinyString,
     pub(crate) committish: StringOrTinyString,
