@@ -185,14 +185,18 @@ function writeProject(root: string, dependencies: Record<string, string>): strin
   return project;
 }
 
-async function runInstall(cwd: string, cacheDir: string, extraEnv: Record<string, string>, ...args: string[]) {
+function runInstall(cwd: string, cacheDir: string, extraEnv: Record<string, string>, ...args: string[]) {
+  return runBun(cwd, cacheDir, extraEnv, "install", ...args);
+}
+
+async function runBun(cwd: string, cacheDir: string, extraEnv: Record<string, string>, ...args: string[]) {
   const env = { ...gitEnv, ...extraEnv, BUN_INSTALL_CACHE_DIR: cacheDir };
   // Set on ASAN CI lanes; it arms a subreaper around internal git spawns that
   // SIGKILLs concurrent clone tasks (see #33982). This test exercises install
   // task bookkeeping, not orphan reaping.
   delete env.BUN_FEATURE_FLAG_NO_ORPHANS;
   await using proc = Bun.spawn({
-    cmd: [bunExe(), "install", ...args],
+    cmd: [bunExe(), ...args],
     cwd,
     env,
     stdout: "pipe",
@@ -619,6 +623,287 @@ test.concurrent("bun install <git url> sorts the workspace dependency by its res
   };
   expect(Object.keys(lockfile.workspaces[""].dependencies)).toEqual(["hhh-first", "iii-middle", "jjj-last"]);
 });
+
+// `#semver:<range>` (issue #5870): the dependency is the highest version tag of
+// the repository that satisfies the range, as for npm, pnpm and yarn. The
+// fixture is a repo whose tags are these; each one is a commit of its own
+// whose index.js exports the version, which is how a test tells what got
+// installed. `v1.1.1` is an annotated tag, the rest are lightweight.
+const versionTags: Record<string, string> = {
+  "v1.0.0": "1.0.0",
+  "v1.1.0": "1.1.0",
+  "v1.1.1": "1.1.1",
+  "1.2.0": "1.2.0",
+  "v1.3.0-canary.20240315": "1.3.0-canary.20240315",
+  "v1.3.0-canary.20240101": "1.3.0-canary.20240101",
+  "v2.0.0": "2.0.0",
+  // not versions
+  "v9": "9",
+  "v9.0.0+build_1": "9.0.0",
+  "release-9.9.9": "9.9.9",
+  "nightly": "nightly",
+};
+
+function versionFiles(version: string) {
+  return { "package.json": JSON.stringify({ name: "versions", version }), "index.js": indexJs(version) };
+}
+
+// Creates `<root>/scope/versions.git`, where both `git+http://<server>/scope/versions.git`
+// and, with GITHUB_SERVER_URL set to the server, `github:scope/versions` find it.
+// Unlike the shared repo it has a HEAD, so that a clone of it in the cache can be
+// refreshed: a `git fetch` of a repository without one fails.
+async function makeVersionedRepo(root: string): Promise<string> {
+  mkdirSync(join(root, "scope"), { recursive: true });
+  const bare = join(root, "scope", "versions.git");
+  await git(join(root, "scope"), "init", "-q", "--bare", "versions.git");
+  await commitTo(
+    bare,
+    Object.entries(versionTags).map(([tag, version]) => ({
+      ref: tag === "v1.1.1" ? "refs/heads/main" : `refs/tags/${tag}`,
+      message: tag,
+      files: versionFiles(version),
+    })),
+  );
+  await git(bare, "symbolic-ref", "HEAD", "refs/heads/main");
+  await git(bare, "-c", "tag.gpgSign=false", "tag", "-a", "-m", "v1.1.1", "v1.1.1", "refs/heads/main");
+  await git(bare, "update-server-info");
+  return bare;
+}
+
+// tag -> commit SHA, from `info/refs`. An annotated tag has two lines there: the
+// tag object, then `<tag>^{}` with the commit it points to.
+function tagCommits(bare: string): Record<string, string> {
+  const commits: Record<string, string> = {};
+  for (const line of readFileSync(join(bare, "info", "refs"), "utf8").split("\n")) {
+    const [sha, ref] = line.split("\t");
+    if (ref?.startsWith("refs/tags/")) commits[ref.slice("refs/tags/".length).replace(/\^\{\}$/, "")] = sha;
+  }
+  return commits;
+}
+
+test.concurrent(
+  "installs the highest version tag that satisfies a #semver: range",
+  async () => {
+    using dir = tempDir("git-dep-semver", {});
+    const root = String(dir);
+    await using server = serveStatic(root);
+    const bare = await makeVersionedRepo(root);
+    const repoUrl = `git+http://localhost:${server.port}/scope/versions.git`;
+
+    // alias -> range
+    const ranges = {
+      caret: "^1.0.0",
+      tilde: "~1.1.0",
+      // percent-encoded `>=1.3.0-canary.0 <2`
+      prerelease: "%3E%3D1.3.0-canary.0%20%3C2",
+      any: "*",
+      exact: "1.0.0",
+    };
+    const aliases = Object.keys(ranges);
+    const project = writeProject(
+      root,
+      Object.fromEntries(Object.entries(ranges).map(([alias, range]) => [alias, `${repoUrl}#semver:${range}`])),
+    );
+    // alias -> tag: what must be printed, installed and locked
+    const expected = (tags: Record<string, string>) => {
+      const commits = tagCommits(bare);
+      return {
+        resolutions: Object.fromEntries(aliases.map(alias => [alias, `${repoUrl}#${commits[tags[alias]]}`])),
+        versions: Object.fromEntries(aliases.map(alias => [alias, tags[alias].replace(/^v/, "")])),
+        locked: Object.fromEntries(
+          aliases.map(alias => [alias, [`versions@${repoUrl}#${commits[tags[alias]]}`, {}, commits[tags[alias]]]]),
+        ),
+      };
+    };
+
+    const tags = {
+      // tagged without a `v`; a prerelease of 1.3.0 is not in `^1.0.0`
+      caret: "1.2.0",
+      // an annotated tag: the commit is what gets locked, not the tag object
+      tilde: "v1.1.1",
+      // prerelease identifiers are compared as numbers, and are too long to be stored inline
+      prerelease: "v1.3.0-canary.20240315",
+      // `v9`, `v9.0.0+build_1` and `release-9.9.9` are not versions
+      any: "v2.0.0",
+      exact: "v1.0.0",
+    };
+    {
+      const { stdout, stderr, exitCode } = await runInstall(project, join(root, "cache"), {});
+      expect(normalizeBunSnapshot(stderr)).toMatchInlineSnapshot(`
+        "Resolving dependencies
+        Resolved, downloaded and extracted [6]
+        Saved lockfile"
+      `);
+      const { resolutions, versions, locked } = expected(tags);
+      expectInstalled(stdout, resolutions);
+      expect(await installedVersions(project, aliases)).toEqual(versions);
+      expect(await lockedPackages(project)).toEqual(locked);
+      expect(exitCode).toBe(0);
+    }
+
+    // A newer version is tagged. `bun update` finds it although the clone of the
+    // repository is in the cache by now, and only the ranges it satisfies move.
+    await commitTo(bare, [{ ref: "refs/tags/v1.4.0", message: "v1.4.0", files: versionFiles("1.4.0") }]);
+    const { stderr, exitCode } = await runBun(project, join(root, "cache"), {}, "update");
+    expect(stderr).toContain("Saved lockfile");
+    const { versions, locked } = expected({ ...tags, caret: "v1.4.0", prerelease: "v1.4.0" });
+    expect(await installedVersions(project, aliases)).toEqual(versions);
+    expect(await lockedPackages(project)).toEqual(locked);
+    expect(exitCode).toBe(0);
+  },
+  30_000,
+);
+
+test.concurrent(
+  "installs a github: dependency at the version tag that satisfies a #semver: range",
+  async () => {
+    using dir = tempDir("github-dep-semver", {});
+    const root = String(dir);
+    const bare = await makeVersionedRepo(root);
+
+    // What the GitHub API serves for the commit of `tag`: a tarball under `<owner>-<repo>-<short sha>/`.
+    const tarballs = new Map<string, Uint8Array>();
+    const releaseOf = async (tag: string, version: string) => {
+      const commit = tagCommits(bare)[tag];
+      const rootDir = `scope-versions-${commit.slice(0, 7)}`;
+      const tarball = await tarballOf(rootDir, versionFiles(version));
+      tarballs.set(commit, tarball);
+      return {
+        commit,
+        resolution: `github:scope/versions#${commit.slice(0, 7)}`,
+        locked: {
+          versions: [`versions@github:scope/versions#${commit.slice(0, 7)}`, {}, rootDir, integrityOf(tarball)],
+        },
+      };
+    };
+
+    // One server is both github.com (the repository, for `git ls-remote`) and
+    // api.github.com (the tarball of a commit).
+    const requests: string[] = [];
+    const tarballRequests = () => requests.filter(path => !path.startsWith("/scope/versions.git/"));
+    await using server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const { pathname } = new URL(req.url);
+        requests.push(pathname);
+        const ref = /^\/repos\/scope\/versions\/tarball\/(.+)$/.exec(pathname)?.[1];
+        if (ref) {
+          const tarball = [...tarballs].find(([commit]) => commit.startsWith(ref))?.[1];
+          return tarball ? new Response(tarball) : new Response("not found", { status: 404 });
+        }
+        const file = Bun.file(join(root, pathname));
+        return (await file.exists()) ? new Response(file) : new Response("not found", { status: 404 });
+      },
+    });
+    const github = {
+      GITHUB_API_URL: `http://localhost:${server.port}`,
+      GITHUB_SERVER_URL: `http://localhost:${server.port}`,
+    };
+    const project = writeProject(root, { versions: "github:scope/versions#semver:^1.0.0" });
+
+    const v1_2_0 = await releaseOf("1.2.0", "1.2.0");
+    {
+      const { stdout, stderr, exitCode } = await runInstall(project, join(root, "cache"), github);
+      expect(normalizeBunSnapshot(stderr)).toMatchInlineSnapshot(`
+      "Resolving dependencies
+      Resolved, downloaded and extracted [2]
+      Saved lockfile"
+    `);
+      expectInstalled(stdout, { versions: v1_2_0.resolution });
+      // the tags come from the repository, the tarball is the one of the tag's commit
+      expect(requests).toContain("/scope/versions.git/info/refs");
+      expect(tarballRequests()).toEqual([`/repos/scope/versions/tarball/${v1_2_0.commit}`]);
+      expect(await installedVersions(project, ["versions"])).toEqual({ versions: "1.2.0" });
+      expect(await lockedPackages(project)).toEqual(v1_2_0.locked);
+      expect(exitCode).toBe(0);
+    }
+
+    // a newer version in the range is tagged: the lockfile keeps the install where it was
+    await commitTo(bare, [{ ref: "refs/tags/v1.4.0", message: "v1.4.0", files: versionFiles("1.4.0") }]);
+    const v1_4_0 = await releaseOf("v1.4.0", "1.4.0");
+    {
+      // cold cache: the locked commit is downloaded, the tags are not listed again
+      rmSync(join(project, "node_modules"), { recursive: true });
+      requests.length = 0;
+      const { stdout, stderr, exitCode } = await runInstall(project, join(root, "cache-cold"), github);
+      expect(stderr).toBe("");
+      expectInstalled(stdout, { versions: v1_2_0.resolution });
+      expect(requests).toEqual([`/repos/scope/versions/tarball/${v1_2_0.commit.slice(0, 7)}`]);
+      expect(await installedVersions(project, ["versions"])).toEqual({ versions: "1.2.0" });
+      expect(await lockedPackages(project)).toEqual(v1_2_0.locked);
+      expect(exitCode).toBe(0);
+    }
+
+    // `bun update` lists the tags again and moves to it
+    requests.length = 0;
+    const { stderr, exitCode } = await runBun(project, join(root, "cache"), github, "update");
+    expect(stderr).toContain("Saved lockfile");
+    expect(tarballRequests()).toEqual([`/repos/scope/versions/tarball/${v1_4_0.commit}`]);
+    expect(await installedVersions(project, ["versions"])).toEqual({ versions: "1.4.0" });
+    expect(await lockedPackages(project)).toEqual(v1_4_0.locked);
+    expect(JSON.parse(await Bun.file(join(project, "package.json")).text()).dependencies).toEqual({
+      versions: "github:scope/versions#semver:^1.0.0",
+    });
+    expect(exitCode).toBe(0);
+  },
+  30_000,
+);
+
+test.concurrent(
+  "reports a #semver: range that no version tag satisfies",
+  async () => {
+    using dir = tempDir("git-dep-semver-none", {});
+    const root = String(dir);
+    const repoUrl = `git+${pathToFileURL(await makeVersionedRepo(root))}`;
+    // alias -> something no version tag satisfies
+    const ranges = {
+      none: "^5.0.0",
+      // a tag of the repository, but not a range
+      tag: "nightly",
+      // what the range parser would read as a comparator that everything satisfies
+      word: "vnext",
+      // npm's attribute list: `path:` is not supported, and the root of the repository is not what it asks for
+      attributes: "1.0.0::path:packages/sub",
+    };
+    const aliases = Object.keys(ranges);
+    const project = writeProject(
+      root,
+      Object.fromEntries(Object.entries(ranges).map(([alias, range]) => [alias, `${repoUrl}#semver:${range}`])),
+    );
+
+    const { stdout, stderr, exitCode } = await runInstall(project, join(root, "cache"), {});
+    for (const [alias, range] of Object.entries(ranges)) {
+      expect(stderr).toContain(
+        `error: no version tag satisfying "${range}" found for "${alias}" (but repository exists)`,
+      );
+      expect(stderr).toContain(`error: ${alias}@${repoUrl}#semver:${range} failed to resolve`);
+    }
+    expect(stdout).not.toContain("installed");
+    expect(await installedVersions(project, aliases)).toEqual(Object.fromEntries(aliases.map(alias => [alias, null])));
+    expect(exitCode).toBe(1);
+
+    // an optional dependency is left out with a warning, like one whose tarball fails to download
+    const optional = join(root, "optional");
+    mkdirSync(optional);
+    writeFileSync(
+      join(optional, "package.json"),
+      JSON.stringify({
+        name: "optional",
+        version: "1.0.0",
+        dependencies: { exact: `${repoUrl}#semver:1.0.0` },
+        optionalDependencies: { none: `${repoUrl}#semver:^5.0.0` },
+      }),
+    );
+    const skipped = await runInstall(optional, join(root, "cache"), {});
+    expect(skipped.stderr).toContain(
+      `warn: no version tag satisfying "^5.0.0" found for "none" (but repository exists)`,
+    );
+    expect(skipped.stderr).not.toContain("error:");
+    expect(await installedVersions(optional, ["exact", "none"])).toEqual({ exact: "1.0.0", none: null });
+    expect(skipped.exitCode).toBe(0);
+  },
+  30_000,
+);
 
 // The git commands of an install used to run on thread-pool threads through
 // the synchronous spawn helper, which installed the signal forwarder meant for

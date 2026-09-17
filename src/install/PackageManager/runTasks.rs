@@ -1501,6 +1501,36 @@ fn run_tasks_erased(
                     let _ = manager.task_queue.remove(&task.id);
                     if cb.has_on_package_manifest_error {
                         (cb.on_package_manifest_error)(extract_ctx, name, err, url);
+                    } else if let Some(range) =
+                        crate::repository::semver_range(commit.committish.slice())
+                    {
+                        let message = if matches!(err, crate::Error::NoMatchingVersion) {
+                            format!(
+                                "no version tag satisfying \"{}\" found for \"{}\" (but repository exists)",
+                                bstr::BStr::new(&range),
+                                bstr::BStr::new(name),
+                            )
+                        } else {
+                            format!(
+                                "failed to list the version tags of \"{}\"",
+                                bstr::BStr::new(name),
+                            )
+                        };
+                        // Like a tarball that fails to download, this only fails the install
+                        // when a required dependency waits for it.
+                        if manager.is_network_task_required(task.id) {
+                            manager.log_mut().add_error_fmt(
+                                None,
+                                bun_ast::Loc::EMPTY,
+                                format_args!("{message}"),
+                            );
+                        } else {
+                            manager.log_mut().add_warning_fmt(
+                                None,
+                                bun_ast::Loc::EMPTY,
+                                format_args!("{message}"),
+                            );
+                        }
                     } else {
                         let _ = manager.log_mut().add_error_fmt(
                             None,
@@ -1855,6 +1885,24 @@ pub fn get_network_task(this: &mut PackageManager) -> *mut NetworkTask {
 }
 
 pub fn alloc_github_url(this: &PackageManager, repository: &Repository) -> Vec<u8> {
+    let mut committish = this.lockfile.str(&repository.committish);
+    // A `semver:` range is not a ref the API knows. Once the dependency is resolved, the
+    // `<owner>-<repo>-<commit>` name of its tarball has the commit.
+    if crate::repository::is_semver_committish(committish) {
+        let resolved = this.lockfile.str(&repository.resolved);
+        if let Some(dash) = strings::last_index_of_char(resolved, b'-') {
+            committish = &resolved[dash + 1..];
+        }
+    }
+    alloc_github_url_at(this, repository, committish)
+}
+
+/// The tarball of `repository` at `committish` rather than at its own.
+pub(crate) fn alloc_github_url_at(
+    this: &PackageManager,
+    repository: &Repository,
+    committish: &[u8],
+) -> Vec<u8> {
     let mut github_api_url: &[u8] = b"https://api.github.com";
     if let Some(url) = this.env().get(b"GITHUB_API_URL") {
         if !url.is_empty() {
@@ -1864,7 +1912,6 @@ pub fn alloc_github_url(this: &PackageManager, repository: &Repository) -> Vec<u
 
     let owner = this.lockfile.str(&repository.owner);
     let repo = this.lockfile.str(&repository.repo);
-    let committish = this.lockfile.str(&repository.committish);
 
     let mut out = Vec::new();
     write!(
@@ -1876,6 +1923,28 @@ pub fn alloc_github_url(this: &PackageManager, repository: &Repository) -> Vec<u
         // repo might be empty if dep is https://github.com/... style
         if !repo.is_empty() { "/" } else { "" },
         bstr::BStr::new(committish),
+    )
+    .expect("unreachable");
+    out
+}
+
+/// `repository` as a git remote, for the `git ls-remote` that lists its tags.
+/// `GITHUB_SERVER_URL` names the host, as on an Actions runner of GitHub Enterprise Server.
+pub(crate) fn alloc_github_remote_url(this: &PackageManager, repository: &Repository) -> Vec<u8> {
+    let mut github_server_url: &[u8] = b"https://github.com";
+    if let Some(url) = this.env().get(b"GITHUB_SERVER_URL") {
+        if !url.is_empty() {
+            github_server_url = url;
+        }
+    }
+
+    let mut out = Vec::new();
+    write!(
+        &mut out,
+        "{}/{}/{}.git",
+        bstr::BStr::new(strings::without_trailing_slash(github_server_url)),
+        bstr::BStr::new(this.lockfile.str(&repository.owner)),
+        bstr::BStr::new(this.lockfile.str(&repository.repo)),
     )
     .expect("unreachable");
     out
@@ -2213,6 +2282,18 @@ impl PackageManager {
     #[inline]
     pub(crate) fn alloc_github_url(&self, repository: &Repository) -> Vec<u8> {
         alloc_github_url(self, repository)
+    }
+    #[inline]
+    pub(crate) fn alloc_github_url_at(
+        &self,
+        repository: &Repository,
+        committish: &[u8],
+    ) -> Vec<u8> {
+        alloc_github_url_at(self, repository, committish)
+    }
+    #[inline]
+    pub(crate) fn alloc_github_remote_url(&self, repository: &Repository) -> Vec<u8> {
+        alloc_github_remote_url(self, repository)
     }
 }
 

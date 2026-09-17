@@ -213,6 +213,15 @@ Bun supports a variety of protocols, including [`github`](https://docs.npmjs.com
 }
 ```
 
+What follows the `#` is a branch, a tag or a commit. To depend on a range of versions instead, use `#semver:<range>`. Bun installs the highest version tag of the repository (`v1.2.3` or `1.2.3`) that satisfies the range, like npm, pnpm and Yarn:
+
+```sh terminal icon="terminal"
+bun add "github:uNetworking/uWebSockets.js#semver:^20.31.0"
+bun add "git+ssh://git@example.com/acme/design-system.git#semver:~2.4"
+```
+
+The range follows the rules of a registry dependency, so a prerelease tag such as `v2.0.0-beta.1` is only picked by a range that names a prerelease of the same version. The lockfile records the commit the tag points to; `bun update` reads the tags again and moves to a newer version in the range. For a `github:` dependency Bun lists the tags with `git ls-remote`, so `git` has to be installed to resolve one that is not in the lockfile yet.
+
 ## Tarball dependencies
 
 A package name can correspond to a publicly hosted `.tgz` file. Bun downloads and installs the package from that tarball URL rather than from the package registry.
