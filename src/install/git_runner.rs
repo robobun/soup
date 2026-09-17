@@ -25,7 +25,10 @@ use bun_threading::thread_pool as ThreadPool;
 
 use crate::install::{ExtractData, ExtractDataJson};
 use crate::package_manager_task::{self as Task, Tag};
-use crate::repository::{GitEnv, Repository, RepositoryExt as _, is_safe_resolved_tag};
+use crate::repository::{
+    GitEnv, Repository, RepositoryExt as _, is_safe_resolved_tag, is_semver_committish,
+    max_satisfying_tag, semver_range,
+};
 use crate::{Error, PackageManager};
 
 impl PackageManager {
@@ -50,12 +53,14 @@ impl PackageManager {
 
 /// The command the running child is.
 enum Step {
-    /// `git fetch` in this cached bare repository (clone task).
+    /// `git fetch --tags` in this cached bare repository (clone task).
     Fetch(bun_sys::Dir),
     /// `git clone --bare <url> <tmp>` (clone task).
     Clone,
     /// `git log -1 <committish>` (commit task).
     Log,
+    /// `git ls-remote --tags <repository>` (commit task of a `semver:` committish).
+    Tags,
     /// `git clone --no-checkout <bare repository> <tmp>` (checkout task).
     CheckoutClone,
     /// `git checkout <resolved>` in `<tmp>` (checkout task).
@@ -473,7 +478,13 @@ impl GitSubprocess {
                 )
                 .to_vec();
                 this.step.set(Step::Fetch(dir));
-                Self::spawn(this, &[b"-C", &path, b"fetch", b"--quiet"])
+                // A bare clone has no fetch refspec, so a plain `git fetch` brings no ref up to
+                // date. `--tags` does it for tags, which a `semver:` committish is resolved
+                // from; `--force` follows one that was moved.
+                Self::spawn(
+                    this,
+                    &[b"-C", &path, b"fetch", b"--quiet", b"--tags", b"--force"],
+                )
             }
             Err(err) if err.get_errno() == bun_sys::E::ENOENT => {
                 if offline {
@@ -517,11 +528,20 @@ impl GitSubprocess {
     fn begin_commit(this: ThisPtr<Self>) -> Result<(), Error> {
         let req = this.task().request_git_commit();
         let committish = req.committish.slice().to_vec();
-        let path = Path::resolve_path::join_abs_string::<Path::platform::Auto>(
-            &this.manager().cache_directory_path,
-            &[&bare_repo_folder_name(req.clone_id)],
-        )
-        .to_vec();
+        // Only a `semver:` committish is looked up without a clone.
+        debug_assert!(req.clone_id.is_some() || is_semver_committish(&committish));
+        let path = match req.clone_id {
+            Some(clone_id) => Path::resolve_path::join_abs_string::<Path::platform::Auto>(
+                &this.manager().cache_directory_path,
+                &[&bare_repo_folder_name(clone_id)],
+            )
+            .to_vec(),
+            None => req.url.slice().to_vec(),
+        };
+        if is_semver_committish(&committish) {
+            this.step.set(Step::Tags);
+            return Self::spawn(this, &[b"ls-remote", b"--tags", b"--", &path]);
+        }
         this.step.set(Step::Log);
         if committish.is_empty() {
             Self::spawn(this, &[b"-C", &path, b"log", b"--format=%H", b"-1"])
@@ -818,6 +838,18 @@ impl GitSubprocess {
             Step::Log => {
                 let result = if ok {
                     Ok(strings::trim(stdout, b" \t\r\n").to_vec())
+                } else {
+                    Err(Error::InstallFailed)
+                };
+                Self::finish_commit(this, result);
+            }
+            Step::Tags => {
+                let committish = this.task().request_git_commit().committish.slice();
+                let result = if ok {
+                    let range = semver_range(committish).unwrap_or_default();
+                    max_satisfying_tag(stdout, &range)
+                        .map(<[u8]>::to_vec)
+                        .ok_or(Error::NoMatchingVersion)
                 } else {
                     Err(Error::InstallFailed)
                 };

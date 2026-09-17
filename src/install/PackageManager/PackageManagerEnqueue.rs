@@ -1430,7 +1430,12 @@ pub fn enqueue_dependency_with_main_and_success_fn(
                                 }
 
                                 let task = enqueue_git_commit(
-                                    this, commit_id, clone_id, alias, url, committish,
+                                    this,
+                                    commit_id,
+                                    Some(clone_id),
+                                    alias,
+                                    url,
+                                    committish,
                                 );
                                 this.enqueue_git_task(task);
                                 return Ok(());
@@ -1519,8 +1524,71 @@ pub fn enqueue_dependency_with_main_and_success_fn(
                 return Ok(());
             }
 
-            let url = this.alloc_github_url(dep);
-            // url is Box<[u8]>; dropped at scope end
+            let ctx = if is_root {
+                TaskCallbackContext::RootDependency(id)
+            } else {
+                TaskCallbackContext::Dependency(id)
+            };
+
+            // The tarball API takes a ref, which a `semver:` range is not: a `git ls-remote`
+            // task finds the commit of the highest version tag in the range first.
+            // `run_tasks` fills `git_commits` and re-enters here.
+            let committish = this.lockfile.str_detached(&dep.committish);
+            let url = if crate::repository::is_semver_committish(committish) {
+                let remote = this.alloc_github_remote_url(dep);
+                let commit_id = Task::Id::for_git_commit(&remote, committish);
+                match this.git_commits.get(&commit_id) {
+                    Some(commit) => this.alloc_github_url_at(dep, commit),
+                    None => {
+                        let entry = this
+                            .task_queue
+                            .get_or_put_context(commit_id, ())
+                            .expect("unreachable");
+                        if !entry.found_existing {
+                            *entry.value_ptr = TaskCallbackList::default();
+                        }
+                        entry.value_ptr.push(ctx);
+
+                        if dependency.behavior.is_peer() && !install_peer {
+                            this.peer_dependencies.write_item(id)?;
+                            return Ok(());
+                        }
+
+                        let is_required = dependency.behavior.is_required();
+                        if this.has_created_network_task(commit_id, is_required) {
+                            return Ok(());
+                        }
+
+                        let alias = this.lockfile.str_detached(&dependency.name);
+                        if this.options.offline
+                            == crate::package_manager_real::options::OfflineMode::Offline
+                        {
+                            if is_required {
+                                this.mark_network_task_failed(commit_id);
+                                let _ = this.log_mut().add_error_fmt(
+                                    None,
+                                    bun_ast::Loc::EMPTY,
+                                    format_args!(
+                                        "--offline: the version tags of \"{}\" cannot be listed",
+                                        bstr::BStr::new(alias)
+                                    ),
+                                );
+                            } else {
+                                // let a later required edge on the same range report it
+                                let _ = this.network_dedupe_map.remove(&commit_id);
+                            }
+                            return Ok(());
+                        }
+
+                        let task =
+                            enqueue_git_commit(this, commit_id, None, alias, &remote, committish);
+                        this.enqueue_git_task(task);
+                        return Ok(());
+                    }
+                }
+            } else {
+                this.alloc_github_url(dep)
+            };
             let task_id = Task::Id::for_tarball(&url);
 
             if cfg!(debug_assertions) {
@@ -1542,11 +1610,6 @@ pub fn enqueue_dependency_with_main_and_success_fn(
                 }
             }
 
-            let ctx = if is_root {
-                TaskCallbackContext::RootDependency(id)
-            } else {
-                TaskCallbackContext::Dependency(id)
-            };
             // reshaped for borrowck — `entry` mutably borrows
             // `this.task_queue`; scope it tightly so the calls below can
             // reborrow `*this`.
@@ -1996,7 +2059,7 @@ fn enqueue_git_clone(
 fn enqueue_git_commit(
     this: &mut PackageManager,
     task_id: Task::Id,
-    clone_id: Task::Id,
+    clone_id: Option<Task::Id>,
     name: &[u8],
     url: &[u8],
     committish: &[u8],

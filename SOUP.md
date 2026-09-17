@@ -1965,6 +1965,101 @@ Files: `src/sourcemap_jsc/CodeCoverage.rs` (`ignore_hints`, `Report::ignore_line
 (`coverage::ignore_hints_for`), `docs/test/code-coverage.mdx`, `docs/test/configuration.mdx`,
 `test/cli/test/coverage.test.ts`.
 
+### 2026-09-17: `#semver:<range>` for git and GitHub dependencies
+
+A package that is released as git tags instead of on npm (uWebSockets.js is the usual example, an
+in-house library on a private git server the common one) could only be pinned: `#v20.31.0`, a
+branch, or a commit. npm, pnpm and yarn all read `#semver:<range>` as "the highest version tag in
+this range", which is what makes such a dependency updatable, and bun passed the text to git as a
+ref: `fatal: invalid object name 'semver'`, then `no commit matching "semver:^20.31.0"`, or for a
+`github:` dependency a 404 from the tarball API. oven-sh/bun#5870 has been open since September
+2023, and three more reports of the same thing (#4978, #5739, #10526) have been closed since. Now it
+works, for every way of writing a git dependency:
+
+```json
+{
+  "dependencies": {
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#semver:^20.31.0",
+    "design-system": "git+ssh://git@git.example.com/acme/design-system.git#semver:~2.4",
+    "protocol": "acme/protocol#semver:>=1.0.0 <3"
+  }
+}
+```
+
+```sh
+bun add "github:uNetworking/uWebSockets.js#semver:^20.31.0"
+# installed uWebSockets.js@github:uNetworking/uWebSockets.js#9ec36de   (v20.71.0 today)
+bun update   # a newer 20.x has been tagged since: the lockfile moves to its commit
+```
+
+A version tag is what pnpm and pacote take for one: `1.2.3` or `v1.2.3`, with an optional
+prerelease or build suffix. `v2`, `release-1.2.3` and `nightly` are not versions. The range is
+parsed and matched by the code behind registry dependencies, so `^`, `~`, `x`, hyphen ranges and
+`||` work and a prerelease tag is only picked by a range that names a prerelease of the same
+version. `semver:%5E1.2.3` is decoded first, an empty range or `*` means the highest release, and
+something that is not a range (`semver:nightly`) matches nothing rather than everything, with
+`no version tag satisfying "nightly" found for "pkg" (but repository exists)`. The lockfile records
+the commit the tag points to (for an annotated tag the commit, not the tag object), so an install
+from the lockfile never looks at tags, and `bun update` does.
+
+The two kinds of dependency get there differently. A git dependency already goes clone, then
+"which commit is this committish" (`git log -1` in the bare clone), then checkout. For a `semver:`
+committish the middle step is `git ls-remote --tags` on the bare clone instead, and everything
+around it is unchanged. A `github:` dependency is never cloned: it is one tarball download from the
+API, which wants a ref. For a range, the same commit task now runs first, without a clone, as
+`git ls-remote --tags https://github.com/<owner>/<repo>.git`, which is what npm does, costs one
+round trip, returns every tag at once (the REST API pages them, 100 at a time) and is not subject to
+the API's rate limit. The tarball is then requested by commit. `GITHUB_SERVER_URL` names the host the
+way `GITHUB_API_URL` already names the API, which is how both are set on a GitHub Enterprise Server
+runner, and it is what lets the test serve a repository over git's dumb HTTP protocol from
+`Bun.serve`. The one new requirement is `git` itself for resolving a `github:` range that is not in
+the lockfile yet.
+
+A review pass (two readers, one on the task bookkeeping, one on parsing and the tests) found no
+hang and no lifetime problem, and four things that are fixed in this commit:
+
+- A git dependency reads the tags of the bare clone in the cache, and that clone never learned of a
+  new one: it is refreshed with a plain `git fetch`, which in a `--bare` clone (no fetch refspec)
+  updates no ref at all. So with a warm cache `bun update` never moved, and a range that only a
+  new tag satisfies failed until `bun pm cache rm`. The refresh is now `git fetch --tags --force`.
+  That is the tag half of what oven-sh/bun#35566 proposes upstream (the other half, branches, is
+  left to it: oven-sh/bun#13769), and it also makes a plain `#v1.5.0` that was tagged after the
+  first install resolve (oven-sh/bun#18947). `github:` ranges always ask the remote.
+- `query::parse` reads any text: `nightly` gives no comparator, but `vnext` or `xyz` give one that
+  everything satisfies, so `#semver:vnext` installed the highest tag. What is not a range by the
+  rule that tells `"pkg": "^1.2.3"` from `"pkg": "nightly"` in `dependencies` is now turned away
+  first, and so is npm-package-arg's attribute list (`#semver:^1::path:packages/foo`), because bun
+  has no `path:` and the root of the repository is not what that asks for.
+- `Version::parse` stops at a byte it does not know and still reports success, so a tag like
+  `v9.0.0+build_1` counted as 9.0.0, and a number too large for it reads as 0. Tags are checked in
+  full now, with node-semver's limit of 16 digits.
+- An optional dependency whose range nothing satisfies (or whose tags cannot be listed) failed the
+  whole install. It is a warning now, as when the tarball of an optional dependency fails to
+  download.
+
+Not done. npm prefers the version that `HEAD` (or a ref named `latest`) points at when it satisfies
+the range, and otherwise takes the highest; this always takes the highest, as pnpm does. While
+testing, a percent-encoded committish on a `github:` dependency (`#feat%2Fx`, `#semver:%5E1.0.0`)
+turned out to be dropped altogether by the shorthand parser, so the default branch is installed
+without a word; that predates this change, affects branches too, and was reported rather than fixed
+here. Encoded ranges do work on git URLs. The fixture repositories of the new tests have a `HEAD`,
+unlike the shared one in that file: `git fetch` fails in a clone of a repository without one, which
+no test had run into because none refreshed a cached clone.
+
+Rebase notes: one conflict, in the SOUP patch for SOCKS5 (`env_loader.rs`: upstream switched the
+proxy variables to a new URL parser the day after rewriting them; the resolution keeps upstream's
+parser and the `socks5:` exception). The fork's bun-types workflow is still red for the reason given
+yesterday (`@types/node@latest` is 22.20.3), upstream main fails the same ten tests, and it has now
+been reported upstream.
+
+Files: `src/install/repository.rs` (`semver_range`, `version_of_tag`, `is_version_range`,
+`max_satisfying_tag`), `src/install/git_runner.rs` (`Step::Tags`, the refresh of a cached clone),
+`src/install/PackageManager/PackageManagerEnqueue.rs` (the `github:` lookup),
+`src/install/PackageManager/runTasks.rs` (`alloc_github_remote_url`, `alloc_github_url_at`, the
+error messages), `src/install/PackageManagerTask.rs`, `docs/pm/cli/add.mdx`,
+`docs/pm/cli/install.mdx`, `docs/guides/install/add-git.mdx`,
+`test/cli/install/bun-install-git-deps.test.ts`, `test/cli/install/bun-install-offline.test.ts`.
+
 ## Dropped
 
 Nothing yet.

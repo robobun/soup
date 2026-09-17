@@ -37,4 +37,12 @@ When possible, Bun downloads GitHub dependencies as HTTP tarballs, which is fast
 
 ---
 
+The part after the `#` is a branch, a tag or a commit. To follow a range of versions, use `#semver:<range>`: Bun installs the highest version tag (`v4.17.21` or `4.17.21`) that satisfies the range, the lockfile pins its commit, and `bun update` moves to a newer tag in the range.
+
+```sh terminal icon="terminal"
+bun add "github:lodash/lodash#semver:^4.17.0"
+```
+
+---
+
 See [`bun install`](/pm/cli/install).
