@@ -418,10 +418,18 @@ pub(crate) struct GitCloneRequest {
 }
 
 pub(crate) struct GitCommitRequest {
-    /// The clone task whose bare repository is searched.
-    pub(crate) clone_id: Id,
+    pub(crate) source: GitCommitSource,
     pub(crate) name: StringOrTinyString,
     pub(crate) committish: StringOrTinyString,
+}
+
+/// Where a commit task looks its committish up.
+pub(crate) enum GitCommitSource {
+    /// The bare repository of this clone task.
+    Clone(Id),
+    /// The remote at this URL: a `github:` dependency is downloaded as a tarball and never
+    /// cloned. Only the tags for a `semver:` committish are read from it.
+    Remote(StringOrTinyString),
 }
 
 pub(crate) struct GitCheckoutRequest {
