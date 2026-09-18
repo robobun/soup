@@ -99,6 +99,61 @@ fn module_preload_registration(
     Ok(code)
 }
 
+/// What goes in front of the IIFE so that its value lands in `globalName`: `var MyLib = `, or
+/// for a property path `var app;\n(app ||= {}).plugins = `. Objects along the path are only
+/// created when they are missing, so several bundles can share one namespace. `this` is
+/// never declared. The text is ASCII, because a `// @bun` file is read as Latin-1.
+fn global_name_assignment(names: &[Box<[u8]>], minify_whitespace: bool) -> Vec<u8> {
+    let Some((variable, path)) = names.split_first() else {
+        return Vec::new();
+    };
+    let space: &[u8] = if minify_whitespace { b"" } else { b" " };
+    let declare = &**variable != b"this";
+
+    let mut target = Vec::new();
+    let iter = strings::CodepointIterator::init(variable);
+    let mut cursor = strings::Cursor::default();
+    while iter.next(&mut cursor) {
+        match u8::try_from(cursor.c) {
+            Ok(ascii) if ascii.is_ascii() => target.push(ascii),
+            _ => target.extend_from_slice(format!("\\u{{{:x}}}", cursor.c).as_bytes()),
+        }
+    }
+
+    let mut out = Vec::new();
+    if declare {
+        out.extend_from_slice(b"var ");
+        out.extend_from_slice(&target);
+        if !path.is_empty() {
+            out.extend_from_slice(if minify_whitespace { b";" } else { b";\n" });
+        }
+    }
+
+    for (i, name) in path.iter().enumerate() {
+        if declare || i > 0 {
+            target = [b"(", &*target, space, b"||=", space, b"{})"].concat();
+        }
+        if bun_js_parser::lexer::is_identifier(name) && strings::is_all_ascii(name) {
+            target.push(b'.');
+            target.extend_from_slice(name);
+        } else {
+            let mut quoted = MutableString::init_empty();
+            let _ = js_printer::quote_for_json(name, &mut quoted, true); // fmt::Result into Vec<u8> is infallible
+            target.push(b'[');
+            target.extend_from_slice(&quoted.list);
+            target.push(b']');
+        }
+    }
+    if !path.is_empty() {
+        out.extend_from_slice(&target);
+    }
+
+    out.extend_from_slice(space);
+    out.push(b'=');
+    out.extend_from_slice(space);
+    out
+}
+
 /// This runs after we've already populated the compile results
 pub(crate) fn post_process_js_chunk(
     ctx: GenerateChunkCtx,
@@ -515,6 +570,17 @@ pub(crate) fn post_process_js_chunk(
             line_offset.advance(start.code);
         }
         options::OutputFormat::Iife => {
+            // The script of an HTML entry point is loaded as a module: it exports nothing.
+            if chunk.is_entry_point()
+                && !chunk.flags.contains(crate::chunk::Flags::HAS_HTML_CHUNK)
+                && !c.options.global_name.is_empty()
+            {
+                let assignment =
+                    global_name_assignment(&c.options.global_name, c.options.minify_whitespace);
+                line_offset.advance(&assignment);
+                j.push_owned(assignment.into_boxed_slice());
+            }
+
             // Bun does not do arrow function lowering. So the wrapper can be an arrow.
             let start: &[u8] = if c.options.minify_whitespace {
                 b"(()=>{"
@@ -1190,8 +1256,61 @@ pub(crate) fn generate_entry_point_tail_js<'a>(
             }
         }
 
-        // TODO: iife
-        options::OutputFormat::Iife => {}
+        // The IIFE returns what `globalName` is assigned: the exports of the entry point.
+        options::OutputFormat::Iife => {
+            let call_wrapper = || {
+                Expr::init(
+                    E::Call {
+                        target: Expr::init_identifier(ast.wrapper_ref, bun_ast::Loc::EMPTY),
+                        ..Default::default()
+                    },
+                    bun_ast::Loc::EMPTY,
+                )
+            };
+            let run = |value: Expr| {
+                Stmt::alloc(
+                    S::SExpr {
+                        value,
+                        ..Default::default()
+                    },
+                    bun_ast::Loc::EMPTY,
+                )
+            };
+            let returns =
+                |value: Expr| Stmt::alloc(S::Return { value: Some(value) }, bun_ast::Loc::EMPTY);
+
+            match flags.wrap {
+                // "return require_foo();", or "require_foo();" when nothing reads the result
+                crate::WrapKind::Cjs if c.options.global_name.is_empty() => {
+                    stmts.push(run(call_wrapper()));
+                }
+                crate::WrapKind::Cjs => stmts.push(returns(call_wrapper())),
+                _ => {
+                    if flags.wrap == crate::WrapKind::Esm && ast.wrapper_ref.is_valid() {
+                        // "init_foo();"
+                        stmts.push(run(call_wrapper()));
+                    }
+
+                    if flags.force_include_exports_for_entry_point {
+                        // "return __toCommonJS(exports_foo);"
+                        stmts.push(returns(Expr::init(
+                            E::Call {
+                                target: Expr::init_identifier(
+                                    to_common_js_ref,
+                                    bun_ast::Loc::EMPTY,
+                                ),
+                                args: bun_ast::ExprNodeList::from_slice(&[Expr::init_identifier(
+                                    ast.exports_ref,
+                                    bun_ast::Loc::EMPTY,
+                                )]),
+                                ..Default::default()
+                            },
+                            bun_ast::Loc::EMPTY,
+                        )));
+                    }
+                }
+            }
+        }
 
         options::OutputFormat::InternalBakeDev => {
             // nothing needs to be done here, as the exports are already
@@ -1269,8 +1388,12 @@ pub(crate) fn generate_entry_point_tail_js<'a>(
     }
 
     let print_options = js_printer::Options {
-        // TODO: IIFE indent
         indent: Default::default(),
+        // The printer indents what goes inside the IIFE wrapper.
+        module_type: match c.options.output_format {
+            options::OutputFormat::Iife => options::OutputFormat::Iife,
+            _ => options::OutputFormat::Esm,
+        },
         has_run_symbol_renamer: true,
 
         to_esm_ref,
