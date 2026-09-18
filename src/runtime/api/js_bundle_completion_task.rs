@@ -1115,6 +1115,7 @@ impl CompletionStruct for JSBundleCompletionTask {
         // Owned so the static bound holds without tying `&mut self` to `'a`.
         transpiler.options.banner = std::borrow::Cow::Owned(config.banner.list.clone());
         transpiler.options.footer = std::borrow::Cow::Owned(config.footer.list.clone());
+        transpiler.options.global_name = config.global_name.list.clone().into_boxed_slice();
         transpiler.options.react_fast_refresh = config.react_fast_refresh;
         transpiler.options.react_compiler = if config.react_compiler.is_enabled() {
             config.react_compiler_output_mode.unwrap_or_else(|| {

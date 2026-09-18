@@ -3867,6 +3867,31 @@ declare module "bun" {
        * **Experimental**
        */
       | "iife";
+
+    /**
+     * With `format: "iife"`, the global variable that receives the exports of
+     * the entry point (`module.exports` for a CommonJS entry point). Use it to
+     * build a library for a `<script>` tag. Any other `format` fails the build.
+     *
+     * Can be a property path such as `"acme.plugins.myLib"` or
+     * `'acme["my-lib"]'`. The bundle creates the objects along the path only
+     * when they are missing, so several bundles can share one namespace.
+     *
+     * CLI: `--global-name`
+     *
+     * @example
+     * ```ts
+     * await Bun.build({
+     *   entrypoints: ["./src/index.ts"],
+     *   outdir: "./dist",
+     *   format: "iife",
+     *   globalName: "MyLib",
+     * });
+     * // dist/index.js: var MyLib = (() => { ... })();
+     * ```
+     */
+    globalName?: string;
+
     /**
      * Output file name templates. Tokens: `[dir]`, `[name]`, `[ext]`,
      * `[target]`, and `[hash]` (8 characters of the content hash, more when

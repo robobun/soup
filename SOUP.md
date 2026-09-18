@@ -2060,6 +2060,119 @@ error messages), `src/install/PackageManagerTask.rs`, `docs/pm/cli/add.mdx`,
 `docs/pm/cli/install.mdx`, `docs/guides/install/add-git.mdx`,
 `test/cli/install/bun-install-git-deps.test.ts`, `test/cli/install/bun-install-offline.test.ts`.
 
+### 2026-09-18: `globalName` for IIFE bundles
+
+A library that a page loads with a `<script>` tag has to put its API on a global. `format: "iife"`
+wraps the bundle in a function so that nothing leaks, and that includes the exports: there was no
+way to get them out. esbuild has `--global-name` for this. Bun's esbuild comparison page listed it
+as "Not supported", the bundler docs said the IIFE format "does not support exposing its exports
+under a global name", and three tests ported from esbuild were waiting for it as `todo`. Now it
+works, from the CLI and from `Bun.build`:
+
+```sh
+bun build ./src/index.ts --outdir ./dist --format iife --global-name MyLib
+```
+
+```ts
+await Bun.build({
+  entrypoints: ["./src/index.ts"],
+  outdir: "./dist",
+  format: "iife",
+  globalName: "MyLib",
+});
+```
+
+```js
+// dist/index.js
+var MyLib = (() => {
+  // ...
+  return __toCommonJS(exports_src);
+})();
+```
+
+```html
+<script src="./dist/index.js"></script>
+<script>
+  MyLib.version; // a named export
+  MyLib.default("Bun"); // the default export
+</script>
+```
+
+The variable holds the module namespace of the entry point, with live bindings and `__esModule`,
+which is what `format: "cjs"` assigns to `module.exports`. A CommonJS entry point gives its
+`module.exports`, and so does a JSON or text entry point. The name can be a property path:
+`acme.plugins["my-lib"]` prints `var acme;` and then `((acme ||= {}).plugins ||= {})["my-lib"] =`,
+so the objects along the path are only created when they are missing and several bundles can share
+one namespace. That is esbuild's behaviour, in the compact form it uses for targets that have `||=`
+(Bun's own helpers already use `??=`). A path that starts with `this` assigns to the global object
+and declares nothing. Every entry point's output assigns to the same name. The script of an HTML
+entry point gets no assignment: Bun loads it as a module, where a `var` is not global and `this` is
+undefined.
+
+The linker already had the shape for this, because it follows esbuild's: a comment in
+`LinkerContext::load` even says "the IIFE format only needs this when the global name is present",
+above a condition that had no global name to test. So the change is small. The entry point gets a
+forced exports object for `cjs`, or for `iife` with a global name, and the existing code then keeps
+`__toCommonJS`, `__export` and the exports alive. The IIFE arm of `generate_entry_point_tail_js`,
+which was `// TODO: iife`, returns `__toCommonJS(exports_entry)`, or `require_entry()` for a
+CommonJS entry point. `post_process_js_chunk` writes the assignment in front of the wrapper, after
+the hashbang, the banner and `"use strict"`, and counts it in the source map offsets. Two things
+follow for IIFE output without a global name. An ESM entry point no longer gets an exports object
+that nothing can read (with the unused `__toCommonJS` helper that came with it), so that output
+shrinks. And a wrapped entry point is now called: before, `bun build --format=iife` of a CommonJS
+entry point printed `var require_entry = __commonJS(...)` and never called it, so the bundle did
+nothing. That is a known bug with an open upstream PR (oven-sh/bun#37843). The same statement was
+needed here for `return require_entry()`, so this commit has the fix too. If the upstream PR
+lands first, this patch shrinks by a few lines.
+
+The name is parsed by hand (`parse_global_name`): a variable, then `.name` and `["name"]` segments,
+with no escapes inside quotes, so every name is a slice of the option text. Property names can be
+reserved words. The variable cannot be one, in sloppy or in strict code, because it is declared next
+to the entry point's `"use strict"`. Validation happens where the linker options are filled in, next
+to the "code splitting needs esm" check, so the CLI and `Bun.build` report the same two errors:
+`Invalid global name "a..b": expected a variable name or a property path, such as "MyLib" or
+"app.plugins.myLib"`, and `A global name is only supported when format is set to "iife"`. An error
+was chosen over making the option imply `iife`, because it can be relaxed later and the reverse
+cannot. A `globalName` that is not a string is a `TypeError`, and an empty one is unset, like
+`banner`.
+
+A review pass (two readers, one on the linker and one on parsing, docs and tests) found four things
+that are fixed in this commit. A non-ASCII variable name (`café`) was written as UTF-8, but Bun reads
+its own `// @bun` output as Latin-1, so a `--target=bun` bundle failed to load: the assignment is
+ASCII now (`var caf\u{e9} =`, `ns["caf\u00E9"]`), as the printer does for identifiers. `let`,
+`static`, `eval` and the other strict mode reserved words passed as variable names and broke next to
+a `"use strict"` entry point. The script of an HTML entry point got the assignment, and a `this.`
+path then throws when the page loads. And the flag was missing from the hand-written CLI reference.
+
+Not done: escapes and whitespace inside the name, `import.meta` as the start of a path (esbuild takes
+all three), and rollup's `output.globals`, the other half of building for a script tag (map an
+external import to a global that is already on the page, oven-sh/bun#2531). While testing, a
+CommonJS entry point whose top-level statements are all function declarations turned out to print
+`var __INVALID__REF__ = __commonJS(...)` (a panic in debug builds) for `esm` and `iife` output. It
+predates this change and was reported rather than fixed here.
+
+Rebase notes: three conflicts, all from upstream's `Bun.ModuleGraph` change (oven-sh/bun#42590). In
+the `append` patch, `Bun.write`'s helpers now take a `cx: &JsThread` where they took a global, and
+`WriteFile::create` lost its callback arguments. In the `bun:sqlite` functions patch, `close(true)`
+moved into `closeWithStatements()`, and the "not from inside a user-defined function" guard now sits
+in front of it. In the `$` kill patch, `interrupted()` gained `context_stopped()` upstream and keeps
+`stopping()` from the patch. The fork's bun-types workflow should be green again: `@types/node@latest`
+is back on the 26.x line and the types test passes locally. One older soup mistake turned up while
+running the bundler suites: the `bytes` loader patch of 2026-09-10 adds 24 bytes to the minified
+`__toESM` helper, and three upstream tests pin exact output (`edgecase/EmitInvalidSourceMap2`, the
+`npm/ReactSSR` file size and columns, one react-compiler snapshot). Their expectations are now updated
+in that commit.
+
+Files: `src/bundler/options.rs` (`parse_global_name`, `BundleOptions::global_name`),
+`src/bundler/bundle_v2.rs` (validation), `src/bundler/LinkerContext.rs`,
+`src/bundler/linker_context/postProcessJSChunk.rs` (`global_name_assignment`, the IIFE tail),
+`src/options_types/context.rs`, `src/runtime/cli/Arguments.rs`, `src/runtime/cli/build_command.rs`,
+`src/runtime/api/JSBundler.rs`, `src/runtime/api/js_bundle_completion_task.rs`,
+`packages/bun-types/bun.d.ts`, `docs/bundler/index.mdx`, `docs/bundler/esbuild.mdx`,
+`docs/snippets/cli/build.mdx`, `test/bundler/bundler_iife.test.ts`,
+`test/bundler/esbuild/default.test.ts`, `test/bundler/esbuild/importstar.test.ts`,
+`test/bundler/expectBundled.ts`, `test/integration/bun-types/fixture/build.ts`.
+
 ## Dropped
 
 Nothing yet.
