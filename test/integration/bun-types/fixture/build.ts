@@ -24,6 +24,19 @@ Bun.build({
 
 Bun.build({
   entrypoints: ["hey"],
+  format: "iife",
+  globalName: "acme.plugins.hey",
+});
+
+Bun.build({
+  entrypoints: ["hey"],
+  format: "iife",
+  // @ts-expect-error
+  globalName: ["hey"],
+});
+
+Bun.build({
+  entrypoints: ["hey"],
   plugins: [
     {
       name: "my-terrible-plugin",

@@ -642,7 +642,10 @@ impl<'a> LinkerContext<'a> {
                 // targeting non-ES6 formats. Note that the IIFE format only needs this
                 // when the global name is present, since that's the only way the exports
                 // can actually be observed externally.
-                if ast_flags.contains(AstFlags::USES_EXPORT_KEYWORD) {
+                if ast_flags.contains(AstFlags::USES_EXPORT_KEYWORD)
+                    && (self.options.output_format == Format::Cjs
+                        || !self.options.global_name.is_empty())
+                {
                     ast_flags_list[entry_point.get() as usize].insert(AstFlags::USES_EXPORTS_REF);
                     meta_flags_list[entry_point.get() as usize]
                         .force_include_exports_for_entry_point = true;
@@ -1434,6 +1437,9 @@ pub struct LinkerOptions {
     /// The order files of `--bytecode-order` / `compile.bytecodeOrder`, read and merged when the bundle started.
     pub(crate) bytecode_order: Option<crate::bytecode_order::BytecodeOrder>,
     pub(crate) output_format: Format,
+    /// `globalName`, parsed (`options::parse_global_name`): what an entry point's IIFE is
+    /// assigned to. Empty when unset.
+    pub(crate) global_name: Vec<Box<[u8]>>,
     pub(crate) ignore_dce_annotations: bool,
     pub(crate) emit_dce_annotations: bool,
     pub(crate) deprecated_namespace_object_setters: bool,
@@ -1485,6 +1491,7 @@ impl Default for LinkerOptions {
             optimize_bytecode: true,
             bytecode_order: None,
             output_format: Format::Esm,
+            global_name: Vec::new(),
             ignore_dce_annotations: false,
             emit_dce_annotations: true,
             deprecated_namespace_object_setters: true,

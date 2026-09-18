@@ -587,7 +587,6 @@ describe.concurrent("bundler", () => {
     },
   });
   itBundled("importstar/ExportSelfIIFEWithName", {
-    todo: true,
     files: {
       "/entry.js": /* js */ `
         export const foo = 123
@@ -1099,7 +1098,6 @@ describe.concurrent("bundler", () => {
     },
   });
   itBundled("importstar/ReExportStarExternalIIFE", {
-    todo: true,
     files: {
       "/entry.js": `export * from "foo"`,
     },

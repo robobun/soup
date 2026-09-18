@@ -327,6 +327,61 @@ impl TargetExt for Target {
 pub use bun_options_types::Format;
 pub use bun_options_types::WindowsOptions;
 
+/// `globalName` names where the exports of an IIFE bundle go: a variable (`MyLib`) or a
+/// property path that starts at one (`app.plugins["my-lib"]`, `this.MyLib`). Returns the names
+/// along the path, or `None` when `text` is not such a path. A property name may be a reserved
+/// word. The variable may not, in sloppy or strict code: it is declared next to the entry
+/// point's `"use strict"`. `this` is allowed there and cannot stand alone. Quoted names take no
+/// escapes, so every name is a slice of `text`.
+pub(crate) fn parse_global_name(text: &[u8]) -> Option<Vec<&[u8]>> {
+    use bun_js_parser::lexer as js_lexer;
+
+    let first_len = strings::index_of_any(text, b".[").unwrap_or(text.len());
+    let (first, mut rest) = text.split_at(first_len);
+    if !js_lexer::is_identifier(first) {
+        return None;
+    }
+    if first == b"this" {
+        if rest.is_empty() {
+            return None;
+        }
+    } else if js_lexer::keyword(first).is_some()
+        || js_lexer::is_strict_mode_reserved_word(first)
+        || first == b"eval"
+        || first == b"arguments"
+    {
+        return None;
+    }
+
+    let mut names = vec![first];
+    while let Some((&punctuation, after)) = rest.split_first() {
+        match punctuation {
+            b'.' => {
+                let len = strings::index_of_any(after, b".[").unwrap_or(after.len());
+                if !js_lexer::is_identifier(&after[..len]) {
+                    return None;
+                }
+                names.push(&after[..len]);
+                rest = &after[len..];
+            }
+            b'[' => {
+                let (&quote, quoted) = after.split_first()?;
+                if quote != b'"' && quote != b'\'' {
+                    return None;
+                }
+                let len = strings::index_of_char_usize(quoted, quote)?;
+                if strings::index_of_any(&quoted[..len], b"\\\r\n").is_some() {
+                    return None;
+                }
+                names.push(&quoted[..len]);
+                rest = quoted[len + 1..].strip_prefix(b"]")?;
+            }
+            _ => return None,
+        }
+    }
+    Some(names)
+}
+
 // Re-export of `bun_ast::Loader`.
 // There is exactly ONE `Loader`; re-export so the bundler's
 // `BundleOptions.loaders` and the resolver's `Path::loader()` operate on the
@@ -1237,6 +1292,8 @@ pub struct BundleOptions<'a> {
 
     // only used by bundle_v2
     pub output_format: Format,
+    /// `globalName`: the text of the option, see [`parse_global_name`]. Empty when unset.
+    pub global_name: Box<[u8]>,
 
     pub(crate) tsconfig_override: Option<Box<[u8]>>,
     pub target: Target,
@@ -1484,6 +1541,7 @@ impl<'a> BundleOptions<'a> {
             preserve_extensions: self.preserve_extensions,
             production: self.production,
             output_format: self.output_format,
+            global_name: self.global_name.clone(),
             tsconfig_override: self.tsconfig_override.clone(),
             target: self.target,
             main_fields: self.main_fields.clone(),
@@ -1745,6 +1803,7 @@ impl<'a> BundleOptions<'a> {
             preserve_extensions: false,
             production: false,
             output_format: Format::Esm,
+            global_name: Box::default(),
             tsconfig_override: None,
             main_fields: owned_string_list(Target::default_main_fields_map()[Target::Browser]),
             allow_unresolved: AllowUnresolved::All,

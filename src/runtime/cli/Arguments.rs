@@ -474,6 +474,9 @@ pub(crate) const BUILD_ONLY_PARAMS: &[ParamType] = concat_params!(
             "--format <STR>                   Specifies the module format to build to. \"esm\", \"cjs\" and \"iife\" are supported. Defaults to \"esm\", or \"cjs\" with --bytecode."
         ),
         parse_param!(
+            "--global-name <STR>              With --format=iife, assign the entry point's exports to this global. ex: MyLib, or a property path like app.plugins.myLib"
+        ),
+        parse_param!(
             "--root <STR>                     Root directory used for multiple entry points"
         ),
         parse_param!("--splitting                      Enable code splitting"),
@@ -2099,6 +2102,10 @@ fn parse_build_command_options(
 
     if let Some(footer) = args.option(b"--footer") {
         ctx.bundler_options.footer = footer.into();
+    }
+
+    if let Some(global_name) = args.option(b"--global-name") {
+        ctx.bundler_options.global_name = global_name.into();
     }
 
     let minify_flag = args.flag(b"--minify") || production;

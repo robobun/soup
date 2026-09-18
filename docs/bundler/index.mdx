@@ -429,7 +429,90 @@ To build a CommonJS module, set `format` to `"cjs"`. When you choose `"cjs"`, th
 
 #### format: "iife" - IIFE
 
-To build an IIFE bundle, set `format` to `"iife"`. Bun wraps the bundle in an immediately invoked function expression and does not support exposing its exports under a global name.
+To build an IIFE bundle, set `format` to `"iife"`. Bun wraps the bundle in an immediately invoked function expression, so nothing in it leaks into the global scope. Use this format for a file that a page loads with a plain `<script>` tag.
+
+<Tabs>
+  <Tab title="JavaScript">
+    ```ts title="build.ts" icon="/icons/typescript.svg"
+    await Bun.build({
+      entrypoints: ['./index.tsx'],
+      outdir: './out',
+      format: "iife",
+    })
+    ```
+  </Tab>
+  <Tab title="CLI">
+    ```bash terminal icon="terminal"
+    bun build ./index.tsx --outdir ./out --format iife
+    ```
+  </Tab>
+</Tabs>
+
+#### globalName
+
+Nothing outside an IIFE bundle can reach its exports. `globalName` names a global variable that receives the exports of the entry point, so a page that loads the bundle with a `<script>` tag can use them. It requires `format: "iife"`.
+
+<Tabs>
+  <Tab title="JavaScript">
+    ```ts title="build.ts" icon="/icons/typescript.svg"
+    await Bun.build({
+      entrypoints: ['./src/index.ts'],
+      outdir: './dist',
+      format: "iife",
+      globalName: "MyLib",
+    })
+    ```
+  </Tab>
+  <Tab title="CLI">
+    ```bash terminal icon="terminal"
+    bun build ./src/index.ts --outdir ./dist --format iife --global-name MyLib
+    ```
+  </Tab>
+</Tabs>
+
+```ts title="src/index.ts" icon="/icons/typescript.svg"
+export const version = "1.0.0";
+export default function greet(name: string) {
+  return `Hello, ${name}!`;
+}
+```
+
+```js title="dist/index.js" icon="/icons/javascript.svg"
+var MyLib = (() => {
+  // ...
+  return __toCommonJS(exports_src);
+})();
+```
+
+```html title="index.html" icon="file-code"
+<script src="./dist/index.js"></script>
+<script>
+  console.log(MyLib.version); // "1.0.0"
+  console.log(MyLib.default("Bun")); // "Hello, Bun!"
+</script>
+```
+
+The variable holds the module namespace of the entry point: one property per export, and the default export as `default`. For a CommonJS entry point it holds `module.exports`.
+
+`globalName` can also be a property path, with `.name` and `["name"]` accesses (quoted names take no escape sequences). The bundle creates the objects along the path only when they are missing, so several bundles can add themselves to one shared namespace without overwriting each other. A path that starts with `this` assigns to the global object and declares no variable.
+
+```ts title="build.ts" icon="/icons/typescript.svg"
+await Bun.build({
+  entrypoints: ["./src/index.ts"],
+  outdir: "./dist",
+  format: "iife",
+  globalName: 'acme.plugins["my-lib"]',
+});
+```
+
+```js title="dist/index.js" icon="/icons/javascript.svg"
+var acme;
+((acme ||= {}).plugins ||= {})["my-lib"] = (() => {
+  // ...
+})();
+```
+
+With more than one entry point, every output file assigns to the same name. The script of an HTML entry point is a module and gets no assignment.
 
 ### `jsx`
 
@@ -1791,6 +1874,11 @@ interface BuildConfig {
    * @default "esm"
    */
   format?: "esm" | "cjs" | "iife";
+  /**
+   * With `format: "iife"`, the global variable (or property path, such as
+   * `"acme.plugins.myLib"`) that the exports of the entry point are assigned to.
+   */
+  globalName?: string;
   /**
    * JSX configuration object for controlling JSX transform behavior
    */
