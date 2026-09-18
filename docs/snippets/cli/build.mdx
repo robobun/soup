@@ -70,6 +70,11 @@ bun build <entry points>
   <code>cjs</code> when <code>--bytecode</code> is used.
 </ParamField>
 
+<ParamField path="--global-name" type="string">
+  With <code>--format=iife</code>, assign the exports of the entry point to this global variable, or to a property path
+  such as <code>app.plugins.myLib</code>
+</ParamField>
+
 ### File Naming
 
 <ParamField path="--entry-naming" type="string" default="[dir]/[name].[ext]">

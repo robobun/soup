@@ -1250,6 +1250,7 @@ function expectBundled(
           allowUnresolved,
           banner,
           format,
+          globalName,
           footer,
           root: outbase,
           packages,
