@@ -378,7 +378,10 @@ impl<'l, 'a> LinkerContext<'l, 'a> {
                 // targeting non-ES6 formats. Note that the IIFE format only needs this
                 // when the global name is present, since that's the only way the exports
                 // can actually be observed externally.
-                if ast_flags.contains(AstFlags::USES_EXPORT_KEYWORD) {
+                if ast_flags.contains(AstFlags::USES_EXPORT_KEYWORD)
+                    && (this.options.output_format == Format::Cjs
+                        || !this.options.global_name.is_empty())
+                {
                     ast_flags_list[entry_point.get() as usize].insert(AstFlags::USES_EXPORTS_REF);
                     meta_flags_list[entry_point.get() as usize]
                         .force_include_exports_for_entry_point = true;
@@ -972,6 +975,9 @@ pub(crate) struct LinkerOptions<'l> {
     pub(crate) bytecode_depth: u32,
     pub(crate) optimize_bytecode: bool,
     pub(crate) output_format: Format,
+    /// `globalName`, parsed (`options::parse_global_name`): what an entry point's IIFE is
+    /// assigned to. Empty when unset.
+    pub(crate) global_name: Vec<Box<[u8]>>,
     pub(crate) ignore_dce_annotations: bool,
     pub(crate) emit_dce_annotations: bool,
     pub(crate) deprecated_namespace_object_setters: bool,
@@ -1013,6 +1019,13 @@ impl<'l> LinkerOptions<'l> {
             bytecode_depth: options.bytecode_depth,
             optimize_bytecode: options.optimize_bytecode,
             output_format: options.output_format,
+            // `BundleV2::init` reports a name that does not parse, and one without the iife format.
+            global_name: match crate::options::parse_global_name(&options.global_name) {
+                Some(names) if options.output_format == Format::Iife => {
+                    names.into_iter().map(Box::<[u8]>::from).collect()
+                }
+                _ => Vec::new(),
+            },
             ignore_dce_annotations: options.ignore_dce_annotations,
             emit_dce_annotations: options.emit_dce_annotations,
             deprecated_namespace_object_setters: options.deprecated_namespace_object_setters,

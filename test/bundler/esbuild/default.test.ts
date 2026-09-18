@@ -194,7 +194,6 @@ describe.concurrent("bundler", () => {
     format: "iife",
     globalName: "globalName",
     run: true,
-    todo: true,
     onAfterBundle(api) {
       api.appendFile(
         "/out.js",
