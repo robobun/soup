@@ -242,6 +242,10 @@ fn apply_bundler_options(ctx: &ContextData, this_transpiler: &mut Transpiler<'st
         std::borrow::Cow::Owned(ctx.bundler_options.banner.clone().into_vec());
     this_transpiler.options.footer =
         std::borrow::Cow::Owned(ctx.bundler_options.footer.clone().into_vec());
+    this_transpiler
+        .options
+        .global_name
+        .clone_from(&ctx.bundler_options.global_name);
     this_transpiler.options.drop = ctx.args.drop.clone().into();
     {
         let flags: Vec<&[u8]> = ctx.args.feature_flags.iter().map(|s| &**s).collect();

@@ -83,6 +83,7 @@ fn report_unsupported_options(options: &BundleOptions<'_>, log: &mut Log) -> boo
         server_components, allow_unresolved, macro_remap, inject, framework, dev_server,
         hot_module_reloading, ignore_module_resolution_errors, disable_transpilation, repl_mode,
         react_compiler_parse_test_pragmas,
+        global_name,
         loaders: _, jsx: _, react_compiler: _, root_dir: _, preserve_symlinks: _,
         tsconfig_override: _, main_fields: _, transform_options: _, external: _, packages: _,
         extension_order: _, main_field_extension_order: _, no_macros: _, custom_conditions: _,
@@ -121,6 +122,7 @@ fn report_unsupported_options(options: &BundleOptions<'_>, log: &mut Log) -> boo
         (!macro_remap.is_empty()).then_some("the \"macros\" map of bunfig.toml"),
         inject.as_ref().is_some_and(|list| !list.is_empty()).then_some("inject"),
         react_compiler_parse_test_pragmas.then_some("reactCompilerParseTestPragmas"),
+        (!global_name.is_empty()).then_some("--global-name"),
         is_development_server.then_some("a development server"),
         is_other_command.then_some("this command"),
     ];
