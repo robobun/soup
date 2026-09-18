@@ -134,6 +134,7 @@ pub(crate) mod js_bundler {
         pub(crate) conditions: StringSet,
         pub(crate) packages: options::PackagesOption,
         pub(crate) format: options::Format,
+        pub(crate) global_name: OwnedString,
         pub(crate) bytecode: bool,
         pub(crate) bytecode_depth: u32,
         pub(crate) optimize_bytecode: bool,
@@ -205,6 +206,7 @@ pub(crate) mod js_bundler {
                 conditions: StringSet::default(),
                 packages: options::PackagesOption::Bundle,
                 format: options::Format::Esm,
+                global_name: OwnedString::default(),
                 bytecode: false,
                 bytecode_depth: u32::MAX,
                 optimize_bytecode: true,
@@ -875,6 +877,11 @@ pub(crate) mod js_bundler {
                         "format must be 'cjs' or 'esm' when bytecode is true."
                     )));
                 }
+            }
+
+            if let Some(slice) = config.get_optional_slice(global_this, b"globalName")? {
+                this.global_name.append_slice_exact(slice.slice())?;
+                drop(slice);
             }
 
             if let Some(hot) = config.get_boolean_loose(global_this, "splitting")? {

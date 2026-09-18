@@ -3281,6 +3281,30 @@ pub mod bv2_impl {
                 );
             }
 
+            if !this.transpiler.options.global_name.is_empty() {
+                if this.transpiler.options.output_format != options::Format::Iife {
+                    this.transpiler.log_mut().add_error(
+                        None,
+                        bun_ast::Loc::EMPTY,
+                        "A global name is only supported when format is set to \"iife\"",
+                    );
+                } else if let Some(names) =
+                    options::parse_global_name(&this.transpiler.options.global_name)
+                {
+                    this.linker.options.global_name =
+                        names.into_iter().map(Box::<[u8]>::from).collect();
+                } else {
+                    this.transpiler.log_mut().add_error_fmt(
+                        None,
+                        bun_ast::Loc::EMPTY,
+                        format_args!(
+                            "Invalid global name {}: expected a variable name or a property path, such as \"MyLib\" or \"app.plugins.myLib\"",
+                            bun_core::fmt::quote(&this.transpiler.options.global_name),
+                        ),
+                    );
+                }
+            }
+
             this.linker.options.minify_syntax = this.transpiler.options.minify_syntax;
             this.linker.options.minify_identifiers = this.transpiler.options.minify_identifiers;
             this.linker.options.minify_whitespace = this.transpiler.options.minify_whitespace;
