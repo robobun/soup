@@ -8,23 +8,41 @@
 #include <JavaScriptCore/JSPromise.h>
 namespace Bun {
 using namespace JSC;
-extern "C" JSPromise* Bun__loadHTMLEntryPoint(Zig::GlobalObject* globalObject)
+
+// Mirrors `BuiltinEntryPoint` in VirtualMachine.rs.
+enum class BuiltinEntryPoint : uint8_t {
+    None = 0,
+    // `bun ./index.html`
+    Html = 1,
+    // `bun serve`
+    StaticServer = 2,
+};
+
+// The entry point is a builtin module. Its default export is the function that starts it.
+extern "C" JSPromise* Bun__loadBuiltinEntryPoint(Zig::GlobalObject* globalObject, BuiltinEntryPoint entryPoint)
 {
     auto& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    JSValue htmlModule = globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::InternalHtml);
+    auto id = InternalModuleRegistry::InternalHtml;
+    auto failureMessage = "Failed to load HTML entry point"_s;
+    if (entryPoint == BuiltinEntryPoint::StaticServer) {
+        id = InternalModuleRegistry::InternalStaticServer;
+        failureMessage = "Failed to load the static file server"_s;
+    }
+
+    JSValue entryModule = globalObject->internalModuleRegistry()->requireId(globalObject, vm, id);
     if (scope.exception()) [[unlikely]] {
         return JSPromise::rejectedPromiseWithCaughtException(globalObject, scope);
     }
 
-    JSObject* htmlModuleObject = htmlModule.getObject();
-    if (!htmlModuleObject) [[unlikely]] {
-        BUN_PANIC("Failed to load HTML entry point");
+    JSObject* entryModuleObject = entryModule.getObject();
+    if (!entryModuleObject) [[unlikely]] {
+        Bun__panic(failureMessage.characters(), failureMessage.length());
     }
 
     MarkedArgumentBuffer args;
-    JSValue result = JSC::call(globalObject, htmlModuleObject, args, "Failed to load HTML entry point"_s);
+    JSValue result = JSC::call(globalObject, entryModuleObject, args, failureMessage);
     if (scope.exception()) [[unlikely]] {
         return JSPromise::rejectedPromiseWithCaughtException(globalObject, scope);
     }
@@ -35,7 +53,7 @@ extern "C" JSPromise* Bun__loadHTMLEntryPoint(Zig::GlobalObject* globalObject)
 
     JSPromise* promise = dynamicDowncast<JSC::JSPromise>(result);
     if (!promise) [[unlikely]] {
-        BUN_PANIC("Failed to load HTML entry point");
+        Bun__panic(failureMessage.characters(), failureMessage.length());
     }
     return promise;
 }
