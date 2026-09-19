@@ -2181,6 +2181,131 @@ Files: `src/bundler/options.rs` (`parse_global_name`, `BundleOptions::global_nam
 `test/bundler/esbuild/default.test.ts`, `test/bundler/esbuild/importstar.test.ts`,
 `test/bundler/expectBundled.ts`, `test/integration/bun-types/fixture/build.ts`.
 
+### 2026-09-19: `bun serve`, a static file server
+
+Python has `python -m http.server`, PHP has `php -S`, and the answer for Bun has been `bunx serve`,
+which is a download and somebody else's package. oven-sh/bun#12986 asks for a server that is simply
+there, to preview a build, to look at a folder of HTML, to move a file to the laptop across the
+room. `bun serve` printed `Script not found "serve"`. Now it serves a directory:
+
+```sh
+bun serve ./dist
+# Bun v1.4.3 ready in 6.12 ms
+#
+# ➜ http://127.0.0.1:3000/
+#   serving ./dist
+#
+# GET / 200 0.4ms
+# GET /assets/index-4f2a.js 200 0.2ms
+# GET /favicon.ico 404 0.1ms
+
+bun serve                                # the current directory
+bun serve ./dist --spa                   # index.html for the routes of a single-page app
+bun serve ./dist --port 8080 --cors
+bun serve ~/Downloads --host 0.0.0.0     # reachable from the phone, prints the LAN addresses
+```
+
+A file is sent with the `Content-Type` of its extension, `ETag`, `Last-Modified` and
+`Cache-Control: no-cache`, so the browser revalidates on every load, gets a `304` for what did not
+change and never shows a stale build. `Range` works (that part is `Bun.serve`'s own handling of a
+`Bun.file()` body, sendfile included). A directory gets its `index.html` or, without one, a listing
+(directories first, sizes, times, light and dark, `--no-listing` turns it off), and `/docs` is
+redirected to `/docs/` so the relative links in either resolve. `/about` finds `about.html`, also
+when there is a directory `about/` next to it, which is the layout a static export writes. A
+`404.html` in the served directory is the not found page. `--spa` answers a path that matches no
+file with the app's `index.html`, except when the last segment has a dot: a missing
+`/assets/app.js` that comes back as HTML with a 200 is the classic "Unexpected token <". Requests are
+logged unless `--quiet`. When the default port (whatever `Bun.serve` would pick: `bun --port`,
+bunfig, the environment, 3000) is taken, the next free one of the ten after it is used and printed.
+A port passed as `--port` is not a suggestion, and a taken one is an error.
+
+What it will not send: anything outside the directory, and dotfiles. `..` is resolved by the URL
+parser before anything is looked up. A segment that decodes to a separator or a NUL is refused (on
+Windows also `\` and `:`, which would select a drive or an alternate data stream). Every path that
+is served or listed goes through one function that resolves symlinks first and then checks the real
+path, so a link is followed but not out of the directory, and neither a link nor another spelling
+of a name (a Windows 8.3 short name) leads into `.git`. `.env` and friends are a 404 and are left
+out of listings unless `--dotfiles` is passed. `/.well-known/`, at the top only, is exempt, because
+RFC 8615 defines it as public. It listens on `127.0.0.1` unless told otherwise.
+
+`serve` is not a new command in the dispatch table, because `bun serve` already means something:
+the `serve` script of a package.json (every Vue CLI project has one), a file named `serve.ts`, a
+`serve` binary in `node_modules/.bin`. All of those still run, and the static server is what
+happens at the end of that list, where the "Script not found" error used to be. `bun run serve` and
+`bun --if-present serve` never reach it. Nothing that worked yesterday does something else today,
+and the bun team can promote it to a real command whenever they like; the substance is elsewhere.
+That substance is one internal module, `src/js/internal/static_server.ts`, started the way
+`bun ./index.html` starts `internal/html.ts`: the VM's `main_is_html_entrypoint: bool` became a
+`BuiltinEntryPoint` enum (`None`, `Html`, `StaticServer`) and the C++ loader takes it as an
+argument. The server is TypeScript on `Bun.serve`, `Bun.file` and `node:fs`, and says so in its
+first line. Upstream's native directory routes (`"/*": { dir }`) were the obvious base and could not
+be one: a miss there ends the response with an empty 404 instead of falling through to `fetch`, so
+there is no place for a listing, a `404.html`, clean URLs or the SPA rule, no way to add a CORS
+header or log a request, and it sends dotfiles. A `fallthrough` option on `{ dir }` routes would let
+a later version hand the file serving back to native code.
+
+The feature was built and tested on Linux, and then run on Windows, which found three bugs that
+Linux never would have. The fixture had a file named `a & <b>.txt`, which NTFS does not allow.
+`fs.realpathSync()` and `fs.promises.realpath()` disagree about 8.3 short names (only the native
+one expands `C:\Users\RUNNER~1`), so under a short temp directory every file was "outside" the
+root: the root now goes through `realpathSync.native`. And two servers ended up on one port,
+because `development: false` quietly turns `reusePort` on in `Bun.serve`, which is `SO_REUSEPORT`
+load balancing on Linux and port stealing on Windows: `reusePort: false` is now explicit, and the
+test holds the port with a `reusePort` server so that it fails on Linux too if that line goes away.
+For the same reason the default host is `127.0.0.1` and not `localhost`: `Bun.serve` binds
+`localhost` to whichever of `::1` and `127.0.0.1` is free, so a second server on the same port is
+not an error and the "next free port" logic never fires.
+
+Two review passes (one reader attacking the server, one reading the CLI glue, the tests and the
+docs against the code) found more, all fixed in this commit. A request without a usable `Host`
+header (`GET / HTTP/1.0`) has a bare path as `req.url`, `new URL()` threw, and the answer was a 500
+with a stack trace in the log. `--host ""` listened on every interface, because that is what
+`Bun.serve` does with an empty hostname. `--spa` answered traversal probes and `/.git/HEAD` with
+the app and a 200, which is harmless and looks terrible in a scanner. An unreadable file was a 500
+from outside the handler and an unreadable directory a 500 from inside it; both are a 403 now. The
+`.well-known` exemption applied at any depth. A backslash was refused on POSIX, where it is a
+legal character in a name. The 301 had no `Cache-Control`, and browsers keep a 301 forever, which
+is wrong for a port that serves a different project tomorrow. `bun serve --watch` failed with
+`util.parseArgs`' advice about `--`, which Bun has already stripped; the error now says that Bun's
+own flags go before `serve`. Colors went into `bun serve > access.log`, because
+`Bun.enableANSIColors` is about the terminal and not about stdout. The port fallback recomputed
+the default port from the environment and so ignored `bun --port` and bunfig. The `--quiet`
+assertion in the test could not fail, the URL regex could match a line that had only half arrived,
+and `bun run serve` in a test would have found a globally installed `serve` in `$PATH`. The first
+version also carried the entry point as a second bool next to `main_is_html_entrypoint`, where
+both could be true. That is the enum now.
+
+Four older bugs in Bun turned up on the way and were reported rather than fixed here. In debug
+builds every response without a body (204, 304, a redirect) carries
+`content-type: application/octet-stream`, because `RequestContext` recognises the fallback MIME
+type by comparing a pointer against a `const`, and only release builds merge the two copies. The
+`localhost` double bind above (uSockets falls through to the next address family on `EADDRINUSE`).
+`Bun.serve` ignores `If-Range` on file, directory and `Bun.file()` responses, so a download that is
+resumed after the file changed gets a 206 of the new bytes; `bun serve` inherits that and will
+inherit the fix. And on Windows `fs.promises.realpath("C:\\")` returns `"C:"`, which means the
+current directory of the drive; serving a drive root works around it in one line.
+
+Not done: compression (soup's `compress` option for `Bun.serve` would be one line here, but this
+commit should not need that one), TLS flags, `--open`, a JSON listing, shell completions and an
+entry for `serve` in the "did you mean" list (both are tables of real commands), a `Host` allow-list
+against DNS rebinding, a cap on the size of a listing, and closing the window between the symlink
+check and the open (it needs `openat2(RESOLVE_IN_ROOT)`, which the native directory route has and
+JavaScript does not). The request log shows the status the handler chose, so a Range request reads
+200 where the client saw 206. And the precedence above has a cost that the docs spell out:
+`bun serve` in a directory with a `serve.js` runs that file, which is how `bun <name>` has always
+worked and not what somebody who read "static file server" expects in a folder they do not trust.
+A `bunfig.toml` with a `preload` there has the same effect on every `bun` command, so this is not a
+new hole, but it is the argument for making `serve` a hard command one day.
+
+Rebase notes: 33 patches onto oven-sh/bun 26e7a4b369, no conflicts, nothing dropped. The fork's
+three workflows were green after yesterday's push.
+
+Files: `src/js/internal/static_server.ts` (new), `src/runtime/cli/run_command.rs`
+(`exec_static_server`, `boot_with_entry_point`), `src/jsc/VirtualMachine.rs` (`BuiltinEntryPoint`),
+`src/jsc/bindings/HTMLEntryPoint.cpp` (`Bun__loadBuiltinEntryPoint`), `src/runtime/cli/mod.rs`
+(the help text), `docs/runtime/http/static-server.mdx` (new), `docs/runtime/http/routing.mdx`,
+`docs/docs.json`, `test/cli/serve/static-server.test.ts` (new).
+
 ## Dropped
 
 Nothing yet.
