@@ -1,0 +1,114 @@
+---
+title: "Static file server"
+description: "Serve a directory of static files over HTTP with `bun serve`"
+---
+
+`bun serve` serves a directory of static files. Use it to preview a production build, to share files with another device, or to open a folder of HTML in a browser. It needs no config file and installs nothing.
+
+```sh terminal icon="terminal"
+bun serve ./dist
+```
+
+```txt
+Bun v1.4.3 ready in 6.12 ms
+
+➜ http://127.0.0.1:3000/
+  serving ./dist
+
+GET / 200 0.4ms
+GET /assets/index-4f2a.js 200 0.2ms
+GET /favicon.ico 404 0.1ms
+```
+
+Without a directory, `bun serve` serves the current one.
+
+<Note>
+  To develop a frontend with bundling and hot reloading, pass the HTML file to Bun instead: `bun ./index.html`. See
+  [Fullstack dev server](/bundler/fullstack). `bun serve` sends the files as they are on disk.
+</Note>
+
+---
+
+## What a request gets
+
+| Request             | Response                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| `/logo.png`         | The file, with a `Content-Type` from its extension                                          |
+| `/docs/`            | `docs/index.html`. Without one, a listing of the directory                                  |
+| `/docs`             | A `301` redirect to `/docs/`, so that relative links in the page resolve                    |
+| `/about`            | `about.html`, when there is no file named `about`. A directory named `about` does not count |
+| Anything else       | `404`, with `404.html` from the served directory as the page when there is one              |
+| Not `GET` or `HEAD` | `405 Method Not Allowed`                                                                    |
+
+Bun sends every file with `ETag`, `Last-Modified` and `Cache-Control: no-cache`. The browser revalidates on every load and gets a `304 Not Modified` for a file that did not change, so you never see a stale file and never download one twice. `Range` requests work, so audio and video can seek. A file that Bun cannot read gets a `403`.
+
+---
+
+## Options
+
+| Flag                | Description                                                                |
+| ------------------- | -------------------------------------------------------------------------- |
+| `-p`, `--port <n>`  | Port to listen on. `0` picks any free port                                 |
+| `--host <hostname>` | Hostname to listen on. Default `127.0.0.1`                                 |
+| `-s`, `--spa`       | Serve `index.html` for paths that match no file, for single-page apps      |
+| `--cors`            | Send `Access-Control-Allow-Origin: *` and answer `OPTIONS` preflights      |
+| `--no-listing`      | Answer `404` for a directory without an `index.html` instead of listing it |
+| `--dotfiles`        | Serve and list files and directories whose name starts with `.`            |
+| `-q`, `--quiet`     | Do not log requests                                                        |
+| `-h`, `--help`      | Print the options                                                          |
+
+These flags go after `serve`. Flags for Bun itself go before it, as in `bun --smol serve ./dist`.
+
+### Port
+
+Without `--port`, the port is the default of [`Bun.serve`](/runtime/http/server#configuring-a-default-port): `bun --port`, `$BUN_PORT`, `$PORT`, `$NODE_PORT`, or `3000`. That default is a suggestion. When another server already has it, `bun serve` tries the ten ports after it and prints the one it took. A port you pass with `--port` is not a suggestion: if it is taken, `bun serve` exits with an error.
+
+### Sharing files on your network
+
+`bun serve` listens on `127.0.0.1`, so only your machine can reach it. To reach it from a phone or another computer, listen on every interface. Bun prints the addresses to use:
+
+```sh terminal icon="terminal"
+bun serve ~/Downloads --host 0.0.0.0
+```
+
+```txt
+➜ http://localhost:3000/
+➜ http://192.168.1.24:3000/
+  serving /Users/jarred/Downloads
+```
+
+### Single-page apps
+
+A single-page app routes in the browser: `/dashboard/settings` is not a file, `index.html` is the page for it. With `--spa`, a path that matches no file gets the `index.html` of the served directory with a `200`. A path whose last segment contains a dot, like `/assets/missing.js`, is a missing file and stays a `404`.
+
+```sh terminal icon="terminal"
+bun serve ./dist --spa
+```
+
+---
+
+## What `bun serve` never sends
+
+- **Anything outside the directory.** Bun resolves `..` before it looks anything up, refuses a path with an encoded separator (`%2F`, and `%5C` on Windows) or a NUL byte, and follows a symlink only when its target is inside the served directory.
+- **Dotfiles**, unless you pass `--dotfiles`. `.env`, `.git/` and the like get a `404`, and listings leave them out. A symlink or another spelling of the name does not get around this. `bun serve` does send `/.well-known/`, because [RFC 8615](https://www.rfc-editor.org/rfc/rfc8615) defines it as a public location.
+
+---
+
+## `bun serve` and the `serve` script
+
+`bun serve` is the static file server only when your project has nothing else named `serve`. A `serve` script in `package.json` runs instead, as it always has. So does a file that `bun serve` resolves to (`serve.ts`, `serve.js`, `serve/index.ts`) and a `serve` binary in `node_modules/.bin`. `bun run serve` and `bun --if-present serve` never start the static file server.
+
+---
+
+## In your own server
+
+`bun serve` is a small wrapper around [`Bun.serve`](/runtime/http/server). To serve a directory next to your own routes, use a [directory route](/runtime/http/routing#directory-routes). A directory route sends dotfiles too, so keep files like `.env` out of the directory.
+
+```ts server.ts icon="/icons/typescript.svg"
+Bun.serve({
+  routes: {
+    "/api/hello": () => Response.json({ hello: "world" }),
+    "/*": { dir: "./public" },
+  },
+});
+```
