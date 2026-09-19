@@ -144,6 +144,9 @@ pub enum MainEntryPoint {
     /// `bun bake`: `src/js/internal/bake.ts` serves the app in the working directory. There is no
     /// entry module, so `main` is `None`.
     Bake,
+    /// `bun serve`: `src/js/internal/static_server.ts` serves a directory. There is no entry
+    /// module either.
+    StaticServer,
 }
 
 /// The built-in module that `Bun__loadBuiltinEntryPoint` runs. Mirrors
@@ -153,6 +156,7 @@ pub enum MainEntryPoint {
 pub enum BuiltinEntryPoint {
     Html = 0,
     Bake = 1,
+    StaticServer = 2,
 }
 
 pub struct VirtualMachine {
@@ -3662,6 +3666,7 @@ impl VirtualMachine {
             MainEntryPoint::File => None,
             MainEntryPoint::Html => Some(BuiltinEntryPoint::Html),
             MainEntryPoint::Bake => Some(BuiltinEntryPoint::Bake),
+            MainEntryPoint::StaticServer => Some(BuiltinEntryPoint::StaticServer),
         };
         // Note: reshaped for borrowck — capture raw ptr before &self call.
         let global = self.global;

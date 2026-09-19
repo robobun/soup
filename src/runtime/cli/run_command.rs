@@ -107,6 +107,9 @@ enum BootMain {
     /// `bun bake`: `src/js/internal/bake.ts` serves the app in the working directory. There is no
     /// entry module.
     Bake,
+    /// `bun serve`: `src/js/internal/static_server.ts` serves a directory. `path` names no file:
+    /// it is what `Bun.main` and `process.argv[1]` are.
+    StaticServer { path: Box<[u8]> },
 }
 
 impl RunCommand {
@@ -1015,11 +1018,14 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
         // `Run::start` does it then, once there is a file watcher.
         let watches = ctx.debug.hot_reload != cli::command::HotReload::None;
         if is_checked && !watches {
-            // `bun bake` always watches, so it checks in `Run::start`.
-            let BootMain::File { path, loader } = &main else {
-                unreachable!("bun bake always watches")
+            let has_type_errors = match &main {
+                BootMain::File { path, loader } => {
+                    !Self::check_main(ctx, path, *loader, &ctx.passthrough, None)
+                }
+                // `bun bake` always watches, so it checks in `Run::start`.
+                BootMain::Bake => unreachable!("bun bake always watches"),
+                BootMain::StaticServer { .. } => false,
             };
-            let has_type_errors = !Self::check_main(ctx, path, *loader, &ctx.passthrough, None);
             if has_type_errors {
                 Global::exit(1);
             }
@@ -1061,9 +1067,11 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
             bun_dns::Order::from_string_or_die(&ctx.runtime_options.dns_result_order) as u8;
         // `vm.main` is a BACKREF into these bytes and the runner never returns,
         // so the allocation is process-lifetime by construction.
+        let is_static_server = matches!(main, BootMain::StaticServer { .. });
         let (entry, loader): (Option<&'static [u8]>, Option<Loader>) = match main {
             BootMain::File { path, loader } => (Some(Box::leak(path)), loader),
             BootMain::Bake => (None, None),
+            BootMain::StaticServer { path } => (Some(Box::leak(path)), None),
         };
         // What `Run::start` passes to `vm.load_entry_point`; `mut` because the
         // cron-execution branch below may swap in a synthetic `cwd/[eval]` path
@@ -1181,6 +1189,7 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
 
         // Only `bun bake` boots with no entry module.
         vm.main_entry_point = match entry {
+            _ if is_static_server => MainEntryPoint::StaticServer,
             None => MainEntryPoint::Bake,
             Some(entry)
                 if loader
@@ -2860,6 +2869,18 @@ impl RunCommand {
             return Ok(true);
         }
 
+        // `bun serve` is the static file server when nothing else is named
+        // "serve": a package.json script, a file or a `node_modules/.bin`
+        // entry keeps running the way it did before. `bun run serve` (first
+        // positional "run") only ever runs those.
+        if ctx
+            .positionals
+            .first()
+            .is_some_and(|first| first.as_ref() == b"serve")
+        {
+            return Self::exec_static_server(ctx);
+        }
+
         if log_errors {
             if let Some((path, loader)) = resolved_to_unrunnable_file {
                 bun_core::pretty_error!(
@@ -3192,6 +3213,33 @@ impl RunCommand {
         let owned: Box<[u8]> = entry_path.to_vec().into_boxed_slice();
         if let Err(err) = Self::boot(ctx, owned, None) {
             Self::boot_failed_exit(ctx, b"-", &err);
+        }
+        Ok(true)
+    }
+
+    /// `bun serve [dir]`: boot the builtin static file server
+    /// (`src/js/internal/static_server.ts`). The directory and the flags are
+    /// in `ctx.passthrough`; the server reads them from `process.argv`.
+    fn exec_static_server(ctx: &mut ContextData) -> crate::Result<bool> {
+        // `Bun.main` and `process.argv[1]`. No file has this name.
+        #[cfg(windows)]
+        const ENTRY_NAME: &[u8] = b"\\[serve]";
+        #[cfg(not(windows))]
+        const ENTRY_NAME: &[u8] = b"/[serve]";
+
+        let entry_path: Box<[u8]> = {
+            let mut cwd_buf = bun_paths::path_buffer_pool::get();
+            let cwd = bun_core::getcwd_or_exe_dir(&mut cwd_buf);
+            [cwd.as_bytes(), ENTRY_NAME].concat().into_boxed_slice()
+        };
+
+        Global::configure_allocator(core::Global::AllocatorConfiguration {
+            long_running: true,
+            ..Default::default()
+        });
+
+        if let Err(err) = Self::boot_main(ctx, BootMain::StaticServer { path: entry_path }) {
+            Self::boot_failed_exit(ctx, b"serve", &err);
         }
         Ok(true)
     }
