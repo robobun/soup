@@ -15,7 +15,7 @@ use bun_core::{self as core, Environment, Global, Output, ZStr};
 use bun_core::{pretty, pretty_errorln, prettyln};
 use bun_dotenv as DotEnv;
 use bun_jsc::js_promise::Status as PromiseStatus;
-use bun_jsc::virtual_machine::{InitOptions as VmInitOptions, VirtualMachine};
+use bun_jsc::virtual_machine::{BuiltinEntryPoint, InitOptions as VmInitOptions, VirtualMachine};
 use bun_jsc::{JSGlobalObject, JSValue};
 use bun_md::root as md;
 use bun_options_types::schema::api;
@@ -927,6 +927,18 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
         entry_path: Box<[u8]>,
         loader: Option<Loader>,
     ) -> crate::Result<()> {
+        Self::boot_with_entry_point(ctx, entry_path, loader, None)
+    }
+
+    /// [`boot`](Self::boot) with the builtin module to run as the entry
+    /// point. `None` leaves it to the loader of `entry_path`: an HTML file
+    /// is served by [`BuiltinEntryPoint::Html`], anything else is a module.
+    fn boot_with_entry_point(
+        ctx: &mut ContextData,
+        entry_path: Box<[u8]>,
+        loader: Option<Loader>,
+        builtin_entry_point: Option<BuiltinEntryPoint>,
+    ) -> crate::Result<()> {
         if !ctx.debug.loaded_bunfig {
             arguments::load_config_path(
                 CommandTag::RunCommand,
@@ -1089,9 +1101,15 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
         );
         Self::do_preconnect(&ctx.runtime_options.preconnect);
 
-        vm.main_is_html_entrypoint = loader
-            .unwrap_or_else(|| vm.transpiler.options.loader(paths::extension(entry)))
-            == Loader::Html;
+        vm.builtin_entry_point = builtin_entry_point.unwrap_or_else(|| {
+            let loader =
+                loader.unwrap_or_else(|| vm.transpiler.options.loader(paths::extension(entry)));
+            if loader == Loader::Html {
+                BuiltinEntryPoint::Html
+            } else {
+                BuiltinEntryPoint::None
+            }
+        });
 
         // `ctx.debug.hot_reload` → `vm.hot_reload` (a `u8` until the
         // b2-cycle widens it to `cli::HotReload`); `Run::start` re-reads it
@@ -2668,6 +2686,18 @@ impl RunCommand {
             return Ok(true);
         }
 
+        // `bun serve` is the static file server when nothing else is named
+        // "serve": a package.json script, a file or a `node_modules/.bin`
+        // entry keeps running the way it did before. `bun run serve` (first
+        // positional "run") only ever runs those.
+        if ctx
+            .positionals
+            .first()
+            .is_some_and(|first| first.as_ref() == b"serve")
+        {
+            return Self::exec_static_server(ctx);
+        }
+
         if log_errors {
             if let Some((path, loader)) = resolved_to_unrunnable_file {
                 bun_core::pretty_error!(
@@ -2982,6 +3012,38 @@ impl RunCommand {
         let owned: Box<[u8]> = entry_path.to_vec().into_boxed_slice();
         if let Err(err) = Self::boot(ctx, owned, None) {
             Self::boot_failed_exit(ctx, b"-", &err);
+        }
+        Ok(true)
+    }
+
+    /// `bun serve [dir]`: boot the builtin static file server
+    /// (`src/js/internal/static_server.ts`). The directory and the flags are
+    /// in `ctx.passthrough`; the server reads them from `process.argv`.
+    fn exec_static_server(ctx: &mut ContextData) -> crate::Result<bool> {
+        // `Bun.main` and `process.argv[1]`. No file has this name.
+        #[cfg(windows)]
+        const ENTRY_NAME: &[u8] = b"\\[serve]";
+        #[cfg(not(windows))]
+        const ENTRY_NAME: &[u8] = b"/[serve]";
+
+        let entry_path: Box<[u8]> = {
+            let mut cwd_buf = bun_paths::path_buffer_pool::get();
+            let cwd = bun_core::getcwd_or_exe_dir(&mut cwd_buf);
+            [cwd.as_bytes(), ENTRY_NAME].concat().into_boxed_slice()
+        };
+
+        Global::configure_allocator(core::Global::AllocatorConfiguration {
+            long_running: true,
+            ..Default::default()
+        });
+
+        if let Err(err) = Self::boot_with_entry_point(
+            ctx,
+            entry_path,
+            None,
+            Some(BuiltinEntryPoint::StaticServer),
+        ) {
+            Self::boot_failed_exit(ctx, b"serve", &err);
         }
         Ok(true)
     }

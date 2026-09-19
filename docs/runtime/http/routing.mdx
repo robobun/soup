@@ -225,6 +225,11 @@ Directory routes share the response path with file routes:
 
 Pass `statCache: false` to disable the per-path `Last-Modified` cache (saves roughly 20 KB per route).
 
+<Note>
+  To serve a directory without writing a server, run [`bun serve ./public`](/runtime/http/static-server). It adds
+  directory listings, clean URLs, a `404.html` page and a single-page app mode, and it does not send dotfiles.
+</Note>
+
 ---
 
 ## Streaming files
