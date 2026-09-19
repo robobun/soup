@@ -15,6 +15,8 @@ enum class BuiltinEntryPoint : uint8_t {
     Html = 0,
     // `bun bake`: src/js/internal/bake.ts
     Bake = 1,
+    // `bun serve`: src/js/internal/static_server.ts
+    StaticServer = 2,
 };
 
 // Runs the default export of a built-in module as the program, instead of a user file.
@@ -23,7 +25,12 @@ extern "C" JSPromise* Bun__loadBuiltinEntryPoint(Zig::GlobalObject* globalObject
     auto& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    auto id = entryPoint == BuiltinEntryPoint::Bake ? InternalModuleRegistry::InternalBake : InternalModuleRegistry::InternalHtml;
+    auto id = InternalModuleRegistry::InternalHtml;
+    if (entryPoint == BuiltinEntryPoint::Bake) {
+        id = InternalModuleRegistry::InternalBake;
+    } else if (entryPoint == BuiltinEntryPoint::StaticServer) {
+        id = InternalModuleRegistry::InternalStaticServer;
+    }
     JSValue module = DeclaredModuleLoad::requireForCommandLine(globalObject, id);
     if (scope.exception()) [[unlikely]] {
         return JSPromise::rejectedPromiseWithCaughtException(globalObject, scope);
