@@ -92,7 +92,8 @@
               "/runtime/http/cookies",
               "/runtime/http/tls",
               "/runtime/http/error-handling",
-              "/runtime/http/metrics"
+              "/runtime/http/metrics",
+              "/runtime/http/static-server"
             ]
           },
           {

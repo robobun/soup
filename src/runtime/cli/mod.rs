@@ -657,6 +657,7 @@ pub mod help_command {
   <b><magenta>x<r>         <d>{:<16}<r>     Execute a package binary (CLI), installing if needed <d>(bunx)<r>
   <b><magenta>repl<r>                           Start a REPL session with Bun
   <b><magenta>exec<r>                           Run a shell script directly with Bun
+  <b><magenta>serve<r>     <d>./public<r>             Serve a directory of static files
 
   <b><blue>install<r>                        Install dependencies for a package.json <d>(bun i)<r>
   <b><blue>add<r>       <d>{:<16}<r>     Add a dependency to package.json <d>(bun a)<r>
