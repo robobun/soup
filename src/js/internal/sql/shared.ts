@@ -626,7 +626,34 @@ export interface DatabaseAdapter<Connection, ConnectionHandle, QueryHandle> exte
   /** COMMIT PREPARED or ROLLBACK PREPARED */
   getFinishDistributedSQL(commit: boolean, name: string): string;
 }
+
+let stderrHasColors: boolean | undefined;
+
+/// `debug: true`: one line on stderr for each query.
+function printQuery(_connection: number, query: string, parameters: unknown[]) {
+  if (stderrHasColors === undefined) {
+    // Bun.enableANSIColors is also true when only stdout is a terminal, and `2> queries.log` must stay plain.
+    const force = Bun.env.FORCE_COLOR;
+    stderrHasColors =
+      Bun.enableANSIColors &&
+      ((force !== undefined && force !== "0" && force !== "false") || require("node:tty").isatty(2));
+  }
+  let line = (stderrHasColors ? "\x1b[2m[sql]\x1b[0m " : "[sql] ") + query.trim();
+  const { length } = parameters;
+  if (length > 0) {
+    try {
+      line += " " + Bun.inspect(parameters, { colors: stderrHasColors, compact: true });
+    } catch {
+      // a parameter with an inspect function of its own, which threw
+      line += ` [ ${length} parameters ]`;
+    }
+  }
+  // not console.error(), which makes the line red
+  console.warn(line);
+}
+
 export default {
+  printQuery,
   SQLHelper,
   SQLResultArray,
   SQLArrayParameter,

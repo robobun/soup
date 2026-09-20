@@ -185,7 +185,7 @@ function hasServerOption(options: AnyOptions): boolean {
 }
 
 const TARGET_OPTIONS = ["adapter", "filename", "url"];
-const SQLITE_OPTIONS = ["readonly", "create", "safeIntegers"];
+const SQLITE_OPTIONS = ["readonly", "create", "safeIntegers", "debug"];
 const SERVER_OPTIONS = [
   "hostname",
   "host",
@@ -218,6 +218,7 @@ const SERVER_OPTIONS = [
   "transform",
   "onconnect",
   "onclose",
+  "debug",
 ];
 
 /** `options` has the own keys of `source` already. Every key is read once: a getter is the caller's code. */
@@ -315,6 +316,23 @@ function refuseRequiredChannelBinding(adapter: Adapter, channelBinding: unknown)
   }
 }
 
+type DebugCallback = Extract<Bun.SQL.PostgresOrMySQLOptions["debug"], Function>;
+
+/// `true`, a function, or nothing. Unset falls back to BUN_CONFIG_VERBOSE_SQL, which takes BUN_CONFIG_VERBOSE_FETCH's values.
+function parseDebugOption(debug: unknown): true | DebugCallback | undefined {
+  if (debug == null) {
+    const verbose = env.BUN_CONFIG_VERBOSE_SQL;
+    debug = verbose === "1" || verbose === "true";
+  }
+  if (typeof debug === "boolean") {
+    return debug || undefined;
+  }
+  if (!$isCallable(debug)) {
+    throw $ERR_INVALID_ARG_TYPE("options.debug", ["boolean", "function"], debug);
+  }
+  return debug as DebugCallback;
+}
+
 function parseSQLiteOptions(target: string | URL | null, options: AnyOptions): Bun.SQL.__internal.DefinedSQLiteOptions {
   if ("readOnly" in options) throw new TypeError('Misspelled option "readOnly" should be "readonly"');
 
@@ -376,6 +394,13 @@ function parseSQLiteOptions(target: string | URL | null, options: AnyOptions): B
   if (safeIntegers !== undefined) sqliteOptions.safeIntegers = safeIntegers;
 
   if (sqliteOptions.transform != null) sqliteOptions.transform = parseTransform(sqliteOptions.transform);
+
+  const debug = parseDebugOption(options.debug);
+  if (debug !== undefined) {
+    sqliteOptions.debug = debug;
+  } else {
+    delete sqliteOptions.debug;
+  }
 
   return sqliteOptions;
 }
@@ -748,6 +773,7 @@ function parseOptions(
     throw $ERR_INVALID_ARG_TYPE("onclose", "function", onclose);
   }
   const transform = transformOption != null ? parseTransform(transformOption) : undefined;
+  const debug = parseDebugOption(options.debug);
 
   // The name of a TLS_* URL variable asks for `require`, and PGSSLMODE can ask for more.
   let sslMode: SSLMode = requireTLS ? SSLMode.require : SSLMode.disable;
@@ -870,6 +896,10 @@ function parseOptions(
 
   if (transform !== undefined) {
     ret.transform = transform;
+  }
+
+  if (debug !== undefined) {
+    ret.debug = debug;
   }
 
   if (path) {

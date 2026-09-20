@@ -29,6 +29,24 @@ const sql2 = new Bun.SQL("postgres://localhost:5432/mydb");
 const sql3 = new Bun.SQL(new URL("postgres://localhost:5432/mydb"));
 const sql4 = new Bun.SQL({ url: "postgres://localhost:5432/mydb", idleTimeout: 1000 });
 
+// `debug` logs queries: to stderr, or to a function
+new Bun.SQL({ url: "postgres://localhost:5432/mydb", debug: true });
+new Bun.SQL("postgres://localhost:5432/mydb", {
+  debug(connection, query, parameters) {
+    expectType(connection).is<number>();
+    expectType(query).is<string>();
+    expectType(parameters).is<unknown[]>();
+  },
+});
+new Bun.SQL({
+  adapter: "sqlite",
+  filename: ":memory:",
+  debug: (connection, query, parameters) => console.log(connection, query.trim(), parameters.length),
+});
+new Bun.SQL("sqlite://:memory:", { debug: false });
+// @ts-expect-error - not a log level
+new Bun.SQL({ url: "postgres://localhost:5432/mydb", debug: "verbose" });
+
 const query1 = sql1<string>`SELECT * FROM users WHERE id = ${1}`;
 const query2 = sql2({ foo: "bar" });
 
