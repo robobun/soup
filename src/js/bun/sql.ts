@@ -13,11 +13,15 @@ interface PooledConnection {
   close(): void;
 }
 
-const { Query, SQLQueryFlags } = require("internal/sql/query");
+const {
+  Query,
+  SQLQueryFlags,
+  symbols: { _strings, _values },
+} = require("internal/sql/query");
 const { PostgresAdapter } = require("internal/sql/postgres");
 const { MySQLAdapter } = require("internal/sql/mysql");
 const { SQLiteAdapter } = require("internal/sql/sqlite");
-const { SQLHelper, parseOptions } = require("internal/sql/shared");
+const { SQLHelper, parseOptions, printQuery } = require("internal/sql/shared");
 
 const { SQLError, PostgresError, SQLiteError, MySQLError } = require("internal/sql/errors");
 const { validateAbortSignal } = require("internal/validators");
@@ -86,6 +90,29 @@ const SQL = function SQL(
     definitelyOptionsButMaybeEmpty,
   );
   const pool = adapterFromOptions(connectionInfo);
+  // parseOptions() leaves `true`, a function, or nothing
+  const debugOption = connectionInfo.debug;
+  const debug: ((connection: number, query: string, parameters: unknown[]) => void) | undefined =
+    debugOption === true ? printQuery : debugOption || undefined;
+
+  /// The `debug` option: `query` is about to go to `connectionHandle`.
+  function debugQuery(query: Query<any, any>, connectionHandle: unknown) {
+    try {
+      // what the query's handle was created from; only a debugged query pays for it twice
+      const [text, parameters] = pool.normalizeQuery(query[_strings], query[_values]);
+      // the slot in the pool; SQLite has one connection
+      const connections: unknown[] | undefined = (pool as { connections?: unknown[] }).connections;
+      debug!(
+        connections ? connections.indexOf(connectionHandle) : 0,
+        text,
+        // unsafe() binds the caller's own array, and SQLite's named parameters are one object
+        $isArray(parameters) ? parameters.slice() : [parameters],
+      );
+    } catch (err) {
+      // The query is sent anyway: a lost COMMIT or ROLLBACK would put an open transaction back in the pool.
+      reportError(err);
+    }
+  }
 
   function onQueryDisconnected(this: Query<any, any>, err: Error) {
     // connection closed mid query this will not be called if the query finishes first
@@ -101,7 +128,13 @@ const SQL = function SQL(
     }
   }
 
-  function onQueryConnected(this: Query<any, any>, handle: BaseQueryHandle<any>, err, connectionHandle) {
+  function onQueryConnected(
+    this: Query<any, any>,
+    handle: BaseQueryHandle<any>,
+    debugFrame: unknown,
+    err,
+    connectionHandle,
+  ) {
     const query = this;
     if (err) {
       // fail to aquire a connection from the pool
@@ -119,6 +152,9 @@ const SQL = function SQL(
 
     try {
       const connection = pool.getConnectionForQuery ? pool.getConnectionForQuery(connectionHandle) : connectionHandle;
+      if (debug) {
+        AsyncContextFrame.run(debugFrame, debugQuery, undefined, query, connectionHandle);
+      }
       const result = handle.run(connection, query);
 
       if (result && $isPromise(result)) {
@@ -139,7 +175,8 @@ const SQL = function SQL(
       return query.reject(pool.queryCancelledError());
     }
 
-    pool.connect(onQueryConnected.bind(query, handle));
+    // A query that waits is resumed from a socket or release event: `debug` keeps the caller's async context.
+    pool.connect(onQueryConnected.bind(query, handle, debug ? AsyncContextFrame.current() : undefined));
   }
 
   function queryFromPool(
@@ -197,6 +234,9 @@ const SQL = function SQL(
     try {
       // Use adapter method to get the actual connection
       const connection = pool.getConnectionForQuery ? pool.getConnectionForQuery(pooledConnection) : pooledConnection;
+      if (debug) {
+        debugQuery(query, pooledConnection);
+      }
       const result = handle.run(connection, query);
       if (result && $isPromise(result)) {
         result.catch(err => query.reject(err));

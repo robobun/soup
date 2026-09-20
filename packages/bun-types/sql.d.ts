@@ -199,6 +199,18 @@ declare module "bun" {
        * Receives the closing `Error`, or `null`.
        */
       onclose?: ((err: Error | null) => void) | undefined;
+
+      /**
+       * Log the queries this instance runs. `true` prints each query and its
+       * parameters to stderr. A function is called with them instead, right
+       * before the query runs: `connection` is always `0`, and named
+       * parameters are one object in `parameters`.
+       *
+       * When not set, `BUN_CONFIG_VERBOSE_SQL=1` turns on `debug: true`.
+       *
+       * @default false
+       */
+      debug?: boolean | ((connection: number, query: string, parameters: unknown[]) => void) | undefined;
     }
 
     interface PostgresOrMySQLOptions {
@@ -377,6 +389,30 @@ declare module "bun" {
        * Receives the closing `Error`, or `null`.
        */
       onclose?: ((err: Error | null) => void) | undefined;
+
+      /**
+       * Log the queries this instance runs. `true` prints each query and its
+       * parameters to stderr. A function is called with them instead, right
+       * before the query is sent: `connection` is the index of the pooled
+       * connection that runs it, `query` is the text with its `$1` or `?`
+       * placeholders, and `parameters` is an array of the values bound to
+       * them. These are the first three arguments postgres.js passes to its
+       * `debug` option. The statements that `sql.begin()` and
+       * `tx.savepoint()` send are included. The function only observes: if it
+       * throws, the error is reported as uncaught and the query is still sent.
+       *
+       * When not set, `BUN_CONFIG_VERBOSE_SQL=1` turns on `debug: true`.
+       *
+       * @default false
+       *
+       * @example
+       * ```ts
+       * const sql = new SQL({ debug: true });
+       * await sql`SELECT * FROM users WHERE id = ${1}`;
+       * // [sql] SELECT * FROM users WHERE id = $1 [ 1 ]
+       * ```
+       */
+      debug?: boolean | ((connection: number, query: string, parameters: unknown[]) => void) | undefined;
 
       /**
        * Postgres client runtime configuration options

@@ -1612,12 +1612,61 @@ function parseSQLiteOptions(
     sqliteOptions.safeIntegers = options.safeIntegers;
   }
 
+  const debug = parseDebugOption(options.debug);
+  if (debug !== undefined) {
+    sqliteOptions.debug = debug;
+  } else {
+    delete sqliteOptions.debug;
+  }
+
   return sqliteOptions;
 }
 
 const DEFAULT_PROTOCOL: Bun.SQL.__internal.Adapter = "postgres";
 
 const env = Bun.env;
+
+type DebugCallback = Extract<Bun.SQL.PostgresOrMySQLOptions["debug"], Function>;
+
+/// `true`, a function, or nothing. Unset falls back to BUN_CONFIG_VERBOSE_SQL, which takes BUN_CONFIG_VERBOSE_FETCH's values.
+function parseDebugOption(debug: unknown): true | DebugCallback | undefined {
+  if (debug == null) {
+    const verbose = env.BUN_CONFIG_VERBOSE_SQL;
+    debug = verbose === "1" || verbose === "true";
+  }
+  if (typeof debug === "boolean") {
+    return debug || undefined;
+  }
+  if (!$isCallable(debug)) {
+    throw $ERR_INVALID_ARG_TYPE("options.debug", ["boolean", "function"], debug);
+  }
+  return debug as DebugCallback;
+}
+
+let stderrHasColors: boolean | undefined;
+
+/// `debug: true`: one line on stderr for each query.
+function printQuery(_connection: number, query: string, parameters: unknown[]) {
+  if (stderrHasColors === undefined) {
+    // Bun.enableANSIColors is also true when only stdout is a terminal, and `2> queries.log` must stay plain.
+    const force = env.FORCE_COLOR;
+    stderrHasColors =
+      Bun.enableANSIColors &&
+      ((force !== undefined && force !== "0" && force !== "false") || require("node:tty").isatty(2));
+  }
+  let line = (stderrHasColors ? "\x1b[2m[sql]\x1b[0m " : "[sql] ") + query.trim();
+  const { length } = parameters;
+  if (length > 0) {
+    try {
+      line += " " + Bun.inspect(parameters, { colors: stderrHasColors, compact: true });
+    } catch {
+      // a parameter with an inspect function of its own, which threw
+      line += ` [ ${length} parameters ]`;
+    }
+  }
+  // not console.error(), which makes the line red
+  console.warn(line);
+}
 
 /**
  * Reads environment variables to try and find a connnection string
@@ -2092,6 +2141,7 @@ function parseOptions(
 
   onconnect ??= options.onconnect;
   onclose ??= options.onclose;
+  const debug = parseDebugOption(options.debug);
 
   if (onconnect !== undefined) {
     if (!$isCallable(onconnect)) {
@@ -2212,6 +2262,10 @@ function parseOptions(
     ret.onclose = onclose;
   }
 
+  if (debug !== undefined) {
+    ret.debug = debug;
+  }
+
   if (path) {
     if (require("node:fs").existsSync(path)) {
       ret.path = path;
@@ -2270,6 +2324,7 @@ export interface DatabaseAdapter<Connection, ConnectionHandle, QueryHandle> {
 
 export default {
   parseOptions,
+  printQuery,
   SQLHelper,
   SQLResultArray,
   SQLArrayParameter,

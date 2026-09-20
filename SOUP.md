@@ -2306,6 +2306,120 @@ Files: `src/js/internal/static_server.ts` (new), `src/runtime/cli/run_command.rs
 (the help text), `docs/runtime/http/static-server.mdx` (new), `docs/runtime/http/routing.mdx`,
 `docs/docs.json`, `test/cli/serve/static-server.test.ts` (new).
 
+### 2026-09-20: query logging for `Bun.SQL`
+
+`Bun.SQL` had no way to show the queries it runs. oven-sh/bun#22203 asks for one ("Debugging is so
+painful without this"), the workaround people pass around in that thread wraps the whole instance in
+a `Proxy`, and every other driver has the switch: `debug` in postgres.js, `verbose` in
+better-sqlite3, `log: ["query"]` in Prisma, `logger: true` in Drizzle. Now there is one, for
+PostgreSQL, MySQL and SQLite alike, and like `BUN_CONFIG_VERBOSE_FETCH` it can be turned on from
+outside the program:
+
+```ts
+import { SQL } from "bun";
+
+const sql = new SQL({ debug: true });
+
+await sql.begin(async tx => {
+  const [user] =
+    await tx`INSERT INTO users ${tx({ name: "Alice", age: 30 })} RETURNING id`;
+  await tx`UPDATE accounts SET owner = ${user.id} WHERE id IN ${tx([1, 2])}`;
+});
+// [sql] BEGIN
+// [sql] INSERT INTO users ("name", "age") VALUES($1, $2)  RETURNING id [ "Alice", 30 ]
+// [sql] UPDATE accounts SET owner = $1  WHERE id IN ($2, $3) [ 7, 1, 2 ]
+// [sql] COMMIT
+```
+
+```sh
+BUN_CONFIG_VERBOSE_SQL=1 bun run index.ts   # no code change: Bun.sql, an ORM's instance, all of them
+```
+
+```ts
+const sql = new SQL({
+  debug(connection, query, parameters) {
+    logger.debug({
+      requestId: requests.getStore(),
+      connection,
+      query,
+      parameters,
+    });
+  },
+});
+```
+
+`debug: true` prints one line per query to stderr, right before the query goes to its connection:
+the text the database gets (the `$1` or `?` placeholders Bun wrote, the `sql()` helpers expanded,
+nothing interpolated), then the parameters on the same line, with a dim `[sql]` in front when
+stderr has colors. The statements Bun sends on its own (`BEGIN`, `SAVEPOINT s0`, `COMMIT`, the
+`ROLLBACK` after a throw) are there too, because a log without the transaction boundaries answers
+half the questions. A query that never runs is not (a fragment, a query that is built and dropped,
+one that is cancelled while it waits for a connection). `BUN_CONFIG_VERBOSE_SQL=1` (or `true`, the
+values `BUN_CONFIG_VERBOSE_FETCH` takes) does the same for every instance that does not set `debug`,
+from the environment or a `.env` file, and `debug: false` keeps one instance quiet. A function gets
+`(connection, query, parameters)`, the first three arguments postgres.js passes to its `debug`
+option, so a logger written for it carries over: the index of the pooled connection (the statements
+of one transaction share one, SQLite is always `0`), the text, and an array of the parameters that
+is the callback's own. SQLite's named parameters arrive as one object in that array, the way
+`bun:sqlite` takes them as one argument.
+
+Two things about the callback took some thought. It is called in the async context of the code
+that ran the query. That sounds automatic and is not: a query that has to wait for a connection
+(every query on a cold pool, any query on a busy one) is resumed from the socket event or from the
+query that released the connection, so an `AsyncLocalStorage` store in the callback would be
+missing or, worse, another request's. The frame is captured when the query asks the pool for a
+connection and restored around the call, and a test that goes red without those two lines pins it
+on PostgreSQL and MySQL. And the callback only observes. The first version let a throw reject the
+query, which is what postgres.js does and reads well until the statement is `COMMIT`: Bun clears
+its "needs a rollback" flag before it sends `COMMIT`, so a logger that failed at that moment sent
+neither, and the connection went back to the pool with the transaction open. The next `BEGIN` on
+it is a warning in PostgreSQL, an implicit commit in MySQL and an error in SQLite. A throw is now
+reported as an uncaught exception, the way the callbacks of `sql.listen()` already are, and the
+statement is sent. The built-in printer cannot throw at all: a parameter whose custom inspect
+function throws is printed as `[ 2 parameters ]`.
+
+It is all JavaScript, in the layer the three adapters share. Every query ends in one of two
+`handle.run(connection, query)` calls in `src/js/bun/sql.ts` (the pool's, and the one transactions
+and reserved connections use), and the hook sits in front of both. The text is not stored on the
+query: the hook runs `normalizeQuery()` again, so only a debugged query pays for it, and without
+`debug` the whole cost is one more bound argument per query. The printer goes through
+`console.warn`, because `console.error` paints its line red, and it asks whether stderr itself has
+colors, because `Bun.enableANSIColors` is also true when only stdout is a terminal and
+`2> queries.log` should stay plain.
+
+A review pass (two readers, one on the implementation and one on the docs, types and tests) is
+where the `COMMIT` problem came from. It also found that the first version kept every query's text
+and parameters alive for as long as the query object (hence the recomputation), that a lone
+`Uint8Array` bound by the SQLite adapter was spread into an object with one key per byte, that
+`FORCE_COLOR=0` counted as forced, that the environment variable took `off` and `FALSE` for yes,
+that the docs said `sql.savepoint()` for what is `tx.savepoint()` and showed `debug: false` in the
+option examples, which would have switched the environment variable off for everyone who copied
+them, and that three tests could not fail: the one for "before the query runs" now looks at a file
+database through a second connection from inside the callback.
+
+Not done: the `LISTEN` and `UNLISTEN` that `sql.listen()` sends on its dedicated connection are not
+reported (that connection retries a failed `LISTEN` forever, and a hook in there deserves its own
+look), there is no duration or row count (it would take a second hook at the end of a query, and
+postgres.js has none to be compatible with), and the parameter types postgres.js passes as a fourth
+argument are not known to the JavaScript layer. Two older bugs turned up on the way. The callback
+of `sql.begin()` loses its `AsyncLocalStorage` store when the pool has to connect first, so the
+first transaction after a start runs without its request context; that was reported rather than
+fixed here. And ``await expect(sql`...`).rejects`` hangs `bun test` for good, without even the test
+timeout, because a query is lazy and `.rejects` does not call `then()`; upstream has an open PR for
+it (oven-sh/bun#40996), as it has for a query that is cancelled before it runs and then never
+settles (oven-sh/bun#41492).
+
+Rebase notes: 34 patches onto oven-sh/bun fc297d4658, no textual conflicts, nothing dropped. One
+patch stopped compiling all the same: upstream made `SignalCode::to_exit_code()` total
+(oven-sh/bun#39970), and the `$` kill patch of 2026-09-15 used its `None` to refuse signal 0 and to
+compute the exit code of a killed script. Two lines, folded into that commit, and its 34 tests pass.
+The fork's three workflows were green after yesterday's push.
+
+Files: `src/js/bun/sql.ts` (`debugQuery`, the frame in `queryFromPoolHandler`),
+`src/js/internal/sql/shared.ts` (`parseDebugOption`, `printQuery`), `packages/bun-types/sql.d.ts`,
+`docs/runtime/sql.mdx`, `docs/runtime/debugger.mdx`, `docs/runtime/environment-variables.mdx`,
+`test/js/sql/sql-debug.test.ts` (new), `test/integration/bun-types/fixture/sql.ts`.
+
 ## Dropped
 
 Nothing yet.

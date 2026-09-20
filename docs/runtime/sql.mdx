@@ -660,6 +660,8 @@ const sql = new SQL({
   //   cert: "path/to/cert.pem",
   // },
 
+  // debug: true, // print every query to stderr (see "Logging queries")
+
   // Callbacks
   onconnect: client => {
     console.log("Connected to MySQL");
@@ -709,6 +711,8 @@ const sql = new SQL({
   //   },
   // },
 
+  // debug: true, // print every query to stderr (see "Logging queries")
+
   // Callbacks
   onconnect: client => {
     console.log("Connected to PostgreSQL");
@@ -737,6 +741,8 @@ const sql = new SQL({
   // SQLite data handling
   strict: true, // Enable strict mode for better type safety
   safeIntegers: false, // Use BigInt for integers exceeding JS number range
+
+  // debug: true, // print every query to stderr (see "Logging queries")
 
   // Callbacks
   onconnect: client => {
@@ -773,6 +779,55 @@ const sql = new SQL(url, {
   password: async () => await signer.getAuthToken(),
 });
 ```
+
+---
+
+## Logging queries
+
+To see the queries your code runs, set `debug: true`. Each query is printed to stderr with its parameters, right before it is sent. That includes the statements Bun sends for you in `sql.begin()` and `tx.savepoint()`.
+
+```ts
+import { SQL } from "bun";
+
+const sql = new SQL({ debug: true });
+
+await sql.begin(async tx => {
+  const [user] = await tx`INSERT INTO users ${tx({ name: "Alice", age: 30 })} RETURNING id`;
+  await tx`UPDATE accounts SET owner = ${user.id} WHERE id IN ${tx([1, 2])}`;
+});
+```
+
+```txt
+[sql] BEGIN
+[sql] INSERT INTO users ("name", "age") VALUES($1, $2)  RETURNING id [ "Alice", 30 ]
+[sql] UPDATE accounts SET owner = $1  WHERE id IN ($2, $3) [ 7, 1, 2 ]
+[sql] COMMIT
+```
+
+This is the text the database receives, with the `$1` or `?` placeholders Bun wrote for the values and with the `sql()` helpers expanded. Values are never interpolated into it: the parameters follow the text.
+
+To turn this on without touching the code, set the `BUN_CONFIG_VERBOSE_SQL` environment variable to `1` or `true`, in the shell or in a `.env` file. It applies to every `SQL` instance that does not set `debug` itself, which includes `Bun.sql` and the instances a library or an ORM creates. It is read when an instance is created.
+
+```bash
+BUN_CONFIG_VERBOSE_SQL=1 bun run index.ts
+```
+
+Pass a function to send the queries somewhere else. It is called with the connection, the query text and the parameters, which are the first three arguments [postgres.js](https://github.com/porsager/postgres) passes to its `debug` option.
+
+```ts
+const sql = new SQL({
+  debug(connection, query, parameters) {
+    logger.debug({ connection, query, parameters });
+  },
+});
+```
+
+- `connection` is the index of the pooled connection that runs the query (`0` to `max - 1`, always `0` for SQLite). The queries of one transaction share one connection.
+- `parameters` is an array of its own, so it can be kept or changed. The values in it are the ones that are sent: do not change a `Buffer` or an object in place. With SQLite's named parameters the array holds the object, the way `bun:sqlite` takes it as one argument.
+- The function is called in the async context of the code that ran the query, so an `AsyncLocalStorage` store (a request id, for example) is there, also when the query had to wait for a connection.
+- The function only observes. If it throws, the error is reported as an uncaught exception and the query is sent anyway.
+
+`debug: false` turns logging off for one instance while `BUN_CONFIG_VERBOSE_SQL` is set. Parameters can hold passwords and personal data, so think twice before logging them in production. `sql.listen()` keeps a connection of its own, and the `LISTEN` and `UNLISTEN` statements it sends there are not reported.
 
 ---
 
