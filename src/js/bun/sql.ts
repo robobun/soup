@@ -8,6 +8,7 @@ type Pool = Adapter | (Adapter & Pick<InstanceType<typeof PostgresAdapter>, "lis
 type QueryHandle = BaseQueryHandle<any>;
 type QueryHandler = (query: Query, handle: QueryHandle) => void;
 type TransactionCallback = (sql: Bun.SQL) => unknown;
+type DebugCallback = (connection: number, query: string, parameters: unknown[]) => void;
 type CloseOptions = { timeout?: number };
 
 /// SQLite's is the Database itself.
@@ -21,12 +22,12 @@ const {
   Query,
   SQLQueryFlags,
   onQuerySettled,
-  symbols: { _flags, _strings, _waiter, _copy },
+  symbols: { _flags, _strings, _values, _waiter, _copy },
 } = require("internal/sql/query");
 const { PostgresAdapter } = require("internal/sql/postgres");
 const { MySQLAdapter } = require("internal/sql/mysql");
 const { SQLiteAdapter } = require("internal/sql/sqlite");
-const { SQLHelper, SQLResultArray, transforms } = require("internal/sql/shared");
+const { SQLHelper, SQLResultArray, transforms, printQuery } = require("internal/sql/shared");
 const { closeTimeoutMs } = require("internal/sql/pool");
 const { parseOptions } = require("internal/sql/options");
 
@@ -69,6 +70,8 @@ class Client implements Target {
   pool: Pool;
   options: Bun.SQL.__internal.DefinedOptions;
   flags: number;
+  /// The `debug` option. parseOptions() leaves `true`, a function, or nothing.
+  debug: DebugCallback | undefined;
   handler: QueryHandler = dispatchToPool.bind(this);
   reserve = reserve.bind(this);
   listen = listen.bind(this);
@@ -79,6 +82,8 @@ class Client implements Target {
     this.pool = pool;
     this.options = options;
     this.flags = options.bigint ? SQLQueryFlags.bigint : SQLQueryFlags.none;
+    const debug = options.debug;
+    this.debug = debug === true ? printQuery : debug || undefined;
   }
 }
 
@@ -190,10 +195,45 @@ function file(this: Target, path: string, values?: unknown) {
   return unsafeQuery(this, path, values, SQLQueryFlags.deferredText, readFileThenDispatch.bind(this));
 }
 
-function runOn(pool: Pool, pooledConnection: PooledConnection | null, query: Query, handle: QueryHandle) {
+/// The `debug` option: `query` is about to go to `pooledConnection`.
+function debugQuery(this: Client, query: Query, pooledConnection: PooledConnection | null) {
   try {
-    const connection = pool.getConnectionForQuery(pooledConnection);
+    const pool = this.pool;
+    // what the query's handle was created from; only a debugged query pays for it twice
+    const [text, parameters] = pool.normalizeQuery(query[_strings], query[_values]);
+    // the slot in the pool; SQLite has one connection
+    const connections: unknown[] | undefined = (pool as { connections?: unknown[] }).connections;
+    this.debug!(
+      connections ? connections.indexOf(pooledConnection) : 0,
+      text,
+      // unsafe() binds the caller's own array, and SQLite's named parameters are one object
+      $isArray(parameters) ? parameters.slice() : [parameters],
+    );
+  } catch (err) {
+    // The query is sent anyway: a lost COMMIT or ROLLBACK would put an open transaction back in the pool.
+    reportError(err);
+  }
+}
+
+/// `debug` runs in the async context of the code that ran the query. A query that waits for a connection is
+/// resumed from a socket or release event, so the context is taken where the query is handed over.
+function debugFrameOf(client: Client) {
+  return client.debug !== undefined ? AsyncContextFrame.current() : undefined;
+}
+
+function runOn(
+  client: Client,
+  pooledConnection: PooledConnection | null,
+  query: Query,
+  handle: QueryHandle,
+  debugFrame: unknown,
+) {
+  try {
+    const connection = client.pool.getConnectionForQuery(pooledConnection);
     query.active = true;
+    if (client.debug !== undefined) {
+      AsyncContextFrame.run(debugFrame, debugQuery, client, query, pooledConnection);
+    }
     handle.run(connection, query);
   } catch (err) {
     query.reject(err as Error);
@@ -201,22 +241,23 @@ function runOn(pool: Pool, pooledConnection: PooledConnection | null, query: Que
 }
 
 function onQueryConnected(
-  this: Pool,
+  this: Client,
   query: Query,
   handle: QueryHandle,
+  debugFrame: unknown,
   err: Error | null,
   pooledConnection: PooledConnection | null,
 ) {
   query[_waiter] = null;
   if (err) {
     // The caller dropped it while it waited. As in onQuerySettled(): one that is only started ends no process.
-    if (this.closedAtOnce) {
+    if (this.pool.closedAtOnce) {
       $pokePromiseAsHandled(query);
     }
     return query.reject(err);
   }
   pooledConnection!.bindQuery?.(query);
-  runOn(this, pooledConnection, query, handle);
+  runOn(this, pooledConnection, query, handle, debugFrame);
 }
 
 function dispatchToPool(this: Client, query: Query, handle: QueryHandle) {
@@ -224,7 +265,7 @@ function dispatchToPool(this: Client, query: Query, handle: QueryHandle) {
   if (pool.closed) {
     return query.reject(pool.connectionClosedError());
   }
-  pool.connect((query[_waiter] = onQueryConnected.bind(pool, query, handle)));
+  pool.connect((query[_waiter] = onQueryConnected.bind(this, query, handle, debugFrameOf(this))));
 }
 
 function refusal(scope: Scope): Error {
@@ -259,7 +300,7 @@ function forget(this: Scope, query: Query) {
 function start(scope: Scope, query: Query, handle: QueryHandle) {
   scope.running.add(query);
   onQuerySettled(query, forget.bind(scope, query));
-  runOn(scope.pool, scope.connection, query, handle);
+  runOn(scope.client, scope.connection, query, handle, debugFrameOf(scope.client));
 }
 
 /// A statement of the caller.

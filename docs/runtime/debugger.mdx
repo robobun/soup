@@ -207,6 +207,24 @@ await fetch("https://example.com", {
 
 ---
 
+## Debugging SQL Queries
+
+Set the `BUN_CONFIG_VERBOSE_SQL` environment variable to `1` or `true` to print the queries made with [`Bun.SQL`](/runtime/sql#logging-queries), to PostgreSQL, MySQL and SQLite alike. Each query is printed to stderr before it is sent, followed by its parameters.
+
+```sh icon="terminal" title="terminal"
+BUN_CONFIG_VERBOSE_SQL=1 bun run index.ts
+```
+
+```txt
+[sql] BEGIN
+[sql] SELECT * FROM users WHERE id = $1 [ 42 ]
+[sql] COMMIT
+```
+
+It is the same as passing `debug: true` to each `SQL` instance, and an instance that sets the `debug` option is not affected.
+
+---
+
 ## Stacktraces & sourcemaps
 
 Bun transpiles every file, which could leave stack traces pointing at the transpiled output. To avoid this, Bun generates and serves sourcemapped files for every file it transpiles. When you see a stack trace in the console, you can click on the file path and land in the original source code, even though it was written in TypeScript or JSX, or has some other transformation applied.
