@@ -2420,6 +2420,168 @@ Files: `src/js/bun/sql.ts` (`debugQuery`, the frame in `queryFromPoolHandler`),
 `docs/runtime/sql.mdx`, `docs/runtime/debugger.mdx`, `docs/runtime/environment-variables.mdx`,
 `test/js/sql/sql-debug.test.ts` (new), `test/integration/bun-types/fixture/sql.ts`.
 
+### 2026-09-21: the Web Locks API (`navigator.locks`)
+
+Every codebase with more than one async task has written this mutex: a promise chain in a module
+variable, or `async-mutex`, `async-lock`, `await-lock` from npm. The web platform has had a real one
+since 2019, Node.js ships it since 24.5, and Bun's compatibility page listed it as missing twice
+(under `navigator` and under `node:worker_threads`). Now it is there, and because the state lives in
+one place for the whole process, the same call that serializes two async tasks also serializes the
+main thread and its Workers:
+
+```ts
+// One holder at a time, on whichever thread. Held until the promise the callback returns settles,
+// and the request resolves with the callback's result afterwards.
+const rows = await navigator.locks.request("reports.db", async lock => {
+  return await rebuildReport();
+});
+
+// Any number of "shared" holders, or one "exclusive" one (the default).
+await navigator.locks.request("config", { mode: "shared" }, () => readConfig());
+
+// Don't wait: the callback gets null when the lock is taken.
+await navigator.locks.request(
+  "cache-refresh",
+  { ifAvailable: true },
+  async lock => {
+    if (lock) await refreshCache();
+  },
+);
+
+// Give up waiting after 5 seconds. Once the lock is held the signal has no say.
+await navigator.locks.request(
+  "export",
+  { signal: AbortSignal.timeout(5000) },
+  runExport,
+);
+
+// Take it from whoever has it; their request rejects with an AbortError.
+await navigator.locks.request("leader", { steal: true }, lead);
+
+await navigator.locks.query();
+// { held: [{ name: "reports.db", mode: "exclusive", clientId: "bun-4242-0" }], pending: [] }
+
+import { locks } from "node:worker_threads"; // the same LockManager, as in Node.js
+```
+
+It follows the specification (https://w3c.github.io/web-locks/) down to the parts that are easy to
+get wrong: requests for a name are granted in order, so a shared request behind a waiting exclusive
+one waits too and readers cannot starve a writer; `ifAvailable` fails when there is a queue even if
+the held locks would be compatible; the callback never runs inside `request()`; a signal that aborts
+after the registry granted the lock but before the callback's task ran means the callback is not
+called and the lock goes straight back; a stolen lock's callback keeps running and what it returns
+is dropped. The twelve web-platform-tests files for the API that do not need a DOM (`acquire`,
+`held`, `ifAvailable`, `lock-attributes`, `mode-*`, `query*`, `resource-names`, `signal`, `steal`:
+70 subtests, two of them with a Worker) pass, run through a throwaway `testharness.js` shim that is
+not part of the commit. Node's own two test files are, unmodified (`test-web-locks.js`,
+`test-web-locks-query.js`), and so are the details they pin down: the stolen lock's error is an
+`AbortError` that says "The operation was aborted", the callback runs in the `AsyncLocalStorage`
+context of the `request()` call (it is invoked from an event-loop task, so the frame is captured and
+restored by hand), and the four `locks.request.*` diagnostics channels are published to. `Lock` and
+`LockManager` are not globals, as in Node.
+
+Node's tests found the first real bug. `request()` twice in a row, the second with `steal`: the
+registry grants the first, breaks it for the second, and posts "granted" and then "broken" to the
+thread. The callback ran on "granted", returned, its microtasks ran, the request resolved, and only
+then did "broken" arrive for a request that no longer existed. The release now reports whether the
+lock was still held, and a callback that finishes holding nothing rejects the way the specification
+says it must.
+
+The design is a process-wide registry in C++ (`WebLocks.cpp`: per name, the held locks and a deque
+of pending requests, behind one mutex) and a JavaScript shell (`internal/web_locks.ts`: the two
+classes, WebIDL argument handling, what to do when the registry says granted, not available or
+broken). The registry posts its decisions with `ScriptExecutionContext::postTaskTo()` while it still
+holds the mutex, which is what guarantees that every thread hears about its requests in the order
+they were decided. The per-request JavaScript state is rooted natively, by a client object that
+belongs to the context whose script made the request, and that is the second half of the design: a
+request is owned. When the context stops, what it held is released and what it waited for is
+dropped, without running any script. A Worker that exits or is terminated is one such context. A
+disposed `Bun.ModuleGraph` is another (upstream's new multi-tenant graphs: "what a graph opens is
+the graph's" now includes its locks, the host gets them back on `dispose()`, and a request that a
+disposed graph's leftover code still makes stays pending like everything else it starts). The global
+of a finished test file under `bun test --isolate` is the third, so a test that forgets to release a
+lock cannot hang the next file.
+
+Two decisions go beyond the specification, which has no notion of a thread that exits on its own. A
+pending request keeps its thread's event loop alive exactly while a lock or request of another
+thread is ahead of it. Without that, a Worker whose script is one `await navigator.locks.request()`
+would exit silently while it waits (it has no listener, no timer, no port), which is what happens in
+Node.js 26.3: the Worker exits with code 0 and never gets the lock. With "always", two requests on
+one thread where the first never releases would keep the process from exiting, where an unsettled
+promise normally does not; behind only its own thread's locks a request is exactly that, an
+unsettled promise. The rule costs one pass over a name's queue per change, skipped when the whole
+queue belongs to one thread, so 50,000 queued requests on one name stay linear. And `query()`
+reports the whole process, with the caller's own held locks first. The specification says the whole
+origin, the two WPT tests with a Worker expect it, and it is the only way to see a deadlock between
+threads. Node reports only the calling thread, and its test reads `held[0]` as "my lock", hence the
+order.
+
+A review pass (three readers: the C++, the JavaScript against the specification, the tests and docs)
+found the second bug, in the part described two paragraphs up. When a lock went to a waiting thread,
+the registry posted the end of that thread's keep-alive first and the grant second. The first post
+wakes the thread, and a Worker with nothing else to do could find its event loop empty and exit
+before the grant was in its queue: one hand-over in about four thousand on sixteen cores, three in
+eight when pinned to one. The grant goes first now, a test hands the lock over fifty times, and the
+reviewer's loop ran fifteen thousand hand-overs without losing the Worker. The same pass found that
+the abort handling trusted the `abort` event too much (an earlier listener calling
+`stopImmediatePropagation()` left the request queued and later unsettled for good, an `abort` event
+dispatched by hand on a signal that is not aborted rejected the request and leaked its lock, a
+polluted `Object.prototype.capture` kept the listener from being removed); that a returned promise
+with a throwing `constructor` getter escaped `dispatch()` and leaked the lock; that a missed
+`ifAvailable` request published its `end` before its callback's promise had settled; that printing
+`Lock.prototype` threw and `util.inspect()` lost the class names; that the interface objects had a
+`length`; that stopping a client rotated every pending queue of the process under the mutex; that
+two tests could not fail (one probed the lock before the first callback had run, one checked a flag
+that is still false one task after any grant); and that the first docs sample rejects until its file
+exists. All fixed in this commit, the behaviors with tests.
+
+Checked beyond the tests in the commit: a stress run with six Workers and the main thread on three
+names, mixed modes, `ifAvailable` and aborts (12,000 grants, no two holders that exclude each
+other); the same with a `worker.terminate()` at random several times a second under ASAN (no crash,
+nothing left held or pending); 150,000 requests with flat memory. The feature was built and run on
+Windows as well (the new test file and Node's two pass there), which found nothing this time.
+
+No change to `packages/bun-types`: `navigator.locks` and `locks` are declared by `@types/node`,
+which bun-types depends on, and by `lib.dom.d.ts`; lines in the `worker.ts` fixture pin that it
+type-checks under both.
+
+One thing a reader of `WebLocks.cpp` should know: the registry posts while it holds its mutex, which
+is what orders the events and is harmless because a post never blocks. The one exception is the
+debug-only teardown gate that `worker-late-completion.test.ts` arms, which parks posters until the
+Worker drains, and a stopping Worker needs the mutex before it drains. That test has no locks in it
+and should not grow any.
+
+Not done: locks do not reach across processes (in a browser they span tabs; here that would take a
+lock file or a named OS primitive and a different failure model), there is no deadlock detection
+(two threads that wait for each other wait, as with any lock, and with the keep-alive rule they now
+do so visibly instead of one of them exiting), the `Lock` and `LockManager` interface objects are
+not exposed as globals, and the records of a disposed graph's requests are dropped without rejecting
+their promises, like everything else a disposed graph was waiting for. One unrelated bug turned up
+and was reported rather than fixed here: a listener added with `addEventListener()` on the global
+scope is called with `this === undefined` instead of the global object, on the main thread and in a
+Worker, which is how the WPT helper `worker.js` (`const target = this`) failed before the shim
+worked around it.
+
+Rebase notes: 35 patches onto oven-sh/bun 2f6284cd03, two textual conflicts, nothing dropped. Both
+sides had appended tests to `filesink.test.ts` (the `append` patch of 2026-08-29), and upstream's
+"Typecheck the built-in modules" (oven-sh/bun#43649) retyped the function the query logging patch of
+2026-09-20 adds a parameter to. That change also means upstream now runs `tsc` and oxlint over
+`src/js` in its Lint workflow, which only runs on pull requests, so the fork's push CI cannot see
+it. The whole stack passes `tsc`. A lint rule upstream added in the meantime (a property read in an
+`if` and again in its body) flagged the `EventSource` patch of 2026-09-01 once and the
+`expect.poll()` patch of 2026-09-08 three times; the fixes are folded into those commits and their
+tests pass. The MySQL third of the query logging tests could not run in today's container (its
+MariaDB refuses `root` over TCP, with stock Bun too); the PostgreSQL and SQLite parts pass. The
+fork's three workflows were green after yesterday's push.
+
+Files: `src/jsc/bindings/webcore/WebLocks.cpp`, `src/jsc/bindings/webcore/WebLocks.h` (new),
+`src/js/internal/web_locks.ts` (new), `src/jsc/bindings/ZigGlobalObject.cpp` (the `locks` getter of
+`navigator`), `src/js/node/worker_threads.ts` (`locks`), `docs/runtime/workers.mdx`,
+`docs/runtime/web-apis.mdx`, `docs/runtime/nodejs-compat.mdx`, `docs/runtime/module-graph.mdx`,
+`test/js/web/locks/locks.test.ts` (new), `test/js/node/test/parallel/test-web-locks.js`,
+`test/js/node/test/parallel/test-web-locks-query.js` (from Node.js, unmodified),
+`test/integration/bun-types/fixture/worker.ts`.
+
 ## Dropped
 
 Nothing yet.

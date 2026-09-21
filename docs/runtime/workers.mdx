@@ -306,6 +306,48 @@ const config = getEnvironmentData("config");
 console.log(config); // => { apiUrl: "https://api.example.com" }
 ```
 
+## Locks with `navigator.locks`
+
+The [Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) coordinates work on a named resource. `navigator.locks.request()` waits until the lock is free, calls your function, and holds the lock until the promise that function returns settles. Locks are shared by every thread of the process, so the same code serializes async tasks on one thread and the main thread with its workers.
+
+```ts title="worker.ts" icon="/icons/typescript.svg"
+// Read, change, write: one thread at a time, whichever thread gets here first.
+await navigator.locks.request("stats.json", async lock => {
+  const file = Bun.file("stats.json");
+  const stats = (await file.exists()) ? await file.json() : { jobs: 0 };
+  stats.jobs += 1;
+  await Bun.write(file, JSON.stringify(stats));
+});
+```
+
+The request resolves (or rejects) with whatever the function returns, after the lock was released. An options object goes between the name and the function:
+
+```ts
+// Any number of "shared" holders at once, or one "exclusive" holder (the default).
+await navigator.locks.request("config", { mode: "shared" }, async () => readConfig());
+
+// Don't wait: the function gets `null` when the lock is taken.
+await navigator.locks.request("cache-refresh", { ifAvailable: true }, async lock => {
+  if (lock === null) return; // someone else is already refreshing
+  await refreshCache();
+});
+
+// Stop waiting after 5 seconds. Has no effect once the lock is held.
+await navigator.locks.request("report", { signal: AbortSignal.timeout(5000) }, buildReport);
+
+// Take the lock from whoever holds it. Their request rejects with an "AbortError".
+await navigator.locks.request("leader", { steal: true }, lead);
+```
+
+`navigator.locks.query()` resolves to a snapshot of every held lock and pending request in the process. Entries with the same `clientId` belong to the same thread (or the same `Bun.ModuleGraph`).
+
+```ts
+const { held, pending } = await navigator.locks.query();
+// held: [{ name: "stats.json", mode: "exclusive", clientId: "bun-4242-1" }], pending: []
+```
+
+A worker that waits for a lock held by another thread stays alive until it gets the lock. When a worker exits or is terminated, the locks it held are released and its pending requests are dropped. The same happens to the locks of a [`Bun.ModuleGraph`](/runtime/module-graph) that is disposed, and to what a test file leaves behind under `bun test --isolate`. Locks do not reach outside the process, and two threads that wait for each other's locks wait forever, as with any lock. The same `LockManager` is exported as `locks` from `node:worker_threads`.
+
 ## Worker Events
 
 Listen for worker creation events using `process.on()`:
