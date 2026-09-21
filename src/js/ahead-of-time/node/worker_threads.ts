@@ -1,5 +1,5 @@
 // What the compiler reads in place of src/js/node/worker_threads.ts, which `bun run` evaluates. The two do the same.
-// Written against that file with the SHA-256 3df5d2644db4a035b3d4fdc2597dd4def4a570466397f5de1010dd7ad4427d60.
+// Written against that file with the SHA-256 4a72dc966a12f21a12c9d6cb4b1576eed162a997410b5c4a17a5b388a213dbec.
 // When that file changes, bring the change here and write the new hash: test/internal/second-texts-of-modules.test.ts.
 
 declare const self: EventTarget & {
@@ -1353,4 +1353,8 @@ export default {
   SHARE_ENV,
   threadId,
   threadName,
+  // The LockManager that is also navigator.locks.
+  get locks() {
+    return require("internal/web_locks").locks;
+  },
 };
