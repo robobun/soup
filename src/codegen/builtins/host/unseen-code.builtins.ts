@@ -261,6 +261,7 @@ const nativeFiles = [
   "StructuredClone.cpp",
   "Undici.cpp",
   "UtilInspect.cpp",
+  "WebLocks.cpp",
   "ZigSourceProvider.cpp",
   "bindgen_test.bind.ts",
   "decodeURIComponentSIMD.cpp",

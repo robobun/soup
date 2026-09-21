@@ -398,6 +398,15 @@ export default b.declarations(
     userAgent: describesMachine(b.string),
     platform: describesMachine(b.string),
     hardwareConcurrency: describesMachine(b.f64),
+    // The LockManager of the library (src/js/internal/web_locks.ts), which the getter loads where it is first called.
+    locks: {
+      this: b.any,
+      getter: b.object,
+      capability: "js",
+      throws: true,
+      uses: { this: b.inspected },
+      implementation: b.generic,
+    },
     "@@toStringTag": b.property(b.string),
   }),
   b.inherits("navigator", "Object.prototype"),
