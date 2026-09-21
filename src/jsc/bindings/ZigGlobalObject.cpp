@@ -2302,6 +2302,13 @@ JSC_DEFINE_HOST_FUNCTION(functionNavigatorGetHardwareConcurrency, (JSC::JSGlobal
     return JSValue::encode(JSC::jsNumber(WTF::numberOfProcessorCores()));
 }
 
+// The LockManager is JavaScript (src/js/internal/web_locks.ts), evaluated the first time `locks` is read.
+JSC_DEFINE_HOST_FUNCTION(functionNavigatorGetLocks, (JSC::JSGlobalObject * lexicalGlobalObject, JSC::CallFrame*))
+{
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+    return JSValue::encode(BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalWebLocks, "navigator.locks", "locks"_s));
+}
+
 JSC_DECLARE_HOST_FUNCTION(makeGetterTypeErrorForBuiltins);
 JSC_DECLARE_HOST_FUNCTION(makeDOMExceptionForBuiltins);
 JSC_DECLARE_HOST_FUNCTION(isAbortSignal);
@@ -3082,11 +3089,12 @@ void GlobalObject::finishCreation(VM& vm)
              JSC::JSGlobalObject* globalObject = init.owner;
              unsigned accessorAttributes = PropertyAttribute::Accessor | 0;
 
-             JSC::JSObject* obj = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 4);
+             JSC::JSObject* obj = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 5);
 
              obj->putDirectNativeIntrinsicGetter(init.vm, globalObject, JSC::Identifier::fromString(init.vm, "userAgent"_s), functionNavigatorGetUserAgent, JSC::NoIntrinsic, accessorAttributes);
              obj->putDirectNativeIntrinsicGetter(init.vm, globalObject, JSC::Identifier::fromString(init.vm, "platform"_s), functionNavigatorGetPlatform, JSC::NoIntrinsic, accessorAttributes);
              obj->putDirectNativeIntrinsicGetter(init.vm, globalObject, JSC::Identifier::fromString(init.vm, "hardwareConcurrency"_s), functionNavigatorGetHardwareConcurrency, JSC::NoIntrinsic, accessorAttributes);
+             obj->putDirectNativeIntrinsicGetter(init.vm, globalObject, JSC::Identifier::fromString(init.vm, "locks"_s), functionNavigatorGetLocks, JSC::NoIntrinsic, accessorAttributes);
 
              obj->putDirect(init.vm, init.vm.propertyNames->toStringTagSymbol,
                  jsNontrivialString(init.vm, "Navigator"_s), PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly);

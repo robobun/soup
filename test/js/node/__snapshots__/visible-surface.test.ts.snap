@@ -3739,6 +3739,7 @@ worker_threads[receiveMessageOnPort][name] c-- string
 worker_threads[SHARE_ENV] cew symbol
 worker_threads[threadId] cew number
 worker_threads[threadName] cew string
+worker_threads[locks] cea accessor get=function set=undefined
 zlib: object above=Object extensible=true
 zlib[crc32] cew function
 zlib[crc32]: function native name="crc32" length=1 above=Function extensible=true
