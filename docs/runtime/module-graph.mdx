@@ -35,6 +35,7 @@ A graph has a context of its own for timers and I/O. Everything its code opens b
 - workers
 - database connections
 - files opened through `Bun.file().writer()`, `bun:sqlite` and `node:sqlite`
+- locks held, and lock requests waiting, through [`navigator.locks`](/runtime/workers#locks-with-navigator-locks)
 - graphs its code makes
 
 The context follows the code asynchronously, like `AsyncLocalStorage`: through `await`, timers, socket handlers and event listeners.
