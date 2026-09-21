@@ -6810,6 +6810,22 @@ node:worker_threads.Worker.prototype [Symbol.asyncDispose]()
   object Promise <- every receiver
 node:worker_threads.Worker.prototype [Symbol.asyncDispose]("a", 1)
   object Promise <- every receiver
+what is above node:worker_threads.locks request()
+  object Promise <- every receiver
+what is above node:worker_threads.locks request("a", 1)
+  object Promise <- every receiver
+what is above node:worker_threads.locks query()
+  object Promise <- every receiver
+what is above node:worker_threads.locks query("a", 1)
+  object Promise <- every receiver
+what is above node:worker_threads.locks [nodejs.util.inspect.custom]()
+  the receiver <- every object, a number, a string
+  undefined <- undefined
+  null <- null
+what is above node:worker_threads.locks [nodejs.util.inspect.custom]("a", 1)
+  the receiver <- every object, a number, a string
+  undefined <- undefined
+  null <- null
 "
 `;
 
