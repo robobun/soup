@@ -161,7 +161,7 @@ We update this page regularly. It reflects the latest version of Bun's compatibi
 
 ### [`node:worker_threads`](https://nodejs.org/api/worker_threads.html)
 
-🟡 `Worker` ignores the `resourceLimits` and `trackUnmanagedFds` options. Some `execArgv` flags take effect in the worker, for example `--no-addons`, `--stack-trace-limit` and `--tls-min-v1.3`. Others, for example `--conditions` and `--no-deprecation`, only set `process.execArgv`. `worker.performance.eventLoopUtilization()` is a stub. Missing `moveMessagePortToContext` and `locks`.
+🟡 `Worker` ignores the `resourceLimits` and `trackUnmanagedFds` options. Some `execArgv` flags take effect in the worker, for example `--no-addons`, `--stack-trace-limit` and `--tls-min-v1.3`. Others, for example `--conditions` and `--no-deprecation`, only set `process.execArgv`. `worker.performance.eventLoopUtilization()` is a stub. `locks` is implemented; `locks.query()` reports the locks and requests of every thread, as the Web Locks specification says, where Node.js reports only the calling thread's. Missing `moveMessagePortToContext`.
 
 ### [`node:inspector`](https://nodejs.org/api/inspector.html)
 
@@ -345,7 +345,7 @@ The following list covers the globals implemented by Node.js and Bun's compatibi
 
 ### [`navigator`](https://nodejs.org/api/globals.html#navigator)
 
-🟡 `userAgent`, `platform` and `hardwareConcurrency` are implemented. Missing `language`, `languages` and `locks`. The `Navigator` class is not a global.
+🟡 `userAgent`, `platform`, `hardwareConcurrency` and [`locks`](/runtime/workers#locks-with-navigator-locks) are implemented. Missing `language` and `languages`. The `Navigator` class is not a global.
 
 ### [`PerformanceEntry`](https://developer.mozilla.org/en-US/docs/Web/API/PerformanceEntry)
 

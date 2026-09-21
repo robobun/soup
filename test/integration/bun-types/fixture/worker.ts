@@ -1,4 +1,4 @@
-import { Worker as NodeWorker } from "node:worker_threads";
+import { locks, Worker as NodeWorker } from "node:worker_threads";
 import * as tsd from "./utilities";
 
 const webWorker = new Worker("./worker.js");
@@ -60,3 +60,20 @@ const _worker3 = new Worker(new URL("worker.ts", "/path/to/").href, {
 });
 
 export { _worker2, _worker3, nodeWorker as worker };
+
+// Web Locks
+tsd.expectType<Promise<number>>(
+  navigator.locks.request("resource", async lock => {
+    tsd.expectType<string | undefined>(lock?.name);
+    tsd.expectType<"exclusive" | "shared" | undefined>(lock?.mode);
+    return 1;
+  }),
+);
+await navigator.locks.request(
+  "resource",
+  { mode: "shared", ifAvailable: true, steal: false, signal: new AbortController().signal },
+  lock => lock === null,
+);
+const lockState = await locks.query();
+tsd.expectType<string | undefined>(lockState.held?.[0]?.clientId);
+tsd.expectType<"exclusive" | "shared" | undefined>(lockState.pending?.[0]?.mode);
