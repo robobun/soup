@@ -1293,4 +1293,8 @@ export default {
   SHARE_ENV,
   threadId,
   threadName,
+  // The LockManager that is also navigator.locks.
+  get locks() {
+    return require("internal/web_locks").locks;
+  },
 };
