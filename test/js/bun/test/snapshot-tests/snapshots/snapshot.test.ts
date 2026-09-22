@@ -2,6 +2,7 @@ import { $ } from "bun";
 import { describe, expect, it, test } from "bun:test";
 import { readFileSync, writeFileSync } from "fs";
 import { bunEnv, bunExe, DirectoryTree, isDebug, tempDir, tempDirWithFiles } from "harness";
+import { join } from "path";
 
 function test1000000(arg1: any, arg218718132: any) {}
 
@@ -957,4 +958,350 @@ test("write snapshot from filter", async () => {
   expect(await Bun.file(dir + "/mytests/snap.test.ts").text()).toBe(sver("a", true));
   expect(await Bun.file(dir + "/mytests/snap2.test.ts").text()).toBe(sver("b", true));
   expect(await Bun.file(dir + "/mytests/more/testing.test.ts").text()).toBe(sver("TEST", true));
+});
+
+describe("expect.addSnapshotSerializer()", () => {
+  // A serializer applies to every snapshot of the run once it is added, so each of
+  // these only accepts instances of a class that is local to this block.
+  class Point {
+    constructor(
+      public x: number,
+      public y: number,
+    ) {}
+  }
+  class Box {
+    constructor(public items: unknown[]) {}
+  }
+  class Legacy {
+    constructor(public child: unknown) {}
+  }
+  class Node {
+    next: unknown;
+    constructor(public name: string) {}
+  }
+  class Answer {}
+  class Throws {
+    constructor(public where: "test" | "serialize") {}
+  }
+  class NotAString {}
+
+  expect.addSnapshotSerializer({
+    test: value => value instanceof Point,
+    serialize: (point: Point) => `Point(${point.x}, ${point.y})`,
+  });
+  expect.addSnapshotSerializer({
+    test: value => value instanceof Box,
+    serialize(box: Box, config, indentation, depth, refs, printer) {
+      const inner = indentation + config.indent;
+      const items = box.items.map(item => inner + printer(item, config, inner, depth + 1, refs) + ",\n");
+      return "Box [\n" + items.join("") + indentation + "]";
+    },
+  });
+  expect.addSnapshotSerializer({
+    test: value => value instanceof Legacy,
+    print: (legacy: Legacy, print, indent) => "Legacy {\n" + indent("child: " + print(legacy.child)) + "\n}",
+  });
+  expect.addSnapshotSerializer({
+    test: value => value instanceof Node,
+    serialize(node: Node, config, indentation, depth, refs, printer) {
+      if (refs.includes(node)) return "[Circular]";
+      return `Node(${node.name}) -> ` + printer(node.next, config, indentation, depth, [...refs, node]);
+    },
+  });
+
+  test("prints the value a serializer accepts", () => {
+    expect(new Point(1, 2)).toMatchInlineSnapshot(`Point(1, 2)`);
+    expect(new Point(3, 4)).toMatchSnapshot();
+  });
+
+  test("applies at any depth", () => {
+    expect({ a: new Point(1, 2), b: [new Point(3, 4)] }).toMatchInlineSnapshot(`
+      {
+        "a": Point(1, 2),
+        "b": [
+          Point(3, 4),
+        ],
+      }
+    `);
+    expect(new Map([[new Point(5, 6), new Point(7, 8)]])).toMatchInlineSnapshot(`
+      Map {
+        Point(5, 6) => Point(7, 8),
+      }
+    `);
+    expect(new Set([new Point(9, 10)])).toMatchInlineSnapshot(`
+      Set {
+        Point(9, 10),
+      }
+    `);
+  });
+
+  test("printer() formats the values a serializer hands back", () => {
+    expect(new Box([1, "two", { three: new Point(3, 3) }, new Box([new Point(0, 0)])])).toMatchInlineSnapshot(`
+      Box [
+        1,
+        "two",
+        {
+          "three": Point(3, 3),
+        },
+        Box [
+          Point(0, 0),
+        ],
+      ]
+    `);
+    expect({ box: new Box([{ a: 1 }]) }).toMatchInlineSnapshot(`
+      {
+        "box": Box [
+          {
+            "a": 1,
+          },
+        ],
+      }
+    `);
+  });
+
+  test("printer() starts a Map, a Set and a multi-line string where the serializer puts them", () => {
+    class Wrapper {
+      constructor(public inner: unknown) {}
+    }
+    expect.addSnapshotSerializer({
+      test: value => value instanceof Wrapper,
+      serialize: (wrapper: Wrapper, config, indentation, depth, refs, printer) =>
+        "Wrapper<" + printer(wrapper.inner, config, indentation, depth, refs) + ">",
+    });
+    expect(new Wrapper(new Map([["k", new Point(1, 2)]]))).toMatchInlineSnapshot(`
+      Wrapper<Map {
+        "k" => Point(1, 2),
+      }>
+    `);
+    expect([new Wrapper(new Set([1]))]).toMatchInlineSnapshot(`
+      [
+        Wrapper<Set {
+          1,
+        }>,
+      ]
+    `);
+    expect(new Wrapper("two\nlines")).toMatchInlineSnapshot(`
+      Wrapper<"two
+      lines">
+    `);
+    expect(new Wrapper(new Wrapper({ a: 1 }))).toMatchInlineSnapshot(`
+      Wrapper<Wrapper<{
+        "a": 1,
+      }>>
+    `);
+  });
+
+  test("print() and indent() of the older interface", () => {
+    expect(new Legacy({ x: [1, 2], point: new Point(9, 9) })).toMatchInlineSnapshot(`
+      Legacy {
+        child: {
+          "point": Point(9, 9),
+          "x": [
+            1,
+            2,
+          ],
+        }
+      }
+    `);
+  });
+
+  test("serialize() gets pretty-format's arguments", () => {
+    let args: any[] = [];
+    class Probe {}
+    expect.addSnapshotSerializer({
+      test: value => value instanceof Probe,
+      serialize(...all) {
+        args = all;
+        return "Probe";
+      },
+    });
+    const outer = { nested: [new Probe()] };
+    expect(outer).toMatchInlineSnapshot(`
+      {
+        "nested": [
+          Probe,
+        ],
+      }
+    `);
+    const [value, config, indentation, depth, refs, printer] = args;
+    expect(value).toBeInstanceOf(Probe);
+    expect(config).toMatchObject({
+      indent: "  ",
+      min: false,
+      spacingInner: "\n",
+      spacingOuter: "\n",
+      escapeRegex: true,
+      printFunctionName: false,
+      colors: { value: { open: "", close: "" } },
+    });
+    expect(config.plugins).toBeArray();
+    expect(indentation).toBe("    ");
+    expect(depth).toBe(2);
+    // The values the Probe is nested in.
+    expect(refs).toHaveLength(2);
+    expect(refs).toContain(outer);
+    expect(refs).toContain(outer.nested);
+    expect(printer(["a"], config, "", 0, [])).toBe('[\n  "a",\n]');
+  });
+
+  test("refs reach the serializers further in", () => {
+    const a = new Node("a");
+    const b = new Node("b");
+    a.next = b;
+    b.next = a;
+    expect(a).toMatchInlineSnapshot(`Node(a) -> Node(b) -> [Circular]`);
+  });
+
+  test("a cycle that runs through a serializer ends in [Circular]", () => {
+    const cycle: any = { name: "cycle" };
+    cycle.self = new Box([cycle]);
+    expect(cycle).toMatchInlineSnapshot(`
+      {
+        "name": "cycle",
+        "self": Box [
+          [Circular],
+        ],
+      }
+    `);
+  });
+
+  test("the serializer added last is asked first", () => {
+    expect.addSnapshotSerializer({ test: value => value instanceof Answer, serialize: () => "first" });
+    expect.addSnapshotSerializer({ test: value => value instanceof Answer, serialize: () => "second" });
+    expect(new Answer()).toMatchInlineSnapshot(`second`);
+  });
+
+  // The messages have colors when the terminal does.
+  function thrownMessage(fn: () => unknown): string {
+    try {
+      fn();
+    } catch (error) {
+      return Bun.stripANSI((error as Error).message);
+    }
+    throw new Error("Expected the function to throw");
+  }
+
+  test("errors", () => {
+    for (const invalid of [undefined, null, 1, {}, { test() {} }, { serialize() {} }, { test: 1, print() {} }]) {
+      // @ts-expect-error
+      expect(thrownMessage(() => expect.addSnapshotSerializer(invalid))).toContain(
+        "Expected an object with a test function and a serialize or print function",
+      );
+    }
+
+    expect.addSnapshotSerializer({
+      test(value) {
+        if (value instanceof Throws && value.where === "test") throw new Error("test() threw");
+        return value instanceof Throws;
+      },
+      serialize() {
+        throw new Error("serialize() threw");
+      },
+    });
+    // @ts-expect-error
+    expect.addSnapshotSerializer({ test: value => value instanceof NotAString, serialize: () => 123 });
+
+    expect(() => expect(new Throws("test")).toMatchSnapshot()).toThrow("test() threw");
+    expect(() => expect({ a: [new Throws("serialize")] }).toMatchSnapshot()).toThrow("serialize() threw");
+    expect(() => expect(new Map([["key", new Throws("serialize")]])).toMatchSnapshot()).toThrow("serialize() threw");
+    expect(() => expect(new Set([new Throws("serialize")])).toMatchSnapshot()).toThrow("serialize() threw");
+    expect(() => expect(new NotAString()).toMatchSnapshot()).toThrow(
+      "Snapshot serializer must return a string, but it returned number",
+    );
+  });
+
+  test("a serializer that never stops recursing throws a RangeError", () => {
+    class Loop {}
+    expect.addSnapshotSerializer({
+      test: value => value instanceof Loop,
+      serialize: (loop, config, indentation, depth, refs, printer) =>
+        "Loop(" + printer({ again: loop }, config, indentation, depth, refs) + ")",
+    });
+    expect(() => expect(new Loop()).toMatchSnapshot()).toThrow(RangeError);
+  });
+
+  test("does not apply to matcher failure messages", () => {
+    const message = thrownMessage(() => expect(new Point(1, 2)).toEqual(new Point(1, 3)));
+    expect(message).toContain(`"y": 2`);
+    expect(message).not.toContain("Point(1, 2)");
+  });
+
+  // Like `expect.extend()`: a serializer lasts as long as the global it was added in.
+  test.each([
+    { mode: "one global for the run", args: [], symbol: "Sym<x>" },
+    { mode: "--isolate", args: ["--isolate"], symbol: "Symbol(x)" },
+  ])("a serializer lasts as long as its global: $mode", async ({ args, symbol }) => {
+    using dir = tempDir("snapshot-serializer-scope", {
+      "bunfig.toml": `[test]\npreload = ["./preload.ts"]\n`,
+      "preload.ts": /*js*/ `
+        import { expect } from "bun:test";
+        expect.addSnapshotSerializer({ test: v => typeof v === "bigint", serialize: v => "BigInt<" + v + ">" });
+      `,
+      "a.test.ts": /*js*/ `
+        import { expect, test } from "bun:test";
+        expect.addSnapshotSerializer({ test: v => typeof v === "symbol", serialize: v => "Sym<" + v.description + ">" });
+        expect.addSnapshotSerializer({ test: v => v === 1n, serialize: () => "one" });
+        test("a", () => {
+          expect([1n, 2n, Symbol("x")]).toMatchSnapshot();
+          expect(() => { throw new Error("boom"); }).toThrowErrorMatchingSnapshot();
+        });
+      `,
+      "b.test.ts": /*js*/ `
+        import { expect, test } from "bun:test";
+        test("b", () => {
+          expect([2n, Symbol("x")]).toMatchSnapshot();
+          expect({ id: 2n, when: 5 }).toMatchSnapshot({ when: expect.any(Number) });
+        });
+      `,
+    });
+
+    // Twice: the first run writes the snapshots, the second one has to match them.
+    for (let run = 0; run < 2; run++) {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", ...args, "./a.test.ts", "./b.test.ts"],
+        env: { ...bunEnv, CI: "false" },
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+      expect(stderr).toContain(" 2 pass");
+      expect(stderr).toContain(" 0 fail");
+      expect(stderr).toContain(run === 0 ? "+4 added" : " 4 snapshots");
+      expect(exitCode).toBe(0);
+    }
+
+    expect(await Bun.file(join(String(dir), "__snapshots__", "a.test.ts.snap")).text()).toBe(
+      `// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[\`a 1\`] = \`
+[
+  one,
+  BigInt<2>,
+  Sym<x>,
+]
+\`;
+
+exports[\`a 2\`] = \`"boom"\`;
+`,
+    );
+    expect(await Bun.file(join(String(dir), "__snapshots__", "b.test.ts.snap")).text()).toBe(
+      `// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[\`b 1\`] = \`
+[
+  BigInt<2>,
+  ${symbol},
+]
+\`;
+
+exports[\`b 2\`] = \`
+{
+  "id": BigInt<2>,
+  "when": Any<Number>,
+}
+\`;
+`,
+    );
+  });
 });
