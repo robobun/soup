@@ -1616,11 +1616,9 @@ impl Expect {
         Ok(this_value)
     }
 
-    // Rust has no associated const-fn aliases that satisfy
-    // `Expect::add_snapshot_serializer(..)` UFCS, so forward.
     #[inline]
     pub(crate) fn add_snapshot_serializer(global_this: &JSGlobalObject, call_frame: &CallFrame) -> JsResult<JSValue> {
-        Self::not_implemented_static_fn(global_this, call_frame)
+        super::snapshot_serializer::add(global_this, call_frame)
     }
 
     // extern shim emitted by `#[bun_jsc::JsClass]` codegen (TypeClass__construct/__call); bare `#[host_fn]` cannot target an associated fn without a receiver.
@@ -1691,12 +1689,6 @@ impl Expect {
         execution.expect_assertions = ExpectAssertions::Exact(unsigned_expected_assertions);
 
         Ok(JSValue::UNDEFINED)
-    }
-
-
-    // extern shim emitted by `#[bun_jsc::JsClass]` codegen (TypeClass__construct/__call); bare `#[host_fn]` cannot target an associated fn without a receiver.
-    pub(crate) fn not_implemented_static_fn(global_this: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
-        Err(global_this.throw(format_args!("Not implemented")))
     }
 
 

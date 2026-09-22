@@ -424,6 +424,8 @@ pub(crate) struct BunTestRoot {
     /// state (node:test root) resets on `--rerun-each` where `Bun.main` is
     /// unchanged across iterations.
     pub(crate) file_generation: u32,
+    /// What `expect.addSnapshotSerializer()` registered.
+    pub(crate) snapshot_serializers: super::snapshot_serializer::SnapshotSerializers,
 }
 
 impl BunTestRoot {
@@ -444,13 +446,16 @@ impl BunTestRoot {
             hook_scope,
             pending_then_refs: std::cell::RefCell::new(Vec::new()),
             file_generation: 0,
+            snapshot_serializers: Default::default(),
         }
     }
 
-    /// Drop preload-level hooks registered in the previous global. The next
-    /// file's `loadPreloads()` re-registers them against the fresh global.
+    /// Drop preload-level hooks and snapshot serializers registered in the
+    /// previous global. The next file's `loadPreloads()` re-registers them
+    /// against the fresh global.
     pub(crate) fn reset_hook_scope_for_test_isolation(&mut self) {
         debug_assert!(self.hook_scope.entries.is_empty());
+        self.snapshot_serializers.clear();
         // drop old, create fresh
         self.hook_scope = DescribeScope::create(BaseScope {
             parent: None,
