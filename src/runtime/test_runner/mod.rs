@@ -145,6 +145,7 @@ cfg_jsc! {
     #[path = "pretty_format.rs"]  pub(crate) mod pretty_format;
     #[path = "ScopeFunctions.rs"] pub(crate) mod scope_functions;
     #[path = "snapshot.rs"]       pub(crate) mod snapshot;
+    #[path = "snapshot_serializer.rs"] pub(crate) mod snapshot_serializer;
 
     // expect.rs is the umbrella file (Expect struct + asymmetric matchers +
     // ExpectStatic + mock helpers); each `expect/to*.rs` adds one inherent
@@ -226,6 +227,7 @@ pub(crate) mod expect {
                 add_newline: false,
                 flush: false,
                 quote_strings: true,
+                snapshot_serializers: true,
             };
             JestPrettyFormat::format(
                 MessageLevel::Debug,

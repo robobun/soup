@@ -236,6 +236,79 @@ exports[`snapshot with dynamic values 1`] = `
 `;
 ```
 
+## Custom Serializers
+
+`expect.addSnapshotSerializer()` registers a serializer that decides how some values are written into snapshots. It takes the same serializer objects as `expect.addSnapshotSerializer()` in Jest and Vitest (pretty-format plugins).
+
+A serializer has a `test()` function that says whether it prints a value, and a `serialize()` function that returns the text:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+class Money {
+  constructor(
+    public cents: number,
+    public currency: string,
+  ) {}
+}
+
+expect.addSnapshotSerializer({
+  test: value => value instanceof Money,
+  serialize: (money: Money) => `Money<${(money.cents / 100).toFixed(2)} ${money.currency}>`,
+});
+
+test("order total", () => {
+  expect({ items: 2, total: new Money(1999, "EUR") }).toMatchInlineSnapshot(`
+    {
+      "items": 2,
+      "total": Money<19.99 EUR>,
+    }
+  `);
+});
+```
+
+Serializers apply to `toMatchSnapshot()`, `toMatchInlineSnapshot()` and the error snapshot matchers, to the value itself and to every value nested in it. When more than one serializer accepts a value, the one added last prints it.
+
+`serialize()` receives `(value, config, indentation, depth, refs, printer)`. Call `printer()` for the values the serializer does not print itself, and pass the other arguments along. A value that goes one level deeper gets `indentation + config.indent`:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+class Stack {
+  constructor(public items: unknown[]) {}
+}
+
+expect.addSnapshotSerializer({
+  test: value => value instanceof Stack,
+  serialize(stack: Stack, config, indentation, depth, refs, printer) {
+    const inner = indentation + config.indent;
+    const items = stack.items.map(item => inner + printer(item, config, inner, depth + 1, refs) + ",\n");
+    return "Stack [\n" + items.join("") + indentation + "]";
+  },
+});
+```
+
+The older `print(value, print, indent, options, colors)` form of a serializer is supported too.
+
+Like a matcher added with `expect.extend()`, a serializer applies from the moment it is added until the end of the run, in every test file that runs after that (with `--isolate`, until the end of the file that added it). Add a project's serializers in a [preload script](/test/lifecycle#global-setup-and-teardown), so that they are in place before the first test file runs:
+
+```ts title="setup.ts" icon="/icons/typescript.svg"
+import { expect } from "bun:test";
+import { moneySerializer } from "./serializers";
+
+expect.addSnapshotSerializer(moneySerializer);
+```
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+preload = ["./setup.ts"]
+```
+
+Bun formats snapshots with its own printer, not with pretty-format, so a few details differ for serializers:
+
+- The values in `config` are the ones snapshots are always formatted with. Changing them, or passing `printer()` another `config`, has no effect.
+- `printer()` indents by the length of `indentation` in steps of `config.indent` (two spaces).
+- `refs` contains the values that the value is nested in, in no particular order.
+- The keys of an object are not offered to serializers. Its values are.
+
 ## Best Practices
 
 ### Keep Snapshots Small

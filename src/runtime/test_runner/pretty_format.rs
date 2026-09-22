@@ -10,6 +10,7 @@ use bun_jsc::{
 use bun_core::{strings, EncodedSlice, Utf8Bytes};
 
 use super::expect;
+use super::snapshot_serializer;
 use crate::webcore::BlobExt as _;
 
 /// `<tag>` colour templates used by the formatter, rewritten to ANSI (or
@@ -101,6 +102,8 @@ pub(crate) struct FormatOptions {
     pub(crate) add_newline: bool,
     pub flush: bool,
     pub(crate) quote_strings: bool,
+    /// The value goes into a snapshot, so `expect.addSnapshotSerializer()` serializers apply.
+    pub(crate) snapshot_serializers: bool,
 }
 
 impl JestPrettyFormat {
@@ -146,6 +149,9 @@ impl JestPrettyFormat {
         if len == 1 {
             fmt = Formatter::new(global);
             fmt.quote_strings = options.quote_strings;
+            if options.snapshot_serializers {
+                fmt.serializers = snapshot_serializer::active();
+            }
             let tag = Tag::get(vals[0], global)?;
 
             if tag.tag == Tag::String {
@@ -192,6 +198,9 @@ impl JestPrettyFormat {
         fmt = Formatter::new(global);
         fmt.remaining_values = &vals[..len][1..];
         fmt.quote_strings = options.quote_strings;
+        if options.snapshot_serializers {
+            fmt.serializers = snapshot_serializer::active();
+        }
 
         let result: JsResult<()> = (|| {
             let mut this_value: JSValue = vals[0];
@@ -257,6 +266,36 @@ impl JestPrettyFormat {
         // map_node release handled by `impl Drop for Formatter`.
         result
     }
+
+    /// Formats a value that a snapshot serializer gave back to `printer()` / `print()`. It sits
+    /// inside the serializer's output, `indent` levels deep. `refs` are the values around it:
+    /// one of them again is `[Circular]`. The caller keeps them alive.
+    pub(crate) fn format_for_serializer(
+        global: &JSGlobalObject,
+        value: JSValue,
+        out: &mut Vec<u8>,
+        indent: u32,
+        config: JSValue,
+        refs: &[JSValue],
+    ) -> JsResult<()> {
+        type W<'a, 'b> = bun_io::write::FmtAdapter<'a, AsFmt<'b>>;
+        let mut bridge = AsFmt::new(out);
+        let mut writer = bun_io::write::FmtAdapter::new(&mut bridge);
+        let mut fmt = Formatter::new(global);
+        fmt.quote_strings = true;
+        fmt.indent = indent;
+        fmt.nested_in_serializer = Some(indent);
+        fmt.serializers = snapshot_serializer::active();
+        fmt.serializer_config = config;
+        if !refs.is_empty() {
+            fmt.acquire_visited_map();
+            for visited in refs {
+                let _ = fmt.map.get_or_put(*visited).expect("unreachable");
+            }
+        }
+        let tag = Tag::get(value, global)?;
+        fmt.format::<W, false>(tag, &mut writer, value, global)
+    }
 }
 
 // For detecting circular references
@@ -265,6 +304,7 @@ pub(crate) mod visited {
 
     // JSValue keys live on heap; safe because every visited value is also
     // on the stack frame during format() — conservative scan still sees them.
+    // (The ones `format_for_serializer` seeds are rooted by its caller.)
     //
     // `HashMap<JSValue, ()>` is a foreign type, so we cannot impl the foreign
     // `ObjectPoolType` trait on it directly (orphan rule). A `#[repr(transparent)]`
@@ -318,6 +358,14 @@ pub(crate) struct Formatter<'a> {
     pub(crate) failed: bool,
     pub(crate) estimated_line_length: usize,
     pub(crate) always_newline_scope: bool,
+    /// `expect.addSnapshotSerializer()` serializers to ask before a value is printed, newest
+    /// first. Empty unless the output is a snapshot. The registry roots them.
+    pub(crate) serializers: Vec<JSValue>,
+    /// The `config` serializers receive, made for the first one that prints something.
+    pub(crate) serializer_config: JSValue,
+    /// The output goes back to a serializer, which places it inside its own: the indent level
+    /// of the value the serializer asked for.
+    pub(crate) nested_in_serializer: Option<u32>,
 }
 
 impl<'a> Formatter<'a> {
@@ -332,6 +380,43 @@ impl<'a> Formatter<'a> {
             failed: false,
             estimated_line_length: 0,
             always_newline_scope: false,
+            serializers: Vec::new(),
+            serializer_config: JSValue::ZERO,
+            nested_in_serializer: None,
+        }
+    }
+
+    /// A snapshot that spans several lines starts and ends with a line break. The value that
+    /// is the whole snapshot writes them.
+    pub(crate) fn is_snapshot_root(&self) -> bool {
+        self.indent == 0 && self.nested_in_serializer.is_none()
+    }
+
+    /// The value a serializer asked `printer()` / `print()` for. The serializer decides what
+    /// goes before and after it, so it starts where it is and ends without a line break.
+    fn is_serializer_value(&self) -> bool {
+        self.nested_in_serializer == Some(self.indent)
+    }
+
+    /// Takes `map` from the pool on first use. `Drop` gives it back.
+    pub(crate) fn acquire_visited_map(&mut self) {
+        if self.map_node.is_some() {
+            return;
+        }
+        // `visited::Pool::get()` returns an RAII `PoolGuard` that
+        // would release on scope exit; instead the raw node is stashed on
+        // `self` and released in `Drop`, so take the raw node directly.
+        // `data` is initialized by `Map::INIT` (see `visited::Map: ObjectPoolType`).
+        let node = core::ptr::NonNull::new(visited::Pool::get_node())
+            .expect("ObjectPool::get_node never returns null");
+        self.map_node = Some(node);
+        // Take the map here and swap it back into `node.data` at release
+        // time, so the pooled allocation is retained across uses.
+        // SAFETY: see above.
+        unsafe {
+            let data = (*node.as_ptr()).data.assume_init_mut();
+            data.clear();
+            self.map = core::mem::take(data);
         }
     }
 
@@ -880,7 +965,7 @@ impl<'a, 'f, W: bun_io::Write, const ENABLE_ANSI_COLORS: bool>
         self.always_newline = true;
         self.formatter.estimated_line_length = (self.formatter.indent as usize) * 2 + 1;
 
-        if self.formatter.indent == 0 {
+        if self.formatter.is_snapshot_root() {
             let _ = self.writer.write_all(b"\n");
         }
         let classname = value.get_class_name(global_this)?;
@@ -1048,25 +1133,7 @@ impl<'a> Formatter<'a> {
         let mut writer = WrappedWriter::new(writer_);
 
         if FORMAT.can_have_circular_references() {
-            if self.map_node.is_none() {
-                // `visited::Pool::get()` returns an RAII `PoolGuard` that
-                // would release on scope exit; instead the raw node is stashed on
-                // `self` and released from `JestPrettyFormat::format`'s tail, so
-                // take the raw node directly. `data` is initialized by
-                // `Map::INIT` (see `visited::Map: ObjectPoolType`).
-                let node = core::ptr::NonNull::new(visited::Pool::get_node())
-                    .expect("ObjectPool::get_node never returns null");
-                self.map_node = Some(node);
-                // Take the map here and swap it back into
-                // `node.data` at release time (see JestPrettyFormat::format tail),
-                // so the pooled allocation is retained across uses.
-                // SAFETY: see above.
-                unsafe {
-                    let data = (*node.as_ptr()).data.assume_init_mut();
-                    data.clear();
-                    self.map = core::mem::take(data);
-                }
-            }
+            self.acquire_visited_map();
 
             let entry = self.map.get_or_put(value).expect("unreachable");
             if entry.found_existing {
@@ -1109,7 +1176,7 @@ impl<'a> Formatter<'a> {
                             writer.write_all(b"String {}");
                             return Ok(());
                         }
-                        if self.indent == 0 && str.len > 0 {
+                        if self.is_snapshot_root() && str.len > 0 {
                             writer.write_all(b"\n");
                         }
                         writer.write_all(b"String {\n");
@@ -1141,7 +1208,7 @@ impl<'a> Formatter<'a> {
 
                         let mut has_newline = false;
 
-                        if str.index_of_any(b"\n\r").is_some() {
+                        if str.index_of_any(b"\n\r").is_some() && !self.is_serializer_value() {
                             has_newline = true;
                             writer.write_all(b"\n");
                         }
@@ -1393,7 +1460,7 @@ impl<'a> Formatter<'a> {
                         return Ok(());
                     }
 
-                    if self.indent == 0 {
+                    if self.is_snapshot_root() {
                         writer.write_all(b"\n");
                     }
 
@@ -1483,7 +1550,7 @@ impl<'a> Formatter<'a> {
                     writer.write_all(b"\n");
                     let _ = self.write_indent(writer.ctx);
                     writer.write_all(b"]");
-                    if self.indent == 0 {
+                    if self.is_snapshot_root() {
                         writer.write_all(b"\n");
                     }
                     self.reset_line();
@@ -1736,7 +1803,10 @@ impl<'a> Formatter<'a> {
                         return Ok(());
                     }
 
-                    writer.print(format_args!("\n{} {{\n", map_name));
+                    if !self.is_serializer_value() {
+                        writer.write_all(b"\n");
+                    }
+                    writer.print(format_args!("{} {{\n", map_name));
                     {
                         self.indent += 1;
                         // hoist global_this (Copy &ref) before iter mutably
@@ -1760,7 +1830,9 @@ impl<'a> Formatter<'a> {
                     }
                     let _ = self.write_indent(writer.ctx);
                     writer.write_all(b"}");
-                    writer.write_all(b"\n");
+                    if !self.is_serializer_value() {
+                        writer.write_all(b"\n");
+                    }
                 }
                 Tag::Set => {
                     let length_value = value
@@ -1775,7 +1847,9 @@ impl<'a> Formatter<'a> {
                     let prev_quote_strings = self.quote_strings;
                     self.quote_strings = true;
 
-                    let _ = self.write_indent(writer.ctx);
+                    if !self.is_serializer_value() {
+                        let _ = self.write_indent(writer.ctx);
+                    }
 
                     let set_name: &str =
                         if value.js_type() == JSType::WeakSet { "WeakSet" } else { "Set" };
@@ -1786,7 +1860,10 @@ impl<'a> Formatter<'a> {
                         return Ok(());
                     }
 
-                    writer.print(format_args!("\n{} {{\n", set_name));
+                    if !self.is_serializer_value() {
+                        writer.write_all(b"\n");
+                    }
+                    writer.print(format_args!("{} {{\n", set_name));
                     {
                         self.indent += 1;
                         let global = self.global_this;
@@ -1807,7 +1884,9 @@ impl<'a> Formatter<'a> {
                     }
                     let _ = self.write_indent(writer.ctx);
                     writer.write_all(b"}");
-                    writer.write_all(b"\n");
+                    if !self.is_serializer_value() {
+                        writer.write_all(b"\n");
+                    }
                 }
                 Tag::JSON => {
                     let str = value.json_stringify(self.global_this, self.indent)?;
@@ -2362,7 +2441,7 @@ impl<'a> Formatter<'a> {
                             writer.write_all(b" }");
                         }
 
-                        if self.indent == 0 {
+                        if self.is_snapshot_root() {
                             writer.write_all(b"\n");
                         }
                     }
@@ -2371,7 +2450,7 @@ impl<'a> Formatter<'a> {
                     let array_buffer = value.as_array_buffer(self.global_this).unwrap();
                     let slice = array_buffer.byte_slice();
 
-                    if self.indent == 0 && !slice.is_empty() {
+                    if self.is_snapshot_root() && !slice.is_empty() {
                         writer.write_all(b"\n");
                     }
 
@@ -2379,7 +2458,7 @@ impl<'a> Formatter<'a> {
                         let buffer_name = value.get_class_name(self.global_this)?;
                         if buffer_name.eq_ascii(b"Buffer") {
                             // special formatting for 'Buffer' snapshots only
-                            if slice.is_empty() && self.indent == 0 {
+                            if slice.is_empty() && self.is_snapshot_root() {
                                 writer.write_all(b"\n");
                             }
                             writer.write_all(b"{\n");
@@ -2410,7 +2489,7 @@ impl<'a> Formatter<'a> {
                             let _ = self.write_indent(writer.ctx);
                             writer.write_all(b"}");
 
-                            if self.indent == 0 {
+                            if self.is_snapshot_root() {
                                 writer.write_all(b"\n");
                             }
 
@@ -2466,7 +2545,7 @@ impl<'a> Formatter<'a> {
                         writer.write_all(b"\n");
                         let _ = self.write_indent(writer.ctx);
                         writer.write_all(b"]");
-                        if self.indent == 0 {
+                        if self.is_snapshot_root() {
                             writer.write_all(b"\n");
                         }
                     } else {
@@ -2497,6 +2576,15 @@ impl<'a> Formatter<'a> {
         let prev_global_this = self.global_this;
         // `self.global_this` is restored to the previous value at the end.
         self.global_this = global_this;
+
+        // Script never sees the empty value or a `NativeCode` cell.
+        if !self.serializers.is_empty() && result.tag != Tag::NativeCode && !value.is_empty() {
+            let printed = self.print_with_serializer(writer, value);
+            if !matches!(printed, Ok(false)) {
+                self.global_this = prev_global_this;
+                return printed.map(drop);
+            }
+        }
 
         // This looks incredibly redundant. Each tag variant dispatches to its
         // own small formatting function; that _should_ limit the stack usage

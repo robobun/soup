@@ -745,6 +745,120 @@ declare module "bun:test" {
      * @param options `interval` and `timeout` in milliseconds, and a `message` for the failure
      */
     poll<T>(fn: () => T, options?: ExpectPollOptions): PollMatchers<Awaited<T>>;
+
+    /**
+     * Registers a serializer that decides how some values are written into
+     * snapshots.
+     *
+     * Before a value is formatted for `toMatchSnapshot()`,
+     * `toMatchInlineSnapshot()` or one of the error snapshot matchers, every
+     * serializer's `test(value)` is asked, starting with the serializer added
+     * last. The first one that returns `true` prints the value, wherever in the
+     * snapshot the value is. The interface is the one of Jest's and Vitest's
+     * `expect.addSnapshotSerializer()` (a pretty-format plugin).
+     *
+     * Like a matcher added with `expect.extend()`, a serializer applies from
+     * the moment it is added until the end of the run (with `--isolate`, until
+     * the end of the test file that added it). Add serializers in a
+     * `--preload` script to have them in every test file.
+     *
+     * @example
+     * expect.addSnapshotSerializer({
+     *   test: value => value instanceof Temporal.Instant,
+     *   serialize: value => `Instant<${value.toString()}>`,
+     * });
+     *
+     * @example
+     * // printer() formats the values that the serializer does not print itself
+     * expect.addSnapshotSerializer({
+     *   test: value => value instanceof Ok,
+     *   serialize: (value, config, indentation, depth, refs, printer) =>
+     *     `Ok(${printer(value.inner, config, indentation, depth, refs)})`,
+     * });
+     *
+     * @param serializer the serializer to add
+     */
+    addSnapshotSerializer(serializer: SnapshotSerializer): void;
+  }
+
+  /**
+   * A serializer for {@link Expect.addSnapshotSerializer `expect.addSnapshotSerializer()`}.
+   *
+   * `test()` says whether the serializer prints a value. `serialize()` returns
+   * the text for it. `print()` is the older form of `serialize()` that
+   * pretty-format still accepts.
+   */
+  export type SnapshotSerializer =
+    | {
+        test(value: any): boolean;
+        /**
+         * @param value the value `test()` accepted
+         * @param config how the snapshot is formatted, e.g. `config.indent` is one level of indentation
+         * @param indentation the indentation of the line `value` starts on
+         * @param depth how deep `value` is nested in the snapshot
+         * @param refs the values around `value`, for a serializer that tracks circular references
+         * @param printer formats another value. Pass the other arguments along, with a longer `indentation` for a value that goes one level deeper.
+         */
+        serialize(
+          value: any,
+          config: SnapshotSerializerConfig,
+          indentation: string,
+          depth: number,
+          refs: unknown[],
+          printer: SnapshotSerializerPrinter,
+        ): string;
+      }
+    | {
+        test(value: any): boolean;
+        /**
+         * @param value the value `test()` accepted
+         * @param print formats another value at the indentation of `value`
+         * @param indent indents every line of `text` by one more level than `value`
+         * @param options the line breaks to put between and around the parts
+         * @param colors always empty strings, snapshots have no colors
+         */
+        print(
+          value: any,
+          print: (value: unknown) => string,
+          indent: (text: string) => string,
+          options: { edgeSpacing: string; min: boolean; spacing: string },
+          colors: SnapshotSerializerConfig["colors"],
+        ): string;
+      };
+
+  /**
+   * Formats `value` the way the snapshot would: with the serializers, and
+   * otherwise like any other snapshot value.
+   */
+  export type SnapshotSerializerPrinter = (
+    value: unknown,
+    config: SnapshotSerializerConfig,
+    indentation: string,
+    depth: number,
+    refs: unknown[],
+  ) => string;
+
+  /**
+   * The `config` a {@link SnapshotSerializer} receives: pretty-format's
+   * options, with the values snapshots are formatted with.
+   */
+  export interface SnapshotSerializerConfig {
+    callToJSON: boolean;
+    colors: Record<"comment" | "content" | "prop" | "tag" | "value", { open: string; close: string }>;
+    compareKeys: undefined;
+    escapeRegex: boolean;
+    escapeString: boolean;
+    /** One level of indentation: two spaces. */
+    indent: string;
+    maxDepth: number;
+    maxWidth: number;
+    min: boolean;
+    /** The serializers that apply, in the order they are asked. */
+    plugins: SnapshotSerializer[];
+    printBasicPrototype: boolean;
+    printFunctionName: boolean;
+    spacingInner: string;
+    spacingOuter: string;
   }
 
   export interface ExpectPollOptions {
