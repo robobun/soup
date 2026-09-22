@@ -10,6 +10,7 @@ import {
   type Matchers,
   mock,
   type Mock,
+  type SnapshotSerializer,
   spyOn,
   test,
   xdescribe,
@@ -95,6 +96,35 @@ describe("bun:test", () => {
     expect.poll(() => 1).toMatchSnapshot();
     // @ts-expect-error not a function
     expect.poll(1);
+  });
+
+  test("expect.addSnapshotSerializer()", () => {
+    expectType(
+      expect.addSnapshotSerializer({
+        test: value => value instanceof Date,
+        serialize(value: Date, config, indentation, depth, refs, printer) {
+          expectType(config.indent).is<string>();
+          expectType(config.plugins).is<SnapshotSerializer[]>();
+          expectType(indentation).is<string>();
+          expectType(depth).is<number>();
+          expectType(refs).is<unknown[]>();
+          return printer(value.getTime(), config, indentation + config.indent, depth + 1, refs);
+        },
+      }),
+    ).is<void>();
+    const legacy: SnapshotSerializer = {
+      test: value => typeof value === "bigint",
+      print(value, print, indent, options, colors) {
+        expectType(print).is<(value: unknown) => string>();
+        expectType(indent).is<(text: string) => string>();
+        return colors.value.open + indent(print(String(value))) + options.edgeSpacing + colors.value.close;
+      },
+    };
+    expect.addSnapshotSerializer(legacy);
+    // @ts-expect-error a serializer needs serialize() or print()
+    expect.addSnapshotSerializer({ test: () => true });
+    // @ts-expect-error serialize() returns the text
+    expect.addSnapshotSerializer({ test: () => true, serialize: () => 1 });
   });
 });
 

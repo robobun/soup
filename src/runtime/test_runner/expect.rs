@@ -1550,8 +1550,8 @@ impl Expect {
         Ok(this_value)
     }
 
-    pub(crate) fn add_snapshot_serializer<'a>(heap: &JsHeap<'a>) -> bindgen::Result<'a, ()> {
-        Err(heap.error(format_args!("Not implemented")))
+    pub(crate) fn add_snapshot_serializer(cx: &mut JsScope<'_>, serializer: JsLocal<'_>) -> JsResult<()> {
+        super::snapshot_serializer::add(cx.global(), serializer.to_js())
     }
 
     pub(crate) fn has_assertions(cx: &mut JsScope<'_>) -> JsResult<()> {
