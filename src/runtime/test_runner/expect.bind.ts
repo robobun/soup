@@ -175,7 +175,7 @@ export const Expect = b.class({
     toThrowErrorMatchingSnapshot: { ...matcher, args: { hint: b.any } },
   },
   static: {
-    addSnapshotSerializer: { capability: "heap", throws: true, length: 1 },
+    addSnapshotSerializer: { args: { serializer: b.any }, ...js },
     any: asymmetricMatchers.any,
     anything: asymmetricMatchers.anything,
     arrayContaining: asymmetricMatchers.arrayContaining,
