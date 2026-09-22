@@ -2582,6 +2582,140 @@ Files: `src/jsc/bindings/webcore/WebLocks.cpp`, `src/jsc/bindings/webcore/WebLoc
 `test/js/node/test/parallel/test-web-locks-query.js` (from Node.js, unmodified),
 `test/integration/bun-types/fixture/worker.ts`.
 
+### 2026-09-22: `expect.addSnapshotSerializer()`
+
+`expect.addSnapshotSerializer()` existed in `bun:test` as a function that throws "Not implemented",
+and the docs listed it as the one matcher "Not Yet Implemented". It is the call a Jest or Vitest
+setup file makes to register a serializer (for styled components, for DOM nodes, for a project's own
+`Money` or `Temporal` values), so a project that has one could not move its snapshot tests over
+without deleting it and rewriting the snapshots. Now it works, with the same serializer objects
+(pretty-format plugins), for all four snapshot matchers:
+
+```ts
+import { expect, test } from "bun:test";
+
+expect.addSnapshotSerializer({
+  test: value => value instanceof Money,
+  serialize: (money: Money) =>
+    `Money<${(money.cents / 100).toFixed(2)} ${money.currency}>`,
+});
+
+test("order total", () => {
+  expect({ items: 2, total: new Money(1999, "EUR") }).toMatchInlineSnapshot(`
+    {
+      "items": 2,
+      "total": Money<19.99 EUR>,
+    }
+  `);
+});
+
+// printer() formats what the serializer does not print itself, serializers included
+expect.addSnapshotSerializer({
+  test: value => value instanceof Stack,
+  serialize(stack: Stack, config, indentation, depth, refs, printer) {
+    const inner = indentation + config.indent;
+    const items = stack.items.map(
+      item => inner + printer(item, config, inner, depth + 1, refs) + ",\n",
+    );
+    return "Stack [\n" + items.join("") + indentation + "]";
+  },
+});
+
+// the older interface
+expect.addSnapshotSerializer({
+  test: value => value instanceof Tag,
+  print: (tag: Tag, print, indent) =>
+    `<${tag.name}>\n${indent(print(tag.child))}\n</${tag.name}>`,
+});
+```
+
+Every value is offered to the serializers before Bun prints it, the snapshot's root and everything
+nested in it (object property values, array elements, Map keys and values, Set elements, JSX
+children), newest serializer first. `serialize()` receives pretty-format's arguments: the `config`
+object jest-snapshot formats with (`indent`, `spacingInner`, `spacingOuter`, `min`, empty `colors`,
+`plugins`, ...), the indentation string of the value's line, the depth, the values it is nested in
+as `refs`, and `printer`. A multi-line result at the root gets the line breaks a multi-line snapshot
+starts and ends with. Matcher failure messages (`toEqual()` diffs) do not go through serializers, as
+in Jest.
+
+Bun's snapshot printer is native, so the work is where the two meet. `Formatter::format()` is the
+one function every value passes through, and the hook is there: with no serializer registered it is
+one `Vec::is_empty()`. `printer()` and the older `print()` are host functions that run a second
+formatter into a buffer, at the indent level the serializer asked for. That formatter knows it is
+nested: it does not write the line breaks a multi-line snapshot starts and ends with (the nine
+`indent == 0` checks that emulate jest-snapshot's `addExtraLineBreaks` became `is_snapshot_root()`),
+and a Map, a Set or a multi-line string handed straight to `printer()` starts where the serializer
+puts it (Bun's printer otherwise surrounds those three with line breaks at any depth, see below).
+The values that formatter is nested in are seeded from `refs` into its visited set, and the `refs` a
+serializer receives are the visited set, so a cycle that runs object, serializer, `printer()`, same
+object ends in `[Circular]` exactly where Jest prints it, instead of recursing. A serializer that
+really never stops (it wraps its value in a new object each time) ends in a `RangeError` from a
+stack check in `printer()`, under ASAN too.
+
+The output was compared byte for byte with pretty-format 29.7.0 itself: twenty-one cases with both
+interfaces, at the root and nested in objects and arrays, multi-line results inside arrays, Maps,
+Sets and multi-line strings through `printer()` and `print()`, and three cycles through a
+serializer, formatted by pretty-format with jest-snapshot's options and by `toMatchSnapshot()`. All
+identical, including the older interface's double indentation of nested `indent(print(child))`
+output, which is pretty-format's behavior and the reason the newer interface exists.
+
+Where a serializer applies is the one decision Jest does not make for Bun. Jest gives every test
+file its own module registry, so a serializer lasts for one file. Bun runs the files of a run in one
+global with one module registry, and `expect.extend()` matchers simply stay. The first version of
+this patch ended a file's serializers with the file and kept only those of `--preload` scripts. The
+review pass found what that breaks: a helper module that registers serializers at its top level and
+is imported by two test files is evaluated once, so the second file would have run without them, and
+so would every repetition under `--rerun-each`. Serializers now last as long as the global they were
+added in, like `expect.extend()`: the run, or one file under `--isolate` (where the list is cleared
+with the global, and the preload runs again). The registry holds `Strong` references and is emptied
+on the same path that drops the preload hooks before the VM exits. It is reached through a raw field
+pointer, not through `&mut TestRunner`, because `toMatchInlineSnapshot()` formats while it holds the
+runner and a serializer's script may register another serializer from in there.
+
+Not done: object keys are not offered to serializers (pretty-format prints keys through `printer()`
+too, so a serializer for strings also rewrites keys there), `config.plugins` lists the registered
+serializers only (pretty-format's built-in plugins for React elements, DOM nodes and asymmetric
+matchers are native code in Bun and have no plugin object to list), the options in `config` are
+fixed and `printer()` ignores a changed `config` and `depth`, `refs` is in no particular order, and
+`expect.addSnapshotSerializer()` outside `bun test` checks its argument and does nothing. The docs
+list the differences. Bun's own printing is unchanged, including two places where it differs from
+Jest that this work ran into and that were reported rather than fixed here: a Map or Set nested in
+an object prints with stray line breaks, and so does a nested multi-line string. The new tests stay
+clear of both.
+
+A review pass (one reader, the whole diff) found the scoping problem above and that `printer()`
+returned a Map, a Set and a multi-line string with the stray line breaks just mentioned, which a
+pass-through serializer at the root then doubled. Both are fixed with tests, and the comments it
+found stale are corrected. It found no problem with the rooting of the values (the registry's
+`Strong`s for the serializers, a private array for the seeded `refs`), with exceptions (a throwing
+serializer inside an object, a Map or a Set surfaces from the matcher, also under
+`BUN_JSC_validateExceptionChecks=1`) or with output when no serializer is registered.
+
+Rebase notes: 36 patches onto oven-sh/bun bf80d21c69, nothing dropped. Four textual conflicts, all
+from upstream narrowing `pub` to `pub(crate)` across `bun_runtime` (`bun_test.rs` under the
+`--dry-run` patch, `api.rs` under `Bun.INI` and `Bun.CSV`, `cli/mod.rs` under "did you mean",
+`shell/mod.rs` under `sort`/`uniq`). Two upstream changes broke the stack without a conflict.
+"event loop: remove ManagedTask" (oven-sh/bun#43675) deleted the generic callback task that the
+`wc` patch of 2026-08-15 used to hop a non-pollable stdin read onto the JS loop; that hop is now its
+own task type with its own tag (`ShellIOReaderUnpolledRead`), a `Taskable` impl that drops the
+boxed keep-alive when the VM stops first, and arms in `dispatch.rs`, which is what upstream did for
+its own nineteen users. And `bun_runtime` is now compiled with `-D unreachable-pub` (it became the
+root crate when the rlibs started being linked directly, oven-sh/bun#43650), which rejected 42 `pub`
+items in six patches (`wc`, `head`/`tail`, `sort`/`uniq`, `--reporter=json`, `--last-failed`,
+response compression). All of it is folded into the patches it belongs to, so each still
+cherry-picks on its own; the stack builds, and `test/internal/source-lints/` passes. One test in
+`snapshot.test.ts` ("error snapshots") fails in a terminal without colors because its expected text
+contains ANSI codes; it fails the same way with stock Bun and passes with `FORCE_COLOR=1`. The
+fork's three workflows were green after yesterday's push.
+
+Files: `src/runtime/test_runner/snapshot_serializer.rs` (new),
+`src/runtime/test_runner/pretty_format.rs` (the hook, `format_for_serializer()`,
+`is_snapshot_root()`, `acquire_visited_map()`), `src/runtime/test_runner/bun_test.rs` (the
+registry's lifetime), `src/runtime/test_runner/expect.rs`, `src/runtime/test_runner/mod.rs`,
+`src/runtime/test_runner/diff_format.rs`, `packages/bun-types/test.d.ts`, `docs/test/snapshots.mdx`,
+`docs/test/writing-tests.mdx`, `test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts`,
+`test/integration/bun-types/fixture/test.ts`.
+
 ## Dropped
 
 Nothing yet.
