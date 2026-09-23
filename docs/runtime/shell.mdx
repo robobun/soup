@@ -310,6 +310,61 @@ const result = await $`cat < ${response} | wc -w`.text();
 console.log(result); // 6\n
 ```
 
+## Loops (`for`)
+
+`for` runs a list of commands once for each word in a list, with a variable set to that word:
+
+```js
+import { $ } from "bun";
+
+await $`
+  for file in src/*.ts; do
+    echo checking $file
+    bun run check.ts $file
+  done
+`;
+
+// An interpolated array is one word per element, and no element is ever split or globbed
+const packages = ["core", "cli", "my docs"];
+await $`for pkg in ${packages}; do (cd packages/$pkg && bun run build); done`;
+```
+
+On Windows, `bun run` runs `package.json` scripts in Bun Shell, so a loop in a script works there the way it does in `sh` on Linux and macOS:
+
+```json package.json icon="file-json"
+{
+  "scripts": {
+    "build:all": "for pkg in packages/*; do bun run --cwd $pkg build; done"
+  }
+}
+```
+
+The words after `in` are expanded like the arguments of a command: variables, command substitution (split into words unless it is quoted), brace expansion, globs and interpolated JavaScript values all work. They are expanded once, before the first iteration. Three things to know, all of which are how Bun Shell expands arguments everywhere:
+
+- A variable is one word, even when its value has spaces in it. For a list, interpolate an array or use command substitution: `for f in $(cat files.txt)`.
+- The matches of a glob are not sorted.
+- A glob that matches nothing is an error: the loop prints `no matches found`, does not run, and exits with `1`.
+
+`break` ends the loop and `continue` skips to the next word. In nested loops both take a count, so `break 2` also ends the loop around the current one:
+
+```js
+import { $ } from "bun";
+
+await $`
+  for dir in packages/*; do
+    [[ -f $dir/package.json ]] || continue
+    for script in build test; do
+      # a script failed: leave both loops
+      bun run --cwd $dir $script || break 2
+    done
+  done
+`;
+```
+
+The exit code of a loop is the exit code of the last command its body ran, or `0` when the body never ran. `break` and `continue` are commands that succeed, so a loop that ends with one of them exits with `0`. The variable is a shell variable: it is not exported to the commands in the body, and it keeps its last value after the loop. A loop can be a member of a pipeline and an operand of `&&` and `||`.
+
+`while` and `until` loops, `for name; do` without a word list, and redirecting a whole loop (`done > file`) are not supported yet. Redirect the commands in the body instead.
+
 ## Command substitution (`$(...)`)
 
 Command substitution inserts the output of another command into the current script:
@@ -582,6 +637,7 @@ For cross-platform compatibility, Bun Shell implements a set of builtin commands
 - `which`
 - `mv`
 - `exit`
+- `break`, `continue`: leave a [`for` loop](#loops-for), or skip to its next word
 - `true`
 - `false`
 - `yes`
