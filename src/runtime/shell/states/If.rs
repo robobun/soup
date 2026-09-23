@@ -11,7 +11,7 @@ pub(crate) struct If {
     pub node: bun_ptr::BackRef<ast::If>,
     pub(crate) io: IO,
     pub(crate) state: IfState,
-    shell: Env,
+    pub(crate) shell: Env,
 }
 
 #[derive(Default, strum::IntoStaticStr)]

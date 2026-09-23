@@ -13,8 +13,8 @@ use crate::shell::ExitCode;
 use crate::shell::ast;
 use crate::shell::builtins::batch::Batch;
 use crate::shell::builtins::{
-    basename, cat, cd, cp, dirname, echo, exit, export, head_tail, ls, mkdir, mv, pwd, rm, seq,
-    sort_uniq, touch, wc, which, yes,
+    basename, break_continue, cat, cd, cp, dirname, echo, exit, export, head_tail, ls, mkdir, mv,
+    pwd, rm, seq, sort_uniq, touch, wc, which, yes,
 };
 use crate::shell::interpreter::{Interpreter, NodeId, is_pollable_from_mode, shell_openat};
 use crate::shell::io::{InKind, OutFd, OutKind};
@@ -94,6 +94,8 @@ shell_builtins! {
     Dirname  "dirname"  dirname::start,
     Cd       "cd"       cd::start,
     Echo     "echo"     echo::start,
+    Break    "break"    |interp, cmd| break_continue::start(interp, cmd, Kind::Break),
+    Continue "continue" |interp, cmd| break_continue::start(interp, cmd, Kind::Continue),
     Export   "export"   export::start,
     Cat      "cat"      cat::start,
     Mv       "mv"       mv::start,

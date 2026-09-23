@@ -7,7 +7,7 @@ use crate::shell::yield_::Yield;
 
 pub(crate) struct Stmt {
     pub(crate) base: Base,
-    shell: *mut ShellExecEnv,
+    pub(crate) shell: *mut ShellExecEnv,
     pub node: bun_ptr::BackRef<ast::Stmt>,
     pub(crate) idx: usize,
     pub(crate) last_exit_code: Option<ExitCode>,
