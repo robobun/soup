@@ -181,6 +181,8 @@ shell_builtins! {
         Cd       => (cd::Cd,            "cd",       b""),
         Echo     => (echo::Echo,        "echo",     b""),
         Export   => (export::Export,    "export",   b""),
+        Break    => (break_continue::Break,       "break",    b"usage: break [n]\n"),
+        Continue => (break_continue::Continue,    "continue", b"usage: continue [n]\n"),
     }
     boxed: {
         Cat      => (cat::Cat,          "cat",      b"usage: cat [-belnstuv] [file ...]\n"),

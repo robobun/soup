@@ -45,6 +45,7 @@ use crate::shell::states::binary::Binary;
 pub(crate) use crate::shell::states::cmd::Cmd;
 use crate::shell::states::cond_expr::CondExpr;
 use crate::shell::states::expansion::Expansion;
+use crate::shell::states::r#for::For;
 use crate::shell::states::r#if::If;
 use crate::shell::states::pipeline::Pipeline;
 use crate::shell::states::script::Script;
@@ -114,6 +115,7 @@ pub(crate) enum Node {
     Assigns(Assigns),
     Expansion(Expansion),
     If(If),
+    For(For),
     CondExpr(CondExpr),
     Async(Async),
     Subshell(Subshell),
@@ -131,6 +133,7 @@ impl Node {
             Node::Assigns(_) => StateKind::Assign,
             Node::Expansion(_) => StateKind::Expansion,
             Node::If(_) => StateKind::IfClause,
+            Node::For(_) => StateKind::ForClause,
             Node::CondExpr(_) => StateKind::Condexpr,
             Node::Async(_) => StateKind::Async,
             Node::Subshell(_) => StateKind::Subshell,
@@ -150,6 +153,7 @@ impl Node {
             Node::Assigns(s) => Some(&s.base),
             Node::Expansion(s) => Some(&s.base),
             Node::If(s) => Some(&s.base),
+            Node::For(s) => Some(&s.base),
             Node::CondExpr(s) => Some(&s.base),
             Node::Async(s) => Some(&s.base),
             Node::Subshell(s) => Some(&s.base),
@@ -167,6 +171,7 @@ impl Node {
             Node::Assigns(s) => Some(&mut s.base),
             Node::Expansion(s) => Some(&mut s.base),
             Node::If(s) => Some(&mut s.base),
+            Node::For(s) => Some(&mut s.base),
             Node::CondExpr(s) => Some(&mut s.base),
             Node::Async(s) => Some(&mut s.base),
             Node::Subshell(s) => Some(&mut s.base),
@@ -218,6 +223,7 @@ node_accessors! {
     Assigns   => Assigns,   as_assigns,   as_assigns_mut;
     Expansion => Expansion, as_expansion, as_expansion_mut;
     If        => If,        as_if,        as_if_mut;
+    For       => For,       as_for,       as_for_mut;
     CondExpr  => CondExpr,  as_condexpr,  as_condexpr_mut;
     Async     => Async,     as_async,     as_async_mut;
     Subshell  => Subshell,  as_subshell,  as_subshell_mut;
@@ -242,6 +248,7 @@ pub enum StateKind {
     Pipeline,
     Expansion,
     IfClause,
+    ForClause,
     Condexpr,
     Async,
     Subshell,
@@ -290,6 +297,9 @@ pub(crate) struct Interpreter {
     pub(crate) context: Cell<Option<bun_jsc::ContextId>>,
 
     pub(crate) async_commands_executing: Cell<u32>,
+    /// Rounds that the loops of the script, nested ones included, ran since one of them last
+    /// gave the event loop a turn.
+    loop_rounds_since_yield: Cell<u32>,
 
     // JSC_BORROW: always borrowed, never owned. Stored raw because the struct
     // is heap-allocated and outlives any single &JSGlobalObject borrow scope.
@@ -552,6 +562,8 @@ impl Interpreter {
                 __prev_cwd: cwd_arr.clone(),
                 __cwd: cwd_arr,
                 cwd_fd,
+                loop_depth: 0,
+                loop_jump: None,
             }),
             root_io: JsCell::new(IO {
                 stdin: crate::shell::io::InKind::Fd(stdin_reader),
@@ -565,6 +577,7 @@ impl Interpreter {
             keep_alive: JsCell::new(bun_io::KeepAlive::default()),
             context: Cell::new(None),
             async_commands_executing: Cell::new(0),
+            loop_rounds_since_yield: Cell::new(0),
             global_this: Cell::new(core::ptr::null_mut()),
             flags: Cell::new(InterpreterFlags::default()),
             // Starts at `None` so `async_cmd_done` only finishes once
@@ -873,6 +886,36 @@ impl Interpreter {
         self.context_stopped()
             || self.stopping()
             || self.node(id).base().is_some_and(|b| b.interrupted)
+            || self.loop_jump_pending(id)
+    }
+
+    /// Counts a round of a loop. True when the loop has to give the event loop a turn first
+    /// (`ShellLoopYieldTask`). A round of builtins costs a few microseconds, so this keeps the
+    /// thread for a millisecond or less at a time.
+    pub(crate) fn loop_round_should_yield(&self) -> bool {
+        const ROUNDS_PER_YIELD: u32 = 128;
+        let rounds = self.loop_rounds_since_yield.get();
+        if rounds >= ROUNDS_PER_YIELD {
+            self.loop_rounds_since_yield.set(0);
+            return true;
+        }
+        self.loop_rounds_since_yield.set(rounds + 1);
+        false
+    }
+
+    /// The event loop had its turn and the loop that asked for it goes on. The count starts
+    /// again here as well: another loop of the same pipeline can have filled it in the meantime,
+    /// and the resumed loop would wait once more for every time that happens.
+    pub(crate) fn loop_round_resumed(&self) {
+        self.loop_rounds_since_yield.set(0);
+    }
+
+    /// A `break` or `continue` ran in `id`'s env and its loop has not seen it yet. The sequencing
+    /// states in between stop early on it as well, which is all the unwinding there is.
+    fn loop_jump_pending(&self, id: NodeId) -> bool {
+        self.node(id)
+            .base()
+            .is_some_and(|b| !b.shell.is_null() && b.shell().loop_jump.is_some())
     }
 
     /// Whose script the shell's completion continues: the one that started it (a `Bun.ModuleGraph`'s),
@@ -947,6 +990,7 @@ impl Interpreter {
         Assign   => Assigns,
         Expansion,
         IfClause => If,
+        ForClause => For,
         Condexpr => CondExpr,
         Async,
         Subshell,
@@ -970,6 +1014,7 @@ impl Interpreter {
             ast::Expr::Pipeline(p) => Pipeline::init(self, shell, *p, parent, io),
             ast::Expr::Assign(a) => Assigns::init(self, shell, *a, parent, AssignCtx::Shell),
             ast::Expr::If(i) => If::init(self, shell, *i, parent, io),
+            ast::Expr::For(f) => For::init(self, shell, *f, parent, io),
             ast::Expr::CondExpr(c) => CondExpr::init(self, shell, *c, parent, io),
             ast::Expr::Subshell(s) => {
                 // Stmt/Binary callers dupe
@@ -1014,6 +1059,7 @@ impl Interpreter {
             StateKind::Assign => Assigns::deinit(self, id),
             StateKind::Expansion => Expansion::deinit(self, id),
             StateKind::IfClause => If::deinit(self, id),
+            StateKind::ForClause => For::deinit(self, id),
             StateKind::Condexpr => CondExpr::deinit(self, id),
             StateKind::Async => return, // Async deinit is purposefully empty; freed later by async_cmd_done → actually_deinit.
             StateKind::Subshell => Subshell::deinit(self, id),
@@ -1779,6 +1825,26 @@ pub(crate) struct ShellExecEnv {
     pub(crate) __prev_cwd: Vec<u8>,
     pub(crate) __cwd: Vec<u8>,
     pub(crate) cwd_fd: Fd,
+    /// Loops whose body is running in this env. `break` and `continue` mean
+    /// something only when it is not zero.
+    pub(crate) loop_depth: u32,
+    /// A `break` or `continue` ran and the loop it names has not seen it yet.
+    /// The sequencing states between the two finish early on it (see
+    /// `Interpreter::interrupted`).
+    pub(crate) loop_jump: Option<LoopJump>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopJumpKind {
+    Break,
+    Continue,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LoopJump {
+    pub(crate) kind: LoopJumpKind,
+    /// Loops left to go, counting the one the jump is meant for.
+    pub(crate) levels: u32,
 }
 
 pub(crate) enum Bufio {
@@ -1940,6 +2006,18 @@ impl ShellExecEnv {
             __prev_cwd: self.__prev_cwd.clone(),
             __cwd: self.__cwd.clone(),
             cwd_fd: dupedfd,
+            // The loop around a subshell runs in the parent env and never sees
+            // a `break` from in here. As in bash, `( )` starts out of any loop,
+            // so `break` there only warns, while `$( )` and a pipeline member
+            // are still in their loops and `break` ends what is left of them.
+            // `Pipeline` takes a member that is a compound command out again.
+            loop_depth: match kind {
+                ShellExecEnvKind::Subshell => 0,
+                ShellExecEnvKind::Normal
+                | ShellExecEnvKind::CmdSubst
+                | ShellExecEnvKind::Pipeline => self.loop_depth,
+            },
+            loop_jump: None,
         });
         Ok(bun_core::heap::into_raw(duped))
     }
