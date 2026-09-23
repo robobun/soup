@@ -2716,6 +2716,139 @@ registry's lifetime), `src/runtime/test_runner/expect.rs`, `src/runtime/test_run
 `docs/test/writing-tests.mdx`, `test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts`,
 `test/integration/bun-types/fixture/test.ts`.
 
+### 2026-09-23: `for` loops in Bun Shell, with `break` and `continue`
+
+Bun Shell had `if` and `[[ ]]` but no loop of any kind. `` $`for i in 1 2 3; do echo $i; done` `` answered
+`bun: command not found: for`, then the same for `do` and `done`. So the moment a script needed to
+do something per file or per package it left the template literal for a JavaScript loop around many
+small `$` calls, and a `package.json` script with a `for` in it, which works on Linux and macOS
+because `bun run` hands it to `sh`, failed on Windows, where `bun run` uses Bun Shell. Now:
+
+```ts
+import { $ } from "bun";
+
+await $`
+  for file in src/*.ts; do
+    echo checking $file
+    bun run check.ts $file
+  done
+`;
+
+// an interpolated array is one word per element, never split, never globbed
+const packages = ["core", "cli", "my docs"];
+await $`for pkg in ${packages}; do (cd packages/$pkg && bun run build); done`;
+
+await $`
+  for dir in packages/*; do
+    [[ -f $dir/package.json ]] || continue
+    for script in build test; do
+      bun run --cwd $dir $script || break 2
+    done
+  done
+`;
+```
+
+```json
+{
+  "scripts": {
+    "build:all": "for pkg in packages/*; do bun run --cwd $pkg build; done"
+  }
+}
+```
+
+The words after `in` go through the same expansion as the arguments of a command (variables,
+`$(...)` split into fields unless quoted, braces, globs, interpolated values), once, before the
+first iteration. The variable is an ordinary shell variable: not exported, and it keeps its last
+value after the loop. The loop exits with the status of the last command its body ran, or 0 if it
+never ran. It can be a member of a pipeline (where it runs in a copy of the environment, like any
+other member), an operand of `&&` and `||`, the condition of an `if`, and it nests. `break [n]` and
+`continue [n]` are builtins. All of it was checked against bash 5.2, about sixty scripts by a review
+pass on top of the tests: counts larger than the nesting end every loop, a count that is not a
+positive integer is an error that also ends every loop (status 1), outside a loop they print
+`break: only meaningful in a loop` and succeed, `( break )` is outside the loop while `$( break )`
+and `break | cat` end what is left of the substitution or the pipeline member and never the loop
+around it.
+
+How it is built:
+
+- Parser. `for`, `in`, `do` and `done` join `if`/`then`/`elif`/`else`/`fi` in the one mechanism the
+  parser has for reserved words (`IfClauseTok`), so they get its two safety properties for free: a
+  word is only reserved where the grammar looks for it (`echo done`, `for x in for in do done`, a
+  variable called `in` all work), and an interpolated `${"done"}` is data and can never close a
+  loop. `for x; do` without a list (it means `"$@"`, which Bun Shell does not have), an empty body
+  and `done > file` are parse errors that say so, and `for $x in` explains that it wants the name.
+- Interpreter. A new `For` state next to `If`: expand each word through the `Expansion` state `Cmd`
+  uses, then run the body's statements once per field. An expansion that fails (a glob with no
+  match) prints its error and fails the loop, not the script, through the same IOWriter path
+  `[[ ]]` uses.
+- `break` and `continue` unwind nothing themselves. They leave a `LoopJump { kind, levels }` in the
+  shell environment and finish. Upstream already has the predicate every sequencing state (`Script`,
+  `Stmt`, `If`, `&&`/`||`) asks before it starts its next child, `Interpreter::interrupted()`, added
+  for Ctrl+C and script failure; a pending jump is one more reason to say yes, so `if`, `&&` and
+  nested statement lists between the `break` and its loop fall away with no code of their own, and
+  the loop consumes the jump (or decrements it and passes it on). The environment also counts the
+  loops it is in, which is what makes `break` outside a loop a warning and lets a copy of the
+  environment (subshell, substitution, pipeline member) decide whether it is still inside.
+- The event loop. The shell's trampoline only returns to the event loop when something waits, and a
+  body of builtins (`echo`, assignments, `[[ a == b ]]`) never does. The first version ran such a
+  loop to its end in one go: the review measured a 10 ms interval timer that did not fire once
+  during a 100,000-iteration loop, and soup's own `.timeout()` and `.kill()` from 2026-09-15 did
+  nothing until the loop was over. Upstream's `yes` builtin has the same problem and solves it by
+  re-queueing itself; `For` does the same every 128 iterations through a small boxed task
+  (`ShellLoopYield`, on `enqueue_task_after_yield`, the queue upstream added for exactly this), and
+  checks whether the script was stopped when it comes back. 2,000 iterations of builtins now give
+  timers 15 turns, and `.timeout(200)` ends a loop of 100,000.
+
+A review pass (one reader, the whole diff, with the debug build to run things) found no crash, leak
+or unbalanced state in some sixty malformed inputs and every exit path of the loop (LSan clean,
+file descriptors and RSS flat over 100,000 iterations), and four things that are fixed here: the
+event loop point above, `break` inside `$( )` (it warned and carried on, bash ends the
+substitution), an empty body being accepted, and a docs example whose comment promised more than
+`|| break 2` does.
+
+The work also ran into older bugs that loops make easier to meet. They are upstream's, reproduce
+with stock Bun, and were reported through the hand-off instead of being fixed inside this patch.
+Two matter enough to know about: a tab is not a word separator in Bun Shell's lexer, so a loop body
+indented with tabs fails with `command not found: \techo` (so does a tab-indented `if`; this report
+was picked up for a fix), and a comment at the end of a line swallows the newline, so
+`for f in a b  # comment` joins `do` to the word list (`echo a # c` followed by `echo b` prints
+`a echo b`). The others: a second builtin that reads an input which is already at its end never
+finishes (`echo hi | (cat; cat)` with the builtin `cat` that Windows has by default, and so
+`... | for i in 1 2; do cat; done`), and `echo *.{txt,md}` prints the two patterns next to the
+matches. Glob matches are also not sorted, which a loop makes visible. The docs use spaces and
+whole-line comments, and say that glob matches come unsorted and that a variable is one word
+(`for x in $LIST` runs once, as everywhere in Bun Shell; interpolate an array or use `$(...)`).
+
+Not done: `while` and `until` (the loop state and the yield task are most of what they need; they
+also want `read`, and `exit` actually ending the script, which upstream's `exit` deliberately does
+not, so `cmd || exit 1` in a loop does not stop it), `for x; do` over positional parameters,
+redirecting a whole loop, and `$?`.
+
+Rebase notes: 37 patches onto oven-sh/bun 6d504dd983, no textual conflict, nothing dropped, and one
+break that git could not see. `dispatch.rs` asserts the number of task tags at compile time.
+Upstream added a tag (`S3UploadWriterCollected`) and raised the number from 82 to 83; soup's `wc`
+patch, which adds a tag of its own, had raised it from 82 to 83 as well. Both sides wrote the same
+line, git merged it without a word, and the build failed because there are 84 now. Fixed in the
+`wc` patch, where soup's tag comes from. Today's `ShellLoopYield` makes it 85. The patch does not touch lines other soup patches own
+(the `interrupted()` change is a new line, the task tag sits apart from soup's, the tests stay
+clear of soup-only builtins and skip the `kill()` test where `kill()` does not exist), so it
+cherry-picks onto upstream with the count as its only conflict. `test/internal/source-lints/`
+passes and the fork's three workflows were green after yesterday's push. A full run of
+`test/js/bun/shell/` in the ASAN build had many timeouts in tests that start processes, on a shared
+machine with a load average above 100. Run alone in a quieter moment, `kill.test.ts`,
+`exec.test.ts`, `pipeline_stack.test.ts`, `file-io.test.ts` and `brace.test.ts` pass. What still
+fails alone has no loop in it and fails for reasons of its own: `shell-hang.test.ts` gives a debug
+build 700 ms to start, `commands/ls.test.ts` expects permission errors that root does not get, and
+`shell-load`, `shell-leak-args`, `shell-blocking-pipe` and one `rm` test run out of time.
+
+Files: `src/shell_parser/parse.rs` (`ast::For`, the reserved words, `parse_for_clause`),
+`src/shell_parser/json_fmt.rs`, `src/runtime/shell/states/For.rs` (new),
+`src/runtime/shell/builtin/break_continue.rs` (new), `src/runtime/shell/interpreter.rs` (`LoopJump`,
+`loop_depth`, `loop_jump_pending`, the node table), `src/runtime/shell/dispatch_tasks.rs`
+(`ShellLoopYieldTask`), `src/runtime/dispatch.rs`, `src/event_loop/ConcurrentTask.rs`,
+`src/runtime/shell/{Builtin,IOWriter,mod}.rs`, `src/runtime/shell/states/{Pipeline,Async}.rs`,
+`docs/runtime/shell.mdx`, `test/js/bun/shell/bunshell.test.ts`, `test/js/bun/shell/parse.test.ts`.
+
 ## Dropped
 
 Nothing yet.

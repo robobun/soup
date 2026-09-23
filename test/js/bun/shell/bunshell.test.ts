@@ -2550,6 +2550,257 @@ cat redir_out`
   });
 });
 
+describe("for_loop", () => {
+  TestBuilder.command`for i in 1 2 3; do echo $i; done`.stdout("1\n2\n3\n").runAsTest("basic");
+
+  TestBuilder.command`
+for name in alice bob
+do
+  echo hello $name
+  echo bye $name
+done
+echo end`
+    .stdout("hello alice\nbye alice\nhello bob\nbye bob\nend\n")
+    .runAsTest("newlines instead of semicolons");
+
+  TestBuilder.command`for f in *.txt; do echo "<$f>"; done`
+    .file("a.txt", "a")
+    .file("b c.txt", "b c")
+    .file("d.md", "d")
+    .stdout(out => expect(sortedShellOutput(out)).toEqual(["<a.txt>", "<b c.txt>"]))
+    .runAsTest("glob, one iteration per file even with spaces in the name");
+
+  TestBuilder.command`for f in *.nope; do echo $f; done; echo after`
+    .stdout("after\n")
+    .stderr("bun: no matches found: *.nope\n")
+    .runAsTest("a glob that matches nothing fails the loop, not the script");
+
+  TestBuilder.command`for x in {a,b}{1,2}; do echo $x; done`.stdout("a1\na2\nb1\nb2\n").runAsTest("brace expansion");
+
+  TestBuilder.command`LIST="x y z"; for x in $(echo 1 2) "$(echo 3 4)" $LIST; do echo "<$x>"; done`
+    .stdout("<1>\n<2>\n<3 4>\n<x y z>\n")
+    .runAsTest("command substitution is split into fields unless quoted, variables are not");
+
+  TestBuilder.command`for x in ${"a b"} ${["c d", "e"]} ${"*"}; do echo "<$x>"; done`
+    .file("file.txt", "")
+    .stdout("<a b>\n<c d>\n<e>\n<*>\n")
+    .runAsTest("interpolated values are one word each and never syntax");
+
+  TestBuilder.command`for x in $UNSET; do echo never; done; for y in; do echo never; done; echo "<$x$y>"`
+    .stdout("<>\n")
+    .runAsTest("an empty list runs nothing and leaves the variable unset");
+
+  TestBuilder.command`for x in "" ''; do echo "<$x>"; done`.stdout("<>\n<>\n").runAsTest("quoted empty words count");
+
+  TestBuilder.command`x=before; for x in 1 2; do echo $x; done; echo after=$x`
+    .stdout("1\n2\nafter=2\n")
+    .runAsTest("the variable keeps its last value");
+
+  TestBuilder.command`for x in a; do ${BUN} -e "console.log(process.env.x, process.env.y)"; done`
+    .env({ ...bunEnv, y: "exported" })
+    .stdout("undefined exported\n")
+    .runAsTest("the variable is a shell variable, not an environment variable");
+
+  TestBuilder.command`for i in 1 2; do for j in a b; do echo $i$j; done; done`
+    .stdout("1a\n1b\n2a\n2b\n")
+    .runAsTest("nested");
+
+  TestBuilder.command`for i in 1 2 3; do echo $i; done | cat`
+    .stdout("1\n2\n3\n")
+    .runAsTest("as the first member of a pipeline");
+
+  TestBuilder.command`echo in | for i in 1; do cat; done`.stdout("in\n").runAsTest("the body reads the loop's stdin");
+
+  TestBuilder.command`x=outer; for x in inner; do echo $x; done | cat; echo $x`
+    .stdout("inner\nouter\n")
+    .runAsTest("a loop in a pipeline runs in a subshell");
+
+  TestBuilder.command`echo $(for i in 1 2; do echo $i; done); (for i in 3 4; do echo $i; done)`
+    .stdout("1 2\n3\n4\n")
+    .runAsTest("in a command substitution and in a subshell");
+
+  TestBuilder.command`for i in 1 2; do echo $i; done && echo and; for i in 1; do false; done || echo or`
+    .stdout("1\n2\nand\nor\n")
+    .runAsTest("with && and ||");
+
+  TestBuilder.command`if for i in 1 2; do [[ $i == 1 ]]; done; then echo yes; else echo no; fi`
+    .stdout("no\n")
+    .runAsTest("exits with the status of the last command the body ran");
+
+  TestBuilder.command`false; for i in; do echo never; done`
+    .exitCode(0)
+    .runAsTest("exits with 0 when the body never ran");
+
+  TestBuilder.command`for i in $(seq 1 5000); do echo $i; done`
+    .stdout(out => expect(out).toBe(Array.from({ length: 5000 }, (_, i) => `${i + 1}\n`).join("")))
+    .runAsTest("many iterations");
+
+  TestBuilder.command`for i in for in do done if then fi; do echo $i do done; done`
+    .stdout("for do done\nin do done\ndo do done\ndone do done\nif do done\nthen do done\nfi do done\n")
+    .runAsTest("reserved words are ordinary words in the list and in arguments");
+
+  TestBuilder.command`for f in a b; do cd $f; pwd; cd ..; done`
+    .directory("a")
+    .directory("b")
+    .stdout(out =>
+      expect(
+        out
+          .trim()
+          .split("\n")
+          .map(dir => dir.split(/[\\/]/).at(-1)),
+      ).toEqual(["a", "b"]),
+    )
+    .runAsTest("cd in the body moves the shell");
+
+  test("in a script file", async () => {
+    using dir = tempDir("shell-for-loop", {
+      "a.txt": "",
+      "b.txt": "",
+      "loops.sh": `
+for f in *.txt
+do
+  echo file $f
+done
+for i in 1 2 3; do
+  for j in a b; do
+    if [[ $j == b ]]; then continue 2; fi
+    if [[ $i == 3 ]]; then break 2; fi
+    echo $i$j
+  done
+done
+for i in $(seq 1 300); do n=$i; done
+echo counted to $n
+for f in *.nope; do echo never; done
+for f in last; do false; done
+`,
+    });
+    await using proc = Bun.spawn({
+      cmd: [BUN, "loops.sh"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("bun: no matches found: *.nope\n");
+    expect(stdout.split("\n").sort()).toEqual(["", "1a", "2a", "counted to 300", "file a.txt", "file b.txt"]);
+    expect(exitCode).toBe(1);
+  }, 30_000);
+
+  test("a loop of builtins gives the event loop a turn", async () => {
+    let turns = 0;
+    let running = true;
+    const turn = () => {
+      if (!running) return;
+      turns++;
+      setImmediate(turn);
+    };
+    setImmediate(turn);
+    const { stdout } = await $`for i in $(seq 1 2000); do n=$i; done; echo $n`.quiet();
+    running = false;
+    expect(stdout.toString()).toBe("2000\n");
+    expect(turns).toBeGreaterThanOrEqual(5);
+  });
+
+  // ShellPromise.kill() is not in every build these tests run against.
+  test.skipIf(typeof ($`true` as any).kill !== "function")("kill() stops a loop of builtins", async () => {
+    const script = $`for i in $(seq 1 20000); do true; done; echo finished`.quiet().nothrow() as any;
+    const running = script.run();
+    running.kill();
+    const result = await running;
+    expect(result.stdout.toString()).toBe("");
+    expect(result.exitCode).toBe(143);
+  });
+
+  describe("break and continue", () => {
+    TestBuilder.command`for i in 1 2 3; do if [[ $i == 2 ]]; then break; fi; echo $i; done; echo end`
+      .stdout("1\nend\n")
+      .runAsTest("break");
+
+    TestBuilder.command`for i in 1 2 3; do if [[ $i == 2 ]]; then continue; fi; echo $i; done; echo end`
+      .stdout("1\n3\nend\n")
+      .runAsTest("continue");
+
+    TestBuilder.command`for i in 1 2 3; do echo $i; [[ $i == 2 ]] && break; echo after $i; done`
+      .stdout("1\nafter 1\n2\n")
+      .runAsTest("break after &&");
+
+    TestBuilder.command`for i in 1 2; do break || echo or; echo never; done; for i in 1 2; do continue && echo and; echo never; done`
+      .stdout("")
+      .runAsTest("nothing else in the list runs");
+
+    TestBuilder.command`for i in 1 2; do for j in a b; do echo $i$j; break; done; echo outer $i; done`
+      .stdout("1a\nouter 1\n2a\nouter 2\n")
+      .runAsTest("break leaves the innermost loop");
+
+    TestBuilder.command`for i in 1 2; do for j in a b; do echo $i$j; break 2; done; echo never; done; echo end`
+      .stdout("1a\nend\n")
+      .runAsTest("break 2");
+
+    TestBuilder.command`for i in 1 2; do for j in a b; do echo $i$j; continue 2; done; echo never; done; echo end`
+      .stdout("1a\n2a\nend\n")
+      .runAsTest("continue 2");
+
+    TestBuilder.command`for i in 1 2; do for j in a b; do for k in x y; do echo $i$j$k; if [[ $j == a ]]; then continue 2; fi; break 3; done; done; done; echo end`
+      .stdout("1ax\n1bx\nend\n")
+      .runAsTest("three deep");
+
+    TestBuilder.command`for i in 1 2; do for j in a b; do echo $i$j; break 99; done; done; echo end`
+      .stdout("1a\nend\n")
+      .runAsTest("a count past the outermost loop ends them all");
+
+    TestBuilder.command`for i in 1 2; do false; break; done`
+      .exitCode(0)
+      .runAsTest("break is the last command of the loop");
+
+    TestBuilder.command`if for i in 1 2; do false; continue; done; then echo yes; fi`
+      .stdout("yes\n")
+      .runAsTest("so is continue");
+
+    TestBuilder.command`break; continue 2; echo end`
+      .stdout("end\n")
+      .stderr("break: only meaningful in a loop\ncontinue: only meaningful in a loop\n")
+      .runAsTest("outside a loop they warn and do nothing");
+
+    TestBuilder.command`for i in 1 2; do (break; echo subshell $i); done`
+      .stdout("subshell 1\nsubshell 2\n")
+      .stderr("break: only meaningful in a loop\nbreak: only meaningful in a loop\n")
+      .runAsTest("a subshell is outside the loop");
+
+    TestBuilder.command`for i in 1 2; do x=$(echo a; break; echo never); echo "[$x]"; echo "[$(continue; echo never)]"; done`
+      .stdout("[a]\n[]\n[a]\n[]\n")
+      .runAsTest("in a command substitution they end the substitution, not the loop");
+
+    TestBuilder.command`for i in 1 2; do echo $(for j in a b; do echo $i$j; break 2; done; echo never); done`
+      .stdout("1a\n2a\n")
+      .runAsTest("a count cannot reach out of a command substitution");
+
+    TestBuilder.command`for i in 1 2; do break | cat; echo $i; done`
+      .stdout("1\n2\n")
+      .runAsTest("break in a pipeline member does not reach the loop");
+
+    TestBuilder.command`for i in 1 2; do for j in a b; do echo $i$j; break 0; echo never; done; echo never; done; echo end`
+      .stdout("1a\nend\n")
+      .stderr("break: 0: loop count out of range\n")
+      .runAsTest("a count of 0 is an error that ends every loop");
+
+    TestBuilder.command`for i in 1 2; do echo $i; continue nope; echo never; done; echo end`
+      .stdout("1\nend\n")
+      .stderr("continue: nope: numeric argument required\n")
+      .runAsTest("so is a count that is not a number");
+
+    TestBuilder.command`for i in 1 2; do echo $i; break 1 2; echo never; done; echo end`
+      .stdout("1\nend\n")
+      .stderr("break: too many arguments\n")
+      .runAsTest("and more than one count");
+
+    TestBuilder.command`if for i in 1; do break 0; done; then echo yes; else echo no; fi`
+      .stdout("no\n")
+      .stderr("break: 0: loop count out of range\n")
+      .runAsTest("a bad count fails");
+  });
+});
+
 describe("condexprs", () => {
   TestBuilder.command`[[ -f package.json ]] && echo yes!`.file("package.json", "hi").stdout("yes!\n").runAsTest("-f");
   TestBuilder.command`[[ -f mumbo.jumbo ]] && echo yes!`.exitCode(1).runAsTest("-f non-existent");
@@ -3431,6 +3682,29 @@ describe("interpolated values in reserved-word position", () => {
     .stdout("if then elif else fi\n")
     .stderr("bun: command not found: BUNISBAD\n")
     .runAsTest("interpolated reserved words in argument position pass through");
+
+  TestBuilder.command`${"for"} i in a; echo B`
+    .stdout("B\n")
+    .stderr("bun: command not found: for\n")
+    .runAsTest("interpolated for stays a single command word");
+
+  TestBuilder.command`for i ${"in"} a; do echo $i; done`
+    .error('Expected "in" after "for i" but got: in')
+    .runAsTest("interpolated in does not start the word list");
+
+  TestBuilder.command`for i in a; ${"do"} echo $i; done`
+    .error('Expected "do" but got: do')
+    .runAsTest("interpolated do does not start the body");
+
+  TestBuilder.command`for i in a b; do echo $i; ${"done"}; done`
+    .stdout("a\nb\n")
+    .stderr("bun: command not found: done\nbun: command not found: done\n")
+    .exitCode(1)
+    .runAsTest("interpolated done stays a single command word");
+
+  TestBuilder.command`for i in ${"for"} ${"in"} ${"do"} ${"done"}; do echo $i; done`
+    .stdout("for\nin\ndo\ndone\n")
+    .runAsTest("interpolated loop words in the word list pass through");
 });
 
 test("redirect target buffer stays attached while a builtin command is running", async () => {
