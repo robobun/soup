@@ -16,7 +16,7 @@ use core::fmt::{self, Write};
 
 use super::parse::SmolList;
 use super::parse::ast::{
-    Assign, Atom, Binary, BinaryOp, Cmd, CmdSubst, CompoundAtom, CondExpr, Expr, If, JSBuf,
+    Assign, Atom, Binary, BinaryOp, Cmd, CmdSubst, CompoundAtom, CondExpr, Expr, For, If, JSBuf,
     Pipeline, PipelineItem, Redirect, RedirectFlags, Script, SimpleAtom, Stmt, Subshell,
 };
 
@@ -108,6 +108,10 @@ fn write_expr(w: &mut impl Write, e: &Expr<'_>) -> fmt::Result {
             w.write_str("{\"if\":")?;
             write_if(w, i)?;
         }
+        Expr::For(f) => {
+            w.write_str("{\"for\":")?;
+            write_for(w, f)?;
+        }
         Expr::CondExpr(c) => {
             w.write_str("{\"condexpr\":")?;
             write_condexpr(w, c)?;
@@ -160,6 +164,10 @@ fn write_pipeline_item(w: &mut impl Write, p: &PipelineItem<'_>) -> fmt::Result 
             w.write_str("{\"if\":")?;
             write_if(w, i)?;
         }
+        PipelineItem::For(f) => {
+            w.write_str("{\"for\":")?;
+            write_for(w, f)?;
+        }
         PipelineItem::CondExpr(c) => {
             w.write_str("{\"condexpr\":")?;
             write_condexpr(w, c)?;
@@ -188,6 +196,16 @@ fn write_if(w: &mut impl Write, i: &If<'_>) -> fmt::Result {
     write_stmt_smol(w, &i.then)?;
     w.write_str(",\"else_parts\":")?;
     write_array(w, i.else_parts.slice(), |w, part| write_stmt_smol(w, part))?;
+    w.write_char('}')
+}
+
+fn write_for(w: &mut impl Write, f: &For<'_>) -> fmt::Result {
+    w.write_str("{\"var\":")?;
+    encode_json_string(w, f.var)?;
+    w.write_str(",\"words\":")?;
+    write_array(w, f.words, write_atom)?;
+    w.write_str(",\"body\":")?;
+    write_stmt_smol(w, &f.body)?;
     w.write_char('}')
 }
 

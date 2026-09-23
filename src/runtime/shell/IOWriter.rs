@@ -86,6 +86,7 @@ pub(crate) enum WriterTag {
     Builtin,
     Cmd,
     CondExpr,
+    For,
     Pipeline,
     /// `subproc::PipeReader::CapturedWriter` — heap-allocated, addressed via
     /// `ChildPtr::raw` rather than `node`.
@@ -1214,13 +1215,14 @@ pub(crate) fn on_io_writer_chunk(
     err: Option<sys::SystemError>,
 ) -> Yield {
     use crate::shell::builtin::Builtin;
-    use crate::shell::states::{cmd, cond_expr, pipeline};
+    use crate::shell::states::{cmd, cond_expr, r#for, pipeline};
     match child.tag {
         WriterTag::Builtin => Builtin::on_io_writer_chunk(interp, child.node, written, err),
         WriterTag::Cmd => cmd::Cmd::on_io_writer_chunk(interp, child.node, written, err),
         WriterTag::CondExpr => {
             cond_expr::CondExpr::on_io_writer_chunk(interp, child.node, written, err)
         }
+        WriterTag::For => r#for::For::on_io_writer_chunk(interp, child.node, written, err),
         WriterTag::Pipeline => {
             pipeline::Pipeline::on_io_writer_chunk(interp, child.node, written, err)
         }

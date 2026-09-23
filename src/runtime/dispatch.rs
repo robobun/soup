@@ -459,6 +459,7 @@ pub(crate) fn run_task(
         | task_tag::ShellTouchTask
         | task_tag::ShellMkdirTask
         | task_tag::ShellLsTask
+        | task_tag::ShellLoopYield
         | task_tag::ShellMvBatchedTask
         | task_tag::ShellMvCheckTargetTask
         | task_tag::ShellRmTask
@@ -693,6 +694,11 @@ fn run_task_cold(task: Task) {
         task_tag::ShellTouchTask => shell_dispatch!(ShellTouchTask),
         task_tag::ShellMkdirTask => shell_dispatch!(ShellMkdirTask),
         task_tag::ShellLsTask => shell_dispatch!(ShellLsTask),
+        task_tag::ShellLoopYield => {
+            crate::shell::dispatch_tasks::ShellLoopYieldTask::run_from_main_thread(cast_ptr!(
+                crate::shell::dispatch_tasks::ShellLoopYieldTask
+            ));
+        }
         task_tag::ShellMvBatchedTask => shell_dispatch!(ShellMvBatchedTask),
         task_tag::ShellMvCheckTargetTask => shell_dispatch!(ShellMvCheckTargetTask),
         task_tag::ShellRmTask => shell_dispatch!(ShellRmTask),
@@ -736,7 +742,7 @@ fn run_task_cold(task: Task) {
 /// `release_task_unrun` track `bun_event_loop::task_tag::COUNT`. Bump when
 /// adding a variant — and give it an arm in both.
 const _: () = assert!(
-    task_tag::COUNT == 84,
+    task_tag::COUNT == 85,
     "dispatch::run_task / release_task_unrun arm count out of sync with bun_event_loop::task_tag",
 );
 
@@ -1482,6 +1488,7 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
             unreachable!("posix-only tag");
         }
         task_tag::ShellLsTask => release!(ShellLsTask),
+        task_tag::ShellLoopYield => release!(crate::shell::dispatch_tasks::ShellLoopYieldTask),
         task_tag::ShellMkdirTask => release!(ShellMkdirTask),
         task_tag::ShellMvBatchedTask => release!(ShellMvBatchedTask),
         task_tag::ShellMvCheckTargetTask => release!(ShellMvCheckTargetTask),

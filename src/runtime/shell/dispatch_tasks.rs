@@ -18,6 +18,72 @@ pub(crate) struct ShellAsyncTask {
     pub node: NodeId,
 }
 
+/// A loop puts itself back on the event loop every so often. A body of builtins
+/// never waits for anything, so without this a long loop would run to its end
+/// before a timer, another promise or anything that wants to stop the script
+/// got a turn (`yes` does the same, see `YesTask`). Boxed per hop: whoever runs
+/// or releases the task frees it. The loop is suspended while one is queued, so
+/// its node is still there when the task runs.
+pub(crate) struct ShellLoopYieldTask {
+    interp: *mut Interpreter,
+    node: NodeId,
+}
+
+impl ShellLoopYieldTask {
+    /// The caller returns `Yield::suspended()`; `next` of `node` continues it.
+    pub(crate) fn enqueue(interp: &Interpreter, node: NodeId) {
+        use crate::shell::interpreter::EventLoopHandle;
+        let task: *mut Self = bun_core::heap::into_raw(Box::new(Self {
+            interp: interp.as_ctx_ptr(),
+            node,
+        }));
+        match interp.event_loop {
+            // Next loop iteration, after I/O and timers have had a turn.
+            EventLoopHandle::Js { owner } => {
+                owner.enqueue_task_after_yield(bun_jsc::Task::init(task))
+            }
+            EventLoopHandle::Mini(mut mini) => {
+                let any = bun_jsc::AnyTaskWithExtraContext::AnyTaskWithExtraContext::from_callback_auto_deinit(
+                    task,
+                    Self::run_from_main_thread_mini,
+                );
+                // SAFETY: the shell's own mini loop, on its thread (see
+                // `Async::enqueue_self`).
+                unsafe { mini.get_mut() }
+                    .enqueue_task_concurrent(core::ptr::NonNull::new(any).expect("heap task"));
+            }
+        }
+    }
+
+    // Dispatch trampoline: `this` validity is guaranteed by the `run_task`
+    // contract; signature is fixed by `dispatch.rs`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub(crate) fn run_from_main_thread(this: *mut Self) {
+        // SAFETY: the box `enqueue` allocated for this one run of the task.
+        let task = unsafe { bun_core::heap::take(this) };
+        // SAFETY: the interpreter outlives its script, which cannot end while
+        // the loop at `node` is waiting for this task.
+        let interp = unsafe { &*task.interp };
+        interp.next_node(task.node).run(interp);
+    }
+
+    fn run_from_main_thread_mini(this: *mut Self, _: *mut core::ffi::c_void) {
+        Self::run_from_main_thread(this);
+    }
+}
+
+impl bun_event_loop::Taskable for ShellLoopYieldTask {
+    const TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::ShellLoopYield;
+    unsafe fn release_unrun(this: *mut Self) {
+        // SAFETY: fn contract — boxed in `enqueue`, and nothing else frees an unrun one.
+        drop(unsafe { bun_core::heap::take(this) });
+    }
+    /// See [`ShellTaskCtx`](crate::shell::interpreter::ShellTaskCtx): a step of a shell script always runs.
+    unsafe fn context(_: *const Self) -> bun_event_loop::ContextId {
+        bun_event_loop::ContextId::NONE
+    }
+}
+
 /// Stat task backing shell conditional expressions (`[ -f x ]` etc.). Wraps an
 /// inner [`ShellTask`].
 #[repr(C)]

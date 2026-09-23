@@ -116,6 +116,7 @@ impl Async {
                     ast::Expr::Assign(_)
                     | ast::Expr::Binary(_)
                     | ast::Expr::Subshell(_)
+                    | ast::Expr::For(_)
                     | ast::Expr::Async(_) => panic!(
                         "Unexpected Expr variant as Async child, this indicates a bug in Bun."
                     ),

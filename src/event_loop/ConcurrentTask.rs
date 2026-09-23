@@ -127,6 +127,7 @@ pub mod task_tag {
         ShellGlobTask,
         ShellIOReaderUnpolledRead,
         ShellLsTask,
+        ShellLoopYield,           // shell `for`: hands the thread back between iterations
         ShellMkdirTask,
         ShellMvBatchedTask,
         ShellMvCheckTargetTask,

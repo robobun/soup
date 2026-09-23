@@ -80,6 +80,7 @@ pub mod ast {
         Cmd(&'arena Cmd<'arena>),
         Subshell(&'arena Subshell<'arena>),
         If(&'arena If<'arena>),
+        For(&'arena For<'arena>),
         CondExpr(&'arena CondExpr<'arena>),
         /// Valid async (`&`) expressions: pipeline, cmd, subshell, if, condexpr.
         /// Note that commands in a pipeline cannot be async.
@@ -99,6 +100,7 @@ pub mod ast {
         Cmd,
         Subshell,
         If,
+        For,
         #[strum(serialize = "condexpr")]
         CondExpr,
         Async,
@@ -111,6 +113,7 @@ pub mod ast {
                 Expr::Cmd(c) => Some(PipelineItem::Cmd(*c)),
                 Expr::Subshell(s) => Some(PipelineItem::Subshell(*s)),
                 Expr::If(i) => Some(PipelineItem::If(*i)),
+                Expr::For(f) => Some(PipelineItem::For(*f)),
                 Expr::CondExpr(c) => Some(PipelineItem::CondExpr(*c)),
                 _ => None,
             }
@@ -369,6 +372,25 @@ pub mod ast {
         }
     }
 
+    /// `for var in words; do body; done`
+    pub struct For<'arena> {
+        pub var: &'arena [u8],
+        /// Expanded like command arguments (variables, command substitution,
+        /// braces, globs), once, before the first iteration.
+        pub words: &'arena [Atom<'arena>],
+        pub body: SmolList<Stmt<'arena>, 1>,
+    }
+
+    impl<'arena> For<'arena> {
+        pub(crate) fn to_expr(
+            self,
+            bump: &'arena Bump,
+        ) -> Result<Expr<'arena>, bun_alloc::AllocError> {
+            let f = bump.alloc(self);
+            Ok(Expr::For(f))
+        }
+    }
+
     pub struct Binary<'arena> {
         pub op: BinaryOp,
         pub left: Expr<'arena>,
@@ -391,6 +413,7 @@ pub mod ast {
         Assigns(&'arena [Assign<'arena>]),
         Subshell(&'arena Subshell<'arena>),
         If(&'arena If<'arena>),
+        For(&'arena For<'arena>),
         CondExpr(&'arena CondExpr<'arena>),
     }
 
@@ -949,6 +972,10 @@ impl<'bump> Parser<'bump> {
             IfClauseTok::Elif => b"elif",
             IfClauseTok::Then => b"then",
             IfClauseTok::Fi => b"fi",
+            IfClauseTok::For => b"for",
+            IfClauseTok::In => b"in",
+            IfClauseTok::Do => b"do",
+            IfClauseTok::Done => b"done",
         }
     }
 
@@ -1000,6 +1027,13 @@ impl<'bump> Parser<'bump> {
         if self.is_if_clause_text_token(IfClauseTok::If) {
             return self
                 .parse_if_clause()?
+                .to_expr(self.alloc)
+                .map_err(Into::into);
+        }
+
+        if self.is_if_clause_text_token(IfClauseTok::For) {
+            return self
+                .parse_for_clause()?
                 .to_expr(self.alloc)
                 .map_err(Into::into);
         }
@@ -1235,7 +1269,12 @@ impl<'bump> Parser<'bump> {
         };
 
         match if_clause_tok {
-            IfClauseTok::If | IfClauseTok::Then => {
+            IfClauseTok::If
+            | IfClauseTok::Then
+            | IfClauseTok::For
+            | IfClauseTok::In
+            | IfClauseTok::Do
+            | IfClauseTok::Done => {
                 self.add_error(format_args!(
                     "Expected \"else\", \"elif\", or \"fi\" but got: {}",
                     <&'static str>::from(self.peek().tag())
@@ -1312,6 +1351,101 @@ impl<'bump> Parser<'bump> {
                 })
             }
         }
+    }
+
+    /// for_clause : For name linebreak in wordlist sequential_sep do_group
+    ///
+    /// The form without `in` iterates over the positional parameters (`"$@"`),
+    /// which Bun Shell does not have as a list, so `in` is required.
+    fn parse_for_clause(&mut self) -> ParseResult<ast::For<'bump>> {
+        let _ = self.expect_if_clause_text_token(IfClauseTok::For);
+
+        let var = match self.peek() {
+            Token::Text(range)
+                if self.delimits(self.peek_n(1)) && is_valid_var_name(self.text(range)) =>
+            {
+                let _ = self.advance();
+                let _ = self.r#match(TokenTag::Delimit);
+                self.text(range)
+            }
+            Token::Var(range) => {
+                let name = bstr::BStr::new(self.text(range));
+                self.add_error(format_args!(
+                    "\"for\" takes the name of a variable, not its value: write \"for {name}\" instead of \"for ${name}\""
+                ))?;
+                return Err(ParseError::Expected.into());
+            }
+            _ => {
+                self.add_error(format_args!(
+                    "Expected a variable name after \"for\" but got: {}",
+                    bstr::BStr::new(self.peek().as_human_readable(self.strpool))
+                ))?;
+                return Err(ParseError::Expected.into());
+            }
+        };
+
+        self.skip_newlines();
+        if !self.is_if_clause_text_token(IfClauseTok::In) {
+            self.add_error(format_args!(
+                "Expected \"in\" after \"for {}\" but got: {}",
+                bstr::BStr::new(var),
+                bstr::BStr::new(self.peek().as_human_readable(self.strpool))
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+        let _ = self.advance();
+        let _ = self.r#match(TokenTag::Delimit);
+
+        let mut words = bun_alloc::ArenaVec::new_in(self.alloc);
+        while let Some(word) = self.parse_atom()? {
+            words.push(word);
+        }
+
+        if !self.match_any(&[TokenTag::Semicolon, TokenTag::Newline]) {
+            self.add_error(format_args!(
+                "Expected \";\" or a newline before \"do\" but got: {}",
+                bstr::BStr::new(self.peek().as_human_readable(self.strpool))
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+        self.skip_newlines();
+
+        if !self.match_if_clausetok(IfClauseTok::Do) {
+            self.add_error(format_args!(
+                "Expected \"do\" but got: {}",
+                bstr::BStr::new(self.peek().as_human_readable(self.strpool))
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+
+        let body = self.parse_if_body(&[IfClauseTok::Done])?;
+        if body.slice().iter().all(|stmt| stmt.exprs.is_empty()) {
+            self.add_error(format_args!(
+                "Expected a command between \"do\" and \"done\""
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+
+        if !self.match_if_clausetok(IfClauseTok::Done) {
+            self.add_error(format_args!(
+                "Expected \"done\" but got: {}",
+                bstr::BStr::new(self.peek().as_human_readable(self.strpool))
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+
+        if self.peek().tag() == TokenTag::Redirect {
+            self.add_error(format_args!(
+                "Redirecting a \"for\" loop is not supported yet. Redirect the commands in its body instead."
+            ))?;
+            return Err(ParseError::Unsupported.into());
+        }
+
+        Ok(ast::For {
+            var,
+            words: words.into_bump_slice(),
+            body,
+        })
     }
 
     fn parse_simple_cmd(&mut self) -> ParseResult<ast::CmdOrAssigns<'bump>> {
@@ -1922,9 +2056,9 @@ struct ParsedRedirect<'bump> {
     redirect: Option<ast::Redirect<'bump>>,
 }
 
-/// We make it so that `if`/`else`/`elif`/`then`/`fi` need to be single,
-/// simple .Text tokens (so the whitespace logic remains the same).
-/// This is used to convert them
+/// We make it so that `if`/`else`/`elif`/`then`/`fi` and `for`/`in`/`do`/`done`
+/// need to be single, simple .Text tokens (so the whitespace logic remains the
+/// same). This is used to convert them
 #[derive(Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum IfClauseTok {
@@ -1938,6 +2072,14 @@ pub enum IfClauseTok {
     Then,
     #[strum(serialize = "fi")]
     Fi,
+    #[strum(serialize = "for")]
+    For,
+    #[strum(serialize = "in")]
+    In,
+    #[strum(serialize = "do")]
+    Do,
+    #[strum(serialize = "done")]
+    Done,
 }
 
 impl IfClauseTok {
@@ -1970,6 +2112,18 @@ impl IfClauseTok {
         }
         if txt == b"fi" {
             return Some(IfClauseTok::Fi);
+        }
+        if txt == b"for" {
+            return Some(IfClauseTok::For);
+        }
+        if txt == b"in" {
+            return Some(IfClauseTok::In);
+        }
+        if txt == b"do" {
+            return Some(IfClauseTok::Do);
+        }
+        if txt == b"done" {
+            return Some(IfClauseTok::Done);
         }
         None
     }
@@ -4101,8 +4255,8 @@ pub fn needs_escape_utf8_ascii_latin1(str: &[u8]) -> bool {
 }
 
 pub fn is_if_clause_keyword_bunstr(bunstr: &BunString) -> bool {
-    use IfClauseTok::{Elif, Else, Fi, If, Then};
-    [If, Else, Elif, Then, Fi]
+    use IfClauseTok::{Do, Done, Elif, Else, Fi, For, If, In, Then};
+    [If, Else, Elif, Then, Fi, For, In, Do, Done]
         .iter()
         .any(|&kw| bunstr.eq_ascii(<&'static str>::from(kw).as_bytes()))
 }
