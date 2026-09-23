@@ -9,6 +9,7 @@ use crate::shell::io_writer::{self, IOWriter};
 use crate::shell::states::base::{Base, Env, InheritedEnv};
 use crate::shell::states::cmd::Cmd;
 use crate::shell::states::cond_expr::CondExpr;
+use crate::shell::states::r#for::For;
 use crate::shell::states::r#if::If;
 use crate::shell::states::subshell::Subshell;
 use crate::shell::yield_::Yield;
@@ -236,10 +237,18 @@ impl Pipeline {
                 }
             };
 
+            // As in bash, only a simple command stays in the loops around the pipeline
+            // (`break | cat` says nothing). A compound member starts outside of them.
+            if !matches!(item, ast::PipelineItem::Cmd(_)) {
+                // SAFETY: `env` was allocated above and nothing else refers to it yet.
+                unsafe { (*env.as_ptr()).loop_depth = 0 };
+            }
+
             let id = match *item {
                 ast::PipelineItem::Cmd(c) => Cmd::init(interp, Env::Owned(env), c, this, child_io),
                 ast::PipelineItem::Subshell(s) => Subshell::init(interp, env, s, this, child_io),
                 ast::PipelineItem::If(f) => If::init(interp, Env::Owned(env), f, this, child_io),
+                ast::PipelineItem::For(f) => For::init(interp, Env::Owned(env), f, this, child_io),
                 ast::PipelineItem::CondExpr(c) => {
                     CondExpr::init(interp, Env::Owned(env), c, this, child_io)
                 }

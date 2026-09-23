@@ -59,6 +59,8 @@ pub(crate) mod states {
     pub(crate) mod cond_expr;
     #[path = "Expansion.rs"]
     pub(crate) mod expansion;
+    #[path = "For.rs"]
+    pub(crate) mod r#for;
     #[path = "If.rs"]
     pub(crate) mod r#if;
     #[path = "Pipeline.rs"]
@@ -79,6 +81,8 @@ pub(crate) mod builtins {
     pub(crate) mod basename;
     #[path = "batch.rs"]
     pub(crate) mod batch;
+    #[path = "break_continue.rs"]
+    pub(crate) mod break_continue;
     #[path = "cat.rs"]
     pub(crate) mod cat;
     #[path = "cd.rs"]
@@ -159,6 +163,7 @@ pub(crate) mod ast {
     pub(crate) type Cmd = p::Cmd<'static>;
     pub(crate) type Redirect = p::Redirect<'static>;
     pub(crate) type If = p::If<'static>;
+    pub(crate) type For = p::For<'static>;
     pub(crate) type Subshell = p::Subshell<'static>;
     pub(crate) type CondExpr = p::CondExpr<'static>;
     pub(crate) type Assign = p::Assign<'static>;

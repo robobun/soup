@@ -7,7 +7,7 @@ use crate::shell::yield_::Yield;
 
 pub(crate) struct Binary {
     pub(crate) base: Base,
-    shell: *mut ShellExecEnv,
+    pub(crate) shell: *mut ShellExecEnv,
     pub node: bun_ptr::BackRef<ast::Binary>,
     pub(crate) io: IO,
     /// Once `left` is done, this holds its exit code; `None` while running left.
