@@ -9,6 +9,7 @@ use crate::shell::io_writer::{self, IOWriter};
 use crate::shell::states::base::Base;
 use crate::shell::states::cmd::Cmd;
 use crate::shell::states::cond_expr::CondExpr;
+use crate::shell::states::r#for::For;
 use crate::shell::states::r#if::If;
 use crate::shell::states::subshell::Subshell;
 use crate::shell::yield_::Yield;
@@ -254,6 +255,7 @@ impl Pipeline {
                 ast::PipelineItem::Cmd(c) => Cmd::init(interp, duped, c, this, child_io),
                 ast::PipelineItem::Subshell(s) => Subshell::init(interp, duped, s, this, child_io),
                 ast::PipelineItem::If(f) => If::init(interp, duped, f, this, child_io),
+                ast::PipelineItem::For(f) => For::init(interp, duped, f, this, child_io),
                 ast::PipelineItem::CondExpr(c) => CondExpr::init(interp, duped, c, this, child_io),
                 ast::PipelineItem::Assigns(_) => unreachable!("skipped above"),
             };
@@ -422,7 +424,7 @@ impl Pipeline {
         let kind = interp.node(child).kind();
         if matches!(
             kind,
-            StateKind::Cmd | StateKind::IfClause | StateKind::Condexpr
+            StateKind::Cmd | StateKind::IfClause | StateKind::ForClause | StateKind::Condexpr
         ) {
             if let Some(base) = interp.node_mut(child).base_mut() {
                 let shell = core::mem::replace(&mut base.shell, core::ptr::null_mut());
