@@ -453,6 +453,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "upgrade_command.bind.ts": null,
   "valkey.bind.ts": "typeof Bun",
   "virtual_machine_exports.bind.ts": null,
+  "watch_path.bind.ts": null,
 };
 
 /**

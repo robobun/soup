@@ -1558,6 +1558,8 @@ impl Run<'_> {
             }
         }
 
+        cli::watch_path::start(vm, &ctx.debug.watch_paths);
+
         let has_type_errors = match unchecked {
             None => false,
             Some(Unchecked::Main(loader)) => {
