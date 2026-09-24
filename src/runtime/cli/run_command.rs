@@ -1502,6 +1502,8 @@ impl Run<'_> {
             }
         }
 
+        cli::watch_path::start(vm, &ctx.debug.watch_paths);
+
         let has_type_errors = unchecked.is_some_and(|loader| {
             let watching = crate::cli::check_command::watching(vm);
             !RunCommand::check_main(ctx, vm.main(), loader, &vm.argv, watching)

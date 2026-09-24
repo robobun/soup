@@ -168,6 +168,26 @@ describe("fs.watch", () => {
     });
   });
 
+  // Windows kept one libuv handle per directory, so whoever watched it first
+  // decided for everyone after whether the watch was recursive.
+  test("a recursive watcher is recursive although a plain one on the same directory came first", async () => {
+    const root = tempDirWithFiles("watch-recursive-after-plain", { "sub/file.txt": "hello" });
+    const plain = fs.watch(root);
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const recursive = fs.watch(root, { recursive: true }, (_event, filename) => {
+      if (String(filename).replaceAll("\\", "/") === "sub/file.txt") resolve();
+    });
+    recursive.on("error", reject);
+    const interval = repeat(() => fs.writeFileSync(path.join(root, "sub", "file.txt"), "world"));
+    try {
+      await promise;
+    } finally {
+      clearInterval(interval);
+      plain.close();
+      recursive.close();
+    }
+  });
+
   test("should emit event when file is deleted", done => {
     const testsubdir = tempDirWithFiles("subdir", {
       "deleted.txt": "hello",

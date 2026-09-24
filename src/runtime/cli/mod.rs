@@ -217,6 +217,8 @@ pub(crate) mod did_you_mean;
 pub(crate) mod discord_command;
 #[path = "shell_completions.rs"]
 pub(crate) mod shell_completions;
+#[path = "watch_path.rs"]
+pub(crate) mod watch_path;
 #[path = "which_npm_client.rs"]
 pub(crate) mod which_npm_client;
 

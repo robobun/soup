@@ -8,6 +8,7 @@ use bun_core::{ThreadLock, ZStr, feature_flags, output as Output, strings, zstr}
 use bun_sys::{self as sys, Fd};
 use bun_threading::Mutex;
 
+use crate::exclude::ExcludePattern;
 use crate::watcher_trace as WatcherTrace;
 
 // Android: same kernel inotify ABI as glibc/musl Linux, so list both.
@@ -114,6 +115,9 @@ pub struct Watcher {
     /// was never read — only `is_some()`/`is_none()` — so this is a `bool`.
     pub(crate) watchloop_handle: bun_core::AtomicCell<bool>,
     pub(crate) cwd: &'static [u8],
+    /// `--watch-exclude`. Set before `start` and never written again, so
+    /// [`Watcher::is_excluded`] reads it from any thread without the mutex.
+    pub(crate) exclude_patterns: &'static [ExcludePattern],
     pub(crate) thread: Option<std::thread::JoinHandle<()>>,
     /// Main thread clears this in `shutdown`; watcher thread polls it in
     /// `watch_loop` and the platform `watch_loop_cycle`.
@@ -192,6 +196,7 @@ impl Watcher {
             watchlist: WatchList::default(),
             mutex: Mutex::default(),
             cwd: top_level_dir,
+            exclude_patterns: &[],
             ctx: ctx.cast::<()>(),
             on_file_update: on_file_update_wrapped::<T>,
             on_error: on_error_wrapped::<T>,
@@ -213,6 +218,33 @@ impl Watcher {
         WatcherTrace::init();
 
         Ok(this)
+    }
+
+    /// `--watch-exclude`: a file one of `patterns` covers is never added to
+    /// the watchlist. Call before [`Watcher::start`].
+    pub fn set_exclude_patterns(&mut self, patterns: &[Box<[u8]>]) {
+        debug_assert!(!self.watchloop_handle.load());
+        let parsed: Vec<ExcludePattern> = patterns
+            .iter()
+            .filter_map(|pattern| ExcludePattern::parse(pattern, self.cwd))
+            .collect();
+        // One list for the life of the process.
+        self.exclude_patterns = Vec::leak(parsed);
+    }
+
+    /// Whether a `--watch-exclude` pattern covers the absolute path.
+    pub fn is_excluded(&self, abs_path: &[u8]) -> bool {
+        if self.exclude_patterns.is_empty() {
+            return false;
+        }
+        let mut buf = bun_paths::path_buffer_pool::get();
+        if abs_path.len() > buf.len() {
+            return false;
+        }
+        let abs_path = bun_paths::resolve_path::platform_to_posix_buf(abs_path, &mut buf[..]);
+        self.exclude_patterns
+            .iter()
+            .any(|pattern| pattern.covers(abs_path))
     }
 
     /// Lock, check `running`, then dispatch a batch of `watch_events` /
@@ -684,6 +716,9 @@ impl Watcher {
         let _guard = LOCK.then(|| self.mutex.lock_guard());
 
         debug_assert!(file_path.len() > 1);
+        if self.is_excluded(file_path) {
+            return Ok(FdOwnership::Caller);
+        }
         let pathname = bun_paths::fs::PathName::init(file_path);
 
         let parent_dir = pathname.dir_with_trailing_slash();
@@ -822,6 +857,9 @@ impl Watcher {
             if already_watched {
                 return true;
             }
+        }
+        if self.is_excluded(file_path) {
+            return true;
         }
 
         // Only open fd if we might need it
