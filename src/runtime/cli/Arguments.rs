@@ -219,6 +219,12 @@ const RUNTIME_PARAMS_: &[ParamType] = &[
         "--watch-kill-signal <STR>         Signal whose handlers run when --watch restarts the process (default: \"SIGTERM\")"
     ),
     parse_param!(
+        "--watch-path <STR>...             Also watch a file or directory that is not imported. Turns on --watch unless --hot is set"
+    ),
+    parse_param!(
+        "--watch-exclude <STR>...          Glob of files whose changes never restart or reload the process"
+    ),
+    parse_param!(
         "--hot                             Enable auto reload in the Bun runtime, test runner, or bundler"
     ),
     parse_param!(
@@ -446,8 +452,9 @@ pub(crate) const UNHANDLED_REJECTIONS_PARAM: usize =
 pub(crate) const CODE_GENERATION_PARAM: usize =
     startup_options::index_of_long(AUTO_PARAMS, b"disallow-code-generation-from-strings");
 /// These need `Feature::HotReload` besides what their rows say.
-pub(crate) const HOT_RELOAD_PARAMS: [usize; 2] = [
+pub(crate) const HOT_RELOAD_PARAMS: [usize; 3] = [
     startup_options::index_of_long(AUTO_PARAMS, b"watch"),
+    startup_options::index_of_long(AUTO_PARAMS, b"watch-path"),
     startup_options::index_of_long(AUTO_PARAMS, b"hot"),
 ];
 /// What each parameter of `AUTO_PARAMS` needs, in the same order. A parameter without a row fails the build.
@@ -468,6 +475,8 @@ pub(crate) const AUTO_REQUIREMENT_ROWS: &[RequirementRow] = {
         (Long(b"sequential"), Nothing),
         (Long(b"no-exit-on-error"), Nothing),
         (Long(b"watch"), RuntimeCode),
+        (Long(b"watch-path"), RuntimeCode),
+        (Long(b"watch-exclude"), Nothing),
         (Long(b"watch-kill-signal"), Nothing),
         (Long(b"hot"), RuntimeCode),
         (Long(b"no-clear-screen"), Nothing),
@@ -1487,9 +1496,14 @@ pub(crate) fn parse(cmd: CommandTag, ctx: Context<'_>) -> crate::Result<api::Tra
             }
         }
 
+        ctx.debug.watch_paths = slice_to_owned(args.options(b"--watch-path"));
+        ctx.debug.watch_paths.retain(|path| !path.is_empty());
+        ctx.debug.watch_excludes = slice_to_owned(args.options(b"--watch-exclude"));
+
         if args.flag(b"--hot") {
             ctx.debug.hot_reload = HotReload::Hot;
-        } else if args.flag(b"--watch") {
+        } else if args.flag(b"--watch") || !ctx.debug.watch_paths.is_empty() {
+            // Like node, `--watch-path` alone starts watch mode.
             ctx.debug.hot_reload = HotReload::Watch;
 
             // Windows applies this to the watcher child process.
