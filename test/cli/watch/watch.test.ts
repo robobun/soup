@@ -2,7 +2,17 @@ import type { Subprocess } from "bun";
 import { spawn } from "bun";
 import { afterEach, expect, it } from "bun:test";
 import { bunEnv, bunExe, isBroken, isLinux, isMacOS, isWindows, tempDir, tmpdirSync } from "harness";
-import { readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 let watchee: Subprocess;
@@ -707,4 +717,291 @@ it.skipIf(!isLinux)("watcher opens the watched directory and files with O_CLOEXE
     "/dep.ts": [O_CLOEXEC],
     "/main.ts": [O_CLOEXEC],
   });
+});
+
+// --watch-path and --watch-exclude. Each fixture prints what it reads, so a
+// test waits for the output of the run that saw the change, however many
+// restarts the events of one write turn into.
+function spawnWatchee(cwd: string, args: string[]) {
+  watchee = spawn({
+    cwd,
+    cmd: [bunExe(), ...args],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "inherit",
+    stdin: "ignore",
+  });
+  const out = stdoutWaiter(watchee as Subprocess<"ignore", "pipe", "inherit">);
+  return {
+    ...out,
+    // Before the temporary directory goes: Windows cannot remove the working
+    // directory of a running process.
+    stop: async () => {
+      out.release();
+      watchee.kill("SIGKILL");
+      await watchee.exited;
+    },
+    // "Nothing restarted" as something to wait for. A fixture built with
+    // `stillAlive` names its run and, once the files it is given have the
+    // contents it is given, prints a line every few milliseconds. A restart
+    // ends the run within a millisecond or two of the write, so the third
+    // line of the run that was current before the write means the write did
+    // not restart it.
+    stayedAlive: async () => {
+      const run = out
+        .output()
+        .match(/run=(\w+)/g)!
+        .at(-1)!;
+      await out.waitFor(`alive ${run} 3\n`);
+    },
+  };
+}
+
+const stillAlive = (expected: Record<string, string>) => `
+const run = "run=" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+{
+  const { readFileSync } = require("node:fs");
+  const expected = ${JSON.stringify(expected)};
+  let lines = 0;
+  setInterval(() => {
+    for (const file in expected) {
+      try {
+        if (readFileSync(file, "utf8") !== expected[file]) return;
+      } catch {
+        return;
+      }
+    }
+    console.log("alive " + run + " " + ++lines);
+  }, 5);
+}
+`;
+
+it("--watch-path restarts on a change below a directory that nothing imports, and turns on --watch", async () => {
+  using dir = tempDir("watch-path-dir", {
+    "views/index.html": "one",
+    "main.js": `const { readFileSync, existsSync } = require("node:fs");
+console.log("index=" + readFileSync("views/index.html", "utf8") + " partial=" + existsSync("views/partials/new.html"));
+setInterval(() => {}, 1e6);
+`,
+  });
+  const cwd = String(dir);
+  const out = spawnWatchee(cwd, ["--watch-path", "./views", "main.js"]);
+
+  await out.waitFor("index=one partial=false\n");
+  await Bun.write(join(cwd, "views/index.html"), "two");
+  await out.waitFor("index=two partial=false\n");
+  // A file in a directory that did not exist when the watch began.
+  await Bun.write(join(cwd, "views/partials/new.html"), "new");
+  await out.waitFor("index=two partial=true\n");
+  await out.stop();
+});
+
+it("--watch-path watches a single file: created later, saved by rename, and nothing next to it", async () => {
+  using dir = tempDir("watch-path-file", {
+    "other.json": "A",
+    "main.js": `${stillAlive({ "other.json": "B" })}
+const { readFileSync, existsSync } = require("node:fs");
+const config = existsSync("config.json") ? readFileSync("config.json", "utf8") : "missing";
+console.log("config=" + config + " other=" + readFileSync("other.json", "utf8") + " " + run);
+`,
+  });
+  const cwd = String(dir);
+  const save = (contents: string) => {
+    writeFileSync(join(cwd, "config.json.tmp"), contents);
+    renameSync(join(cwd, "config.json.tmp"), join(cwd, "config.json"));
+  };
+  const out = spawnWatchee(cwd, ["--watch", "--watch-path=./config.json", "main.js"]);
+
+  await out.waitFor("config=missing other=A ");
+  writeFileSync(join(cwd, "config.json"), "1");
+  await out.waitFor("config=1 other=A ");
+  // The rename replaces the inode; the next save is still seen.
+  save("2");
+  await out.waitFor("config=2 other=A ");
+  writeFileSync(join(cwd, "other.json"), "B");
+  await out.stayedAlive();
+  save("3");
+  await out.waitFor("config=3 other=B ");
+  await out.stop();
+  expect(out.output()).not.toContain("config=2 other=B");
+});
+
+it.skipIf(isWindows)("--watch-path follows a symlink to a file", async () => {
+  using dir = tempDir("watch-path-symlink", {
+    "real/target.json": "1",
+    "main.js": `console.log("config=" + require("node:fs").readFileSync("config.json", "utf8"));
+setInterval(() => {}, 1e6);
+`,
+  });
+  const cwd = String(dir);
+  symlinkSync(join("real", "target.json"), join(cwd, "config.json"));
+  const out = spawnWatchee(cwd, ["--watch-path=config.json", "main.js"]);
+
+  await out.waitFor("config=1\n");
+  // Nothing happens in the directory of the link when its target changes.
+  writeFileSync(join(cwd, "real/target.json"), "2");
+  await out.waitFor("config=2\n");
+  await out.stop();
+});
+
+it("--watch-exclude keeps an imported file and a file below --watch-path from restarting the process", async () => {
+  using dir = tempDir("watch-exclude", {
+    "gen/data.js": "module.exports = 1;",
+    "lib.js": "module.exports = 1;",
+    "views/a.txt": "1",
+    "main.js": `${stillAlive({ "gen/data.js": "module.exports = 2;", "views/x.tmp": "T" })}
+const { readFileSync } = require("node:fs");
+console.log("data=" + require("./gen/data.js") + " lib=" + require("./lib.js") + " view=" + readFileSync("views/a.txt", "utf8") + " " + run);
+`,
+  });
+  const cwd = String(dir);
+  const out = spawnWatchee(cwd, [
+    "--watch",
+    "--watch-path=./views",
+    // A directory and everything in it, and a glob.
+    "--watch-exclude=./gen/",
+    "--watch-exclude=**/*.tmp",
+    "main.js",
+  ]);
+
+  await out.waitFor("data=1 lib=1 view=1 ");
+  await Bun.write(join(cwd, "gen/data.js"), "module.exports = 2;");
+  await Bun.write(join(cwd, "views/x.tmp"), "T");
+  await out.stayedAlive();
+  // What is not excluded still restarts, and the new run reads the rest.
+  await Bun.write(join(cwd, "lib.js"), "module.exports = 2;");
+  await out.waitFor("data=2 lib=2 view=1 ");
+  await Bun.write(join(cwd, "views/a.txt"), "2");
+  await out.waitFor("data=2 lib=2 view=2 ");
+  await out.stop();
+  expect(out.output()).not.toContain("data=2 lib=1");
+});
+
+it("--watch-exclude with a negated glob watches nothing but what the glob matches", async () => {
+  using dir = tempDir("watch-exclude-negated", {
+    "src/a.js": "module.exports = 1;",
+    "lib/b.js": "module.exports = 1;",
+    "main.js": `${stillAlive({ "lib/b.js": "module.exports = 2;" })}
+console.log("a=" + require("./src/a.js") + " b=" + require("./lib/b.js") + " " + run);
+`,
+  });
+  const cwd = String(dir);
+  const out = spawnWatchee(cwd, ["--watch", "--watch-exclude=!src/**", "main.js"]);
+
+  await out.waitFor("a=1 b=1 ");
+  await Bun.write(join(cwd, "lib/b.js"), "module.exports = 2;");
+  await out.stayedAlive();
+  await Bun.write(join(cwd, "src/a.js"), "module.exports = 2;");
+  await out.waitFor("a=2 b=2 ");
+  await out.stop();
+  expect(out.output()).not.toContain("a=1 b=2");
+});
+
+const hotFixture = (file: string) => `const { readFileSync, existsSync } = require("node:fs");
+globalThis.loads = (globalThis.loads ?? 0) + 1;
+console.log("file=" + (existsSync("${file}") ? readFileSync("${file}", "utf8") : "missing") + " loads=" + (globalThis.loads > 1 ? "many" : "one"));
+globalThis.timer ??= setInterval(() => {}, 1e6);
+`;
+
+it("--hot --watch-path reloads in place", async () => {
+  using dir = tempDir("watch-path-hot", {
+    "views/index.html": "one",
+    "main.js": hotFixture("views/index.html"),
+  });
+  const cwd = String(dir);
+  const out = spawnWatchee(cwd, ["--hot", "--watch-path", "./views", "main.js"]);
+
+  await out.waitFor("file=one loads=one\n");
+  // globalThis survives, so this is a reload and not a restart. The watcher
+  // survives the reload too, and a second write right behind the first is not
+  // taken for a duplicate of it.
+  await Bun.write(join(cwd, "views/index.html"), "two");
+  await out.waitFor("file=two loads=many\n");
+  await Bun.write(join(cwd, "views/index.html"), "three");
+  await out.waitFor("file=three loads=many\n");
+  await out.stop();
+});
+
+it("--hot --watch-path keeps watching a directory that is deleted and made again", async () => {
+  using dir = tempDir("watch-path-hot-recreate", {
+    "dist/out.js": "one",
+    "main.js": hotFixture("dist/out.js"),
+  });
+  const cwd = String(dir);
+  const out = spawnWatchee(cwd, ["--hot", "--watch-path=dist", "main.js"]);
+
+  await out.waitFor("file=one loads=one\n");
+  // What the clean step of a build does. The new directory can even have the
+  // inode number of the old one.
+  rmSync(join(cwd, "dist"), { recursive: true });
+  mkdirSync(join(cwd, "dist"));
+  writeFileSync(join(cwd, "dist/out.js"), "two");
+  await out.waitFor("file=two loads=many\n");
+  writeFileSync(join(cwd, "dist/out.js"), "three");
+  await out.waitFor("file=three loads=many\n");
+  await out.stop();
+});
+
+it("--hot --watch-path waits for a path whose directories do not exist yet", async () => {
+  using dir = tempDir("watch-path-hot-nested", {
+    "main.js": hotFixture("dist/client/app.js"),
+  });
+  const cwd = String(dir);
+  const out = spawnWatchee(cwd, ["--hot", "--watch-path=dist/client", "main.js"]);
+
+  await out.waitFor("file=missing loads=one\n");
+  await Bun.write(join(cwd, "dist/client/app.js"), "one");
+  await out.waitFor("file=one loads=many\n");
+  await Bun.write(join(cwd, "dist/client/app.js"), "two");
+  await out.waitFor("file=two loads=many\n");
+  // Gone with a directory above it, and back.
+  rmSync(join(cwd, "dist"), { recursive: true });
+  await out.waitFor("file=missing loads=many\n");
+  await Bun.write(join(cwd, "dist/client/app.js"), "three");
+  await out.waitFor("file=three loads=many\n");
+  await out.stop();
+});
+
+it("bun test --watch --watch-path reruns when a fixture changes", async () => {
+  using dir = tempDir("watch-path-test", {
+    "fixtures/data.txt": "one",
+    "a.test.js": `import { test } from "bun:test";
+import { readFileSync } from "node:fs";
+test("a", () => console.log("data=" + readFileSync("fixtures/data.txt", "utf8")));
+`,
+  });
+  const cwd = String(dir);
+  const out = spawnWatchee(cwd, ["test", "--watch", "--watch-path=fixtures"]);
+
+  await out.waitFor("data=one\n");
+  await Bun.write(join(cwd, "fixtures/data.txt"), "two");
+  await out.waitFor("data=two\n");
+  await out.stop();
+});
+
+it("bun test --watch --isolate --watch-path still watches in the global of a later test file", async () => {
+  // --isolate closes what a test file left open with its global, these
+  // watchers too. Whichever file runs second in the first run saves the
+  // fixture from its own global and waits for the rerun to replace the process.
+  const testFile = `import { test } from "bun:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+test("reads the fixture", async () => {
+  const data = readFileSync("fixtures/data.txt", "utf8");
+  console.log("data=" + data);
+  if (data !== "one") return;
+  if (!existsSync("first-file-ran")) return writeFileSync("first-file-ran", "");
+  writeFileSync("fixtures/data.txt", "two");
+  await new Promise(() => {});
+});
+`;
+  using dir = tempDir("watch-path-test-isolate", {
+    "fixtures/data.txt": "one",
+    "a.test.js": testFile,
+    "b.test.js": testFile,
+  });
+  const out = spawnWatchee(String(dir), ["test", "--watch", "--isolate", "--watch-path=fixtures"]);
+
+  await out.waitFor("data=two\n");
+  await out.stop();
+  expect(out.output()).toContain("data=one\ndata=one\n");
 });

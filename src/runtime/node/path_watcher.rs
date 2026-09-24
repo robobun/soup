@@ -217,6 +217,9 @@ pub(crate) struct PathWatcher {
 /// ever need shared access to a `PathWatcher`.
 #[derive(Default)]
 pub(crate) struct ChangeEvent {
+    /// [`Arguments::every_event`](crate::node::node_fs_watcher::Arguments):
+    /// nothing is a duplicate for this handler.
+    every_event: bool,
     hash: Cell<u64>,
     event_type: Cell<WatchEventKind>,
     timestamp: Cell<i64>,
@@ -224,6 +227,9 @@ pub(crate) struct ChangeEvent {
 
 impl ChangeEvent {
     fn should_emit(&self, hash: u64, timestamp: i64, event_type: WatchEventKind) -> bool {
+        if self.every_event {
+            return true;
+        }
         let time_diff = timestamp - self.timestamp.get();
         if self.timestamp.get() == 0
             || time_diff > 1
@@ -409,6 +415,7 @@ pub(crate) fn watch(
     vm: &VirtualMachine,
     path: &ZStr,
     recursive: bool,
+    every_event: bool,
     callback: Callback,
     update_end: UpdateEndCallback,
     ctx: *mut c_void,
@@ -467,7 +474,15 @@ pub(crate) fn watch(
     // scoped to this lookup.
     if let Some(&existing) = unsafe { (*manager.watchers.get()).get(key) } {
         // SAFETY: existing is a live PathWatcher under manager.mutex.
-        unsafe { handle_oom((*existing).handlers.put(ctx, ChangeEvent::default())) };
+        unsafe {
+            handle_oom((*existing).handlers.put(
+                ctx,
+                ChangeEvent {
+                    every_event,
+                    ..Default::default()
+                },
+            ))
+        };
         manager.mutex.unlock();
         return Ok(existing);
     }
@@ -485,7 +500,15 @@ pub(crate) fn watch(
         platform: PlatformWatch::default(),
     });
     // SAFETY: watcher just allocated; we hold the only reference.
-    unsafe { handle_oom((*watcher).handlers.put(ctx, ChangeEvent::default())) };
+    unsafe {
+        handle_oom((*watcher).handlers.put(
+            ctx,
+            ChangeEvent {
+                every_event,
+                ..Default::default()
+            },
+        ))
+    };
     // SAFETY: holding manager.mutex; exclusive access to manager.watchers.
     unsafe { handle_oom((*manager.watchers.get()).put(key, watcher)) };
 
