@@ -54,6 +54,9 @@ unsafe impl uv::UvHandle for PathWatcher {}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ChangeEvent {
+    /// [`Arguments::every_event`](crate::node::node_fs_watcher::Arguments):
+    /// nothing is a duplicate for this handler.
+    every_event: bool,
     hash: bun_watcher::HashType,
     event_type: WatchEventKind,
     timestamp: u64,
@@ -62,6 +65,7 @@ pub(crate) struct ChangeEvent {
 impl Default for ChangeEvent {
     fn default() -> Self {
         Self {
+            every_event: false,
             hash: 0,
             event_type: WatchEventKind::Change,
             timestamp: 0,
@@ -76,6 +80,9 @@ impl ChangeEvent {
         timestamp: u64,
         event_type: WatchEventKind,
     ) -> bool {
+        if self.every_event {
+            return true;
+        }
         let time_diff = timestamp.saturating_sub(self.timestamp);
         // skip consecutive exact duplicates (same path and event type) only
         if self.timestamp == 0
@@ -326,12 +333,19 @@ pub(crate) fn watch(
     vm: &jsc::VirtualMachineRef,
     path: &ZStr,
     recursive: bool,
+    every_event: bool,
     ctx: *mut c_void,
 ) -> sys::Result<Handle> {
     let watcher = PathWatcher::init(vm, path, recursive)?;
     // SAFETY: watcher is a valid freshly-returned heap pointer.
     unsafe { &*watcher }.handlers.with_mut(|h| {
-        h.insert(ctx, ChangeEvent::default());
+        h.insert(
+            ctx,
+            ChangeEvent {
+                every_event,
+                ..ChangeEvent::default()
+            },
+        );
     });
     sys::Result::Ok(watcher)
 }

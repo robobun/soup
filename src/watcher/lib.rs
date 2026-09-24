@@ -26,10 +26,12 @@ pub(crate) mod watcher_trace;
 pub mod watcher_impl;
 
 pub mod error;
+pub(crate) mod exclude;
 
 // ─── public re-exports ────────────────────────────────────────────────────
 
 pub use error::{Error, Result};
+pub use exclude::ExcludePatterns;
 
 pub use WatchItemKind as Kind;
 pub use watcher_impl::{

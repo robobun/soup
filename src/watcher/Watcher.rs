@@ -9,6 +9,7 @@ use bun_core::{feature_flags, output as Output, strings, zstr};
 use bun_sys::{self as sys, CloseOnDrop, File};
 use bun_threading::Guarded;
 
+use crate::exclude::ExcludePatterns;
 use crate::watcher_trace as WatcherTrace;
 
 // Android: same kernel inotify ABI as glibc/musl Linux, so list both.
@@ -74,6 +75,8 @@ pub struct Watcher {
     /// Locked while a `WatcherContext` method runs.
     pub(crate) state: Guarded<State>,
     cwd: &'static [u8],
+    /// `--watch-exclude`. Set before `start` and never written again.
+    exclude_patterns: std::sync::OnceLock<ExcludePatterns>,
     /// Cleared when the `OwnedWatcher` drops, polled by `watch_loop`.
     pub(crate) running: bun_core::AtomicCell<bool>,
 }
@@ -143,6 +146,7 @@ impl Watcher {
             port: Arc::clone(&thread.platform.port),
             state: Guarded::new(State::new(thread)),
             cwd: top_level_dir,
+            exclude_patterns: std::sync::OnceLock::new(),
             running: bun_core::AtomicCell::new(true),
         });
 
@@ -150,6 +154,28 @@ impl Watcher {
         WatcherTrace::init();
 
         Ok(OwnedWatcher(this))
+    }
+
+    /// `--watch-exclude`: a file that `patterns` cover is never added to the
+    /// watchlist. Call before [`Watcher::start`].
+    pub fn set_exclude_patterns(&self, patterns: ExcludePatterns) {
+        let was_unset = self.exclude_patterns.set(patterns).is_ok();
+        debug_assert!(was_unset);
+    }
+
+    /// Whether a `--watch-exclude` pattern covers the absolute path.
+    pub fn is_excluded(&self, abs_path: &[u8]) -> bool {
+        self.exclude_patterns
+            .get()
+            .is_some_and(|patterns| patterns.covers(abs_path))
+    }
+
+    /// Whether `abs_path` is a file on the watchlist, so that a change to it
+    /// reloads without anyone else's help.
+    pub fn is_watching_file(&self, abs_path: &[u8]) -> bool {
+        let watchlist = &self.state.lock().watchlist;
+        index_of(watchlist, Self::get_hash(abs_path))
+            .is_some_and(|index| watchlist.items_kind()[index] == WatchItemKind::File)
     }
 
     /// Hands `watch_events[..event_count]` to the trace writer and to `on_file_update`.
@@ -413,6 +439,9 @@ impl Watcher {
         hash: HashType,
     ) -> sys::Result<()> {
         debug_assert!(file_path.len() > 1);
+        if self.is_excluded(file_path) {
+            return Ok(());
+        }
         let pathname = bun_paths::fs::PathName::init(file_path);
 
         let parent_dir = pathname.dir_with_trailing_slash();
@@ -516,6 +545,9 @@ impl Watcher {
         let hash = Self::get_hash(file_path);
 
         if index_of(&self.state.lock().watchlist, hash).is_some() {
+            return true;
+        }
+        if self.is_excluded(file_path) {
             return true;
         }
 
