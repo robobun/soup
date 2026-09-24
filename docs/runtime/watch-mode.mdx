@@ -166,3 +166,65 @@ On hot reload, Bun:
 This implementation isn't particularly optimized. It re-transpiles files that haven't changed. It makes no attempt at incremental compilation. It's a starting point.
 
 </Accordion>
+
+---
+
+## Files that are not imported
+
+Both modes watch the files your code imports. Templates, SQL files, a config file read with `fs`, the output of another build: nothing imports those, so a change to them goes unnoticed. Two flags change what is watched. They work with `bun run` under `--watch` and `--hot`, and with `bun test --watch`.
+
+### `--watch-path`
+
+`--watch-path` takes a file or a directory to watch in addition to the imported files. A directory is watched recursively. Repeat the flag for more than one path.
+
+```bash terminal icon="terminal"
+bun --watch --watch-path ./views --watch-path ./config.json server.ts
+```
+
+A change below `./views` or to `config.json` now restarts the process, exactly like a change to an imported file. With `--hot` it reloads in place instead:
+
+```bash terminal icon="terminal"
+bun --hot --watch-path ./views server.ts
+```
+
+As in Node.js, `--watch-path` on its own turns on `--watch`. Unlike Node.js, imported files stay watched.
+
+```bash terminal icon="terminal"
+bun --watch-path ./views server.ts      # same as: bun --watch --watch-path ./views server.ts
+bun test --watch-path ./fixtures        # rerun the tests when a fixture changes
+```
+
+- Relative paths are resolved against the working directory. A symlink is followed.
+- The path does not have to exist yet, and neither do the directories above it. Bun notices when it is created, and when a watched directory is deleted and created again (`rm -rf dist && bun run build`).
+- Changes inside `node_modules` and `.git` directories below a watched directory are ignored. Without that, every `bun install` and every `git` command would restart your process.
+- Prefer the directories you care about over the project root: on Linux, watching a directory recursively costs one inotify watch per subdirectory, `node_modules` included.
+- Write `./test` or `--watch-path=test` for a directory that is named like a Bun command (`test`, `build`, `run`, ...). A bare `bun --watch-path test server.ts` is read as `bun test`.
+
+<Note>
+  Changes to a `--watch-path` path are noticed on the main thread, between two turns of the event loop. A script that
+  blocks the event loop for a long time (an infinite loop, a long synchronous computation) is restarted by a change to
+  one of its imported files, but not by a change to a `--watch-path` path until the event loop runs again. With `bun
+  test --isolate` (without `--parallel`), the paths are watched again in the fresh global of each test file, so a change
+  that lands while one test file hands over to the next can be missed. Save the file again to rerun.
+</Note>
+
+### `--watch-exclude`
+
+`--watch-exclude` takes a [glob](/runtime/glob). A file that matches is never watched: changing it does not restart or reload the process, whether your code imports it or it sits below a `--watch-path` directory. Repeat the flag for more than one pattern.
+
+```bash terminal icon="terminal"
+# another tool rewrites src/generated/ while the server runs
+bun --watch --watch-exclude src/generated server.ts
+
+# reload for the server code, never for the client components it also imports
+bun --hot --watch-exclude '**/*.tsx' server.ts
+
+# only restart for what is in src/
+bun --watch --watch-exclude '!src/**' server.ts
+```
+
+- A relative pattern is relative to the working directory (`../shared` works). A pattern can also be absolute.
+- A pattern covers what it matches and everything below it, so `src/generated` excludes the directory and all of its contents.
+- A leading `!` negates the pattern: everything that does not match is excluded.
+- As everywhere in Bun, `*` does not cross a `/`: use `**/*.tsx` for "every `.tsx` file", not `*.tsx`.
+- On Windows a `\` in a pattern is a path separator, so write `/` or `\` as you like, and nothing can be escaped.

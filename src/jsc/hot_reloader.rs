@@ -62,6 +62,29 @@ impl ImportWatcher {
         }
     }
 
+    /// See [`Watcher::is_excluded`].
+    #[inline]
+    pub fn is_excluded(&self, abs_path: &[u8]) -> bool {
+        match self {
+            ImportWatcher::Hot(w) | ImportWatcher::Watch(w) => w.is_excluded(abs_path),
+            ImportWatcher::None => false,
+        }
+    }
+
+    /// Whether `abs_path` is a file on the watchlist, so that a change to it
+    /// reloads without anyone else's help.
+    pub fn is_watching_file(&self, abs_path: &[u8]) -> bool {
+        let w = match self {
+            ImportWatcher::Hot(w) | ImportWatcher::Watch(w) => w,
+            ImportWatcher::None => return false,
+        };
+        let _guard = w.mutex.lock_guard();
+        w.index_of(Watcher::get_hash(abs_path))
+            .is_some_and(|index| {
+                w.watchlist.items_kind()[index as usize] == bun_watcher::Kind::File
+            })
+    }
+
     #[inline]
     pub fn add_file<const COPY_FILE_PATH: bool>(
         &mut self,
@@ -125,6 +148,12 @@ impl HotReloaderCtx for VirtualMachine {
         self.log_ref()
             .map(|l| l.level.at_least(bun_ast::Level::Info))
             .unwrap_or(false)
+    }
+
+    fn watch_exclude_patterns(&self) -> &[Box<[u8]>] {
+        bun_options_types::context::try_get()
+            .map(|ctx| ctx.debug.watch_excludes.as_slice())
+            .unwrap_or(&[])
     }
 
     fn is_watcher_enabled(&self) -> bool {
@@ -211,6 +240,11 @@ pub trait HotReloaderCtx {
 
     fn log_level_at_least_info(&self) -> bool {
         false
+    }
+
+    /// `--watch-exclude` globs, for [`Watcher::set_exclude_patterns`].
+    fn watch_exclude_patterns(&self) -> &[Box<[u8]>] {
+        &[]
     }
 
     // ── enable_hot_module_reloading accessors ────────────────────────────
@@ -360,6 +394,23 @@ fn is_watched_env_file(hash: bun_watcher::HashType) -> bool {
 
 unsafe extern "C" {
     safe fn BunDebugger__willHotReload();
+}
+
+/// The reload a change outside the watchlist asks for (`--watch-path`), from
+/// the JS thread: what [`Task::enqueue`] and [`Task::run`] do between them for
+/// a change the watcher thread saw.
+pub fn reload_from_js_thread(vm: &mut VirtualMachine) {
+    match vm.hot_reload {
+        bun_options_types::context::HotReload::None => {}
+        // Replaces the process.
+        bun_options_types::context::HotReload::Watch => vm.reload(None),
+        bun_options_types::context::HotReload::Hot => {
+            BunDebugger__willHotReload();
+            // `report_exception_in_hot_reloaded_module_if_needed` reloads on
+            // this turn of the run loop, once the entry point has settled.
+            vm.hot_reload_deferred = true;
+        }
+    }
 }
 
 // Rust can't put a static in a generic impl, so HotReloader and WatchReloader
@@ -751,6 +802,18 @@ where
 
         // SAFETY: see above.
         let watcher_ptr = unsafe { (*this).install_bun_watcher(watcher, RELOAD_IMMEDIATELY) };
+
+        // SAFETY: `watcher_ptr` was just installed and its thread has not
+        // started; `this` as above, and `reloader` is the box leaked above.
+        unsafe {
+            (*watcher_ptr).set_exclude_patterns((*this).watch_exclude_patterns());
+            // `on_file_update` reloads the entry point by `main.hash` when its
+            // directory reports it replaced, whether it is on the watchlist or
+            // not.
+            if (*watcher_ptr).is_excluded((*reloader).main.file) {
+                (*reloader).main = MainFile::default();
+            }
+        }
 
         // SAFETY: single-threaded init; watcher thread not yet started.
         CLEAR_SCREEN.store(

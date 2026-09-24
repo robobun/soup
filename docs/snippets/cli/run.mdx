@@ -121,6 +121,15 @@ bun run <file or script>
   Signal whose handlers run when --watch restarts the process
 </ParamField>
 
+<ParamField path="--watch-path" type="string">
+  Also watch a file or directory that is not imported. Turns on <code>--watch</code> unless <code>--hot</code> is set.
+  Can be repeated
+</ParamField>
+
+<ParamField path="--watch-exclude" type="string">
+  Glob of files whose changes never restart or reload the process. Can be repeated
+</ParamField>
+
 <ParamField path="--hot" type="boolean">
   Enable auto reload in the Bun runtime, test runner, or bundler
 </ParamField>

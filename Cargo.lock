@@ -1699,6 +1699,7 @@ dependencies = [
  "bun_collections",
  "bun_core",
  "bun_errno",
+ "bun_glob",
  "bun_paths",
  "bun_ptr",
  "bun_sys",

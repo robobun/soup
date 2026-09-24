@@ -1441,6 +1441,8 @@ impl Run<'_> {
             }
         }
 
+        cli::watch_path::start(vm, &ctx.debug.watch_paths);
+
         match vm.load_entry_point(entry) {
             Ok(promise) => {
                 // SAFETY: `promise` is a live GC cell returned by the module loader.
