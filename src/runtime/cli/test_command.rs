@@ -4912,6 +4912,8 @@ impl TestCommand {
         let mut ran_parallel = false;
         let mut left_by_workers = ParallelRunner::LeftByWorkers::default();
 
+        crate::cli::watch_path::start(vm, &ctx.debug.watch_paths);
+
         if !test_files.is_empty() {
             // Randomize the order of test files if --randomize flag is set
             if let Some(mut rand) = random_instance {
@@ -5376,6 +5378,7 @@ impl TestCommand {
                                 .bun_test_root
                                 .reset_hook_scope_for_test_isolation();
                             crate::test_runner::Expect::reset_for_test_isolation(vm.global());
+                            crate::cli::watch_path::restart(vm);
                         }
                     }
                 }

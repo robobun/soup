@@ -467,6 +467,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "vi_utils.bind.ts": null,
   "vi_wait.bind.ts": null,
   "virtual_machine_exports.bind.ts": null,
+  "watch_path.bind.ts": null,
 };
 
 /** `jest` and `vi` each have their own function for these: `jestUseFakeTimers` and `viUseFakeTimers`. */

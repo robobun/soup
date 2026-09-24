@@ -206,6 +206,9 @@ pub(crate) struct PathWatcher {
 /// ever need shared access to a `PathWatcher`.
 #[derive(Default)]
 pub(crate) struct ChangeEvent {
+    /// [`Arguments::every_event`](crate::node::node_fs_watcher::Arguments):
+    /// nothing is a duplicate for this handler.
+    every_event: bool,
     hash: Cell<u64>,
     event_type: Cell<WatchEventKind>,
     timestamp: Cell<i64>,
@@ -213,6 +216,9 @@ pub(crate) struct ChangeEvent {
 
 impl ChangeEvent {
     fn should_emit(&self, hash: u64, timestamp: i64, event_type: WatchEventKind) -> bool {
+        if self.every_event {
+            return true;
+        }
         let time_diff = timestamp - self.timestamp.get();
         if self.timestamp.get() == 0
             || time_diff > 1
@@ -233,9 +239,15 @@ pub(crate) type UpdateEndCallback = fn(ctx: Option<*mut c_void>);
 
 impl PathWatcher {
     /// Heap-allocate with `ctx` as the first handler and return a raw pointer.
-    fn new(init: PathWatcher, ctx: *mut c_void) -> *mut PathWatcher {
+    fn new(init: PathWatcher, ctx: *mut c_void, every_event: bool) -> *mut PathWatcher {
         let mut this = Box::new(init);
-        handle_oom(this.handlers.put(ctx, ChangeEvent::default()));
+        handle_oom(this.handlers.put(
+            ctx,
+            ChangeEvent {
+                every_event,
+                ..Default::default()
+            },
+        ));
         bun_core::heap::into_raw(this)
     }
 
@@ -400,6 +412,7 @@ pub(crate) fn watch(
     vm: &VirtualMachine,
     path: &ZStr,
     recursive: bool,
+    every_event: bool,
     callback: Callback,
     update_end: UpdateEndCallback,
     ctx: *mut c_void,
@@ -456,7 +469,15 @@ pub(crate) fn watch(
 
     if let Some(&existing) = locked.watchers.get(key) {
         // SAFETY: existing is a live PathWatcher under manager.mutex.
-        unsafe { handle_oom((*existing).handlers.put(ctx, ChangeEvent::default())) };
+        unsafe {
+            handle_oom((*existing).handlers.put(
+                ctx,
+                ChangeEvent {
+                    every_event,
+                    ..Default::default()
+                },
+            ))
+        };
         drop(locked);
         return Ok(existing);
     }
@@ -473,7 +494,7 @@ pub(crate) fn watch(
         handlers: ArrayHashMap::default(),
         platform: PlatformWatch::default(),
     };
-    let watcher = PathWatcher::new(init, ctx);
+    let watcher = PathWatcher::new(init, ctx, every_event);
     handle_oom(locked.watchers.put(key, watcher));
 
     // Linux/FreeBSD: `addWatch` mutates the platform dispatch maps (wd_map/entries)
