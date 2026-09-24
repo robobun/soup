@@ -378,6 +378,10 @@ pub struct DebugOptions {
     pub no_clear_screen: bool,
     /// `--watch` was given. `hot_reload` alone does not tell: `--hot` with `--check` is `Watch` too.
     pub watch_flag: bool,
+    /// `--watch-path`: files and directories watched besides the module graph.
+    pub watch_paths: Vec<Box<[u8]>>,
+    /// `--watch-exclude`: globs of files whose changes never reload.
+    pub watch_excludes: Vec<Box<[u8]>>,
     pub global_cache: GlobalCache,
     pub offline_mode_setting: Option<OfflineMode>,
     pub run_in_bun: bool,
@@ -405,6 +409,8 @@ impl Default for DebugOptions {
             watch_kill_signal_arg: None,
             no_clear_screen: false,
             watch_flag: false,
+            watch_paths: Vec::new(),
+            watch_excludes: Vec::new(),
             global_cache: GlobalCache::auto,
             offline_mode_setting: None,
             run_in_bun: false,
