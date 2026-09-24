@@ -194,6 +194,9 @@ pub(crate) struct Handle(WatcherId);
 /// ever need shared access to a `PathWatcher`.
 #[derive(Default)]
 pub(crate) struct ChangeEvent {
+    /// [`Arguments::every_event`](crate::node::node_fs_watcher::Arguments):
+    /// nothing is a duplicate for this handler.
+    every_event: bool,
     hash: Cell<u64>,
     event_type: Cell<WatchEventKind>,
     timestamp: Cell<i64>,
@@ -201,6 +204,9 @@ pub(crate) struct ChangeEvent {
 
 impl ChangeEvent {
     fn should_emit(&self, hash: u64, timestamp: i64, event_type: WatchEventKind) -> bool {
+        if self.every_event {
+            return true;
+        }
         let time_diff = timestamp - self.timestamp.get();
         if self.timestamp.get() == 0
             || time_diff > 1
@@ -317,6 +323,7 @@ pub(crate) fn watch(
     vm: &VirtualMachine,
     path: &ZStr,
     recursive: bool,
+    every_event: bool,
     callback: Callback,
     update_end: UpdateEndCallback,
     ctx: *mut c_void,
@@ -368,14 +375,26 @@ pub(crate) fn watch(
 
     if let Some(&existing) = manager.by_path.get(key) {
         let handlers = &mut manager.watchers[existing].handlers;
-        handle_oom(handlers.put(ctx, ChangeEvent::default()));
+        handle_oom(handlers.put(
+            ctx,
+            ChangeEvent {
+                every_event,
+                ..Default::default()
+            },
+        ));
         return Ok(Handle(existing));
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     let _ = is_file;
     let mut handlers = ArrayHashMap::default();
-    handle_oom(handlers.put(ctx, ChangeEvent::default()));
+    handle_oom(handlers.put(
+        ctx,
+        ChangeEvent {
+            every_event,
+            ..Default::default()
+        },
+    ));
     let id = manager.watchers.insert(PathWatcher {
         path: ZBox::from_bytes(resolved.as_bytes()),
         recursive,

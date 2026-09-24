@@ -38,6 +38,15 @@ pub fn enable_hot_module_reloading(
     if vm.is_watcher_enabled() {
         return;
     }
+    let excludes = bun_watcher::ExcludePatterns::parse(
+        bun_options_types::context::try_get()
+            .map(|ctx| ctx.debug.watch_excludes.as_slice())
+            .unwrap_or(&[]),
+        FileSystem::get().top_level_dir(),
+    );
+    // `on_file_update` reloads the entry point by `main.hash` when its
+    // directory reports it replaced, whether it is on the watchlist or not.
+    let entry_path = entry_path.filter(|path| !excludes.covers(path));
     let reloader = HotReloader {
         reload_immediately: vm.hot_reload.get() == HotReload::Watch,
         verbose: (vm.log_ref()).is_some_and(|l| l.level.at_least(bun_ast::Level::Info)),
@@ -49,7 +58,7 @@ pub fn enable_hot_module_reloading(
         },
         ..HotReloader::new(vm.transpiler.get())
     };
-    let watcher = reloader.start();
+    let watcher = reloader.start(excludes);
     vm.transpiler
         .with_mut(|t| t.resolver.watcher = Some(Arc::clone(&watcher)));
     vm.bun_watcher.set(Some(watcher));
@@ -57,7 +66,7 @@ pub fn enable_hot_module_reloading(
 
 /// `bun build --watch`.
 pub fn enable_hot_module_reloading_for_bundler(transpiler: &mut Transpiler<'_>) -> OwnedWatcher {
-    let watcher = HotReloader::new(transpiler).start();
+    let watcher = HotReloader::new(transpiler).start(Default::default());
     transpiler.resolver.watcher = Some(Arc::clone(&watcher));
     watcher
 }
@@ -117,6 +126,23 @@ fn is_watched_env_file(hash: bun_watcher::HashType) -> bool {
 
 unsafe extern "C" {
     safe fn BunDebugger__willHotReload();
+}
+
+/// The reload a change outside the watchlist asks for (`--watch-path`), from
+/// the JS thread: what [`HotReloader::reload`] and [`HotReloadTask::run`] do
+/// between them for a change the watcher thread saw.
+pub fn reload_from_js_thread(vm: &VirtualMachine) {
+    match vm.hot_reload.get() {
+        HotReload::None => {}
+        // Replaces the process.
+        HotReload::Watch => vm.reload(),
+        HotReload::Hot => {
+            BunDebugger__willHotReload();
+            // `report_exception_in_hot_reloaded_module_if_needed` reloads on
+            // this turn of the run loop, once the entry point has settled.
+            vm.hot_reload_deferred.set(true);
+        }
+    }
 }
 
 struct HotReloader {
@@ -333,7 +359,7 @@ impl HotReloader {
         }
     }
 
-    fn start(self) -> OwnedWatcher {
+    fn start(self, excludes: bun_watcher::ExcludePatterns) -> OwnedWatcher {
         let watcher = match Watcher::init(Box::new(self), FileSystem::get().top_level_dir()) {
             Ok(w) => w,
             Err(err) => {
@@ -345,6 +371,7 @@ impl HotReloader {
                 bun_core::Global::exit(1);
             }
         };
+        watcher.set_exclude_patterns(excludes);
 
         if let Err(err) = watcher.start() {
             bun_core::handle_error_return_trace(&err);

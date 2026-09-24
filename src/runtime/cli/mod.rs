@@ -19,6 +19,8 @@ pub(crate) mod did_you_mean;
 pub(crate) mod discord_command;
 #[path = "shell_completions.rs"]
 pub(crate) mod shell_completions;
+#[path = "watch_path.rs"]
+pub(crate) mod watch_path;
 
 // ─── open (open_url wrapper; Editor/EditorContext live in open.rs) ───────────
 #[path = "open.rs"]
