@@ -2485,6 +2485,8 @@ impl TestCommand {
         let mut coverage_options: CodeCoverageOptions = ctx.test_options.coverage.clone();
         let mut ran_parallel = false;
 
+        crate::cli::watch_path::start(vm, &ctx.debug.watch_paths);
+
         if !test_files.is_empty() {
             // Randomize the order of test files if --randomize flag is set
             if let Some(mut rand) = random_instance {
@@ -2936,6 +2938,7 @@ impl TestCommand {
                                 .jest
                                 .bun_test_root
                                 .reset_hook_scope_for_test_isolation();
+                            crate::cli::watch_path::restart(vm);
                         }
                     }
                 }

@@ -93,7 +93,8 @@ impl PathWatcherManager {
                     #[cfg(debug_assertions)]
                     {
                         if !path.as_bytes().is_empty() {
-                            debug_assert!(&*watchers.keys()[index] == path.as_bytes());
+                            let key = &*watchers.keys()[index];
+                            debug_assert!(&key[..key.len() - 1] == path.as_bytes());
                         }
                     }
 
@@ -152,6 +153,9 @@ pub(crate) struct PathWatcher {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ChangeEvent {
+    /// [`Arguments::every_event`](crate::node::node_fs_watcher::Arguments):
+    /// nothing is a duplicate for this handler.
+    every_event: bool,
     hash: bun_watcher::HashType,
     event_type: WatchEventKind,
     timestamp: u64,
@@ -160,6 +164,7 @@ pub(crate) struct ChangeEvent {
 impl Default for ChangeEvent {
     fn default() -> Self {
         Self {
+            every_event: false,
             hash: 0,
             event_type: WatchEventKind::Change,
             timestamp: 0,
@@ -174,6 +179,9 @@ impl ChangeEvent {
         timestamp: u64,
         event_type: WatchEventKind,
     ) -> bool {
+        if self.every_event {
+            return true;
+        }
         let time_diff = timestamp.saturating_sub(self.timestamp);
         // skip consecutive exact duplicates (same path and event type) only
         if self.timestamp == 0
@@ -362,7 +370,12 @@ impl PathWatcher {
         // registration against concurrent Worker `watch()` calls.
         let mgr = unsafe { &*manager };
 
-        if let Some(&existing) = mgr.watchers.get().get(event_path.as_bytes()) {
+        // The flag is part of the key, as it is on POSIX: a recursive and a
+        // plain watch of one directory are different libuv handles, and
+        // sharing one gives the second caller the first caller's flag.
+        let mut key = event_path.as_bytes().to_vec();
+        key.push(if recursive { b'R' } else { b'N' });
+        if let Some(&existing) = mgr.watchers.get().get(key.as_slice()) {
             return sys::Result::Ok(existing);
         }
 
@@ -416,10 +429,8 @@ impl PathWatcher {
         // SAFETY: handle is open (uv_fs_event_start succeeded); uv_unref only flips the ref flag.
         unsafe { uv::uv_unref(ptr::addr_of_mut!((*this).handle).cast()) };
 
-        // Owned key: dupe of event_path bytes (the sentinel NUL is not part of the
-        // slice's `.len`, so the StringArrayHashMap key compares equal to `event_path.as_bytes()`).
         mgr.watchers.with_mut(|watchers| {
-            watchers.insert(event_path.as_bytes(), this);
+            watchers.insert(key.as_slice(), this);
         });
 
         sys::Result::Ok(this)
@@ -510,6 +521,7 @@ pub(crate) fn watch(
     vm: &'static jsc::VirtualMachineRef,
     path: &ZStr,
     recursive: bool,
+    every_event: bool,
     ctx: *mut c_void,
 ) -> sys::Result<*mut PathWatcher> {
     #[cfg(not(windows))]
@@ -544,7 +556,13 @@ pub(crate) fn watch(
     };
     // SAFETY: watcher is a valid freshly-returned heap pointer.
     unsafe { &*watcher }.handlers.with_mut(|h| {
-        h.insert(ctx, ChangeEvent::default());
+        h.insert(
+            ctx,
+            ChangeEvent {
+                every_event,
+                ..ChangeEvent::default()
+            },
+        );
     });
     sys::Result::Ok(watcher)
 }

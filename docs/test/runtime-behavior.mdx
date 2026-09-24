@@ -202,6 +202,12 @@ With the `--watch` flag, the test runner watches for file changes and re-runs te
 bun test --watch
 ```
 
+Only imported files are watched. To rerun the tests when a fixture or another file that nothing imports changes, add [`--watch-path`](/runtime/watch-mode#files-that-are-not-imported):
+
+```bash terminal icon="terminal"
+bun test --watch --watch-path ./fixtures
+```
+
 ### Hot Reloading
 
 The `--hot` flag is similar, but more aggressive about preserving state between runs:

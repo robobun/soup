@@ -2849,6 +2849,168 @@ Files: `src/shell_parser/parse.rs` (`ast::For`, the reserved words, `parse_for_c
 `src/runtime/shell/{Builtin,IOWriter,mod}.rs`, `src/runtime/shell/states/{Pipeline,Async}.rs`,
 `docs/runtime/shell.mdx`, `test/js/bun/shell/bunshell.test.ts`, `test/js/bun/shell/parse.test.ts`.
 
+### 2026-09-24: `--watch-path` and `--watch-exclude`
+
+`bun --watch` and `bun --hot` watch what the entry point imports and nothing else. A server that
+reads its templates, its SQL or a config file with `fs` does not restart when one of them changes,
+and the answer since v1.1.27 has been to import the file so that it lands in the module graph. The
+opposite wish is as old: a file that is imported and must not trigger anything, because another
+tool rewrites it while the server runs (a Vite build next to a `--watch`ed server restarts it in a
+loop) or because it is client code the server only passes along. Both are oven-sh/bun#5278 (42
+thumbs up, open since 2023). Node has `--watch-path`, Deno has `--watch=<paths>` and
+`--watch-exclude`, and upstream has been taking Node's watch flags as they come
+(`--watch-kill-signal` is recent), so the names are theirs:
+
+```sh
+# restart when a template or the config changes, although nothing imports them
+bun --watch --watch-path ./views --watch-path ./config.json server.ts
+
+# same, but reload in place: globalThis, the HTTP server and its connections survive
+bun --hot --watch-path ./views server.ts
+
+# --watch-path alone turns on --watch, as in Node
+bun --watch-path ./views server.ts
+
+# rerun the tests when a fixture changes
+bun test --watch --watch-path ./fixtures
+
+# another tool rewrites src/generated/ while the server runs
+bun --watch --watch-exclude src/generated server.ts
+
+# reload for server code, never for the client components it also imports
+bun --hot --watch-exclude '**/*.tsx' server.ts
+
+# Node's meaning of --watch-path: these paths and nothing else
+bun --watch-path ./views --watch-exclude '!views/**' server.ts
+```
+
+`--watch-path` takes a file or a directory (recursive), relative to the working directory, and can
+be repeated. Unlike Node, where the flag replaces the watching of imported modules, it adds to it,
+which is what Deno does and what the issue asks for. The path does not have to exist, and neither
+do the directories above it: a config file that is created later, or a `dist/client` that a build
+makes, is picked up when it appears, and a directory that is deleted and made again
+(`rm -rf dist && bun run build`) is watched again, under `--hot` too, where no restart would do it.
+An editor that saves by renaming a temporary file over the target (vim, JetBrains, most formatters)
+is seen every time, not only the first, and a symlink to a file is followed to its target. Changes
+inside `node_modules` and `.git` below a watched directory are ignored, or every `bun install` and
+every `git fetch` an IDE runs in the background would restart the process. `--watch-exclude` takes a
+`Bun.Glob` pattern and applies to both kinds of file: an imported file it covers is never watched
+(the entry point included), and a change below a `--watch-path` directory it covers is dropped. A
+pattern is relative to the working directory (`../shared` works) or absolute, covers what it
+matches and everything below it (`src/generated` is a whole directory, because that is what people
+will type), and a leading `!` turns it around.
+
+How it is built:
+
+- The paths. `bun_watcher::Watcher`, the watcher behind `--watch` and `--hot`, is shaped around the
+  module graph: one entry per file (on macOS one file descriptor per file), a 16-bit index, and on
+  Windows nothing above the project root. A `--watch-path` is a plain tree of files, which is what
+  the `fs.watch()` backend is for (inotify with new subdirectories followed, FSEvents,
+  `ReadDirectoryChangesW`; recursive, anywhere on disk, no descriptor per file), and upstream
+  rewrote that backend recently and says in its header that it is deliberately independent of
+  `bun.Watcher` for exactly this reason. So `src/runtime/cli/watch_path.rs` creates `FSWatcher`s
+  natively, with native host functions as listeners (`new_function_with_data`, the pattern
+  `UpgradedDuplex` uses).
+- Two watchers per path. `own` is on the path itself while it exists: recursive for a directory,
+  and through the link for a symlink to a file. `above` is on the deepest directory above the path
+  that exists, normally its parent, and only looks at events that name the next component on the
+  way to the path. That is how a plain file is watched (a watch on the file is tied to an inode
+  that a rename-save replaces), how a missing path is seen being created however many directories
+  are missing, and how a directory that comes back gets a new recursive watcher. `own` is never
+  kept across such an event, even when the path looks the same: the first version compared
+  `(st_dev, st_ino)` and the review found that overlayfs, ext4 and xfs hand a recreated directory
+  the inode number it had before. The watchers are held through `bun_jsc::Weak` on their JS
+  wrappers, so closing one never touches freed memory however it went away.
+- Every event. The `fs.watch()` backends drop an event that has the path and type of the one
+  before it within a millisecond. For `fs.watch()` that hides the second `IN_MODIFY` of one write.
+  For this feature it hid the `mkdir` of `rm -rf dist && mkdir dist` (both are `'rename'` of
+  `dist`), after which nothing was watched: lost 3 times in 32 in the review's trials, 0 in 25
+  after. `Arguments` of `FSWatcher` gets an `every_event` field that only this feature sets; the
+  reloads it asks for are coalesced downstream anyway.
+- The reload. The listeners run on the JS thread and call a new
+  `hot_reloader::reload_from_js_thread`: under `--watch` that is `VirtualMachine::reload`, which
+  runs the `--watch-kill-signal` handlers and replaces the process, under `--hot` it sets the
+  existing `hot_reload_deferred` flag, which the run loop already turns into a reload once the
+  entry point has settled, the way it does for a change that arrived during a pending top-level
+  await. A file the import watcher already has on its list is left to it, so a watch path that
+  covers imported files does not reload twice.
+- The excludes live in one place every producer goes through. Files reach the watcher from the
+  module loader, the transpiler store, the bundler, the resolver and the test runner, all through
+  `Watcher::add_file`, so the check sits in `append_file_maybe_lock` and answers
+  `FdOwnership::Caller`, the answer a caller already gets on Windows for a file outside the project
+  root. The same `Watcher::is_excluded` is asked by the `--watch-path` listeners, so the two halves
+  cannot disagree about what a pattern means. A pattern is turned into one absolute glob when the
+  watcher is set up (`src/watcher/exclude.rs`: `./` and `..` resolved against the working
+  directory, whose own glob characters are escaped; backslashes are separators on Windows) and
+  matched against the absolute path only. Matching the relative path as well, as the first version
+  did, makes a negated pattern exclude everything, because one of the two forms always fails to
+  match. The entry point has reload paths of its own in the hot reloader that go by its hash and
+  not by the watchlist, so an excluded entry point clears that too. `bun_watcher` gains a
+  dependency on `bun_glob` (no cycle: both sit on `bun_core`/`bun_paths`/`bun_sys`). Without the
+  flag the cost is one `is_empty()` per newly watched file.
+- `bun test`. Works under `--watch` in every mode. `--isolate` closes what a test file left open
+  together with the global it retires, `fs.watch()` watchers included, so `watch_path::restart` arms
+  them again after each swap, in the new global. With `--parallel` the coordinator never swaps its
+  global and nothing is lost.
+
+A review pass (five readers with the debug build, one per area, and a skeptic who re-ran every
+claim) confirmed 25 findings against the first version, none of them in the memory handling and
+most of them in what the feature promised: the two ways a recreated directory was lost under
+`--hot` (above), a symlinked file and a nested path with a missing parent that were never watched,
+negated globs, `..`, escaped brackets and a working directory of `/` in exclude patterns, an
+excluded entry point that restarted anyway, a panic on a path longer than `PATH_MAX` (both joins
+are the checked kind now), a double reload, and three test assertions that could not fail: "the
+excluded file does not restart the process" passed with the exclude flags removed, because one
+restart picks up every change made before it. Those tests now wait for something only a process
+that was not restarted can say: the fixture names its run and prints a line every few milliseconds
+once it sees the new contents, and the test waits for the third line of the run that was current
+before the write. With the flags removed they fail.
+
+Four bugs in upstream turned up and were reported through the hand-off instead of being fixed
+here, with one exception. On Windows, `fs.watch()` keeps one libuv handle per directory and ignores
+`recursive` when a second watcher asks for the same directory, so whoever comes first decides for
+everyone (stock Bun: `fs.watch(dir)` then `fs.watch(dir, { recursive: true })` never reports a
+nested file). This feature puts a plain watcher on the parent of every path, usually the project
+root, before user code runs, which would have silently broken a script's own recursive watcher
+there, so the six-line fix (the key gets the flag, as on POSIX) and a test for it are part of this
+commit; drop them when upstream has its own. Reported only: the duplicate suppression above folds a
+delete and a create into one `'rename'` where Node delivers two; on macOS the FSEvents prefix match
+has no path-boundary check, so by reading, a watcher on `views` also hears about `views2/` and
+`views.bak`, which would make `--watch-path views` reload for them (not confirmed, no macOS machine);
+and `bun --conditions build main.js` runs `bun build`, because command detection skips options
+without knowing which ones take a value, so `bun --watch-path test server.ts` runs `bun test` (the
+docs say to write `./test`; that report was not picked up).
+
+Verified on Linux and on Windows Server 2019 (built there on top of plain upstream `main`: the
+patch applies without the rest of the stack, and the ten new tests pass on both, the symlink one
+skipped on Windows). macOS is only type-checked (`cargo check` for `aarch64-apple-darwin`) and
+reasoned about from the FSEvents backend. `test/js/node/watch/` passes on Linux and
+`fs.watch.test.ts` on Windows with the backend change.
+
+Not done, and known: a change to a `--watch-path` is noticed on the JS thread, so a script that
+blocks the event loop is restarted by an edit to an imported file but not by these until the loop
+turns again. Serial `bun test --isolate` can miss a change that lands while one test file hands
+over to the next, or during a file that never yields to the event loop; making that exact needs
+native (not JS-bound) handlers in the `fs.watch()` backend, which is also what would lift the first
+limit. No `bunfig.toml` section yet (`[watch]` with `path` and `exclude` is the obvious shape), no
+`bun build --watch` support, no `.gitignore` awareness, and FreeBSD's kqueue backend reports no file
+names, so a single-file path there reloads on any change next to it and misses saves in place.
+
+Rebase notes: 38 patches onto oven-sh/bun 8d36bff512, no conflicts, nothing dropped, the fork's
+three workflows were green after yesterday's push. The patch touches no line another soup patch
+owns (its tests sit at the end of `watch.test.ts`, away from the `.env` tests of 2026-08-23, and
+the `--hot` tests live there too because `hot.test.ts` only imports `tempDir` through that earlier
+patch), and was built and tested on Windows without the rest of the stack.
+
+Files: `src/runtime/cli/watch_path.rs` (new), `src/watcher/exclude.rs` (new),
+`src/watcher/{Watcher.rs,lib.rs,Cargo.toml}`, `Cargo.lock`, `src/jsc/hot_reloader.rs`
+(`reload_from_js_thread`, `ImportWatcher::{is_excluded,is_watching_file}`,
+`HotReloaderCtx::watch_exclude_patterns`), `src/runtime/node/{node_fs_watcher,path_watcher,win_watcher}.rs`
+(`every_event`, the Windows key), `src/runtime/cli/{Arguments,mod,run_command,test_command}.rs`,
+`src/options_types/context.rs`, `docs/runtime/watch-mode.mdx`, `docs/snippets/cli/run.mdx`,
+`docs/test/runtime-behavior.mdx`, `test/cli/watch/watch.test.ts`,
+`test/js/node/watch/fs.watch.test.ts`.
+
 ## Dropped
 
 Nothing yet.

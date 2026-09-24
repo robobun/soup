@@ -151,6 +151,12 @@ const RUNTIME_PARAMS_: &[ParamType] = &[
         "--watch-kill-signal <STR>         Signal whose handlers run when --watch restarts the process (default: \"SIGTERM\")"
     ),
     parse_param!(
+        "--watch-path <STR>...             Also watch a file or directory that is not imported. Turns on --watch unless --hot is set"
+    ),
+    parse_param!(
+        "--watch-exclude <STR>...          Glob of files whose changes never restart or reload the process"
+    ),
+    parse_param!(
         "--hot                             Enable auto reload in the Bun runtime, test runner, or bundler"
     ),
     parse_param!(
@@ -1061,12 +1067,17 @@ pub(crate) fn parse(cmd: CommandTag, ctx: Context<'_>) -> crate::Result<api::Tra
             }
         }
 
+        ctx.debug.watch_paths = slice_to_owned(args.options(b"--watch-path"));
+        ctx.debug.watch_paths.retain(|path| !path.is_empty());
+        ctx.debug.watch_excludes = slice_to_owned(args.options(b"--watch-exclude"));
+
         if args.flag(b"--hot") {
             ctx.debug.hot_reload = HotReload::Hot;
             if args.flag(b"--no-clear-screen") {
                 let _ = bun_dotenv::HAS_NO_CLEAR_SCREEN_CLI_FLAG.set(true);
             }
-        } else if args.flag(b"--watch") {
+        } else if args.flag(b"--watch") || !ctx.debug.watch_paths.is_empty() {
+            // Like node, `--watch-path` alone starts watch mode.
             ctx.debug.hot_reload = HotReload::Watch;
 
             // Windows applies this to the watcher child process.
