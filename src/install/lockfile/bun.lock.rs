@@ -1506,6 +1506,15 @@ pub enum ParseError {
 
 bun_core::oom_from_alloc!(ParseError);
 
+/// What the loader does with a required dependency that has no row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadMode {
+    /// Fail the load. Every lockfile that bun wrote has the row.
+    Strict,
+    /// Leave the dependency unbound (`merge_conflict` binds it or hands it to the resolver).
+    Recover,
+}
+
 type PkgPathSet = PkgMap<()>;
 
 struct PkgMap<T> {
@@ -1800,6 +1809,7 @@ pub(crate) fn parse_into_binary_lockfile(
     source: &bun_ast::Source,
     log: &mut bun_ast::Log,
     manager: Option<&PackageManager>,
+    mode: LoadMode,
 ) -> Result<(), ParseError> {
     let at_value = |key_loc| value_loc_of(source, key_loc);
     let at_item = |key_loc, index| item_loc(source, key_loc, index);
@@ -2837,7 +2847,7 @@ pub(crate) fn parse_into_binary_lockfile(
                     own_peer(dep).or(named)
                 };
                 let Some(res_id) = bound else {
-                    if may_stay_unresolved(dep) {
+                    if may_stay_unresolved(dep) || mode == LoadMode::Recover {
                         continue;
                     }
                     return Err(dependency_resolution_failure(
@@ -2902,7 +2912,7 @@ pub(crate) fn parse_into_binary_lockfile(
                     }) else {
                         // A bun.lock from an older Bun only has this dependency below a `packages`
                         // row of the workspace. The loop over `pkg_rows` below resolves it.
-                        if unlinked || may_stay_unresolved(dep) {
+                        if unlinked || may_stay_unresolved(dep) || mode == LoadMode::Recover {
                             continue;
                         }
                         return Err(dependency_resolution_failure(
@@ -3004,7 +3014,7 @@ pub(crate) fn parse_into_binary_lockfile(
                                     bound_by[dep_id as usize] = RowEvidence::Unprovided;
                                     resolutions[dep_id as usize] = invalid_package_id;
                                 }
-                                if may_stay_unresolved(dep) {
+                                if may_stay_unresolved(dep) || mode == LoadMode::Recover {
                                     continue 'deps;
                                 }
                                 return Err(dependency_resolution_failure(
