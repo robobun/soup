@@ -135,7 +135,11 @@ impl OutdatedCommand {
                 }
             };
 
-        manager.load_lockfile_from_cwd_or_exit("nothing outdated");
+        if manager.load_lockfile_from_cwd_or_exit("nothing outdated") {
+            bun_install::lockfile::merge_conflict::note_merged_for_reading(
+                manager.options.log_level,
+            );
+        }
         Self::outdated_dispatch(&original_cwd, manager)
     }
 

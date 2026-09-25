@@ -925,5 +925,6 @@ pub(crate) fn migrate_yarn_lockfile<'a>(
         migrated: lockfile::Migrated::Yarn,
         serializer_result: Default::default(),
         format: lockfile::LockfileFormat::Binary,
+        merged_conflict: false,
     }))
 }

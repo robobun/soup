@@ -57,6 +57,8 @@ pub mod bun_lockb;
 pub mod catalog_map;
 #[path = "lockfile/lockfile_json_stringify_for_debugging.rs"]
 pub mod lockfile_json_stringify_for_debugging;
+#[path = "lockfile/merge_conflict.rs"]
+pub mod merge_conflict;
 #[path = "lockfile/OverrideMap.rs"]
 pub mod override_map;
 #[path = "lockfile/override_selector.rs"]
@@ -482,7 +484,13 @@ pub struct LoadResultOk<'a> {
     pub(crate) migrated: Migrated,
     pub serializer_result: Serializer::SerializerLoadResult,
     pub(crate) format: LockfileFormat,
+    /// `bun.lock` held git conflict markers and `lockfile` is the merge of
+    /// both sides, so the file on disk has to be written again.
+    pub merged_conflict: bool,
 }
+
+// The flag sits in the padding after `format`.
+const _: () = assert!(size_of::<LoadResult<'static>>() == 3 * size_of::<usize>());
 
 pub enum LoadResult<'a> {
     NotFound,
@@ -617,13 +625,55 @@ impl Lockfile {
         self.load_from_dir::<ATTEMPT_LOADING_FROM_OTHER_LOCKFILE>(Fd::cwd(), manager, log)
     }
 
+    /// The load of `install_with_manager`, which compares the lockfile with
+    /// package.json and resolves. A `bun.lock` with git conflict markers
+    /// loads with the packages that lost their path, and also when a
+    /// dependency has a package on neither side:
+    /// `merge_conflict::open_edges_of` lists what to resolve.
+    pub fn load_from_cwd_for_install<'a>(
+        &'a mut self,
+        manager: &mut PackageManager,
+        log: &mut bun_ast::Log,
+    ) -> LoadResult<'a> {
+        self.load_from_dir_with(
+            true,
+            Fd::cwd(),
+            Some(manager),
+            log,
+            merge_conflict::Purpose::Install,
+        )
+    }
+
     pub fn load_from_dir<'a, const ATTEMPT_LOADING_FROM_OTHER_LOCKFILE: bool>(
         &'a mut self,
         dir: Fd,
         manager: Option<&mut PackageManager>,
         log: &mut bun_ast::Log,
     ) -> LoadResult<'a> {
-        let mut result = self.read_from_dir(ATTEMPT_LOADING_FROM_OTHER_LOCKFILE, dir, manager, log);
+        self.load_from_dir_with(
+            ATTEMPT_LOADING_FROM_OTHER_LOCKFILE,
+            dir,
+            manager,
+            log,
+            merge_conflict::Purpose::Read,
+        )
+    }
+
+    fn load_from_dir_with<'a>(
+        &'a mut self,
+        attempt_loading_from_other_lockfile: bool,
+        dir: Fd,
+        manager: Option<&mut PackageManager>,
+        log: &mut bun_ast::Log,
+        purpose: merge_conflict::Purpose,
+    ) -> LoadResult<'a> {
+        let mut result = self.read_from_dir(
+            attempt_loading_from_other_lockfile,
+            dir,
+            manager,
+            log,
+            purpose,
+        );
         if let LoadResult::Ok(ok) = &mut result {
             ok.lockfile.rebase_folder_dependencies().unwrap_or_oom();
         }
@@ -638,6 +688,7 @@ impl Lockfile {
         dir: Fd,
         manager: Option<&mut PackageManager>,
         log: &mut bun_ast::Log,
+        purpose: merge_conflict::Purpose,
     ) -> LoadResult<'a> {
         debug_assert!(Fs::INSTANCE_LOADED.load(core::sync::atomic::Ordering::Relaxed));
 
@@ -669,9 +720,28 @@ impl Lockfile {
         if lockfile_format == LockfileFormat::Text {
             let source = bun_ast::Source::init_path_string(b"bun.lock", buf.as_slice());
             initialize_store();
+            let log_mark = log.msgs.len();
             let parsed = match JSON::ParsedJson::parse_package_json(&source, log) {
                 Ok(j) => j,
-                Err(e) => return LoadResultErr::of(LoadStep::ParseFile, e.into(), lockfile_format),
+                Err(e) => {
+                    // A line of conflict markers never parses, so a lockfile
+                    // that parses pays nothing for the merge.
+                    if attempt_loading_from_other_lockfile
+                        && let Some(manager) = manager
+                        && merge_conflict::has_marker(&buf)
+                        && merge_conflict::load_conflicted(self, &buf, manager, purpose)
+                    {
+                        merge_conflict::forget_parse_error(log, log_mark);
+                        return LoadResult::Ok(LoadResultOk {
+                            lockfile: self,
+                            serializer_result: Serializer::SerializerLoadResult::default(),
+                            migrated: Migrated::None,
+                            format: lockfile_format,
+                            merged_conflict: true,
+                        });
+                    }
+                    return LoadResultErr::of(LoadStep::ParseFile, e.into(), lockfile_format);
+                }
             };
 
             if let Err(e) = TextLockfile::parse_into_binary_lockfile(
@@ -680,6 +750,7 @@ impl Lockfile {
                 &source,
                 log,
                 manager.as_deref(),
+                TextLockfile::LoadMode::Strict,
             ) {
                 if matches!(e, TextLockfile::ParseError::OutOfMemory) {
                     bun_core::out_of_memory();
@@ -694,6 +765,7 @@ impl Lockfile {
                 serializer_result: Serializer::SerializerLoadResult::default(),
                 migrated: Migrated::None,
                 format: lockfile_format,
+                merged_conflict: false,
             });
         }
 
@@ -732,6 +804,7 @@ impl Lockfile {
             serializer_result: load_result,
             migrated: Migrated::None,
             format: LockfileFormat::Binary,
+            merged_conflict: false,
         })
     }
 

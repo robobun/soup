@@ -1062,10 +1062,11 @@ impl PackageManager {
     }
 
     /// `nothing` is the end of the error message for a missing lockfile, e.g. "nothing to update".
-    pub fn load_lockfile_from_cwd_or_exit(&mut self, nothing: &str) {
+    /// `true`: `bun.lock` held git conflict markers, and what is loaded is the merge of both sides.
+    pub fn load_lockfile_from_cwd_or_exit(&mut self, nothing: &str) -> bool {
         let silent = self.options.log_level == package_manager_options::LogLevel::Silent;
         match self.load_lockfile_from_cwd::<true>() {
-            lockfile::LoadResult::Ok(_) => return,
+            lockfile::LoadResult::Ok(loaded) => return loaded.merged_conflict,
             lockfile::LoadResult::NotFound if !silent => {
                 Output::err_generic("missing lockfile, {s}", (nothing,));
                 bun_core::note!("run 'bun install' first");
