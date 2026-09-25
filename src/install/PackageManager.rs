@@ -216,6 +216,7 @@ pub use directories::{
 };
 
 pub use self::package_manager_enqueue as enqueue;
+pub(crate) use enqueue::follows_npm_alias;
 pub use enqueue::{
     GitEnqueueResult, create_extract_task_for_streaming, enqueue_dependency_list,
     enqueue_dependency_to_root, enqueue_dependency_with_main,
@@ -2683,7 +2684,7 @@ fn init_with_runtime_once(
     };
     if has_lockb {
         let mut lockfile = core::mem::replace(&mut manager.lockfile, Box::new(Lockfile::default()));
-        match lockfile.load_from_cwd::<true>(Some(&mut *manager), log) {
+        match lockfile.load_from_cwd::<false>(Some(&mut *manager), log) {
             lockfile::LoadResult::Ok(_) => {}
             _ => lockfile.init_empty(),
         }

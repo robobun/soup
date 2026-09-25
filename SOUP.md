@@ -3011,6 +3011,287 @@ Files: `src/runtime/cli/watch_path.rs` (new), `src/watcher/exclude.rs` (new),
 `docs/test/runtime-behavior.mdx`, `test/cli/watch/watch.test.ts`,
 `test/js/node/watch/fs.watch.test.ts`.
 
+### 2026-09-25: `bun install` merges a `bun.lock` with git conflict markers
+
+When two branches change dependencies, `git merge` leaves `<<<<<<<` in `bun.lock`. Bun read the file
+as JSON, failed on the first marker, printed `warn: Ignoring lockfile` and resolved the project as if
+it had never been installed. Every dependency moved to the newest version its range allows, the
+ones that no branch had touched included, and the install exited 0. With `--frozen-lockfile` the
+same file ended in `error: lockfile had changes, but lockfile is frozen`, which says nothing about
+the cause. npm, yarn and pnpm read a conflicted lockfile and merge it. For Bun that is
+oven-sh/bun#17717, and the workaround in that issue (`git checkout main -- bun.lock`, then
+`bun install`) gives up the versions of one side. Now:
+
+```sh
+git merge feature
+# CONFLICT (content): Merge conflict in bun.lock
+# resolve package.json by hand, leave bun.lock as it is
+
+bun install
+# note: bun.lock contains git merge conflict markers, using the merge of both sides
+
+git add bun.lock
+```
+
+What the merge does:
+
+- A package that one side has is kept, at the version that side locked.
+- When the sides have two versions of a package at one path of `node_modules`, the higher version
+  keeps the path, and what is below that path is taken from the side of that version. A dependency
+  whose range does not take the version gets the one that its own side locked.
+- When the sides have two ranges for a dependency (`^1` and `^2`), two values for an entry of
+  `overrides` or `catalog`, or the dependency in two groups, package.json says which is right, as
+  on every install. The packages of both sides stay in memory until it has been read, so the
+  dependency gets the version that the side with that range locked.
+- The registry is asked for a dependency that has a package on neither side, and for the manifest
+  of a dependency that package.json has with another range than the merge. The resolver reads a
+  manifest before it takes a package, also one that the lockfile has. For two branches that add
+  one dependency each, that is no manifest request at all. bun 1.4.3 asks for one per package on
+  the same files (3 of 3 in the test) and moves `kept` from 1.0.0 to 1.1.0.
+- `overrides`, `catalog`, `catalogs`, `trustedDependencies` and `patchedDependencies` are the union
+  of both sides, ours on the same key. package.json decides here too.
+- The markers of `merge.conflictStyle = diff3` and `zdiff3`, a longer `conflict-marker-size`,
+  `\r\n` line ends, and the longer markers that git leaves in the base of a merge with two
+  ancestors are read.
+
+What it does not merge, because bun cannot know which side is right: two tarballs or two
+integrity hashes for one package, and two packages at one path of which one is a tarball, a git
+repository or a folder. A side with a `lockfileVersion` that this bun does not read, markers that
+do not pair up, and a side that is not a lockfile are left alone too. Such a file gets what it got
+before (the parse error, `Ignoring lockfile`, everything resolved again), and one line more:
+`note: bun.lock contains git merge conflict markers that bun cannot merge: one package has two
+tarballs or two integrity hashes (kept@1.0.0)`.
+
+What the commands do, each one run on a conflicted lockfile:
+
+| Command                                                            | With markers in `bun.lock`                                                                                                                  |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bun install`, `bun add`, `bun remove`, `bun update`               | merge, resolve what is open, save                                                                                                           |
+| `bun install --frozen-lockfile`, `bun ci`, `--production`          | `error: bun.lock contains git merge conflict markers, but lockfile is frozen`, exit 1, nothing written                                      |
+| `bun install --dry-run`, `--no-save`                               | use the merge, say that `bun.lock` is not saved                                                                                             |
+| `bun pm ls`, `bun pm hash`, `bun why`, `bun outdated`, `bun audit` | read the merge and say so. When a dependency has no package in it: the error of before, and `note: ... Run bun install to merge both sides` |
+| `bun dedupe`, `bun pm trust`, `bun audit fix`                      | refuse, `note: run 'bun install' first`                                                                                                     |
+| `bun pm pack`, `bun publish`, `bun prune`                          | as before: the parse error, exit 1                                                                                                          |
+
+How it is built:
+
+- Where. `Lockfile::load_from_dir` is the one reader of `bun.lock` for every command, and a marker
+  line can never parse as JSON (not in a key, not in a value, bun writes every string on one line).
+  So the merge hangs off the arm that handles the parse error, and a lockfile that parses does
+  nothing new: no scan for markers, no extra pass. What a clean load and a clean install pay is one
+  `usize` read for the log position, one byte for the new `LoadResultOk::merged_conflict` (it sits
+  in padding, a `const` assert holds `LoadResult` at three words), one more argument to the text
+  loader, and in `install_with_manager` four branches on that byte and one empty map on the stack
+  (two empty `Vec`s, no allocation). These counts are from reading the code. They are not
+  measured: there is no release build of this commit, and `valgrind`, `perf` and `strace` are not
+  installed where it was written.
+- Two documents, one union (`src/install/lockfile/merge_conflict.rs`). The lines outside the hunks
+  plus the lines of one side make the document of that side. Both are parsed with the lockfile's
+  own JSON parser, so a hunk can cross any line of the file. The union is written row by row. A
+  row is always taken whole from one side, its tarball and its hash never mix.
+- Who keeps a path. For each key of `"packages"` the union knows the row of each document. The
+  higher version keeps the key, and only the document of that row can fill the keys below it: the
+  `node_modules` of a package belongs to the version that is installed there. The first version
+  decided key by key. The review read from the code what that does: the `outer/leaf` that ours has
+  for `outer@1.0.0` ends below the `outer@1.1.0` of theirs, and a nested row with `"bundled": true`
+  makes a dependency of the other version bundled, which means never installed.
+- The rows that do not keep their path are kept too. They move to a key below `:ours/` or
+  `:theirs/`, with everything their document has below them. A `:` is not valid in a package name,
+  so no dependency reaches such a key by path, and the package is in the graph with its own
+  dependencies bound as its side had them.
+- The loader gets `LoadMode`. `Recover` leaves a required dependency without a row unbound where
+  `Strict` fails the load. It is read in the three arms that return an error today, after
+  `may_stay_unresolved`, so the strict path has no new branch. Only the merge passes `Recover`.
+- Every dependency is checked against its range, not only the rows of the hunks: in real merges
+  most wrong bindings are outside the hunks, where git merged lines on its own. A dependency whose
+  package does not fit goes to the version that lost the path to that package, which is what its
+  side had locked, else to the highest package of the merged graph that fits, else to the
+  resolver. The check has to know what bun binds out of range on purpose, or a merge turns a
+  correct lockfile into work for the registry: peers, bundled dependencies, overrides (scoped ones
+  too) and catalogs (through `dedupe::effective_npm_range`, shared with `bun dedupe`), two rows of
+  one owner that share a folder, workspaces, optional dependencies that the registry has nothing
+  for, and a plain dependency that follows an `npm:` alias of its own name. That last rule was a
+  loop inside `enqueue_dependency_with_main_and_success_fn`. It is a function now,
+  `follows_npm_alias`, and the resolver and the merge call the same one.
+- Two purposes. A command that reads the lockfile (`Purpose::Read`, the 18 call sites that load
+  with `::<true>`) gets a merge only when it is complete. It is printed with the lockfile's own
+  stringifier and loaded again with the strict loader, so what the command sees is what a load of
+  the saved file gives. `install_with_manager` (`Purpose::Install`, through the one new entry
+  `Lockfile::load_from_cwd_for_install`) gets the graph as it is, with the packages that lost
+  their path and with dependencies that have no package. It compares with package.json first, the
+  resolver takes the lost packages where package.json asks for them (`Lockfile::get_package_id`
+  prefers a package of the lockfile), and `clean_with_logger` drops the rest before the save, as
+  it does after `bun remove`. `load_from_cwd::<false>` (pack, publish, prune, the lockfile
+  printer, 5 call sites) never merges. The auto-install of `bun run` moved to `::<false>`: it is
+  reached only when `bun.lockb` is there, so the only thing it loses is a migration that could
+  not happen.
+- Dependencies without a package. `install_with_manager` hands them to the resolver after the diff
+  with package.json, next to the loops that do the same for changed overrides and catalogs. The
+  resolver does not look at the dependencies of a package that it takes from the lockfile, and in
+  a merge such a package can have one without a package. So after the resolver is done the open
+  dependencies of what it reached are handed over again, until there is none that is new.
+
+Numbers, all from the debug build of this commit:
+
+- A conflict hunk with the same row on both sides was put into each of the 51 `bun.lock` files of
+  the repository. The merged load binds 15,832 dependencies. None differs from the clean load.
+- The same for 20 lockfiles that bun wrote for shapes that are hard for a range check (aliases,
+  overrides, peers outside their range, optional dependencies without a version, workspaces that a
+  range binds): 69 dependencies, none differs.
+- 134 conflicted merges were replayed from the history of bun's own `bun.lock` and `test/bun.lock`
+  (commits off `main` that touch a lockfile, merged with `git merge-file` into `main` as it was 7
+  to 224 days later). 113 load for a command that reads, with 280,985 dependencies. 246,840 of
+  them have a range that a version can answer: none is outside it, and no required dependency is
+  without a package. 21 do not load for a reader: in 20 a dependency has a package on neither
+  side, which `bun install` resolves, and one has a folder and a package of the registry at one
+  path. In these merges 338 paths have two versions. For 54 of them git wrote the row of one side
+  into a hunk and took the row of the other side outside of it, so the document of a side has
+  two rows for one path and its own is the one that the other document does not have.
+- Tests: 70 in `test/cli/install/bun-lock.test.ts`. They spawn about 80 processes, and one of
+  them is `git merge-file`. With the debug build of this commit 70 pass. With bun 1.4.3-canary.1
+  66 fail. The 4 that pass pin what did not change: a lockfile without markers that lacks a
+  package, `bun pm pack`, and markers in package.json.
+
+Other suites, on the debug build of this commit with `--timeout 120000`: the 110 tests of
+`bun-lock.test.ts` pass, and so do 2,160 of 2,172 tests in 33 other files of `test/cli/install`,
+the ones that load a lockfile most (lockfile-only, lockfile-version-2, config-version, frozen
+lockfiles, catalogs, overrides, update, workspaces, isolated-install, hoist, add, remove,
+bun-lockb, pm, why, licenses, scan, link, patch, publish, prune, pm-diff, dedupe, audit,
+lifecycle scripts). None of the 12 that fail loads a lockfile with markers. 3 run a lifecycle
+script that does not find `node` or `bun` with the debug binary, and 1 compares an output into
+which the debug build prints an error trace. They pass with bun 1.4.3. 2 fail with bun 1.4.3
+too. 6 in `bun-patch.test.ts` were a use after free in the `engines.bun` patch of 2026-08-27,
+which is repaired in that patch (rebase notes). The other files of the directory were run on the
+first version only (bun-install-registry, bun-install and 11 more, with no failure but timeouts
+and hosts that the network here blocks) or not at all (bunx, migration and 20 smaller ones).
+
+A review pass (five readers, one per area: the text of the union, the range check, the commands,
+memory and panics, tests and docs) read the first version without running it and came back with
+44 findings, 35 when the ones that two readers had are counted once. Each came with the files and
+the command that show it. 32 led to a change. Where that changes what bun does, a test was made
+from the input of the finding, with two exceptions: the time to merge two long arrays, and the
+`configVersion` that a command that only reads gets. 3 changed nothing: an optional dependency
+outside its range, the commands that read the lockfile before they install (both under "Not
+done"), and the hunks with two equal sides in the tests, which git does not write and which send
+a lockfile through the merge as it is. The findings that changed the design, as the readers
+saw them in the code (one was run against the first version, and it says so):
+
+- The union decided who keeps a path key by key. What is below a path has to come from the side
+  whose package keeps it (above).
+- A merge without open dependencies was printed and loaded again before package.json was read,
+  which dropped the packages that had lost their path. When package.json kept the range of that
+  side, the registry was asked and the newest version came in. Now the install gets the graph as
+  it is.
+- The printed merge always said `"configVersion": 1`, because the printer takes that from the
+  options and no command has set them when the lockfile loads. A project at configVersion 0
+  with workspaces would have changed from the hoisted to the isolated linker by merging. The
+  value of the sides is put back after the second load, and the install does not print at all.
+- A peer dependency spoke for a dependency of the same name and owner that was outside its range.
+  A dependency that one side had moved to another group was two rows of one folder, and the row
+  that fit spoke for the one that did not.
+- A range stayed with a tarball or a git repository that the other side had at the path.
+- The resolver took a package that had lost its path and did not look at its dependencies, and
+  the install ended in `failed to resolve`.
+- `lockfileVersion` 0 with a workspace that has no row ended in an index out of bounds in the diff
+  with package.json. A side with a `lockfileVersion` of a later bun was merged at the version of
+  the other side, without a word.
+- `leaf: npm:real@latest` with an override for `leaf` lost its package to the override in every
+  merge: `dedupe::effective_npm_range` looks for the override under the name of the dependency
+  and the resolver under the name of the package. This one was run first, and it held. The
+  merge does not check such a dependency now. `bun dedupe` has a guard of its own and is not
+  affected.
+- A merge that fails after the loader has read the overrides left their `npm:` aliases in
+  `PackageManager::known_npm_aliases`, as positions in a text that is gone. The map is put back.
+  The reader wrote that a lockfile without markers has the same problem in upstream. It has:
+  see below.
+- The notes. `bun update --recursive` printed `Run bun install to save it` and then saved,
+  `bun pm trust` printed `reading the merge` and then refused, and `--lockfile-only --dry-run`
+  printed `bun.lock is not saved` and then saved (that it saves is upstream's). The commands that
+  read print the note for reading now, and the loader prints only why it does not merge.
+- Tests that could not fail. In every test the value that had to win was the one of theirs. Three
+  tests checked the requests to the registry with the manifests of their first install in the
+  cache. No test had a base in a diff3 hunk that would change the result if it leaked into a side.
+  The test for optional and peer dependencies compared the saved lockfile, which cannot show
+  them. It installs with the isolated linker now and compares with the same lockfile without
+  markers.
+
+The tests of these findings pass on this commit. They were not run against the first version,
+which was never pushed, so "fails without the fix" is shown for the released bun only.
+
+The rework was wrong once, and the replay of the 134 merges showed it: the first rewrite of the
+path rule took a document with two rows for one path for damage, and 15 merges that the first
+version had taken were refused.
+
+One bug in upstream turned up and went to the hand-off, with a test that fails on bun 1.4.3. A
+`bun.lock` without any marker that fails to load after its `overrides` were read (a row without
+a hash is enough) leaves the aliases of those overrides behind. bun ignores the lockfile, and the
+install that follows gives `kept@^1.0.0` the alias of an override that package.json does not
+have. Its name is a position in a buffer that is gone, so bun asks the registry for `/` and ends
+with `error: kept@^1.0.0 failed to resolve`. This commit puts the aliases back only around its
+own loads. The loads of upstream are left for upstream's fix.
+
+Not done, and known:
+
+- An optional dependency that is bound to a package outside its range stays there when the merge
+  has no package that fits. In a lockfile that bun wrote that means the registry had nothing, and
+  a load without markers binds it the same way. After a merge it can also be what git left of a
+  row that one side had. The resolver is not asked.
+- A dependency on a tarball or a git repository is not checked against the package it is bound
+  to. Two such packages at one path end the merge, but a range line and a row that git merged
+  from two sides on its own get past it.
+- `bun pm ls` and the other reading commands fail on a merge that lacks a package, and so do the
+  commands that read the lockfile before they install: `bun update --recursive`, `bun update` with
+  a pattern, `bun update -i`, `bun patch --commit`. `bun install` and a plain `bun update` merge
+  the same file. The note says to run `bun install`.
+- `bun dedupe`, `bun pm trust` and `bun audit fix` refuse a conflicted lockfile. They could merge
+  first.
+- When the sides have two `lockfileVersion`s, the merge loads at the later one and, when a row does
+  not pass its checks, at the earlier one, and the saved file keeps the version that loaded. A row
+  with a tarball outside the registry and no hash, which version 2 turns away, stays in the
+  lockfile this way when it comes from a side that is still at version 1. That is what a clean
+  merge of that side gives too. It is a choice for the bun team to look at.
+- Conflict markers in `package-lock.json`, `yarn.lock` and `pnpm-lock.yaml` when bun migrates them.
+  `bun.lockb` is binary and has no markers.
+- A dependency that a clean merge (no markers) left with a package outside its range. That needs
+  the check on every load, which every install would pay for. Upstream has it open as
+  oven-sh/bun#43795 and oven-sh/bun#43375, and this patch stays out of its way: the check is one
+  function and runs only after a conflict.
+- Not run on Windows or macOS. The code has no branch for a platform, and the `\r\n` test runs on
+  Linux.
+- The tests spawn about 80 processes of the debug build and take 18 seconds on a calm machine.
+  The machine this was written on ran at a load average of 120 to 640 from other work. In some
+  runs there, up to 12 tests went over the default timeout of 5 seconds. With `--timeout 120000`
+  all pass in every run.
+
+Rebase notes: 39 patches onto oven-sh/bun 29d9638da3, one conflict, nothing dropped, the fork's
+workflows were green after the push of the day before. The conflict was in
+`src/runtime/jsc_hooks.rs`: upstream 4227e466c4 added a line right below the block that the
+`bytes` loader patch of 2026-09-10 adds, and both are kept. This entry landed a day after its
+date. The design review of where the merge should live took nine hours, and the review of the
+first version found enough to write the path rule and the install flow again.
+
+One earlier patch changed. The `engines.bun` check of 2026-08-27 read the range from the tree
+that the package.json cache keeps. `bun patch` in a workspace package edits the root
+package.json and puts the new text into the cache entry, and the tree still points into the old
+text. AddressSanitizer reported the read after free in six tests of `bun-patch.test.ts` while
+the suites ran for this entry. The check reads the range from the parse that
+`install_with_manager` makes of the file now. The change is folded into the commit of
+2026-08-27, so the commits from there on have new hashes.
+
+The patch applies to upstream `main` without the rest of the stack (`git apply --check` on
+29d9638da3). It was built and tested on top of the stack only. It shares six files with earlier
+soup patches and none of their lines.
+
+Files: `src/install/lockfile/merge_conflict.rs` (new), `src/install/lockfile.rs`
+(`load_from_cwd_for_install`, `LoadResultOk::merged_conflict`, the parse-error arm),
+`src/install/lockfile/bun.lock.rs` (`LoadMode`),
+`src/install/PackageManager/install_with_manager.rs` (`report_merged_conflict`, `OpenEdges`),
+`src/install/PackageManager/PackageManagerEnqueue.rs` (`follows_npm_alias`),
+`src/install/PackageManager.rs`, `src/install/dedupe.rs`,
+`src/runtime/cli/{package_manager_command,outdated_command,pm_trusted_command,audit_command}.rs`,
+`src/install/{migration,pnpm,yarn}.rs` (the new field), `docs/pm/lockfile.mdx`,
+`docs/pm/cli/install.mdx`, `test/cli/install/bun-lock.test.ts`.
+
 ## Dropped
 
 Nothing yet.

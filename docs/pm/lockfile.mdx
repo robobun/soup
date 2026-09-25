@@ -48,6 +48,40 @@ print = "yarn"
 
 </CodeGroup>
 
+#### Merge conflicts
+
+When two branches change dependencies, `git merge` and `git rebase` can leave conflict markers in `bun.lock`. Leave the markers in the file, resolve the conflicts in `package.json`, and run `bun install`:
+
+```bash terminal icon="terminal"
+git merge feature
+# CONFLICT (content): Merge conflict in bun.lock
+bun install
+# note: bun.lock contains git merge conflict markers, using the merge of both sides
+git add bun.lock
+```
+
+Bun merges both sides, compares the merge with `package.json` as on every install, and saves `bun.lock` without the markers. The merge keeps the versions that the sides lock:
+
+- A package that one side has is kept, at the version that side locks.
+- When the sides have two versions of a package at one path of `node_modules`, the higher version keeps the path. A dependency whose range does not take that version gets the version that its own side locks.
+- When the sides have two ranges for a dependency, `package.json` says which one is right. The dependency gets the version that the side with that range locks.
+
+Bun asks the registry for a dependency that has a package on neither side. It also reads the manifest of a dependency when `package.json` has another range for it than the merge. The locked version stays in both cases.
+
+The markers of `merge.conflictStyle = diff3` and `zdiff3` work too.
+
+Other commands on a `bun.lock` with conflict markers:
+
+| Command                                                               | What it does                                                                                       |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `bun add`, `bun remove`, `bun update`                                 | The same as `bun install`: they use the merge and save it.                                         |
+| `bun install --frozen-lockfile`, `bun ci`, `bun install --production` | They fail, because `bun.lock` has to be saved again.                                               |
+| `bun pm ls`, `bun why`, `bun outdated`, `bun audit`                   | They read the merge and leave the file as it is. They fail when a dependency has no package in it. |
+| `bun dedupe`, `bun pm trust`, `bun audit fix`                         | They fail and tell you to run `bun install` first.                                                 |
+| `bun pm pack`, `bun publish`, `bun prune`                             | They do not merge. They fail as on every lockfile that does not parse.                             |
+
+Bun does not merge when it cannot tell which side is right. That is the case when the sides have two integrity hashes for one version of a package, or two packages at one path of which one is a tarball or a git repository. Bun then prints the reason and ignores the lockfile, as it does with every lockfile that does not parse.
+
 #### Text-based lockfile
 
 Bun v1.2 changed the default lockfile format to the text-based `bun.lock`. To migrate an existing binary `bun.lockb`, run `bun install --save-text-lockfile --frozen-lockfile --lockfile-only` and delete `bun.lockb`.

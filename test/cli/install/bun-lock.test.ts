@@ -1,7 +1,7 @@
 import { file, spawn, write } from "bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { readlinkSync } from "fs";
-import { access, copyFile, cp, exists, open, rm, writeFile } from "fs/promises";
+import { access, copyFile, cp, exists, open, realpath, rm, writeFile } from "fs/promises";
 import {
   bunExe,
   bunEnv as env,
@@ -1825,4 +1825,2074 @@ describe.each(["hoisted", "isolated"] as const)("peer no published version satis
     expect(err).not.toContain("Ignoring lockfile");
     expect(await file(lockfilePath).text()).toBe(lockfile);
   });
+});
+
+describe.concurrent("bun.lock with git conflict markers", () => {
+  // name -> version -> what the package.json of that version adds
+  const published: Record<string, Record<string, Record<string, unknown>>> = {
+    "kept": { "1.0.0": {}, "1.1.0": {} },
+    "left": { "1.0.0": {} },
+    "right": { "1.0.0": {} },
+    "extra": { "1.0.0": {} },
+    "shared": { "1.0.0": {}, "1.0.1": {}, "1.0.2": {}, "2.0.0": {} },
+    "uses-old": { "1.0.0": { dependencies: { shared: "1.0.0" } } },
+    "uses-old-too": { "1.0.0": { dependencies: { shared: "1.0.0" } } },
+    "uses-new": { "1.0.0": { dependencies: { shared: "2.0.0" } } },
+    "has-leaf": { "1.0.0": { dependencies: { leaf: "^1.0.0" } } },
+    "leaf": { "1.0.0": {}, "1.0.5": {} },
+    "real": { "1.0.0": {}, "2.0.0": {} },
+    "uses-alias-name": { "1.0.0": { dependencies: { aliased: "^2.0.0" } } },
+    "has-optional": { "1.0.0": { optionalDependencies: { shared: "^1.0.0" } } },
+    "has-peer": { "1.0.0": { peerDependencies: { shared: "^5.0.0" } } },
+    "outer": { "1.0.0": { dependencies: { leaf: "^1.0.0" } }, "1.1.0": { dependencies: { leaf: "^1.0.0" } } },
+    "packs": {
+      "1.0.0": { dependencies: { leaf: "1.0.0" }, bundleDependencies: ["leaf"] },
+      "2.0.0": { dependencies: { leaf: "^1.0.5" } },
+    },
+    "tool": { "1.0.0": { dependencies: { helper: "^1.0.0" } }, "1.1.0": { dependencies: { helper: "^2.0.0" } } },
+    "helper": { "1.0.0": {}, "2.0.0": {} },
+    "needs-old-tool": { "1.0.0": { dependencies: { tool: "1.0.0" } } },
+    "@scope/shared": { "1.0.0": {}, "2.0.0": {} },
+    "uses-scoped-old": { "1.0.0": { dependencies: { "@scope/shared": "1.0.0" } } },
+    "uses-scoped-new": { "1.0.0": { dependencies: { "@scope/shared": "2.0.0" } } },
+  };
+
+  const tarballs = new Map<string, Uint8Array>();
+  const integrity = new Map<string, string>();
+  beforeAll(async () => {
+    for (const [name, versions] of Object.entries(published)) {
+      for (const [version, extra] of Object.entries(versions)) {
+        const archive = new Bun.Archive(
+          { "package/package.json": JSON.stringify({ name, version, ...extra }) },
+          { compress: "gzip" },
+        );
+        const bytes = await archive.bytes();
+        tarballs.set(`/${name}-${version}.tgz`, bytes);
+        integrity.set(`${name}@${version}`, "sha512-" + new Bun.CryptoHasher("sha512").update(bytes).digest("base64"));
+      }
+    }
+  });
+
+  function serveRegistry() {
+    const requests: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { origin, pathname } = new URL(request.url);
+        requests.push(pathname);
+        const tarball = tarballs.get(pathname);
+        if (tarball) return new Response(tarball);
+        const name = decodeURIComponent(pathname.slice(1));
+        const entry = published[name];
+        if (!entry) return new Response("not found", { status: 404 });
+        const versions: Record<string, unknown> = {};
+        for (const [version, extra] of Object.entries(entry)) {
+          versions[version] = {
+            name,
+            version,
+            dist: { tarball: `${origin}/${name}-${version}.tgz`, integrity: integrity.get(`${name}@${version}`) },
+            ...extra,
+          };
+        }
+        return Response.json({ name, versions, "dist-tags": { latest: Object.keys(versions).at(-1) } });
+      },
+    });
+    const origin = server.url.origin;
+    return {
+      url: server.url.href,
+      origin,
+      requests,
+      manifestRequests: () => requests.filter(path => !path.endsWith(".tgz")).toSorted(),
+      // The row of "packages" for a package at a path of node_modules.
+      row(path: string, id: string, info?: Record<string, unknown>) {
+        const [name, version] = [id.slice(0, id.lastIndexOf("@")), id.slice(id.lastIndexOf("@") + 1)];
+        info ??= published[name][version];
+        return `    "${path}": ["${id}", "${origin}/${name}-${version}.tgz", ${JSON.stringify(info)}, "${integrity.get(id)}"],`;
+      },
+      [Symbol.dispose]() {
+        server.stop(true);
+      },
+    };
+  }
+  type Registry = ReturnType<typeof serveRegistry>;
+  type Files = Record<string, string>;
+
+  const project = (dependencies: Record<string, string>, rest: Record<string, unknown> = {}): Files => ({
+    "package.json": JSON.stringify({ name: "app", version: "1.0.0", dependencies, ...rest }),
+  });
+
+  function createProject(registry: Registry, files: Files) {
+    return tempDir("bun-lock-conflict-", {
+      ...files,
+      "bunfig.toml": Bun.TOML.stringify({ install: { registry: registry.url, linker: "hoisted" } }),
+    });
+  }
+
+  async function run(cwd: string, ...args: string[]) {
+    await using proc = spawn({
+      cmd: [bunExe(), ...args],
+      cwd,
+      // A cache per project: what an install asks the registry for is part of what is tested.
+      env: { ...env, BUN_INSTALL_CACHE_DIR: join(cwd, ".bun-cache") },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err, code] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { out, err, code };
+  }
+
+  async function succeed(cwd: string, ...args: string[]) {
+    const { out, err, code } = await run(cwd, ...args);
+    expect({ args, err, code }).toMatchObject({ args, err: expect.not.stringContaining("error:"), code: 0 });
+    return { out, err };
+  }
+
+  const normalize = (registry: Registry, lockfile: string) =>
+    lockfile.replaceAll(registry.origin, "<registry>").replace(/"sha512-[A-Za-z0-9+\/=]+"/g, '"<integrity>"');
+
+  const savedLockfile = async (registry: Registry, dir: { toString(): string }) =>
+    normalize(registry, await file(join(String(dir), "bun.lock")).text());
+
+  const mergedNote = "note: bun.lock contains git merge conflict markers, using the merge of both sides\n";
+  const otherHash = "sha512-" + Buffer.alloc(64, 1).toString("base64");
+
+  // One hunk, as `git merge` writes it with each `merge.conflictStyle` and `conflict-marker-size`.
+  const hunks = {
+    merge: (ours: string, theirs: string) => `<<<<<<< HEAD\n${ours}=======\n${theirs}>>>>>>> feature\n`,
+    diff3: (ours: string, theirs: string, base = "") =>
+      `<<<<<<< HEAD\n${ours}||||||| base\n${base}=======\n${theirs}>>>>>>> feature\n`,
+    long: (ours: string, theirs: string) => `<<<<<<<<<< HEAD\n${ours}==========\n${theirs}>>>>>>>>>> feature\n`,
+    // Not what git writes: it sends a lockfile through the merge as it is.
+    same: (text: string) => `<<<<<<< HEAD\n${text}=======\n${text}>>>>>>> feature\n`,
+    // The base is itself a merge that had a conflict. git writes the markers of that one two longer.
+    recursive: (ours: string, theirs: string) =>
+      `<<<<<<< HEAD\n${ours}||||||| merged common ancestors\n<<<<<<<<< Temporary merge branch 1\n||||||||| merged common ancestors\n=========\n>>>>>>>>> Temporary merge branch 2\n=======\n${theirs}>>>>>>> feature\n`,
+  };
+  type Hunk = (ours: string, theirs: string, base?: string) => string;
+
+  // bun.lock after the merge of two branches that add one dependency each. Both have `kept` at 1.0.0,
+  // and `kept@1.1.0` is out by now: an install that does not read this lockfile takes 1.1.0.
+  const twoBranchesAddADependency = ({ row }: Registry, hunk: Hunk = hunks.merge): Files => ({
+    ...project({ kept: "^1.0.0", left: "1.0.0", right: "1.0.0" }),
+    "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "kept": "^1.0.0",
+${hunk(`        "left": "1.0.0",\n`, `        "right": "1.0.0",\n`)}      },
+    },
+  },
+  "packages": {
+${row("kept", "kept@1.0.0")}
+${hunk(`\n${row("left", "left@1.0.0")}\n`, `\n${row("right", "right@1.0.0")}\n`)}  }
+}
+`,
+  });
+
+  // Adds the dependency `has-leaf` and its row, and no row for the `leaf` that it depends on.
+  function withoutThePackageOfLeaf({ row }: Registry, lockfile: string) {
+    const dependency = `        "kept": "^1.0.0",\n`;
+    const kept = row("kept", "kept@1.0.0");
+    expect(lockfile).toContain(dependency);
+    expect(lockfile).toContain(kept);
+    return lockfile
+      .replace(dependency, `        "has-leaf": "1.0.0",\n${dependency}`)
+      .replace(kept, `${row("has-leaf", "has-leaf@1.0.0")}\n\n${kept}`);
+  }
+
+  // What git itself writes for two branches, from lockfiles as bun writes them.
+  it("bun install merges what git merge-file leaves of the lockfiles of two branches", async () => {
+    using registry = serveRegistry();
+    const lockfileOf = (dependencies: Record<string, string>) => `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${Object.entries(dependencies)
+  .map(([name, range]) => `        "${name}": "${range}",\n`)
+  .join("")}      },
+    },
+  },
+  "packages": {
+${Object.keys(dependencies)
+  .map(name => registry.row(name, `${name}@1.0.0`) + "\n")
+  .join("\n")}  }
+}
+`;
+    using branches = tempDir("bun-lock-merge-file-", {
+      base: lockfileOf({ kept: "^1.0.0" }),
+      ours: lockfileOf({ kept: "^1.0.0", left: "1.0.0" }),
+      theirs: lockfileOf({ kept: "^1.0.0", right: "1.0.0" }),
+    });
+    await using git = spawn({
+      cmd: ["git", "merge-file", "-p", "-L", "HEAD", "-L", "base", "-L", "feature", "ours", "base", "theirs"],
+      cwd: String(branches),
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [conflicted, gitErr, hunkCount] = await Promise.all([git.stdout.text(), git.stderr.text(), git.exited]);
+    expect({ gitErr, hunkCount }).toEqual({ gitErr: "", hunkCount: 2 });
+    expect(conflicted).toContain(`"kept": ["kept@1.0.0", `);
+
+    using dir = createProject(registry, {
+      ...project({ kept: "^1.0.0", left: "1.0.0", right: "1.0.0" }),
+      "bun.lock": conflicted,
+    });
+    const { err } = await succeed(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(mergedNote);
+    expect(err).toContain("Saved lockfile");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "kept": "^1.0.0",
+              "left": "1.0.0",
+              "right": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "kept": ["kept@1.0.0", "<registry>/kept-1.0.0.tgz", {}, "<integrity>"],
+
+          "left": ["left@1.0.0", "<registry>/left-1.0.0.tgz", {}, "<integrity>"],
+
+          "right": ["right@1.0.0", "<registry>/right-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("bun install keeps every version that the sides lock", async () => {
+    using registry = serveRegistry();
+    using dir = createProject(registry, twoBranchesAddADependency(registry));
+    const lockfilePath = join(String(dir), "bun.lock");
+
+    const { out, err } = await succeed(String(dir), "install");
+    expect(err).toContain(mergedNote);
+    expect(err).toContain("Saved lockfile");
+    expect(err).not.toContain("Ignoring lockfile");
+    // Both sides lock everything package.json asks for, so the registry is asked for tarballs only.
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(normalizeBunSnapshot(out, dir)).toMatchInlineSnapshot(`
+      "bun install <version> (<revision>)
+
+      + kept@1.0.0
+      + left@1.0.0
+      + right@1.0.0
+
+      3 packages installed"
+    `);
+
+    const lockfile = await file(lockfilePath).text();
+    expect(normalize(registry, lockfile)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "kept": "^1.0.0",
+              "left": "1.0.0",
+              "right": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "kept": ["kept@1.0.0", "<registry>/kept-1.0.0.tgz", {}, "<integrity>"],
+
+          "left": ["left@1.0.0", "<registry>/left-1.0.0.tgz", {}, "<integrity>"],
+
+          "right": ["right@1.0.0", "<registry>/right-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+
+    // What was saved is what a load of it gives.
+    await succeed(String(dir), "install", "--frozen-lockfile");
+    expect(await file(lockfilePath).text()).toBe(lockfile);
+  });
+
+  it.each([
+    ["diff3 and zdiff3", hunks.diff3, "\n||||||| base\n"],
+    ["a longer conflict-marker-size", hunks.long, "\n<<<<<<<<<< HEAD\n"],
+    ["a merge with two ancestors", hunks.recursive, "\n<<<<<<<<< Temporary merge branch 1\n"],
+    ["\\r\\n line ends", hunks.merge, "\r\n=======\r\n"],
+  ] as const)("reads the markers of %s", async (_, hunk, marker) => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry, hunk);
+    if (marker.startsWith("\r")) files["bun.lock"] = files["bun.lock"].replaceAll("\n", "\r\n");
+    expect(files["bun.lock"]).toContain(marker);
+    using dir = createProject(registry, files);
+
+    const { err } = await succeed(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(mergedNote);
+    expect(registry.manifestRequests()).toEqual([]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`"kept": ["kept@1.0.0", `);
+    expect(lockfile).toContain(`"left": ["left@1.0.0", `);
+    expect(lockfile).toContain(`"right": ["right@1.0.0", `);
+    expect(lockfile).not.toMatch(/^(<<<<<<<|=======|>>>>>>>|\|\|\|\|\|\|\|)/m);
+  });
+
+  it("keeps both versions when the sides put two versions of a package at one path", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Each side has `shared` at the root: 2.0.0 for `uses-new`, 1.0.0 for `uses-old`.
+    using dir = createProject(registry, {
+      ...project({ "uses-new": "1.0.0", "uses-old": "1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${hunks.merge(`        "uses-new": "1.0.0",\n`, `        "uses-old": "1.0.0",\n`)}      },
+    },
+  },
+  "packages": {
+${hunks.merge(
+  `${row("shared", "shared@2.0.0")}\n\n${row("uses-new", "uses-new@1.0.0")}\n`,
+  `${row("shared", "shared@1.0.0")}\n\n${row("uses-old", "uses-old@1.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "uses-new": "1.0.0",
+              "uses-old": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "shared": ["shared@2.0.0", "<registry>/shared-2.0.0.tgz", {}, "<integrity>"],
+
+          "uses-new": ["uses-new@1.0.0", "<registry>/uses-new-1.0.0.tgz", { "dependencies": { "shared": "2.0.0" } }, "<integrity>"],
+
+          "uses-old": ["uses-old@1.0.0", "<registry>/uses-old-1.0.0.tgz", { "dependencies": { "shared": "1.0.0" } }, "<integrity>"],
+
+          "uses-old/shared": ["shared@1.0.0", "<registry>/shared-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+    // The version of `shared` that `require("shared")` in the package gives.
+    const sharedOf = async (name: string) => {
+      const nested = file(join(String(dir), "node_modules", name, "node_modules", "shared", "package.json"));
+      const hoisted = file(join(String(dir), "node_modules", "shared", "package.json"));
+      return (await ((await nested.exists()) ? nested : hoisted).json()).version;
+    };
+    expect({ "uses-old": await sharedOf("uses-old"), "uses-new": await sharedOf("uses-new") }).toEqual({
+      "uses-old": "1.0.0",
+      "uses-new": "2.0.0",
+    });
+  });
+
+  it("takes the higher version when both sides moved a package and every range takes it", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    using dir = createProject(registry, {
+      ...project({ shared: "^1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "shared": "^1.0.0",
+      },
+    },
+  },
+  "packages": {
+${hunks.diff3(
+  `${row("shared", "shared@1.0.2")}\n`,
+  `${row("shared", "shared@1.0.1")}\n`,
+  `${row("shared", "shared@1.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    const { err } = await succeed(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(mergedNote);
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "shared": "^1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "shared": ["shared@1.0.2", "<registry>/shared-1.0.2.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("reads the row that git took from one side, next to a hunk with the row of the other side", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // git does this when the rows around the one that both sides changed are new too: 54 times in 134 merges of bun's own lockfiles.
+    using dir = createProject(registry, {
+      ...project({ left: "1.0.0", right: "1.0.0", shared: "^1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${hunks.merge(`        "left": "1.0.0",\n`, `        "right": "1.0.0",\n`)}        "shared": "^1.0.0",
+      },
+    },
+  },
+  "packages": {
+${hunks.merge(
+  `${row("left", "left@1.0.0")}\n\n`,
+  `${row("right", "right@1.0.0")}\n\n${row("shared", "shared@1.0.2")}\n\n`,
+)}${row("shared", "shared@1.0.1")}
+  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`"left": ["left@1.0.0", `);
+    expect(lockfile).toContain(`"right": ["right@1.0.0", `);
+    expect(lockfile).toContain(`"shared": ["shared@1.0.2", `);
+  });
+
+  it("does not read the base of a diff3 hunk as a side", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Both branches went back from the 1.0.2 of the base.
+    using dir = createProject(registry, {
+      ...project({ shared: "^1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "shared": "^1.0.0",
+      },
+    },
+  },
+  "packages": {
+${hunks.diff3(
+  `${row("shared", "shared@1.0.0")}\n`,
+  `${row("shared", "shared@1.0.1")}\n`,
+  `${row("shared", "shared@1.0.2")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await file(join(String(dir), "bun.lock")).text()).toContain(`"shared": ["shared@1.0.1", `);
+  });
+
+  it("follows the side that moved a dependency to a range the other side does not know", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours adds `left`. Theirs moves `shared` to the next major, on the line after it.
+    using dir = createProject(registry, {
+      ...project({ left: "1.0.0", shared: "^2.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${hunks.merge(`        "left": "1.0.0",\n        "shared": "^1.0.0",\n`, `        "shared": "^2.0.0",\n`)}      },
+    },
+  },
+  "packages": {
+${hunks.merge(
+  `${row("left", "left@1.0.0")}\n\n${row("shared", "shared@1.0.2")}\n`,
+  `${row("shared", "shared@2.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "left": "1.0.0",
+              "shared": "^2.0.0",
+            },
+          },
+        },
+        "packages": {
+          "left": ["left@1.0.0", "<registry>/left-1.0.0.tgz", {}, "<integrity>"],
+
+          "shared": ["shared@2.0.0", "<registry>/shared-2.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("merges two added packages that share a dependency", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    using dir = createProject(registry, {
+      ...project({ "uses-old": "1.0.0", "uses-old-too": "1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${hunks.merge(`        "uses-old": "1.0.0",\n`, `        "uses-old-too": "1.0.0",\n`)}      },
+    },
+  },
+  "packages": {
+${row("shared", "shared@1.0.0")}
+
+${hunks.merge(`${row("uses-old", "uses-old@1.0.0")}\n`, `${row("uses-old-too", "uses-old-too@1.0.0")}\n`)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "uses-old": "1.0.0",
+              "uses-old-too": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "shared": ["shared@1.0.0", "<registry>/shared-1.0.0.tgz", {}, "<integrity>"],
+
+          "uses-old": ["uses-old@1.0.0", "<registry>/uses-old-1.0.0.tgz", { "dependencies": { "shared": "1.0.0" } }, "<integrity>"],
+
+          "uses-old-too": ["uses-old-too@1.0.0", "<registry>/uses-old-too-1.0.0.tgz", { "dependencies": { "shared": "1.0.0" } }, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("merges the catalog and the overrides of both sides", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours has `uses-old` and its `shared@1.0.0`. The override of theirs moves `shared` to 1.0.1 for every package.
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({
+        name: "app",
+        workspaces: {
+          packages: ["packages/*"],
+          catalog: { "kept": "1.0.0", "uses-new": "1.0.0", "uses-old": "1.0.0" },
+        },
+        overrides: { leaf: "1.0.0", shared: "1.0.1" },
+      }),
+      "packages/a/package.json": JSON.stringify({
+        name: "a",
+        dependencies: { "kept": "catalog:", "uses-new": "catalog:", "uses-old": "catalog:" },
+      }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+    },
+    "packages/a": {
+      "name": "a",
+      "dependencies": {
+        "kept": "catalog:",
+${hunks.merge(`        "uses-old": "catalog:",\n`, `        "uses-new": "catalog:",\n`)}      },
+    },
+  },
+  "overrides": {
+${hunks.merge(`    "leaf": "1.0.0",\n`, `    "shared": "1.0.1",\n`)}  },
+  "catalog": {
+    "kept": "1.0.0",
+${hunks.merge(`    "uses-old": "1.0.0",\n`, `    "uses-new": "1.0.0",\n`)}  },
+  "packages": {
+    "a": ["a@workspace:packages/a"],
+
+${row("kept", "kept@1.0.0")}
+
+${hunks.merge(
+  `${row("shared", "shared@1.0.0")}\n\n${row("uses-old", "uses-old@1.0.0")}\n`,
+  `${row("shared", "shared@1.0.1")}\n\n${row("uses-new", "uses-new@1.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+          },
+          "packages/a": {
+            "name": "a",
+            "dependencies": {
+              "kept": "catalog:",
+              "uses-new": "catalog:",
+              "uses-old": "catalog:",
+            },
+          },
+        },
+        "overrides": {
+          "leaf": "1.0.0",
+          "shared": "1.0.1",
+        },
+        "catalog": {
+          "kept": "1.0.0",
+          "uses-new": "1.0.0",
+          "uses-old": "1.0.0",
+        },
+        "packages": {
+          "a": ["a@workspace:packages/a"],
+
+          "kept": ["kept@1.0.0", "<registry>/kept-1.0.0.tgz", {}, "<integrity>"],
+
+          "shared": ["shared@1.0.1", "<registry>/shared-1.0.1.tgz", {}, "<integrity>"],
+
+          "uses-new": ["uses-new@1.0.0", "<registry>/uses-new-1.0.0.tgz", { "dependencies": { "shared": "2.0.0" } }, "<integrity>"],
+
+          "uses-old": ["uses-old@1.0.0", "<registry>/uses-old-1.0.0.tgz", { "dependencies": { "shared": "1.0.0" } }, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("merges two workspaces that were added on two branches", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({ name: "app", workspaces: ["packages/*"] }),
+      "packages/a/package.json": JSON.stringify({ name: "a", dependencies: { left: "1.0.0" } }),
+      "packages/b/package.json": JSON.stringify({ name: "b", dependencies: { right: "1.0.0" } }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+    },
+${hunks.merge(
+  `    "packages/a": {\n      "name": "a",\n      "dependencies": {\n        "left": "1.0.0",\n      },\n    },\n`,
+  `    "packages/b": {\n      "name": "b",\n      "dependencies": {\n        "right": "1.0.0",\n      },\n    },\n`,
+)}  },
+  "packages": {
+${hunks.merge(
+  `    "a": ["a@workspace:packages/a"],\n\n${row("left", "left@1.0.0")}\n`,
+  `    "b": ["b@workspace:packages/b"],\n\n${row("right", "right@1.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+          },
+          "packages/a": {
+            "name": "a",
+            "dependencies": {
+              "left": "1.0.0",
+            },
+          },
+          "packages/b": {
+            "name": "b",
+            "dependencies": {
+              "right": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "a": ["a@workspace:packages/a"],
+
+          "b": ["b@workspace:packages/b"],
+
+          "left": ["left@1.0.0", "<registry>/left-1.0.0.tgz", {}, "<integrity>"],
+
+          "right": ["right@1.0.0", "<registry>/right-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("asks the registry only for what neither side locks", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    // git merged the lines outside the hunks too. Here that lost `leaf`, which `has-leaf` depends on.
+    files["bun.lock"] = withoutThePackageOfLeaf(registry, files["bun.lock"]);
+    using dir = createProject(registry, {
+      ...files,
+      // package.json also has a dependency that no branch installed.
+      ...project({ "extra": "1.0.0", "has-leaf": "1.0.0", "kept": "^1.0.0", "left": "1.0.0", "right": "1.0.0" }),
+    });
+
+    const { out, err } = await succeed(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(mergedNote);
+    expect(registry.manifestRequests()).toEqual(["/extra", "/leaf"]);
+    expect(normalizeBunSnapshot(out, dir)).toMatchInlineSnapshot(`
+      "bun install <version> (<revision>)
+
+      Saved bun.lock (7 packages)"
+    `);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "extra": "1.0.0",
+              "has-leaf": "1.0.0",
+              "kept": "^1.0.0",
+              "left": "1.0.0",
+              "right": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "extra": ["extra@1.0.0", "<registry>/extra-1.0.0.tgz", {}, "<integrity>"],
+
+          "has-leaf": ["has-leaf@1.0.0", "<registry>/has-leaf-1.0.0.tgz", { "dependencies": { "leaf": "^1.0.0" } }, "<integrity>"],
+
+          "kept": ["kept@1.0.0", "<registry>/kept-1.0.0.tgz", {}, "<integrity>"],
+
+          "leaf": ["leaf@1.0.5", "<registry>/leaf-1.0.5.tgz", {}, "<integrity>"],
+
+          "left": ["left@1.0.0", "<registry>/left-1.0.0.tgz", {}, "<integrity>"],
+
+          "right": ["right@1.0.0", "<registry>/right-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  // bun binds these to a package that is not in the range of the dependency. A merge must not take that for damage.
+  it.each([
+    [
+      "an alias of its own name",
+      { dependencies: { "kept": "1.0.0", "shared": "npm:shared@>=1.0.0", "uses-old": "1.0.0" } },
+      `    "shared": ["shared@2.0.0", `,
+    ],
+    [
+      "an alias that an override declares",
+      { dependencies: { "has-leaf": "1.0.0", "kept": "1.0.0" }, overrides: { leaf: "npm:real@^1.0.0" } },
+      `    "leaf": ["real@1.0.0", `,
+    ],
+    [
+      "an alias that an override declares, past a rule for the package that asks",
+      {
+        dependencies: { "has-leaf": "1.0.0", "kept": "1.0.0" },
+        overrides: { "has-leaf": { leaf: "1.0.5" }, "leaf": "npm:real@^1.0.0" },
+      },
+      `    "leaf": ["real@1.0.0", `,
+    ],
+    [
+      "a tag of another package, past an override for its own name",
+      {
+        dependencies: { "has-leaf": "1.0.0", "kept": "1.0.0", "leaf": "npm:real@latest" },
+        overrides: { leaf: "1.0.0" },
+      },
+      `    "leaf": ["real@2.0.0", `,
+    ],
+  ])("keeps the package of a dependency that follows %s", async (_, manifest, bound) => {
+    using registry = serveRegistry();
+    using dir = createProject(registry, { "package.json": JSON.stringify({ name: "app", ...manifest }) });
+    const lockfilePath = join(String(dir), "bun.lock");
+    await succeed(String(dir), "install", "--lockfile-only");
+    const lockfile = await file(lockfilePath).text();
+    expect(lockfile).toContain(bound);
+
+    const row = lockfile.split("\n").find(line => line.startsWith(`    "kept": `))!;
+    await write(lockfilePath, lockfile.replace(row + "\n", hunks.same(row + "\n")));
+    // The manifests that the first install left in the cache would answer in the place of the registry.
+    await rm(join(String(dir), ".bun-cache"), { recursive: true, force: true });
+    registry.requests.length = 0;
+
+    // A dependency without a package goes to the registry, and there is none.
+    const { err } = await succeed(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(mergedNote);
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await file(lockfilePath).text()).toBe(lockfile);
+  });
+
+  it("takes the later lockfileVersion when the sides have two", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    files["bun.lock"] = files["bun.lock"].replace(
+      `  "lockfileVersion": 2,\n`,
+      hunks.merge(`  "lockfileVersion": 2,\n`, `  "lockfileVersion": 1,\n`),
+    );
+    using dir = createProject(registry, files);
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`  "lockfileVersion": 2,\n`);
+    expect(lockfile).toContain(`"kept": ["kept@1.0.0", `);
+  });
+
+  it("loads at the earlier lockfileVersion what the later one does not take", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    // A tarball that is not on the registry and has no hash: lockfileVersion 1 takes it, 2 does not.
+    const unhashed = `    "kept": ["kept@1.0.0", "http://127.0.0.1:1/kept-1.0.0.tgz", {}, ""],`;
+    files["bun.lock"] = files["bun.lock"]
+      .replace(`  "lockfileVersion": 2,\n`, hunks.merge(`  "lockfileVersion": 1,\n`, `  "lockfileVersion": 2,\n`))
+      .replace(registry.row("kept", "kept@1.0.0"), unhashed);
+    using dir = createProject(registry, files);
+
+    const { err } = await succeed(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(mergedNote);
+    expect(registry.manifestRequests()).toEqual([]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`  "lockfileVersion": 1,\n`);
+    expect(lockfile).toContain(unhashed);
+    expect(lockfile).toContain(`"left": ["left@1.0.0", `);
+    expect(lockfile).toContain(`"right": ["right@1.0.0", `);
+  });
+
+  it.each([[["install", "--frozen-lockfile"]], [["ci"]], [["install", "--production"]]])(
+    "bun %p fails and leaves bun.lock as it is",
+    async args => {
+      using registry = serveRegistry();
+      const files = twoBranchesAddADependency(registry);
+      using dir = createProject(registry, files);
+
+      const { out, err, code } = await run(String(dir), ...args);
+      expect(normalizeBunSnapshot(err, dir)).toMatchInlineSnapshot(`
+        "error: bun.lock contains git merge conflict markers, but lockfile is frozen
+        note: run bun install to merge both sides, then commit the updated bun.lock"
+      `);
+      expect(normalizeBunSnapshot(out, dir)).toMatchInlineSnapshot(`"bun install <version> (<revision>)"`);
+      expect(code).toBe(1);
+      expect(registry.requests).toEqual([]);
+      expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+    },
+  );
+
+  it.each([["--dry-run"], ["--no-save"]])("bun install %s uses the merge and does not save it", async flag => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    using dir = createProject(registry, files);
+
+    const { err } = await succeed(String(dir), "install", flag);
+    expect(err).toContain(
+      "note: bun.lock contains git merge conflict markers, using the merge of both sides. bun.lock is not saved\n",
+    );
+    expect(err).not.toContain("Saved lockfile");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  it("commands that only read the lockfile read the merge", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    using dir = createProject(registry, files);
+
+    const { out, err, code } = await run(String(dir), "pm", "ls");
+    expect(normalizeBunSnapshot(err, dir)).toMatchInlineSnapshot(
+      `"note: bun.lock contains git merge conflict markers, reading the merge of both sides. Run bun install to save it"`,
+    );
+    expect(normalizeBunSnapshot(out, dir)).toMatchInlineSnapshot(`
+      "<dir> node_modules (3 installed)
+      ├── kept@1.0.0
+      ├── left@1.0.0
+      └── right@1.0.0"
+    `);
+    expect(code).toBe(0);
+    expect(registry.requests).toEqual([]);
+    expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  it.each([[["why", "kept"]], [["outdated"]]])("bun %p reads the merge", async args => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    using dir = createProject(registry, files);
+
+    const { out, err, code } = await run(String(dir), ...args);
+    expect(err.split("\n").filter(line => line.startsWith("note: "))).toEqual([
+      "note: bun.lock contains git merge conflict markers, reading the merge of both sides. Run bun install to save it",
+    ]);
+    expect(err).not.toContain("error:");
+    expect(out).toContain("kept");
+    expect(code).toBe(0);
+    expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  it("a command that resolves nothing does not read a merge that lacks a package", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    files["bun.lock"] = withoutThePackageOfLeaf(registry, files["bun.lock"]);
+    using dir = createProject(registry, files);
+
+    const { err, code } = await run(String(dir), "pm", "ls");
+    expect(normalizeBunSnapshot(err, dir)).toMatchInlineSnapshot(`
+      "note: bun.lock contains git merge conflict markers. Run bun install to merge both sides
+      error: failed to parse lockfile: ParserError"
+    `);
+    expect(code).toBe(1);
+    expect(registry.requests).toEqual([]);
+  });
+
+  // They change the lockfile and do not compare it with package.json first.
+  it.each([
+    [["pm", "trust", "kept"], "bun.lock contains git merge conflict markers"],
+    [["audit", "fix"], "bun.lock contains git merge conflict markers"],
+    [["dedupe"], "bun.lock contains git merge conflict markers, nothing to dedupe"],
+  ])("bun %p tells to run bun install first", async (args, message) => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    using dir = createProject(registry, files);
+
+    const { err, code } = await run(String(dir), ...args);
+    expect(err).toContain(`error: ${message}\n`);
+    expect(err.split("\n").filter(line => line.startsWith("note: "))).toEqual(["note: run 'bun install' first"]);
+    expect(code).toBe(1);
+    expect(registry.requests).toEqual([]);
+    expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  it("bun pm pack does not merge", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    using dir = createProject(registry, files);
+
+    const { err, code } = await run(String(dir), "pm", "pack", "--dry-run");
+    expect(err).toContain(`error: Expected string but found "<<<<<<<"`);
+    expect(err).toContain("error: failed to parse lockfile: ParserError");
+    expect(err).not.toContain("merge");
+    expect(code).toBe(1);
+    expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  it("leaves the conflict markers of package.json to the person", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    files["package.json"] = `{
+  "name": "app",
+  "dependencies": {
+    "kept": "^1.0.0",
+${hunks.merge(`    "left": "1.0.0"\n`, `    "right": "1.0.0"\n`)}  }
+}
+`;
+    using dir = createProject(registry, files);
+
+    const { err, code } = await run(String(dir), "install");
+    expect(err).toContain("package.json:5:1");
+    expect(err).toContain("ParserError: failed to parse '");
+    expect(err).not.toContain("Saved lockfile");
+    expect(code).toBe(1);
+    expect(registry.requests).toEqual([]);
+    expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  // An install does with them what it does with every lockfile that does not parse, and says why.
+  it.each([
+    [
+      "a marker that nothing closes",
+      (text: string) => text.replace(">>>>>>> feature\n", ""),
+      "the markers do not pair up",
+    ],
+    [
+      "a side that is not JSON",
+      (text: string) => text.replace("=======\n", "=======\n    not json\n"),
+      "one side is not JSON",
+    ],
+    [
+      "two hashes for one version",
+      (text: string, kept: string) =>
+        text.replace(kept, hunks.merge(kept, kept.replace(/"sha512-[^"]+"/, `"${otherHash}"`))),
+      "one package has two tarballs or two integrity hashes (kept@1.0.0)",
+    ],
+    [
+      "two hashes for one tarball",
+      (text: string, kept: string, tarball: string, hash: string) =>
+        text.replace(
+          kept,
+          hunks.merge(
+            `    "kept": ["kept@${tarball}", {}, "${hash}"],\n`,
+            `    "kept": ["kept@${tarball}", {}, "${otherHash}"],\n`,
+          ),
+        ),
+      "one package has two tarballs or two integrity hashes (kept@<registry>/kept-1.0.0.tgz)",
+    ],
+    [
+      "a tarball and a package of the registry at one path",
+      (text: string, kept: string, tarball: string, hash: string) =>
+        text.replace(kept, hunks.merge(`    "kept": ["kept@${tarball}", {}, "${hash}"],\n`, kept)),
+      "the sides have two packages at one path, and one of them is not from the registry (kept)",
+    ],
+    [
+      "a side that nests deeper than a lockfile",
+      (text: string) =>
+        text.replace(`  "packages": {\n`, `  "deep": ${'{"a":'.repeat(70)}1${"}".repeat(70)},\n  "packages": {\n`),
+      "one side is not a lockfile",
+    ],
+    [
+      // The loader has read the alias of the override by then. The install that follows must not know it.
+      "a row that the loader does not take",
+      (text: string, kept: string) =>
+        text
+          .replace(kept, hunks.same(kept.replace(/, "sha512-[^"]+"/, "")))
+          .replace(
+            `  "packages": {\n`,
+            `  "overrides": {\n    "kept": "npm:uses-old-too@1.0.0",\n  },\n  "packages": {\n`,
+          ),
+      "the merge of both sides does not load",
+    ],
+    [
+      "the lockfileVersion of a later bun",
+      (text: string) =>
+        text.replace(
+          `  "lockfileVersion": 2,\n`,
+          hunks.merge(`  "lockfileVersion": 2,\n`, `  "lockfileVersion": 99,\n`),
+        ),
+      "one side has a lockfileVersion that this version of bun does not read",
+    ],
+  ])("does not merge %s", async (_, damage, reason) => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    const damaged = damage(
+      files["bun.lock"],
+      registry.row("kept", "kept@1.0.0") + "\n",
+      `${registry.origin}/kept-1.0.0.tgz`,
+      integrity.get("kept@1.0.0")!,
+    );
+    expect(damaged).not.toBe(files["bun.lock"]);
+    using dir = createProject(registry, { ...files, "bun.lock": damaged });
+
+    const { err, code } = await run(String(dir), "install", "--lockfile-only");
+    expect(err.replaceAll(registry.origin, "<registry>")).toContain(
+      `note: bun.lock contains git merge conflict markers that bun cannot merge: ${reason}\n`,
+    );
+    expect(err).toContain("ParserError: failed to parse lockfile: 'bun.lock'");
+    expect(err).toContain("warn: Ignoring lockfile");
+    expect(code).toBe(0);
+    // Resolved again: the version that both sides lock is lost.
+    expect(await file(join(String(dir), "bun.lock")).text()).toContain(`"kept": ["kept@1.1.0", `);
+  });
+
+  it("a frozen install fails on a lockfile that it cannot merge", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    files["bun.lock"] = files["bun.lock"].replace(">>>>>>> feature\n", "");
+    using dir = createProject(registry, files);
+
+    const { err, code } = await run(String(dir), "install", "--frozen-lockfile");
+    expect(err).toContain(
+      "note: bun.lock contains git merge conflict markers that bun cannot merge: the markers do not pair up\n",
+    );
+    expect(err).toContain("warn: Ignoring lockfile");
+    expect(err).toContain("error: lockfile had changes, but lockfile is frozen");
+    expect(code).toBe(1);
+    expect(await file(join(String(dir), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  it("keeps one declaration when a side moved a dependency to another group", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours has `shared` in "dependencies". Theirs moved it to "devDependencies" and to the next major.
+    using dir = createProject(registry, {
+      ...project({ shared: "^1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+${hunks.merge(
+  `      "dependencies": {\n        "shared": "^1.0.0",\n      },\n`,
+  `      "devDependencies": {\n        "shared": "^2.0.0",\n      },\n`,
+)}    },
+  },
+  "packages": {
+${hunks.merge(`${row("shared", "shared@1.0.1")}\n`, `${row("shared", "shared@2.0.0")}\n`)}  }
+}
+`,
+    });
+
+    // package.json kept what ours has. Ours locks 1.0.1, and the registry has 1.0.2.
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/shared"]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "shared": "^1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "shared": ["shared@1.0.1", "<registry>/shared-1.0.1.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("keeps the version of the side whose range package.json kept", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours adds `left`. Theirs moves `shared` to the next major, on the line after it.
+    using dir = createProject(registry, {
+      ...project({ left: "1.0.0", shared: "^1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${hunks.merge(`        "left": "1.0.0",\n        "shared": "^1.0.0",\n`, `        "shared": "^2.0.0",\n`)}      },
+    },
+  },
+  "packages": {
+${hunks.merge(
+  `${row("left", "left@1.0.0")}\n\n${row("shared", "shared@1.0.1")}\n`,
+  `${row("shared", "shared@2.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    // The resolver reads the manifest of a dependency before it takes a package for it.
+    expect(registry.manifestRequests()).toEqual(["/shared"]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "left": "1.0.0",
+              "shared": "^1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "left": ["left@1.0.0", "<registry>/left-1.0.0.tgz", {}, "<integrity>"],
+
+          "shared": ["shared@1.0.1", "<registry>/shared-1.0.1.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("keeps the version of the side whose catalog package.json kept", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({
+        name: "app",
+        workspaces: { packages: ["packages/*"], catalog: { shared: "^1.0.0" } },
+      }),
+      "packages/a/package.json": JSON.stringify({ name: "a", dependencies: { shared: "catalog:" } }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+    },
+    "packages/a": {
+      "name": "a",
+      "dependencies": {
+        "shared": "catalog:",
+      },
+    },
+  },
+  "catalog": {
+${hunks.merge(`    "shared": "^2.0.0",\n`, `    "shared": "^1.0.0",\n`)}  },
+  "packages": {
+    "a": ["a@workspace:packages/a"],
+
+${hunks.merge(`${row("shared", "shared@2.0.0")}\n`, `${row("shared", "shared@1.0.1")}\n`)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/shared"]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`"shared": "^1.0.0",`);
+    expect(lockfile).toContain(`"shared": ["shared@1.0.1", `);
+    expect(lockfile).not.toContain("shared@2.0.0");
+  });
+
+  it("takes what is below a path from the side whose package keeps the path", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours has `outer@1.0.0` with a `leaf@1.0.0` of its own, and `packs@1.0.0`, which has `leaf@1.0.0` in its tarball.
+    // Theirs has the next version of both. They take the `leaf@1.0.5` of the root.
+    using dir = createProject(registry, {
+      ...project({ leaf: "1.0.5", outer: "^1.0.0", packs: ">=1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "leaf": "1.0.5",
+        "outer": "^1.0.0",
+        "packs": ">=1.0.0",
+      },
+    },
+  },
+  "packages": {
+${row("leaf", "leaf@1.0.5")}
+
+${hunks.merge(
+  [
+    row("outer", "outer@1.0.0"),
+    row("outer/leaf", "leaf@1.0.0"),
+    row("packs", "packs@1.0.0", { dependencies: { leaf: "1.0.0" } }),
+    row("packs/leaf", "leaf@1.0.0", { bundled: true }),
+  ].join("\n\n") + "\n",
+  [row("outer", "outer@1.1.0"), row("packs", "packs@2.0.0")].join("\n\n") + "\n",
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "leaf": "1.0.5",
+              "outer": "^1.0.0",
+              "packs": ">=1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "leaf": ["leaf@1.0.5", "<registry>/leaf-1.0.5.tgz", {}, "<integrity>"],
+
+          "outer": ["outer@1.1.0", "<registry>/outer-1.1.0.tgz", { "dependencies": { "leaf": "^1.0.0" } }, "<integrity>"],
+
+          "packs": ["packs@2.0.0", "<registry>/packs-2.0.0.tgz", { "dependencies": { "leaf": "^1.0.5" } }, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("keeps what is below a package that lost its path", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours pins `outer` to 1.0.0, which has a `leaf@1.0.0` of its own. Theirs took the next version.
+    using dir = createProject(registry, {
+      ...project({ leaf: "1.0.5", outer: "1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "leaf": "1.0.5",
+${hunks.merge(`        "outer": "1.0.0",\n`, `        "outer": "^1.0.0",\n`)}      },
+    },
+  },
+  "packages": {
+${row("leaf", "leaf@1.0.5")}
+
+${hunks.merge(
+  `${row("outer", "outer@1.0.0")}\n\n${row("outer/leaf", "leaf@1.0.0")}\n`,
+  `${row("outer", "outer@1.1.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/outer"]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "leaf": "1.0.5",
+              "outer": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "leaf": ["leaf@1.0.5", "<registry>/leaf-1.0.5.tgz", {}, "<integrity>"],
+
+          "outer": ["outer@1.0.0", "<registry>/outer-1.0.0.tgz", { "dependencies": { "leaf": "^1.0.0" } }, "<integrity>"],
+
+          "outer/leaf": ["leaf@1.0.0", "<registry>/leaf-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("gives a dependency the version that its side locked, not the highest of the merge", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours: workspace `a` takes `shared@1.0.0` from the root. Theirs: the root has 2.0.0, and workspace `b` has 1.0.2.
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { "uses-new": "1.0.0" },
+      }),
+      "packages/a/package.json": JSON.stringify({ name: "a", dependencies: { shared: "^1.0.0" } }),
+      "packages/b/package.json": JSON.stringify({ name: "b", dependencies: { shared: "1.0.2" } }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+${hunks.merge(
+  `    },\n    "packages/a": {\n      "name": "a",\n      "dependencies": {\n        "shared": "^1.0.0",\n      },\n    },\n`,
+  `      "dependencies": {\n        "uses-new": "1.0.0",\n      },\n    },\n    "packages/b": {\n      "name": "b",\n      "dependencies": {\n        "shared": "1.0.2",\n      },\n    },\n`,
+)}  },
+  "packages": {
+${hunks.merge(
+  `    "a": ["a@workspace:packages/a"],\n\n${row("shared", "shared@1.0.0")}\n`,
+  `    "b": ["b@workspace:packages/b"],\n\n${row("b/shared", "shared@1.0.2")}\n\n${row("shared", "shared@2.0.0")}\n\n${row("uses-new", "uses-new@1.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "uses-new": "1.0.0",
+            },
+          },
+          "packages/a": {
+            "name": "a",
+            "dependencies": {
+              "shared": "^1.0.0",
+            },
+          },
+          "packages/b": {
+            "name": "b",
+            "dependencies": {
+              "shared": "1.0.2",
+            },
+          },
+        },
+        "packages": {
+          "a": ["a@workspace:packages/a"],
+
+          "b": ["b@workspace:packages/b"],
+
+          "shared": ["shared@1.0.0", "<registry>/shared-1.0.0.tgz", {}, "<integrity>"],
+
+          "uses-new": ["uses-new@1.0.0", "<registry>/uses-new-1.0.0.tgz", { "dependencies": { "shared": "2.0.0" } }, "<integrity>"],
+
+          "b/shared": ["shared@1.0.2", "<registry>/shared-1.0.2.tgz", {}, "<integrity>"],
+
+          "uses-new/shared": ["shared@2.0.0", "<registry>/shared-2.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("keeps the packages of a workspace that one side moved", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // Ours moved workspace `a` to packages/alpha. Theirs gave it the dependency `leaf`.
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({ name: "app", workspaces: ["packages/*"] }),
+      "packages/alpha/package.json": JSON.stringify({ name: "a", dependencies: { kept: "1.0.0", leaf: "^1.0.0" } }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+    },
+${hunks.merge(
+  `    "packages/alpha": {\n      "name": "a",\n      "dependencies": {\n        "kept": "1.0.0",\n      },\n    },\n`,
+  `    "packages/a": {\n      "name": "a",\n      "dependencies": {\n        "kept": "1.0.0",\n        "leaf": "^1.0.0",\n      },\n    },\n`,
+)}  },
+  "packages": {
+${hunks.merge(`    "a": ["a@workspace:packages/alpha"],\n`, `    "a": ["a@workspace:packages/a"],\n`)}
+${row("kept", "kept@1.0.0")}
+
+${row("leaf", "leaf@1.0.0")}
+  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    // The dependencies of a workspace that changed are resolved again, and take what the lockfile has.
+    expect(registry.manifestRequests()).toEqual(["/kept", "/leaf"]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`"a": ["a@workspace:packages/alpha"],`);
+    expect(lockfile).toContain(`"leaf": ["leaf@1.0.0", `);
+  });
+
+  it("does not take the alias of an override for one package as the alias of all", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    const hasLeaf = row("has-leaf", "has-leaf@1.0.0") + "\n";
+    const overrides = { "has-leaf": { leaf: "npm:real@^1.0.0" } };
+    // The `leaf` of `has-leaf` is `real`. git lost the row of the `leaf` that workspace `a` asks for.
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { "has-leaf": "1.0.0" },
+        overrides,
+      }),
+      "packages/a/package.json": JSON.stringify({ name: "a", dependencies: { leaf: "^1.0.0" } }),
+      "bun.lock": `{
+  "lockfileVersion": 3,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "has-leaf": "1.0.0",
+      },
+    },
+    "packages/a": {
+      "name": "a",
+      "dependencies": {
+        "leaf": "^1.0.0",
+      },
+    },
+  },
+  "overrides": {
+    "has-leaf": {
+      "leaf": "npm:real@^1.0.0",
+    },
+  },
+  "packages": {
+    "a": ["a@workspace:packages/a"],
+
+${hunks.same(hasLeaf)}
+${row("leaf", "real@1.0.0")}
+  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/leaf"]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    // The `leaf` of the workspace is at the root now, so the one of `has-leaf` is below `has-leaf`.
+    expect(lockfile).toContain(`"leaf": ["leaf@1.0.5", `);
+    expect(lockfile).toContain(`"has-leaf/leaf": ["real@1.0.0", `);
+  });
+
+  it("resolves a dependency on a workspace that the merge does not list", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    const kept = row("kept", "kept@1.0.0") + "\n";
+    // git took the dependency on `b` from one side and lost the workspace itself: 2 of 134 merges of bun's own lockfiles.
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { b: "workspace:*", kept: "^1.0.0" },
+      }),
+      "packages/b/package.json": JSON.stringify({ name: "b", version: "1.0.0", dependencies: { left: "1.0.0" } }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "b": "workspace:*",
+        "kept": "^1.0.0",
+      },
+    },
+  },
+  "packages": {
+${hunks.same(kept)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/left"]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`"b": ["b@workspace:packages/b"],`);
+    expect(lockfile).toContain(`"kept": ["kept@1.0.0", `);
+    expect(lockfile).toContain(`"left": ["left@1.0.0", `);
+  });
+
+  it("merges scoped packages", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    using dir = createProject(registry, {
+      ...project({ "uses-scoped-new": "1.0.0", "uses-scoped-old": "1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${hunks.merge(`        "uses-scoped-new": "1.0.0",\n`, `        "uses-scoped-old": "1.0.0",\n`)}      },
+    },
+  },
+  "packages": {
+${hunks.merge(
+  `${row("@scope/shared", "@scope/shared@2.0.0")}\n\n${row("uses-scoped-new", "uses-scoped-new@1.0.0")}\n`,
+  `${row("@scope/shared", "@scope/shared@1.0.0")}\n\n${row("uses-scoped-old", "uses-scoped-old@1.0.0")}\n`,
+)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "uses-scoped-new": "1.0.0",
+              "uses-scoped-old": "1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "@scope/shared": ["@scope/shared@2.0.0", "<registry>/@scope/shared-2.0.0.tgz", {}, "<integrity>"],
+
+          "uses-scoped-new": ["uses-scoped-new@1.0.0", "<registry>/uses-scoped-new-1.0.0.tgz", { "dependencies": { "@scope/shared": "2.0.0" } }, "<integrity>"],
+
+          "uses-scoped-old": ["uses-scoped-old@1.0.0", "<registry>/uses-scoped-old-1.0.0.tgz", { "dependencies": { "@scope/shared": "1.0.0" } }, "<integrity>"],
+
+          "uses-scoped-old/@scope/shared": ["@scope/shared@1.0.0", "<registry>/@scope/shared-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("does not leave a range with the tarball that another dependency has at the path", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    const tarball = `${registry.origin}/shared-2.0.0.tgz`;
+    const kept = row("kept", "kept@1.0.0") + "\n";
+    // The root takes `shared` from a tarball. git put `uses-old` next to it, and that looks for `shared@1.0.0` at the same path.
+    using dir = createProject(registry, {
+      ...project({ "kept": "1.0.0", "shared": tarball, "uses-old": "1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "kept": "1.0.0",
+        "shared": "${tarball}",
+        "uses-old": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+${hunks.same(kept)}
+    "shared": ["shared@${tarball}", {}, "${integrity.get("shared@2.0.0")}"],
+
+${row("uses-old", "uses-old@1.0.0")}
+  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/shared"]);
+    const lockfile = await savedLockfile(registry, dir);
+    expect(lockfile).toContain(`"shared": ["shared@<registry>/shared-2.0.0.tgz", `);
+    expect(lockfile).toContain(`"uses-old/shared": ["shared@1.0.0", `);
+  });
+
+  it("does not let a peer dependency speak for a dependency of the same name", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    const kept = row("kept", "kept@1.0.0") + "\n";
+    // git left `shared@2.0.0` for a root that asks for ^1.0.0. The range of the peer takes 2.0.0.
+    const manifest = {
+      name: "app",
+      dependencies: { kept: "1.0.0" },
+      devDependencies: { shared: "^1.0.0" },
+      peerDependencies: { shared: ">=1.0.0" },
+    };
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify(manifest),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "kept": "1.0.0",
+      },
+      "devDependencies": {
+        "shared": "^1.0.0",
+      },
+      "peerDependencies": {
+        "shared": ">=1.0.0",
+      },
+    },
+  },
+  "packages": {
+${hunks.same(kept)}
+${row("shared", "shared@2.0.0")}
+  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/shared"]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`"shared": ["shared@1.0.2", `);
+    expect(lockfile).not.toContain("shared@2.0.0");
+  });
+
+  it("resolves the dependencies of a package that the resolver takes from the merge", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    // git took the `helper@2.0.0` of theirs, so the `tool@1.0.0` of ours has no `helper` that fits.
+    // package.json has a new dependency that needs just that `tool@1.0.0`.
+    using dir = createProject(registry, {
+      ...project({ "needs-old-tool": "1.0.0", "tool": "^1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "tool": "^1.0.0",
+      },
+    },
+  },
+  "packages": {
+${row("helper", "helper@2.0.0")}
+
+${hunks.merge(`${row("tool", "tool@1.0.0")}\n`, `${row("tool", "tool@1.1.0")}\n`)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install", "--lockfile-only");
+    expect(registry.manifestRequests()).toEqual(["/helper", "/needs-old-tool", "/tool"]);
+    expect(await savedLockfile(registry, dir)).toMatchInlineSnapshot(`
+      "{
+        "lockfileVersion": 2,
+        "configVersion": 1,
+        "workspaces": {
+          "": {
+            "name": "app",
+            "dependencies": {
+              "needs-old-tool": "1.0.0",
+              "tool": "^1.0.0",
+            },
+          },
+        },
+        "packages": {
+          "helper": ["helper@2.0.0", "<registry>/helper-2.0.0.tgz", {}, "<integrity>"],
+
+          "needs-old-tool": ["needs-old-tool@1.0.0", "<registry>/needs-old-tool-1.0.0.tgz", { "dependencies": { "tool": "1.0.0" } }, "<integrity>"],
+
+          "tool": ["tool@1.1.0", "<registry>/tool-1.1.0.tgz", { "dependencies": { "helper": "^2.0.0" } }, "<integrity>"],
+
+          "needs-old-tool/tool": ["tool@1.0.0", "<registry>/tool-1.0.0.tgz", { "dependencies": { "helper": "^1.0.0" } }, "<integrity>"],
+
+          "needs-old-tool/tool/helper": ["helper@1.0.0", "<registry>/helper-1.0.0.tgz", {}, "<integrity>"],
+        }
+      }
+      "
+    `);
+  });
+
+  it("keeps the configVersion of the sides, and the linker that comes with it", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    using dir = tempDir("bun-lock-conflict-", {
+      "package.json": JSON.stringify({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { kept: "^1.0.0", left: "1.0.0", right: "1.0.0" },
+      }),
+      "packages/a/package.json": JSON.stringify({ name: "a" }),
+      // No linker here. With workspaces, configVersion 1 takes the isolated one.
+      "bunfig.toml": Bun.TOML.stringify({ install: { registry: registry.url } }),
+      "bun.lock": `{
+  "lockfileVersion": 2,
+  "configVersion": 0,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "kept": "^1.0.0",
+${hunks.merge(`        "left": "1.0.0",\n`, `        "right": "1.0.0",\n`)}      },
+    },
+    "packages/a": {
+      "name": "a",
+    },
+  },
+  "packages": {
+    "a": ["a@workspace:packages/a"],
+
+${row("kept", "kept@1.0.0")}
+${hunks.merge(`\n${row("left", "left@1.0.0")}\n`, `\n${row("right", "right@1.0.0")}\n`)}  }
+}
+`,
+    });
+
+    await succeed(String(dir), "install");
+    expect(await file(join(String(dir), "bun.lock")).text()).toContain(`  "configVersion": 0,\n`);
+    expect(await exists(join(String(dir), "node_modules", "kept", "package.json"))).toBe(true);
+    expect(await exists(join(String(dir), "node_modules", ".bun"))).toBe(false);
+  });
+
+  it("leaves alone what a range cannot answer", async () => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    const kept = row("kept", "kept@1.0.0") + "\n";
+    // `uses-alias-name` asks for `aliased@^2.0.0` and gets `real@2.0.0` through the alias of the root.
+    // `has-optional` finds `shared@2.0.0` where it looks for its optional `shared@^1.0.0`, and the lockfile has no other.
+    // `has-peer` is bound to the `shared@2.0.0` that is there for its peer `shared@^5.0.0`.
+    const dependencies = {
+      "aliased": "npm:real@^2.0.0",
+      "has-optional": "1.0.0",
+      "has-peer": "1.0.0",
+      "kept": "1.0.0",
+      "shared": "2.0.0",
+      "uses-alias-name": "1.0.0",
+    };
+    const lockfile = (keptRow: string) => `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+${Object.entries(dependencies)
+  .map(([name, range]) => `        "${name}": "${range}",\n`)
+  .join("")}      },
+    },
+  },
+  "packages": {
+${row("aliased", "real@2.0.0")}
+
+${row("has-optional", "has-optional@1.0.0")}
+
+${row("has-peer", "has-peer@1.0.0")}
+
+${keptRow}
+${row("shared", "shared@2.0.0")}
+
+${row("uses-alias-name", "uses-alias-name@1.0.0")}
+  }
+}
+`;
+    using merged = createProject(registry, { ...project(dependencies), "bun.lock": lockfile(hunks.same(kept)) });
+    using clean = createProject(registry, { ...project(dependencies), "bun.lock": lockfile(kept) });
+
+    // With this linker each package has a node_modules of its own, with a link for each dependency that has a package.
+    const linked = async (dir: string) => {
+      await succeed(dir, "install", "--linker=isolated");
+      const dependencyOf = async (name: string, dependency: string) => {
+        const own = join(await realpath(join(dir, "node_modules", name)), "..", dependency, "package.json");
+        if (!(await exists(own))) return "none";
+        const { name: linkedName, version } = await file(own).json();
+        return `${linkedName}@${version}`;
+      };
+      return {
+        alias: await dependencyOf("uses-alias-name", "aliased"),
+        optional: await dependencyOf("has-optional", "shared"),
+        peer: await dependencyOf("has-peer", "shared"),
+      };
+    };
+    const [fromMerge, fromClean] = await Promise.all([linked(String(merged)), linked(String(clean))]);
+    expect(fromClean).toEqual({ alias: "real@2.0.0", optional: "shared@2.0.0", peer: "shared@2.0.0" });
+    expect(fromMerge).toEqual(fromClean);
+    expect(registry.manifestRequests()).toEqual([]);
+    expect(await file(join(String(merged), "bun.lock")).text()).not.toContain("<<<<<<<");
+  });
+
+  type Rows = Record<"kept" | "left" | "right", string>;
+  it.each([
+    [
+      "a side that has nothing",
+      ({ kept, left, right }: Rows) => `  "packages": {\n${kept}\n\n${left}\n${hunks.merge("", `\n${right}\n`)}  }\n`,
+    ],
+    [
+      'the line that opens "packages"',
+      ({ kept, left, right }: Rows) =>
+        hunks.diff3(
+          `  "packages": {\n${kept}\n\n${left}\n  }\n`,
+          `  "packages": {\n${kept}\n\n${right}\n  }\n`,
+          `  "packages": {}\n`,
+        ),
+    ],
+  ])("reads a hunk with %s", async (_, packages) => {
+    using registry = serveRegistry();
+    const { row } = registry;
+    const files = twoBranchesAddADependency(registry);
+    const head = files["bun.lock"].slice(0, files["bun.lock"].indexOf(`  "packages": {\n`));
+    const rows = {
+      kept: row("kept", "kept@1.0.0"),
+      left: row("left", "left@1.0.0"),
+      right: row("right", "right@1.0.0"),
+    };
+    files["bun.lock"] = `${head}${packages(rows)}}\n`;
+    using dir = createProject(registry, files);
+
+    const { err } = await succeed(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(mergedNote);
+    expect(registry.manifestRequests()).toEqual([]);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).toContain(`"kept": ["kept@1.0.0", `);
+    expect(lockfile).toContain(`"left": ["left@1.0.0", `);
+    expect(lockfile).toContain(`"right": ["right@1.0.0", `);
+  });
+
+  it("bun install --lockfile-only saves the merge with --dry-run too, and says nothing else", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    using dir = createProject(registry, files);
+
+    const { err } = await succeed(String(dir), "install", "--lockfile-only", "--dry-run");
+    expect(err).toContain(mergedNote);
+    expect(await file(join(String(dir), "bun.lock")).text()).not.toContain("<<<<<<<");
+  });
+
+  it("bun install --silent merges and says nothing", async () => {
+    using registry = serveRegistry();
+    const files = twoBranchesAddADependency(registry);
+    using dir = createProject(registry, files);
+    using frozen = createProject(registry, files);
+
+    const [merged, refused] = await Promise.all([
+      run(String(dir), "install", "--silent", "--lockfile-only"),
+      run(String(frozen), "install", "--silent", "--frozen-lockfile"),
+    ]);
+    expect(merged).toEqual({ out: "", err: "", code: 0 });
+    expect(await file(join(String(dir), "bun.lock")).text()).toContain(`"right": ["right@1.0.0", `);
+    expect(refused).toEqual({ out: "", err: "", code: 1 });
+    expect(await file(join(String(frozen), "bun.lock")).text()).toBe(files["bun.lock"]);
+  });
+
+  it.each([
+    [["add", "extra@1.0.0"], ["/extra"], { extra: "1.0.0", kept: "1.0.0", left: "1.0.0", right: "1.0.0" }],
+    [["remove", "left"], [], { kept: "1.0.0", right: "1.0.0" }],
+    [["update", "kept"], ["/kept"], { kept: "1.1.0", left: "1.0.0", right: "1.0.0" }],
+    [["update", "--recursive"], ["/kept", "/left", "/right"], { kept: "1.1.0", left: "1.0.0", right: "1.0.0" }],
+  ])("bun %p works on the merge", async (args, requests, versions) => {
+    using registry = serveRegistry();
+    using dir = createProject(registry, twoBranchesAddADependency(registry));
+
+    const { err } = await succeed(String(dir), ...args, "--lockfile-only");
+    expect(err.split("\n").filter(line => line.startsWith("note: "))).toEqual([mergedNote.trimEnd()]);
+    expect(registry.manifestRequests()).toEqual(requests);
+    const lockfile = await file(join(String(dir), "bun.lock")).text();
+    expect(lockfile).not.toContain("<<<<<<<");
+    const locked = Object.fromEntries(
+      [...lockfile.matchAll(/^    "([^"]+)": \["[^"]+@([^"@]+)", /gm)].map(([, name, version]) => [name, version]),
+    );
+    expect(locked).toEqual(versions);
+  });
+
+  it("does not merge a lockfile of an earlier format that lacks a workspace", async () => {
+    using registry = serveRegistry();
+    // lockfileVersion 0 has the workspaces in "packages" only.
+    using dir = createProject(registry, {
+      "package.json": JSON.stringify({ name: "app", version: "1.0.0", workspaces: ["packages/*"] }),
+      "packages/a/package.json": JSON.stringify({ name: "a", version: "1.0.0" }),
+      "bun.lock": `{
+  "lockfileVersion": 0,
+  "workspaces": {
+    "": {
+      "name": "app",
+    },
+    "packages/a": {
+      "name": "a",
+    },
+  },
+  "packages": {
+${hunks.merge("", "")}  }
+}
+`,
+    });
+
+    const { err, code } = await run(String(dir), "install", "--lockfile-only");
+    expect(err).toContain(
+      "note: bun.lock contains git merge conflict markers that bun cannot merge: a workspace has no package on either side\n",
+    );
+    expect(err).toContain("warn: Ignoring lockfile");
+    expect(code).toBe(0);
+    expect(await file(join(String(dir), "bun.lock")).text()).toContain(`"a": ["a@workspace:packages/a"],`);
+  });
+
+  // The loader takes a dependency without a package only from a merge. Without markers it is an error, as before.
+  it.each([
+    ["a package", `"uses-old": [`, `"shared": [`, "Failed to resolve prod dependency 'shared' for package 'uses-old'"],
+    ["a workspace", `"a": [`, `"kept": [`, "Failed to resolve prod dependency 'kept' for package 'a'"],
+  ])(
+    "a lockfile without markers still fails on a dependency of %s that has no package",
+    async (_, __, lost, message) => {
+      using registry = serveRegistry();
+      const { row } = registry;
+      const lockfile = `{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "uses-old": "1.0.0",
+      },
+    },
+    "packages/a": {
+      "name": "a",
+      "dependencies": {
+        "kept": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "a": ["a@workspace:packages/a"],
+
+${row("kept", "kept@1.0.0")}
+
+${row("shared", "shared@1.0.0")}
+
+${row("uses-old", "uses-old@1.0.0")}
+  }
+}
+`;
+      const damaged = lockfile
+        .split("\n")
+        .filter(line => !line.startsWith(`    ${lost}`))
+        .join("\n");
+      expect(damaged).not.toBe(lockfile);
+      using dir = createProject(registry, {
+        "package.json": JSON.stringify({
+          name: "app",
+          workspaces: ["packages/*"],
+          dependencies: { "uses-old": "1.0.0" },
+        }),
+        "packages/a/package.json": JSON.stringify({ name: "a", dependencies: { kept: "1.0.0" } }),
+        "bun.lock": damaged,
+      });
+
+      const { err, code } = await run(String(dir), "install", "--frozen-lockfile");
+      expect(err).toContain(`error: ${message}\n`);
+      expect(err).toContain("failed to parse lockfile: 'bun.lock'");
+      expect(err).toContain("warn: Ignoring lockfile");
+      expect(err).toContain("error: lockfile had changes, but lockfile is frozen");
+      expect(code).toBe(1);
+      expect(registry.requests).toEqual([]);
+    },
+  );
 });

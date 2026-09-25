@@ -1660,6 +1660,15 @@ pub enum ParseError {
 
 bun_core::oom_from_alloc!(ParseError);
 
+/// What the loader does with a required dependency that has no row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadMode {
+    /// Fail the load. Every lockfile that bun wrote has the row.
+    Strict,
+    /// Leave the dependency unbound (`merge_conflict` binds it or hands it to the resolver).
+    Recover,
+}
+
 type PkgPathSet = PkgMap<()>;
 
 struct PkgMap<T> {
@@ -1845,6 +1854,7 @@ pub(crate) fn parse_into_binary_lockfile(
     source: &bun_ast::Source,
     log: &mut bun_ast::Log,
     mut manager: Option<&mut PackageManager>,
+    mode: LoadMode,
 ) -> Result<(), ParseError> {
     lockfile.init_empty();
 
@@ -3091,7 +3101,7 @@ pub(crate) fn parse_into_binary_lockfile(
                 let Some(res_id) =
                     peer_res_id.or_else(|| pkg_map.get(dep.name.slice(string_buf)).copied())
                 else {
-                    if may_stay_unresolved(dep) {
+                    if may_stay_unresolved(dep) || mode == LoadMode::Recover {
                         continue;
                     }
                     dependency_resolution_failure(
@@ -3158,7 +3168,7 @@ pub(crate) fn parse_into_binary_lockfile(
                             .or_else(|| pkg_map.get(dep_name))
                             .copied()
                     }) else {
-                        if may_stay_unresolved(dep) {
+                        if may_stay_unresolved(dep) || mode == LoadMode::Recover {
                             continue;
                         }
                         dependency_resolution_failure(
@@ -3235,7 +3245,7 @@ pub(crate) fn parse_into_binary_lockfile(
                                 return Err(ParseError::InvalidPackageKey);
                             }
                             Err(ResolveError::Unresolvable) => {
-                                if may_stay_unresolved(dep) {
+                                if may_stay_unresolved(dep) || mode == LoadMode::Recover {
                                     continue 'deps;
                                 }
                                 dependency_resolution_failure(

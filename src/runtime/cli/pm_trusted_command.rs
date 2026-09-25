@@ -259,6 +259,8 @@ impl TrustCommand {
         let pm_raw: *mut PackageManager = pm;
         let log_level = pm.options.log_level;
         let load_lockfile = pm.load_lockfile_from_cwd::<true>();
+        // `save_to_disk` below would save a merge that no install has compared with package.json.
+        bun_install::lockfile::merge_conflict::exit_if_merged(&load_lockfile, log_level);
         PackageManagerCommand::handle_load_lockfile_errors_for(&load_lockfile, log_level, "trust");
         // `update_lockfile_if_needed` consumes `LoadResult` but we
         // need it again for `save_to_disk`; inline the body (it only flips

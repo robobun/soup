@@ -758,6 +758,29 @@ fn resolve_from_appended_task(
     Some(pkg_id)
 }
 
+/// Whether a plain dependency takes the package of an `npm:` alias of its own name: its range
+/// accepts the version at one end of a comparator of the alias.
+pub(crate) fn follows_npm_alias(
+    range: &Semver::semver_query::Group,
+    alias: &Semver::semver_query::Group,
+    buf: &[u8],
+) -> bool {
+    let mut curr_list: Option<&Semver::semver_query::List> = Some(&alias.head);
+    while let Some(queries) = curr_list {
+        let mut curr: Option<&Semver::Query> = Some(&queries.head);
+        while let Some(query) = curr {
+            if range.satisfies(query.range.left.version, buf, buf)
+                || range.satisfies(query.range.right.version, buf, buf)
+            {
+                return true;
+            }
+            curr = query.next.as_deref();
+        }
+        curr_list = queries.next.as_deref();
+    }
+    false
+}
+
 /// Q: "What do we do with a dependency in a package.json?"
 /// A: "We enqueue it!"
 pub fn enqueue_dependency_with_main_and_success_fn(
@@ -801,25 +824,16 @@ pub fn enqueue_dependency_with_main_and_success_fn(
             && !dependency.version.npm().is_alias
         {
             if let Some(aliased) = this.known_npm_aliases.get(&name_hash) {
-                let group = &dependency.version.npm().version;
                 let buf = this.lockfile.buffers.string_bytes.as_slice();
                 // SAFETY: `aliased` is always tag == Npm (known_npm_aliases only stores npm versions).
-                let mut curr_list: Option<&Semver::semver_query::List> =
-                    Some(&aliased.npm().version.head);
-                while let Some(queries) = curr_list {
-                    let mut curr: Option<&Semver::Query> = Some(&queries.head);
-                    while let Some(query) = curr {
-                        if group.satisfies(query.range.left.version, buf, buf)
-                            || group.satisfies(query.range.right.version, buf, buf)
-                        {
-                            name = aliased.npm().name;
-                            name_hash =
-                                Semver::string::Builder::string_hash(this.lockfile.str(&name));
-                            break 'version aliased.clone();
-                        }
-                        curr = query.next.as_deref();
-                    }
-                    curr_list = queries.next.as_deref();
+                if follows_npm_alias(
+                    &dependency.version.npm().version,
+                    &aliased.npm().version,
+                    buf,
+                ) {
+                    name = aliased.npm().name;
+                    name_hash = Semver::string::Builder::string_hash(this.lockfile.str(&name));
+                    break 'version aliased.clone();
                 }
 
                 // fallthrough. a package that matches the name of an alias but does not match

@@ -170,7 +170,11 @@ impl PackageManagerCommand {
                 }
                 Global::exit(1);
             }
-            LoadResult::Ok(_) => {}
+            LoadResult::Ok(loaded) => {
+                if loaded.merged_conflict {
+                    bun_install::lockfile::merge_conflict::note_merged_for_reading(log_level);
+                }
+            }
         }
     }
 
