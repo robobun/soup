@@ -552,6 +552,7 @@ fn migrate_npm_lockfile(
         migrated: Migrated::Npm,
         serializer_result: Default::default(),
         format: LockfileFormat::Binary,
+        merged_conflict: false,
     }))
 }
 

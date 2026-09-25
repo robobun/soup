@@ -159,6 +159,10 @@ impl AuditCommand {
         {
             let log_level = manager.options.log_level;
             let load_lockfile = manager.load_lockfile_from_cwd::<true>();
+            if fix {
+                // The fixes are planned on the packages of this load, by their number.
+                bun_install::lockfile::merge_conflict::exit_if_merged(&load_lockfile, log_level);
+            }
             PackageManagerCommand::handle_load_lockfile_errors_for(
                 &load_lockfile,
                 log_level,
