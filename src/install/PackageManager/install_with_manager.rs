@@ -89,10 +89,12 @@ pub fn install_with_manager(
     }
 
     let load_result = if manager.options.do_.load_lockfile() {
-        manager.load_lockfile_from_cwd::<true>()
+        manager.load_lockfile_from_cwd_for_install()
     } else {
         lockfile::LoadResult::NotFound
     };
+    let merged_conflict =
+        matches!(&load_result, lockfile::LoadResult::Ok(ok) if ok.merged_conflict);
 
     update_lockfile_if_needed(manager, &load_result)?;
 
@@ -115,6 +117,7 @@ pub fn install_with_manager(
         Enable::FORCE_SAVE_LOCKFILE,
         manager.options.enable.force_save_lockfile()
             || changed_config_version
+            || merged_conflict
             || matches!(
                 &load_result,
                 lockfile::LoadResult::Ok(ok)
@@ -128,6 +131,9 @@ pub fn install_with_manager(
 
     if manager.subcommand == Subcommand::Dedupe {
         crate::dedupe::dedupe_before_install(manager, &load_result)?;
+    }
+    if merged_conflict {
+        report_merged_conflict(manager, log_level);
     }
 
     let bare_update =
@@ -600,6 +606,7 @@ pub fn install_with_manager(
 
     let named_update = manager.to_update && !manager.update_requests.is_empty();
     let mut named = NamedUpdates::default();
+    let mut open_edges = OpenEdges::default();
     if !needs_new_lockfile {
         if named_update {
             named = enqueue_named_updates(
@@ -610,6 +617,9 @@ pub fn install_with_manager(
         }
         if !manager.audit_fix_pins.is_empty() {
             crate::audit_fix::enqueue_planned_fixes(manager)?;
+        }
+        if merged_conflict {
+            open_edges.enqueue(manager);
         }
     }
 
@@ -658,6 +668,9 @@ pub fn install_with_manager(
         || moved_direct.is_some()
     {
         resolve_pending_tasks(manager, &root, log_level, &mut named, moved_direct)?;
+    }
+    if merged_conflict && !needs_new_lockfile {
+        open_edges.resolve_rest(manager)?;
     }
 
     if manager.summary.changes_resolutions()
@@ -1713,6 +1726,83 @@ fn report_lockfile_load_error(
         Global::crash();
     }
     Ok(())
+}
+
+/// `bun.lock` held git conflict markers and the lockfile in memory is the merge of both sides.
+#[cold]
+#[inline(never)]
+fn report_merged_conflict(manager: &mut PackageManager, log_level: Options::LogLevel) {
+    // A command that read the lockfile before this install has the id from a merge that was loaded for reading.
+    manager.root_package_id.id = None;
+    // The merge can equal what a save would write, so the frozen check further down cannot see it.
+    if manager.options.enable.frozen_lockfile() {
+        if log_level != Options::LogLevel::Silent {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r><d>:<r> bun.lock contains git merge conflict markers, but lockfile is frozen"
+            );
+            bun_core::note!(
+                "run <b>bun install<r> to merge both sides, then commit the updated bun.lock"
+            );
+        }
+        Global::crash();
+    }
+    if log_level == Options::LogLevel::Silent {
+        return;
+    }
+    // Said before the install can fail: what is loaded, not that the file is saved.
+    if manager.options.do_.save_lockfile() {
+        bun_core::note!(
+            "bun.lock contains git merge conflict markers, using the merge of both sides"
+        );
+    } else {
+        bun_core::note!(
+            "bun.lock contains git merge conflict markers, using the merge of both sides. bun.lock is not saved"
+        );
+    }
+}
+
+/// The dependencies of a merged `bun.lock` that have a package on neither side.
+#[derive(Default)]
+struct OpenEdges {
+    enqueued: bun_collections::HashMap<DependencyID, ()>,
+}
+
+impl OpenEdges {
+    /// Hands them to the resolver, each one once. `false` when there is no new one.
+    #[cold]
+    #[inline(never)]
+    fn enqueue(&mut self, manager: &mut PackageManager) -> bool {
+        let mut any = false;
+        for dep_id in lockfile::merge_conflict::open_edges_of(&manager.lockfile) {
+            if self.enqueued.insert(dep_id, ()).is_some() {
+                continue;
+            }
+            any = true;
+            let dependency = manager.lockfile.buffers.dependencies[dep_id as usize].clone();
+            if let Err(err) = enqueue_dependency_with_main(
+                manager,
+                dep_id,
+                &dependency,
+                invalid_package_id,
+                false,
+            ) {
+                add_dependency_error(manager, &dependency, err);
+            }
+        }
+        any
+    }
+
+    /// The resolver takes a package of the lockfile as it is. In a merge that package can have
+    /// a dependency without a package, and it counts once the resolver has reached the package.
+    #[cold]
+    #[inline(never)]
+    fn resolve_rest(&mut self, manager: &mut PackageManager) -> crate::Result<()> {
+        while self.enqueue(manager) {
+            manager.drain_dependency_list();
+            wait_for_resolution(manager)?;
+        }
+        Ok(())
+    }
 }
 
 /// Root first, so that later rows dedupe onto what its rows append. Rows in no list are skipped.

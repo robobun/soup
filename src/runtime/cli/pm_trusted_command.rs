@@ -423,6 +423,8 @@ impl TrustCommand {
         let dry_run = pm.options.dry_run;
         let max_concurrent = pm.options.max_concurrent_lifecycle_scripts;
         let load_lockfile = pm.load_lockfile_from_cwd::<true>();
+        // `save_to_disk` below would save a merge that no install has compared with package.json.
+        bun_install::lockfile::merge_conflict::exit_if_merged(&load_lockfile, log_level);
         PackageManagerCommand::handle_load_lockfile_errors_for(&load_lockfile, log_level, "trust");
         let linker = load_lockfile.node_linker(&pm.lockfile, pm.options.node_linker);
         update_lockfile_if_needed(pm, &load_lockfile)?;
