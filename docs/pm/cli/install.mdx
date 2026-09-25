@@ -178,6 +178,8 @@ Bun does not enable `--frozen-lockfile` automatically in CI; pass the flag or us
 
 To validate the lockfile without installing, use `bun install --frozen-lockfile --dry-run`.
 
+A `bun.lock` with git conflict markers fails `--frozen-lockfile`. Run `bun install` to [merge both sides](/pm/lockfile#merge-conflicts), then commit the lockfile.
+
 ### Offline installs
 
 With a warm cache, `bun install` can run without the network:

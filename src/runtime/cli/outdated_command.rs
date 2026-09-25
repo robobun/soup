@@ -166,10 +166,15 @@ impl OutdatedCommand {
                 }
                 Global::crash();
             }
-            LoadResult::Ok(_) => {
+            LoadResult::Ok(loaded) => {
                 // `load_from_cwd(&mut self, ..)` populates the
                 // lockfile in place, so the `ok.lockfile: &mut Lockfile` reborrow
                 // is the same storage and no reassignment is needed.
+                if loaded.merged_conflict {
+                    bun_install::lockfile::merge_conflict::note_merged_for_reading(
+                        manager.options.log_level,
+                    );
+                }
             }
         }
 
