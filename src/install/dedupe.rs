@@ -653,6 +653,16 @@ pub fn dedupe_before_install(
             }
             Global::crash();
         }
+        LoadResult::Ok(loaded) if loaded.merged_conflict => {
+            if !quiet {
+                Output::err_generic(
+                    "bun.lock contains git merge conflict markers, nothing to dedupe",
+                    (),
+                );
+                bun_core::note!("run 'bun install' first");
+            }
+            Global::exit(1);
+        }
         LoadResult::Ok(_) => {}
     }
 

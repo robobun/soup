@@ -1629,6 +1629,7 @@ pub(crate) fn migrate_pnpm_lockfile<'a>(
         migrated: lockfile::Migrated::Pnpm,
         serializer_result: Default::default(),
         format: lockfile::Format::Text,
+        merged_conflict: false,
     }))
 }
 
