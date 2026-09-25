@@ -1457,6 +1457,7 @@ pub(crate) fn migrate_yarn_berry_lockfile<'a>(
         migrated: lockfile::Migrated::Yarn,
         serializer_result: Default::default(),
         format: lockfile::Format::Text,
+        merged_conflict: false,
     }))
 }
 

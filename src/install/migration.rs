@@ -187,6 +187,7 @@ pub fn detect_and_load_other_lockfile<'a>(
                     migrated,
                     serializer_result: Default::default(),
                     format,
+                    merged_conflict: false,
                 });
             }
             Err(err) => err,
@@ -561,6 +562,7 @@ fn migrate_npm_lockfile<'a>(
         migrated: Migrated::Npm,
         serializer_result: Default::default(),
         format: LockfileFormat::Binary,
+        merged_conflict: false,
     }))
 }
 

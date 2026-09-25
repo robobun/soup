@@ -184,6 +184,8 @@ If the project has a `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml` but n
 
 To validate the lockfile without installing, use `bun install --frozen-lockfile --dry-run`. The command exits with an error if `package.json` disagrees with `bun.lock`, and it does not run lifecycle scripts.
 
+A `bun.lock` with git conflict markers fails `--frozen-lockfile`. Run `bun install` to [merge both sides](/pm/lockfile#merge-conflicts), then commit the lockfile.
+
 ### Offline installs
 
 With a warm cache, `bun install` can run without the network:
