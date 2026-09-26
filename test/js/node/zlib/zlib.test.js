@@ -1,6 +1,6 @@
 import { deflateSync, gunzipSync, gzipSync, inflateSync } from "bun";
 import { describe, expect, it } from "bun:test";
-import { tmpdirSync } from "harness";
+import { bunEnv, bunExe, tmpdirSync } from "harness";
 import * as buffer from "node:buffer";
 import { randomFillSync } from "node:crypto";
 import * as fs from "node:fs";
@@ -502,11 +502,8 @@ for (const [compress, decompressor] of [
     },
   ];
   for (const i in variants) {
-    let should_skip = false;
-    if (decompressor === zlib.createZstdDecompress && i == 1) should_skip = true; // fails in node too
-    if (decompressor === zlib.createZstdDecompress && i == 2) should_skip = true; // fails in node too
     // prettier-ignore
-    it.skipIf(should_skip)(`premature end handles bytesWritten properly: ${compress.name} + ${decompressor.name}: variant ${i}`, async () => {
+    it(`premature end handles bytesWritten properly: ${compress.name} + ${decompressor.name}: variant ${i}`, async () => {
       const variant = variants[i];
       const { promise, resolve, reject } = Promise.withResolvers();
       let output = "";
@@ -660,6 +657,131 @@ describe("zlib.zstd", () => {
     const f1 = zlib.zstdCompressSync(Buffer.from("first\n"));
     const f2 = zlib.zstdCompressSync(Buffer.from("second\n"));
     expect(zlib.zstdDecompressSync(Buffer.concat([f1, f2])).toString()).toBe("first\nsecond\n");
+  });
+
+  // node:zlib/iter needs a flag, so it runs in a child. `chunks` is the source
+  // text of an array of buffers. Both transforms decode it, and each gives its
+  // output or its error.
+  async function decodeWithIter(chunks) {
+    const script = `
+      const { bytes, bytesSync, from, fromSync, pull, pullSync } = require("node:stream/iter");
+      const { decompressZstd, decompressZstdSync } = require("node:zlib/iter");
+      const { zstdCompressSync } = require("node:zlib");
+      const chunks = ${chunks};
+      const result = decode => decode().then(
+        output => ({ output: Buffer.from(output).toString() }),
+        err => ({ message: err.message, code: err.code, errno: err.errno }),
+      );
+      (async () => {
+        console.log(JSON.stringify({
+          decompressZstd: await result(async () => bytes(pull(from(chunks), decompressZstd()))),
+          decompressZstdSync: await result(async () => bytesSync(pullSync(fromSync(chunks), decompressZstdSync()))),
+        }));
+      })();
+    `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "--experimental-stream-iter", "-e", script],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { ...JSON.parse(stdout), exitCode };
+  }
+
+  describe("input after a complete frame", () => {
+    const first = zlib.zstdCompressSync(Buffer.from("first\n"));
+    const second = zlib.zstdCompressSync(Buffer.from("second\n"));
+    const junk = Buffer.from("not valid compressed data");
+    // A magic number from 0x184D2A50 to 0x184D2A5F, a length of 4, then 4
+    // bytes that a decoder skips.
+    const skippable = Buffer.from([0x5a, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4]);
+    // Two default chunks of output from a frame of 30 bytes.
+    const big = Buffer.alloc(zlib.constants.Z_DEFAULT_CHUNK * 2, "hello world ");
+    const bigFrame = zlib.zstdCompressSync(big);
+
+    // One write() for each chunk, then end(). Rejects on 'error'.
+    async function decodeWrites(chunks, options) {
+      const decoder = zlib.createZstdDecompress(options);
+      const { promise, resolve, reject } = Promise.withResolvers();
+      const output = [];
+      decoder.on("data", chunk => output.push(chunk));
+      decoder.on("end", resolve);
+      decoder.on("error", reject);
+      for (const chunk of chunks) decoder.write(chunk);
+      decoder.end();
+      await promise;
+      return { output: Buffer.concat(output), bytesWritten: decoder.bytesWritten };
+    }
+
+    it("bytes that cannot start a frame end the stream when they come in a later write", async () => {
+      const { output, bytesWritten } = await decodeWrites([first, junk, second]);
+      expect({ output: output.toString(), bytesWritten }).toEqual({
+        output: "first\n",
+        bytesWritten: first.length,
+      });
+    });
+
+    it("bytes that cannot start a frame end the stream when the frame fills the output chunk", () => {
+      // The sync driver calls the handle again when the chunk is full, and
+      // that second call has only the trailing bytes as its input.
+      const exact = Buffer.alloc(zlib.constants.Z_DEFAULT_CHUNK, "a");
+      const input = Buffer.concat([zlib.zstdCompressSync(exact), Buffer.from("junkjunk")]);
+      expect(zlib.zstdDecompressSync(input).equals(exact)).toBe(true);
+    });
+
+    it.concurrent("zlib/iter stops at a chunk that cannot start a frame", async () => {
+      expect(await decodeWithIter(`[zstdCompressSync("a"), Buffer.from("junk"), zstdCompressSync("b")]`)).toEqual({
+        decompressZstd: { output: "a" },
+        decompressZstdSync: { output: "a" },
+        exitCode: 0,
+      });
+    });
+
+    // The cases below are the same before and after the decoder began to
+    // track frames across writes. They hold the multi-frame behavior in place.
+    it.each([
+      [
+        "two frames, one byte for each write",
+        () => Array.from(Buffer.concat([first, second]), byte => Buffer.of(byte)),
+      ],
+      [
+        "a frame and 2 bytes of the next, then the rest",
+        () => [Buffer.concat([first, second.subarray(0, 2)]), second.subarray(2)],
+      ],
+      ["a skippable frame between two frames", () => [first, skippable, second]],
+    ])("decodes %s", async (_, chunks) => {
+      const input = chunks();
+      const { output, bytesWritten } = await decodeWrites(input);
+      expect({ output: output.toString(), bytesWritten }).toEqual({
+        output: "first\nsecond\n",
+        bytesWritten: Buffer.concat(input).length,
+      });
+    });
+
+    it("decodes a second frame whose first 20 bytes come alone", async () => {
+      const { output } = await decodeWrites([first, bigFrame.subarray(0, 20), bigFrame.subarray(20)]);
+      expect(output.equals(Buffer.concat([Buffer.from("first\n"), big]))).toBe(true);
+    });
+
+    it("decodes a skippable frame to nothing", () => {
+      expect(zlib.zstdDecompressSync(skippable)).toEqual(Buffer.alloc(0));
+      expect(zlib.zstdDecompressSync(Buffer.concat([first, skippable, second])).toString()).toBe("first\nsecond\n");
+    });
+
+    it("decodes a frame that needs many output chunks", async () => {
+      const options = { chunkSize: zlib.constants.Z_MIN_CHUNK };
+      expect(zlib.zstdDecompressSync(bigFrame, options).equals(big)).toBe(true);
+      const { output } = await decodeWrites([bigFrame], options);
+      expect(output.equals(big)).toBe(true);
+    });
+
+    it("input that is not a frame at the start of the stream is an error", async () => {
+      expect(() => zlib.zstdDecompressSync(junk)).toThrow(
+        expect.objectContaining({ code: "ZSTD_error_prefix_unknown" }),
+      );
+      await expect(decodeWrites([junk])).rejects.toMatchObject({ code: "ZSTD_error_prefix_unknown" });
+    });
   });
 
   it("can compress streaming", async () => {
