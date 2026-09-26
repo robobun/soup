@@ -784,6 +784,230 @@ describe("zlib.zstd", () => {
     });
   });
 
+  describe("input that ends inside a frame", () => {
+    const { ZSTD_e_continue, ZSTD_e_flush, ZSTD_e_end } = zlib.constants;
+    const payload = Buffer.alloc(6000, "hello world ");
+    const frame = zlib.zstdCompressSync(payload);
+    const truncated = frame.subarray(0, frame.length - 10);
+    const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+    const skippableMagic = Buffer.from([0x50, 0x2a, 0x4d, 0x18]);
+    // A length of 4, then 4 bytes that a decoder skips.
+    const skippable = Buffer.concat([skippableMagic, Buffer.from([4, 0, 0, 0, 1, 2, 3, 4])]);
+    const bytewise = buffer => Array.from(buffer, byte => Buffer.of(byte));
+    const repeat = (count, operation) => Array.from({ length: count }, () => operation);
+
+    const unexpectedEnd = {
+      constructor: "Error",
+      message: "unexpected end of file",
+      code: "Z_BUF_ERROR",
+      errno: -5,
+      ownKeys: ["code", "errno"],
+    };
+    const describeError = err => ({
+      constructor: err.constructor.name,
+      message: err.message,
+      code: err.code,
+      errno: err.errno,
+      ownKeys: Object.keys(err).sort(),
+    });
+    function thrownBy(fn) {
+      try {
+        fn();
+      } catch (err) {
+        return describeError(err);
+      }
+    }
+
+    // An operation is a chunk to write, or a function that gets the stream.
+    // Resolves at 'close' with the output size and how the stream stopped.
+    async function run(operations, options) {
+      const decoder = zlib.createZstdDecompress(options);
+      const { promise, resolve } = Promise.withResolvers();
+      const result = { output: 0, stopped: "close" };
+      decoder.on("data", chunk => (result.output += chunk.length));
+      decoder.on("end", () => (result.stopped = "end"));
+      decoder.on("error", err => (result.stopped = describeError(err)));
+      decoder.on("close", () => resolve(result));
+      for (const operation of operations) {
+        if (typeof operation === "function") await operation(decoder);
+        else decoder.write(operation);
+      }
+      return await promise;
+    }
+    const end = decoder => decoder.end();
+    const flushEnd = decoder => decoder.flush(ZSTD_e_end);
+    const written = chunk => decoder => new Promise(resolve => decoder.write(chunk, resolve));
+
+    describe.each([
+      ["no input", Buffer.alloc(0), 0],
+      ["a truncated frame", truncated, 0],
+      ["a frame and a truncated frame", Buffer.concat([frame, truncated]), payload.length],
+      ["a frame and the 4 bytes of a magic number", Buffer.concat([frame, magic]), payload.length],
+      ["2 bytes of a magic number", magic.subarray(0, 2), 0],
+      ["a truncated skippable frame", skippable.subarray(0, skippable.length - 2), 0],
+    ])("%s", (_, input, outputBeforeError) => {
+      it("zstdDecompressSync throws", () => {
+        expect(thrownBy(() => zlib.zstdDecompressSync(input))).toEqual(unexpectedEnd);
+      });
+
+      it("zstdDecompress rejects", async () => {
+        const err = await util
+          .promisify(zlib.zstdDecompress)(input)
+          .catch(err => err);
+        expect(describeError(err)).toEqual(unexpectedEnd);
+      });
+
+      it("a stream emits 'error' after the output of the complete frames", async () => {
+        expect(await run([decoder => decoder.end(input)])).toEqual({
+          output: outputBeforeError,
+          stopped: unexpectedEnd,
+        });
+      });
+    });
+
+    it.each([
+      ["write(truncated) with a callback, then end()", [written(truncated), end], 0],
+      ["write(frame), write(truncated) and end() in one tick", [frame, truncated, end], payload.length],
+      ["end() with no write", [end], 0],
+      ["flush(ZSTD_e_end) before the first write", [flushEnd, end], 0],
+      ["flush(ZSTD_e_end) in the middle of a frame", [truncated, flushEnd, end], 0],
+      [
+        "a magic number split between two writes",
+        [frame, magic.subarray(0, 2), magic.subarray(2), end],
+        payload.length,
+      ],
+      ["one byte for each write", [...bytewise(Buffer.concat([frame, truncated])), end], payload.length],
+      ["reset() after a complete frame, then end()", [written(frame), d => d.reset(), end], payload.length],
+    ])("a stream emits 'error' on %s", async (_, operations, output) => {
+      expect(await run(operations)).toEqual({ output, stopped: unexpectedEnd });
+    });
+
+    it("a stream with options.flush = ZSTD_e_end judges each write", async () => {
+      expect(await run([frame.subarray(0, 10), end], { flush: ZSTD_e_end })).toEqual({
+        output: 0,
+        stopped: unexpectedEnd,
+      });
+    });
+
+    it("a stream emits the output it decoded before the error", async () => {
+      const big = zlib.zstdCompressSync(Buffer.alloc(1 << 20, "hello world "));
+      const { output, stopped } = await run([big.subarray(0, big.length - 10), end]);
+      expect(stopped).toEqual(unexpectedEnd);
+      // The frame has 8 blocks of 128 KiB. The last one is not complete.
+      expect(output).toBe(7 * 128 * 1024);
+    });
+
+    // minizlib, and tar through it, call _processChunk on a handle that stays open.
+    function processChunks(steps) {
+      const decoder = new zlib.ZstdDecompress();
+      const handle = decoder._handle;
+      const close = handle.close;
+      handle.close = () => {};
+      let output = 0;
+      try {
+        for (const [chunk, flush] of steps) {
+          output += decoder._processChunk(chunk, flush).length;
+          decoder._handle = handle;
+        }
+        return { output };
+      } catch (err) {
+        return describeError(err);
+      } finally {
+        close.call(handle);
+      }
+    }
+
+    it.each([
+      ["the truncated frame and ZSTD_e_end", [[truncated, ZSTD_e_end]], unexpectedEnd],
+      [
+        "the truncated frame, then no input and ZSTD_e_end",
+        [
+          [truncated, ZSTD_e_continue],
+          [Buffer.alloc(0), ZSTD_e_end],
+        ],
+        unexpectedEnd,
+      ],
+      [
+        "the frame, then no input and ZSTD_e_end",
+        [
+          [frame, ZSTD_e_continue],
+          [Buffer.alloc(0), ZSTD_e_end],
+        ],
+        { output: payload.length },
+      ],
+    ])("_processChunk with %s", (_, steps, expected) => {
+      expect(processChunks(steps)).toEqual(expected);
+    });
+
+    it.concurrent("zlib/iter throws", async () => {
+      const error = { message: unexpectedEnd.message, code: unexpectedEnd.code, errno: unexpectedEnd.errno };
+      expect(await decodeWithIter(`[zstdCompressSync(Buffer.alloc(6000, "hello world ")).subarray(0, -10)]`)).toEqual({
+        decompressZstd: error,
+        decompressZstdSync: error,
+        exitCode: 0,
+      });
+    });
+
+    describe.each([
+      ["ZSTD_e_flush", ZSTD_e_flush],
+      ["ZSTD_e_continue", ZSTD_e_continue],
+    ])("finishFlush: %s does not judge the end of the input", (_, finishFlush) => {
+      it.each([
+        ["a truncated frame", truncated],
+        ["no input", Buffer.alloc(0)],
+      ])("%s", async (_, input) => {
+        expect(zlib.zstdDecompressSync(input, { finishFlush })).toEqual(Buffer.alloc(0));
+        expect(await util.promisify(zlib.zstdDecompress)(input, { finishFlush })).toEqual(Buffer.alloc(0));
+        expect(await run([decoder => decoder.end(input)], { finishFlush })).toEqual({ output: 0, stopped: "end" });
+      });
+    });
+
+    it("_finishFlushFlag is read at the end of the stream", async () => {
+      const setFlag = decoder => (decoder._finishFlushFlag = ZSTD_e_flush);
+      expect(await run([setFlag, decoder => decoder.end(truncated)])).toEqual({ output: 0, stopped: "end" });
+    });
+
+    it.each([
+      ["destroy()", decoder => decoder.destroy()],
+      ["close()", decoder => decoder.close()],
+    ])("%s in the middle of a frame emits no error", async (_, stop) => {
+      expect(await run([truncated, stop])).toEqual({ output: 0, stopped: "close" });
+    });
+
+    // The cases below decode input that is complete, or that ends with bytes
+    // the decoder ignores. The check must not report them.
+    it.each([
+      ["a frame", frame, 1],
+      ["two frames", Buffer.concat([frame, frame]), 2],
+      ["a frame and bytes that cannot start a frame", Buffer.concat([frame, Buffer.from("not zstd at all")]), 1],
+      ["a frame and 1 byte of a magic number", Buffer.concat([frame, magic.subarray(0, 1)]), 1],
+      ["a frame and 2 bytes of a magic number", Buffer.concat([frame, magic.subarray(0, 2)]), 1],
+      ["a frame and 3 bytes of a magic number", Buffer.concat([frame, magic.subarray(0, 3)]), 1],
+      ["a frame and 1 byte of a skippable magic number", Buffer.concat([frame, skippableMagic.subarray(0, 1)]), 1],
+      ["a frame and 3 bytes of a skippable magic number", Buffer.concat([frame, skippableMagic.subarray(0, 3)]), 1],
+      ["a skippable frame", skippable, 0],
+    ])("zstdDecompressSync decodes %s", (_, input, frames) => {
+      expect(zlib.zstdDecompressSync(input).length).toBe(frames * payload.length);
+      expect(zlib.zstdDecompressSync(input, { chunkSize: zlib.constants.Z_MIN_CHUNK }).length).toBe(
+        frames * payload.length,
+      );
+    });
+
+    it.each([
+      ["3 bytes of a magic number, one for each write", [frame, ...bytewise(magic.subarray(0, 3)), end], 1],
+      ["flush(ZSTD_e_end) between two frames", [frame, flushEnd, frame, end], 2],
+      ["20 calls of flush(ZSTD_e_end) after a frame", [frame, ...repeat(20, flushEnd), end], 1],
+      ["20 writes of no input after a frame", [frame, ...repeat(20, Buffer.alloc(0)), end], 1],
+      ["reset() in the middle of a frame, then a frame", [written(truncated), d => d.reset(), frame, end], 1],
+    ])("a stream ends after %s", async (_, operations, frames) => {
+      expect(await run(operations)).toEqual({ output: frames * payload.length, stopped: "end" });
+      expect(await run(operations, { chunkSize: zlib.constants.Z_MIN_CHUNK })).toEqual({
+        output: frames * payload.length,
+        stopped: "end",
+      });
+    });
+  });
+
   it("can compress streaming", async () => {
     const encoder = zlib.createZstdCompress();
     for (const chunk of window(inputString, 55)) {

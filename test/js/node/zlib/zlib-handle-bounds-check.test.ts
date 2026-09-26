@@ -241,6 +241,16 @@ describe.concurrent("zlib native handle driven outside the zlib.ts lifecycle", (
        new C(10).writeSync(0, null, 0, 0, new Uint8Array(64), 0, 64); console.log("handled");`,
       "handled",
     ],
+    // The decoder reports input that ends inside a frame. A handle with no
+    // DCtx decoded nothing, so it has no end of input to report.
+    [
+      "zstd: a finishing writeSync() before init() reports no error",
+      `const C = zlib.createZstdDecompress()._handle.constructor;
+       const h = new C(11);
+       h.onerror = (message, errno, code) => console.log("onerror " + code);
+       h.writeSync(zlib.constants.ZSTD_e_end, null, 0, 0, new Uint8Array(64), 0, 64); console.log("handled");`,
+      "handled",
+    ],
     // With no onerror / writeCallback cached (init() never ran), an error or
     // an async write completion had no callback to unwrap.
     [
