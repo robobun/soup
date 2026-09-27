@@ -1026,6 +1026,12 @@ pub(crate) struct Request<'a> {
 }
 
 const MAX_REQUEST_HEADERS: usize = 256;
+// Reserve slots for default headers that may be appended after user headers
+// (Connection, User-Agent, Accept, Host, Accept-Encoding, Content-Length/Transfer-Encoding).
+const MAX_DEFAULT_HEADERS: usize = 6;
+/// How many headers of its caller a request carries. `build_request` drops
+/// the ones after that, so a caller that signs its headers has to stay below.
+pub const MAX_USER_HEADERS: usize = MAX_REQUEST_HEADERS - MAX_DEFAULT_HEADERS;
 
 /// What a [`Request`] borrows besides the client's own strings.
 #[derive(Default)]
@@ -2347,11 +2353,6 @@ impl<'a> HTTPClient<'a> {
         let mut override_connection_header = false;
         let mut override_user_agent = false;
         let mut original_content_length: Option<&[u8]> = None;
-
-        // Reserve slots for default headers that may be appended after user headers
-        // (Connection, User-Agent, Accept, Host, Accept-Encoding, Content-Length/Transfer-Encoding).
-        const MAX_DEFAULT_HEADERS: usize = 6;
-        const MAX_USER_HEADERS: usize = MAX_REQUEST_HEADERS - MAX_DEFAULT_HEADERS;
 
         for (i, head) in header_names.iter().enumerate() {
             let name = self.header_str(*head);

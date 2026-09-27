@@ -13,6 +13,7 @@ use bun_ptr::RefPtr;
 use bun_s3_signing::acl::ACL;
 use bun_s3_signing::credentials::{S3Credentials, SignOptions, SignResult};
 use bun_s3_signing::error::{ErrorCodeAndMessage, S3Error, get_sign_error_code_and_message};
+use bun_s3_signing::metadata::Metadata;
 use bun_s3_signing::storage_class::StorageClass;
 use bun_s3_signing::upload::{NO_UPLOAD_ID, Request};
 use bun_url::URL;
@@ -25,7 +26,6 @@ use crate::webcore::s3::{list_objects, xml_response};
 // after the callback). They take an explicit `<'a>` because they are ephemeral stack-only
 // callback payloads (never heap-stored) — the borrow lifetime accurately models ownership.
 
-#[derive(Default)]
 pub(crate) struct S3StatSuccess<'a> {
     pub(crate) size: usize,
     /// etag is not owned and need to be copied if used after this callback
@@ -34,6 +34,8 @@ pub(crate) struct S3StatSuccess<'a> {
     pub(crate) last_modified: &'a [u8],
     /// format: text/plain, contentType is not owned and need to be copied if used after this callback
     pub(crate) content_type: &'a [u8],
+    /// The headers of the response, for its `x-amz-meta-*` ones. Not owned.
+    pub(crate) headers: &'a Headers,
 }
 
 pub(crate) enum S3StatResult<'a> {
@@ -327,6 +329,7 @@ impl S3HttpSimpleTask {
                 etag: response.header(b"etag").unwrap_or(b""),
                 last_modified: response.header(b"last-modified").unwrap_or(b""),
                 content_type: response.header(b"content-type").unwrap_or(b""),
+                headers: response.headers(),
                 size: response
                     .header(b"content-length")
                     .map(bun_http_types::parse_content_length)
@@ -468,6 +471,8 @@ pub(crate) struct Options<'a> {
     pub(crate) acl: Option<ACL>,
     pub(crate) storage_class: Option<StorageClass>,
     pub(crate) request_payer: bool,
+    /// For the request that creates the object: PutObject or CreateMultipartUpload.
+    pub(crate) metadata: Option<&'a Metadata>,
 }
 
 impl<'a> Default for Options<'a> {
@@ -485,6 +490,7 @@ impl<'a> Default for Options<'a> {
             acl: None,
             storage_class: None,
             request_payer: false,
+            metadata: None,
         }
     }
 }
@@ -543,6 +549,7 @@ pub(crate) fn execute_simple_s3_request(
             acl: options.acl,
             storage_class: options.storage_class,
             request_payer: options.request_payer,
+            metadata: options.metadata,
             content_hash: None,
             content_md5: None,
             content_type: None,

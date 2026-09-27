@@ -1183,6 +1183,7 @@ impl BlobExt for Blob {
                 aws_options.content_encoding.as_deref(),
                 None,
                 aws_options.request_payer,
+                aws_options.metadata.clone(),
                 None,
             );
         }
@@ -1382,6 +1383,7 @@ impl BlobExt for Blob {
                     content_encoding_str.as_ref().map(|s| s.slice()),
                     credentials_with_options.storage_class,
                     credentials_with_options.request_payer,
+                    credentials_with_options.metadata,
                 );
             }
 
@@ -1395,6 +1397,7 @@ impl BlobExt for Blob {
                 None,
                 None,
                 s3.request_payer,
+                s3.metadata.clone(),
             );
         }
 
@@ -3592,6 +3595,7 @@ fn write_file_with_empty_source_to_destination(
                 aws_options.acl,
                 aws_options.storage_class,
                 aws_options.request_payer,
+                aws_options.metadata.as_ref(),
                 Box::new(move |result| match result {
                     S3UploadResult::Success => promise.resolve(&global, JSValue::js_number(0.0)),
                     S3UploadResult::Failure(err) => {
@@ -3782,6 +3786,7 @@ pub(crate) fn write_file_with_source_destination(
                             aws_options.content_encoding.as_deref(),
                             None,
                             aws_options.request_payer,
+                            aws_options.metadata.clone(),
                             None,
                         );
                     } else {
@@ -3810,6 +3815,7 @@ pub(crate) fn write_file_with_source_destination(
                         aws_options.acl,
                         aws_options.storage_class,
                         aws_options.request_payer,
+                        aws_options.metadata.as_ref(),
                         Box::new(move |result| match result {
                             S3UploadResult::Success => {
                                 promise.resolve(&global, JSValue::js_number(written as f64))
@@ -3855,6 +3861,7 @@ pub(crate) fn write_file_with_source_destination(
                         aws_options.content_encoding.as_deref(),
                         None,
                         aws_options.request_payer,
+                        aws_options.metadata.clone(),
                         None,
                     );
                 } else {
@@ -4157,6 +4164,7 @@ pub(crate) fn write_file_internal(
                                 aws_options.content_encoding.as_deref(),
                                 None,
                                 aws_options.request_payer,
+                                aws_options.metadata.clone(),
                                 None,
                             )?));
                         }

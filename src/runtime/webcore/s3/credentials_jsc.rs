@@ -5,10 +5,14 @@
 use core::sync::atomic::Ordering;
 
 use bun_core::{String as BunString, Tag as BunStringTag, strings};
-use bun_jsc::{JSGlobalObject, JSValue, JsResult, RangeErrorOptions, StringJsc as _};
+use bun_jsc::{
+    JSGlobalObject, JSPropertyIterator, JSType, JSValue, JsResult, PropertyIteratorOptions,
+    RangeErrorOptions, StringJsc as _,
+};
 
 use bun_s3_signing::{
-    ACL, MultiPartUploadOptions, S3Credentials, S3CredentialsWithOptions, StorageClass,
+    ACL, Metadata, MetadataError, MultiPartUploadOptions, S3Credentials, S3CredentialsWithOptions,
+    SignResult, StorageClass,
 };
 use bun_url::URL;
 
@@ -61,6 +65,7 @@ pub(crate) fn get_credentials_with_options(
     default_acl: Option<ACL>,
     default_storage_class: Option<StorageClass>,
     default_request_payer: bool,
+    default_metadata: Option<&Metadata>,
     global_object: &JSGlobalObject,
 ) -> JsResult<S3CredentialsWithOptions> {
     bun_analytics::features::s3.fetch_add(1, Ordering::Relaxed);
@@ -258,9 +263,78 @@ pub(crate) fn get_credentials_with_options(
             if let Some(request_payer) = opts.get_boolean_strict(global_object, "requestPayer")? {
                 new_credentials.request_payer = request_payer;
             }
+
+            new_credentials.metadata = get_metadata(opts, global_object)?;
         }
     }
+    if new_credentials.metadata.is_none() {
+        new_credentials.metadata = default_metadata.cloned();
+    }
     Ok(new_credentials)
+}
+
+/// The HTTP client drops the headers of a request that it has no room for,
+/// and the signature of an upload counts on each `x-amz-meta-*` one. An
+/// upload has the headers `sign_request` makes and its `Content-Type`.
+const MAX_METADATA_ENTRIES: usize = bun_http::MAX_USER_HEADERS - (SignResult::MAX_HEADERS + 1);
+
+/// `opts.metadata`: the `x-amz-meta-*` headers of an upload. `None` when the
+/// property is not there or `undefined`, and none of them for `null`.
+fn get_metadata(opts: JSValue, global: &JSGlobalObject) -> JsResult<Option<Metadata>> {
+    let Some(value) = opts.get(global, "metadata")? else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(Metadata::default()));
+    }
+    // A `Map` or a `Headers` has no property to read, and would be none.
+    let Some(object) = value.get_object().filter(|_| {
+        matches!(
+            value.js_type(),
+            JSType::Object | JSType::FinalObject | JSType::ProxyObject
+        )
+    }) else {
+        return Err(global.throw_invalid_argument_type_value(b"metadata", b"object", value));
+    };
+
+    let mut metadata = Metadata::default();
+    let entries = JSPropertyIterator::init(
+        global,
+        object,
+        PropertyIteratorOptions {
+            skip_empty_name: false,
+            include_value: true,
+        },
+    )?;
+    if entries.len > MAX_METADATA_ENTRIES {
+        return Err(global.throw_invalid_arguments(format_args!(
+            "metadata must not have more than {MAX_METADATA_ENTRIES} keys"
+        )));
+    }
+    while let Some((key, entry)) = entries.next()? {
+        if !entry.is_string() {
+            return Err(global.throw_invalid_argument_type_value(
+                format!("metadata.{key}"),
+                b"string",
+                entry,
+            ));
+        }
+        let entry = entry.to_utf8(global)?;
+        if let Err(err) = metadata.insert(key.to_utf8().slice(), entry.slice()) {
+            return Err(match err {
+                MetadataError::InvalidKey => global.throw_invalid_arguments(format_args!(
+                    "metadata key \"{key}\" must be a valid HTTP header name"
+                )),
+                MetadataError::InvalidValue => global.throw_invalid_arguments(format_args!(
+                    "metadata value of \"{key}\" must be printable ASCII characters"
+                )),
+                MetadataError::DuplicateKey => global.throw_invalid_arguments(format_args!(
+                    "metadata has more than one \"{key}\" key (keys are case-insensitive)"
+                )),
+            });
+        }
+    }
+    Ok(Some(metadata))
 }
 
 fn contains_newline_or_cr(value: &[u8]) -> bool {
