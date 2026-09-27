@@ -1,0 +1,113 @@
+after: write(frame),write(junk),write(frame),end                {"output":6,"stopped":"end","bytesWritten":15}
+after: write(frame),write(junk) with no end                     {"output":6,"stopped":"end (never closed)","bytesWritten":15}
+after: write(frame),end(junk)                                   {"output":6,"stopped":"end","bytesWritten":15}
+after: write(frame+junk),end                                    {"output":6,"stopped":"end","bytesWritten":15}
+after: sync 16384-byte frame + junkjunk                         {"ok":16384}
+after: sync frame+frame                                         {"ok":13}
+after: stream bytewise(frame+frame),end                         {"output":13,"stopped":"end","bytesWritten":31}
+after: frame+2 bytes of next, rest, end                         {"output":13,"stopped":"end","bytesWritten":31}
+after: frame, first 20 of big, rest, end                        {"output":1048582,"stopped":"end","bytesWritten":131}
+after: sync frame + skippable(0x50) + frame                     {"ok":13}
+after: stream frame, skippable(0x50), frame, end                {"output":13,"stopped":"end","bytesWritten":43}
+after: sync frame + skippable(0x5a) + frame                     {"ok":13}
+after: stream frame, skippable(0x5a), frame, end                {"output":13,"stopped":"end","bytesWritten":43}
+after: sync frame + skippable(0x5f) + frame                     {"ok":13}
+after: stream frame, skippable(0x5f), frame, end                {"output":13,"stopped":"end","bytesWritten":43}
+after: sync frame + skippable(0x60) + frame                     {"ok":6}
+after: stream frame, skippable(0x60), frame, end                {"output":6,"stopped":"end","bytesWritten":15}
+after: sync skippable alone                                     {"ok":0}
+after: sync 1 MiB frame, chunkSize 64                           {"ok":1048576}
+after: stream 1 MiB frame, chunkSize 64                         {"output":1048576,"stopped":"end","bytesWritten":116}
+after: sync junk alone                                          {"error":"Error|Unknown frame descriptor|ZSTD_error_prefix_unknown|10|code+errno"}
+after: stream write(junk),end                                   {"output":0,"stopped":"Error|Unknown frame descriptor|ZSTD_error_prefix_unknown|10|code+errno","bytesWritten":0}
+ends: sync empty                                                {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: callback empty                                            {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: promisify empty                                           {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: stream end(chunk) empty                                   {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":0}
+ends: sync truncated                                            {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: callback truncated                                        {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: promisify truncated                                       {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: stream end(chunk) truncated                               {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":20}
+ends: sync frame+truncated                                      {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: callback frame+truncated                                  {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: promisify frame+truncated                                 {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: stream end(chunk) frame+truncated                         {"output":6000,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":50}
+ends: sync frame+magic4                                         {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: callback frame+magic4                                     {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: promisify frame+magic4                                    {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: stream end(chunk) frame+magic4                            {"output":6000,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":34}
+ends: sync magic2-alone                                         {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: callback magic2-alone                                     {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: promisify magic2-alone                                    {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: stream end(chunk) magic2-alone                            {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":2}
+ends: sync skippable-cut2                                       {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: callback skippable-cut2                                   {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: promisify skippable-cut2                                  {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+ends: stream end(chunk) skippable-cut2                          {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":10}
+ends: written(truncated), end                                   {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":20}
+ends: write(frame),write(truncated),end in one tick             {"output":6000,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":30}
+ends: end() with no write                                       {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":0}
+ends: flush(e_end) before the first write, end                  {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":0}
+ends: truncated, flush(e_end), end                              {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":20}
+ends: options.flush = e_end, first 10 bytes, end                {"output":0,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":0}
+ends: frame, magic[0..2], magic[2..4], end                      {"output":6000,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":32}
+ends: bytewise(frame+truncated), end                            {"output":6000,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":49}
+ends: 1 MiB cut by 10, output before the error                  {"output":917504,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":106}
+ends: written(frame), reset, end                                {"output":6000,"stopped":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","bytesWritten":30}
+ends: _processChunk(truncated, e_end)                           {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","output":0}
+ends: _processChunk(truncated, e_continue),(empty, e_end)       {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno","output":0}
+ends: _processChunk(frame, e_continue),(empty, e_end)           {"ok":6000}
+keeps: sync full                                                {"ok":6000}
+keeps: sync frame+frame                                         {"ok":12000}
+keeps: sync frame+junk                                          {"ok":6000}
+keeps: sync frame+magic1                                        {"default":{"ok":6000},"chunk64":{"ok":6000}}
+keeps: stream frame, magic1 bytewise, end                       {"output":6000,"stopped":"end","bytesWritten":31}
+keeps: sync frame+skmagic1                                      {"default":{"ok":6000},"chunk64":{"ok":6000}}
+keeps: stream frame, skmagic1 bytewise, end                     {"output":6000,"stopped":"end","bytesWritten":31}
+keeps: sync frame+magic2                                        {"default":{"ok":6000},"chunk64":{"ok":6000}}
+keeps: stream frame, magic2 bytewise, end                       {"output":6000,"stopped":"end","bytesWritten":32}
+keeps: sync frame+skmagic2                                      {"default":{"ok":6000},"chunk64":{"ok":6000}}
+keeps: stream frame, skmagic2 bytewise, end                     {"output":6000,"stopped":"end","bytesWritten":32}
+keeps: sync frame+magic3                                        {"default":{"ok":6000},"chunk64":{"ok":6000}}
+keeps: stream frame, magic3 bytewise, end                       {"output":6000,"stopped":"end","bytesWritten":33}
+keeps: sync frame+skmagic3                                      {"default":{"ok":6000},"chunk64":{"ok":6000}}
+keeps: stream frame, skmagic3 bytewise, end                     {"output":6000,"stopped":"end","bytesWritten":33}
+keeps: frame, flush(e_end), frame, end                          {"output":12000,"stopped":"end","bytesWritten":60}
+keeps: frame, flush(e_end), frame, end [chunkSize 64]           {"output":12000,"stopped":"end","bytesWritten":60}
+keeps: frame, 20 flush(e_end), end                              {"output":6000,"stopped":"end","bytesWritten":30}
+keeps: frame, 20 flush(e_end), end [chunkSize 64]               {"output":6000,"stopped":"end","bytesWritten":30}
+keeps: frame, 20 empty writes, end                              {"output":6000,"stopped":"end","bytesWritten":30}
+keeps: frame, 20 empty writes, end [chunkSize 64]               {"output":6000,"stopped":"end","bytesWritten":30}
+keeps: written(truncated), reset, frame, end                    {"output":6000,"stopped":"end","bytesWritten":50}
+keeps: written(truncated), reset, frame, end [chunkSize 64]     {"output":6000,"stopped":"end","bytesWritten":50}
+optout e_flush: sync truncated                                  {"ok":0}
+optout e_flush: callback truncated                              {"ok":0}
+optout e_flush: stream truncated                                {"output":0,"stopped":"end","bytesWritten":20}
+optout e_flush: sync empty                                      {"ok":0}
+optout e_flush: callback empty                                  {"ok":0}
+optout e_flush: stream empty                                    {"output":0,"stopped":"end","bytesWritten":0}
+optout e_continue: sync truncated                               {"ok":0}
+optout e_continue: callback truncated                           {"ok":0}
+optout e_continue: stream truncated                             {"output":0,"stopped":"end","bytesWritten":20}
+optout e_continue: sync empty                                   {"ok":0}
+optout e_continue: callback empty                               {"ok":0}
+optout e_continue: stream empty                                 {"output":0,"stopped":"end","bytesWritten":0}
+optout: _finishFlushFlag = e_flush, end(truncated)              {"output":0,"stopped":"end","bytesWritten":20}
+keeps: write(truncated), destroy                                {"output":0,"stopped":"close","bytesWritten":0}
+keeps: write(truncated), close                                  {"output":0,"stopped":"close","bytesWritten":0}
+iter async [a, junk, b]                                         {"ok":"a"}
+iter sync  [a, junk, b]                                         {"ok":"a"}
+iter async [a, junk]                                            {"ok":"a"}
+iter sync  [a, junk]                                            {"ok":"a"}
+iter async [a + junk]                                           {"ok":"a"}
+iter sync  [a + junk]                                           {"ok":"a"}
+iter async [a, b]                                               {"ok":"ab"}
+iter sync  [a, b]                                               {"ok":"ab"}
+iter async [a + b]                                              {"ok":"ab"}
+iter sync  [a + b]                                              {"ok":"ab"}
+iter async [truncated]                                          {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+iter sync  [truncated]                                          {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+iter async [frame, truncated]                                   {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+iter sync  [frame, truncated]                                   {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+iter async []                                                   {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
+iter sync  []                                                   {"error":"Error|unexpected end of file|Z_BUF_ERROR|-5|code+errno"}
