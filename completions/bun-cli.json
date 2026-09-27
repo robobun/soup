@@ -106,6 +106,14 @@
           "multiple": false
         },
         {
+          "name": "collect-coverage-from",
+          "description": "Glob patterns for the files the coverage report is about, including files that no test loaded.",
+          "hasValue": true,
+          "valueType": "val",
+          "required": false,
+          "multiple": true
+        },
+        {
           "name": "bail",
           "description": "Exit the test suite after <NUMBER> failures. If you do not specify a number, it defaults to 1.",
           "hasValue": true,

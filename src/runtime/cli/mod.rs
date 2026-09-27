@@ -293,6 +293,11 @@ pub(crate) mod test {
     #[path = "LastFailed.rs"]
     pub(crate) mod last_failed;
 
+    /// `collectCoverageFrom`: the files the coverage report is about, loaded
+    /// or not.
+    #[path = "CoverageInclude.rs"]
+    pub(crate) mod coverage_include;
+
     /// `bun test --parallel`: process-pool coordinator/worker entry points.
     /// Thin façade re-exporting from `parallel::runner`.
     #[path = "ParallelRunner.rs"]

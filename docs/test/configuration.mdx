@@ -324,6 +324,26 @@ coverageThreshold = {
 }
 ```
 
+### Files to Cover
+
+Name the files the coverage report is about with glob patterns. The report then has every file the list names, including the ones that no test loaded, and no other file:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+# Single pattern
+collectCoverageFrom = "src/**"
+
+# Multiple patterns, asked in order. A pattern that starts with "!" takes files out.
+collectCoverageFrom = ["src/**", "!src/generated/**"]
+```
+
+```bash terminal icon="terminal"
+# Replaces the list in bunfig.toml
+bun test --coverage --collect-coverage-from 'src/**'
+```
+
+A file that nothing loaded has no line and no function covered and counts towards `coverageThreshold`. See [Choosing the files to cover](/test/code-coverage#choosing-the-files-to-cover).
+
 ### Coverage Path Ignore Patterns
 
 Exclude specific files or file patterns from coverage reports using glob patterns:
@@ -448,6 +468,7 @@ coverageReporter = ["text", "lcov"]
 coverageDir = "./coverage"
 coverageThreshold = { lines = 0.85, functions = 0.90 }
 coverageSkipTestFiles = true
+collectCoverageFrom = ["src/**"]
 coveragePathIgnorePatterns = [
   "**/*.spec.ts",
   "src/utils/**",

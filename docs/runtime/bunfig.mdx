@@ -255,6 +255,17 @@ Whether to report coverage against transpiled output instead of remapping line n
 coverageIgnoreSourcemaps = false
 ```
 
+### `test.collectCoverageFrom`
+
+The files the coverage report is about, as glob patterns relative to the directory `bun test` runs in. Accepts a single pattern or an array of patterns. Use `--collect-coverage-from` to override.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+collectCoverageFrom = ["src/**", "!src/generated/**"]
+```
+
+By default the report has the files the tests loaded. With this list it has the files the list names, including the ones that no test loaded, which have nothing covered. See [Choosing the files to cover](/test/code-coverage#choosing-the-files-to-cover).
+
 ### `test.coveragePathIgnorePatterns`
 
 Exclude files from coverage reports using glob patterns. Accepts a single pattern or an array of patterns.

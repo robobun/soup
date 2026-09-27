@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, normalizeBunSnapshot, tempDir } from "harness";
-import { readFileSync } from "node:fs";
+import { bunEnv, bunExe, isWindows, normalizeBunSnapshot, tempDir } from "harness";
+import { readFileSync, symlinkSync } from "node:fs";
 import path from "path";
 
 test("coverage crash", () => {
@@ -1373,4 +1373,619 @@ test("parse", () => {
     { row: " parse.ts | 100.00 | 80.00 | 4", exitCode: 1 },
     { row: " parse.ts | 100.00 | 100.00 | ", exitCode: 0 },
   ]);
+});
+
+// https://github.com/oven-sh/bun/issues/5928
+describe("collectCoverageFrom", () => {
+  // The table in stderr, one entry per row: `file | % Funcs | % Lines | Uncovered Line #s`.
+  function tableRows(stderr: string) {
+    return stderr
+      .split("\n")
+      .filter(line => line.startsWith(" ") && line.split("|").length === 4)
+      .map(line =>
+        line
+          .replaceAll("\\", "/")
+          .split("|")
+          .map(cell => cell.trim())
+          .join(" | ")
+          .trimEnd(),
+      );
+  }
+
+  // lcov.info by file: functions hit/found, lines hit/found and the lines it lists.
+  function lcovRecords(dir: string) {
+    const records: Record<string, { functions: string; lines: string; listed: number[] }> = {};
+    const lcov = readFileSync(path.join(dir, "coverage", "lcov.info"), "utf-8");
+    for (const record of lcov.split("end_of_record")) {
+      const file = /^SF:(.*)$/m.exec(record)?.[1];
+      if (!file) continue;
+      const count = (key: string) => new RegExp(`^${key}:(\\d+)$`, "m").exec(record)![1];
+      records[file.replaceAll("\\", "/")] = {
+        functions: `${count("FNH")}/${count("FNF")}`,
+        lines: `${count("LH")}/${count("LF")}`,
+        listed: [...record.matchAll(/^DA:(\d+),\d+$/gm)].map(match => Number(match[1])),
+      };
+    }
+    return records;
+  }
+
+  async function run(cwd: string, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", ...args],
+      // Start both workers at once instead of when the first one is busy.
+      env: { ...bunEnv, BUN_TEST_PARALLEL_SCALE_MS: "0" },
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode, rows: tableRows(stderr) };
+  }
+
+  const lcovFlags = ["--coverage", "--coverage-reporter=text", "--coverage-reporter=lcov"];
+
+  const unused = `// Nothing imports this file.
+import { used } from "./used";
+
+export interface Shape {
+  sides: number;
+}
+
+export function first(shape: Shape) {
+  // A comment and an empty line in a function that never runs.
+
+  return shape.sides + used();
+}
+
+export const second = () => {
+  return 2;
+};
+`;
+  const unusedRow = "src/unused.ts | 0.00 | 0.00 | 2,8,11,14-15";
+
+  const project = {
+    "bunfig.toml": `[test]
+coverageSkipTestFiles = true
+collectCoverageFrom = ["./src/**", "!src/generated/**"]
+`,
+    "src/used.ts": `export function used() {
+  return 1;
+}
+export function notCalled() {
+  return 2;
+}
+`,
+    "src/unused.ts": unused,
+    "src/unused.cjs": `function first() {
+  return 1;
+}
+module.exports = { first };
+`,
+    "src/constants.ts": `export const one = 1;
+export const two = one + 1;
+`,
+    "src/view.tsx": `export function View() {
+  return <div>never rendered</div>;
+}
+`,
+    // Nothing in these can run, so there is nothing to cover.
+    "src/types.ts": `export interface OnlyTypes {
+  name: string;
+}
+export type Maybe = OnlyTypes | null;
+`,
+    "src/augments.ts": `declare global {
+  var fromSomewhere: number;
+}
+export {};
+`,
+    // Left out for its name: what is in it would have a row.
+    "src/globals.d.ts": `export const notADeclaration = 1;\n`,
+    "src/empty.ts": ``,
+    "src/comments.ts": `// Only a comment.\n/* And another one. */\n`,
+    // A file that nothing loads must not run because the report names it.
+    "src/exits.ts": `console.log("a file that nothing loaded ran");
+process.exit(3);
+`,
+    "src/does-not-parse.ts": `export function fine() {
+  return 1;
+}
+export function broken( {
+`,
+    "src/calls-a-macro.ts": `import { macro } from "./used" with { type: "macro" };
+export const value = macro();
+`,
+    "src/generated/out.ts": `export function generated() {
+  return 1;
+}
+`,
+    "src/node_modules/dependency/index.js": `export function dependency() {
+  return 1;
+}
+`,
+    "src/not-run.test.ts": `import { test } from "bun:test";
+test("is not run", () => {});
+`,
+    "lib/outside.ts": `export function outside() {
+  return 1;
+}
+`,
+    "a.test.ts": `import { expect, test } from "bun:test";
+import { outside } from "./lib/outside";
+import { used } from "./src/used";
+
+test("a", () => {
+  expect(used() + outside()).toBe(2);
+});
+test("another", () => {});
+`,
+    "b.test.ts": `import { expect, test } from "bun:test";
+import { used } from "./src/used";
+
+test("b", () => {
+  expect(used()).toBe(1);
+});
+`,
+  };
+
+  test.concurrent.each([
+    ["in one process", []],
+    ["with --isolate", ["--isolate"]],
+    ["with --parallel", ["--parallel=2"]],
+  ])("reports the files that nothing loaded %s", async (_, flags) => {
+    using dir = tempDir("cov-collect-from", project);
+    const { stdout, stderr, exitCode, rows } = await run(String(dir), "a.test.ts", "b.test.ts", ...lcovFlags, ...flags);
+
+    expect(stderr).toContain("3 pass");
+    // Not in it: lib/outside.ts, which is loaded and which the list does not
+    // name, and what is in src/generated, in node_modules and in a test file.
+    expect(rows).toEqual([
+      "src/constants.ts | 0.00 | 0.00 | 1-2",
+      "src/exits.ts | 0.00 | 0.00 | 1-2",
+      "src/unused.cjs | 0.00 | 0.00 | 1-2,4",
+      unusedRow,
+      "src/used.ts | 50.00 | 66.67 | 4",
+      "src/view.tsx | 0.00 | 0.00 | 1-2",
+    ]);
+    const records = lcovRecords(String(dir));
+    expect(records).toEqual({
+      // A module without functions counts as one, as it does when it is loaded.
+      "src/constants.ts": { functions: "0/1", lines: "0/2", listed: [1, 2] },
+      "src/exits.ts": { functions: "0/1", lines: "0/2", listed: [1, 2] },
+      // The function Bun wraps a CommonJS module in counts too.
+      "src/unused.cjs": { functions: "0/2", lines: "0/3", listed: [1, 2, 4] },
+      "src/unused.ts": { functions: "0/2", lines: "0/5", listed: [2, 8, 11, 14, 15] },
+      "src/used.ts": { functions: "1/2", lines: "2/3", listed: [1, 2, 4] },
+      "src/view.tsx": { functions: "0/1", lines: "0/2", listed: [1, 2] },
+    });
+    // One line each, in the order of the paths, and then the table.
+    expect(stderr).toContain(
+      `warn: Failed to collect coverage from ${path.join("src", "calls-a-macro.ts")}:2:22: Macros are disabled\n` +
+        `warn: Failed to collect coverage from ${path.join("src", "does-not-parse.ts")}:4:26: Expected identifier but found end of file\n` +
+        "---",
+    );
+    expect(stderr.match(/warn:/g)).toHaveLength(2);
+    expect(stdout).not.toContain("a file that nothing loaded ran");
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("--collect-coverage-from replaces the list in bunfig.toml", async () => {
+    using dir = tempDir("cov-collect-from", project);
+    const [repeated, once, withoutCoverage] = await Promise.all([
+      run(
+        String(dir),
+        "a.test.ts",
+        "--coverage",
+        "--collect-coverage-from",
+        // A glob walk cannot follow a "/" in braces. The files are found all the same.
+        "{src/generated,lib}/**",
+        "--collect-coverage-from=lib/*.ts",
+      ),
+      run(String(dir), "a.test.ts", "--coverage", "--collect-coverage-from=src/u*.ts"),
+      // The list asks for nothing by itself.
+      run(String(dir), "a.test.ts", "--collect-coverage-from=src/u*.ts"),
+    ]);
+    expect({
+      repeated: repeated.rows,
+      once: once.rows,
+      withoutCoverage: withoutCoverage.rows,
+    }).toEqual({
+      repeated: ["lib/outside.ts | 100.00 | 100.00 |", "src/generated/out.ts | 0.00 | 0.00 | 1-2"],
+      once: [unusedRow, "src/used.ts | 50.00 | 66.67 | 4"],
+      withoutCoverage: [],
+    });
+    expect(withoutCoverage.stderr).toContain("2 pass");
+    expect(withoutCoverage.stderr).not.toContain("warn:");
+    expect([repeated.exitCode, once.exitCode, withoutCoverage.exitCode]).toEqual([0, 0, 0]);
+  });
+
+  test.concurrent.each([
+    ["with --parallel", ["--parallel=2"]],
+    // One test file: --parallel runs it in this process.
+    ["with --parallel and one test file", ["--parallel=2", "a.test.ts"]],
+  ])("reads the list of --config %s", async (_, flags) => {
+    using dir = tempDir("cov-collect-from", {
+      ...project,
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      "other.toml": `[test]\ncoverageSkipTestFiles = true\ncollectCoverageFrom = "src/*.cjs"\n`,
+    });
+    const { rows, exitCode } = await run(String(dir), "--coverage", "--config=other.toml", ...flags);
+    expect(rows).toEqual(["src/unused.cjs | 0.00 | 0.00 | 1-2,4"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("the last pattern that matches decides", async () => {
+    using dir = tempDir("cov-collect-from", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      "src/a.ts": `export const a = 1;\n`,
+      "src/generated/b.ts": `export const b = 1;\n`,
+      "src/generated/kept.ts": `export const kept = 1;\n`,
+      "tools/c.ts": `export const c = 1;\n`,
+      "only.test.ts": `import { test } from "bun:test";\ntest("loads nothing", () => {});\n`,
+    });
+    const list = (...patterns: string[]) =>
+      run(String(dir), "--coverage", ...patterns.map(pattern => `--collect-coverage-from=${pattern}`));
+    const [included, excluded, negated] = await Promise.all([
+      list("src/**", "!src/generated/**", "src/generated/kept.ts"),
+      list("src/generated/kept.ts", "src/a.ts", "!src/generated/**"),
+      // Every file that none of them names.
+      list("!src/generated/**", "!**/a.ts"),
+    ]);
+    expect({
+      included: included.rows,
+      excluded: excluded.rows,
+      negated: negated.rows,
+    }).toEqual({
+      included: ["src/a.ts | 0.00 | 0.00 | 1", "src/generated/kept.ts | 0.00 | 0.00 | 1"],
+      excluded: ["src/a.ts | 0.00 | 0.00 | 1"],
+      negated: ["tools/c.ts | 0.00 | 0.00 | 1"],
+    });
+  });
+
+  test.concurrent("coveragePathIgnorePatterns applies to the files that nothing loaded", async () => {
+    using dir = tempDir("cov-collect-from", {
+      ...project,
+      "bunfig.toml": `[test]
+coverageSkipTestFiles = false
+collectCoverageFrom = "src/*.ts"
+coveragePathIgnorePatterns = ["src/u*", "src/does-not-parse.ts", "**/calls-a-macro.ts", "**/exits.ts"]
+`,
+    });
+    const { rows, stderr, exitCode } = await run(String(dir), "a.test.ts", "--coverage");
+    // With coverageSkipTestFiles off, a test file that did not run is a file that nothing loaded.
+    expect(rows).toEqual(["src/constants.ts | 0.00 | 0.00 | 1-2", "src/not-run.test.ts | 0.00 | 0.00 | 1-2"]);
+    expect(stderr).not.toContain("warn:");
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("a file that nothing loaded counts towards coverageThreshold", async () => {
+    using dir = tempDir("cov-collect-from", {
+      "bunfig.toml": `[test]
+coverageSkipTestFiles = true
+coverageThreshold = 0.6
+collectCoverageFrom = ["src/**"]
+`,
+      "src/used.ts": project["src/used.ts"],
+      "src/unused.ts": unused,
+      "a.test.ts": `import { expect, test } from "bun:test";
+import { notCalled, used } from "./src/used";
+
+test("a", () => {
+  expect(used() + notCalled()).toBe(3);
+});
+`,
+    });
+    const { rows, stderr, exitCode } = await run(String(dir), "--coverage");
+    expect(stderr).toContain("1 pass");
+    expect(rows).toEqual([unusedRow, "src/used.ts | 100.00 | 100.00 |"]);
+    expect(exitCode).toBe(1);
+  });
+
+  test.concurrent("a run has to run a test file to report the files that nothing loaded", async () => {
+    using dir = tempDir("cov-collect-from", {
+      "bunfig.toml": `[test]
+coverageSkipTestFiles = true
+collectCoverageFrom = ["src/**"]
+coverageThreshold = 0.9
+`,
+      "src/unused.ts": unused,
+      "only.test.ts": `import { test } from "bun:test";\ntest("one", () => {});\ntest("two", () => {});\n`,
+    });
+    const [emptyShard, someTests] = await Promise.all([
+      run(String(dir), "--coverage", "--shard=2/2"),
+      // The test file loads no file of the list. It has a report all the same.
+      run(String(dir), ...lcovFlags, "-t", "one"),
+    ]);
+    expect({ rows: emptyShard.rows, exitCode: emptyShard.exitCode }).toEqual({ rows: [], exitCode: 0 });
+    expect({ rows: someTests.rows, exitCode: someTests.exitCode }).toEqual({ rows: [unusedRow], exitCode: 1 });
+    expect(lcovRecords(String(dir))).toEqual({
+      "src/unused.ts": { functions: "0/2", lines: "0/5", listed: [2, 8, 11, 14, 15] },
+    });
+  });
+
+  test.concurrent("a file has one row, and a test that changes directory moves nothing", async () => {
+    using dir = tempDir("cov-collect-from", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncollectCoverageFrom = ["src/**", "shared/**"]\n`,
+      "shared/loaded.ts": project["src/used.ts"],
+      "shared/unused.ts": `export const unused = 1;\n`,
+      "src/index.ts": isWindows
+        ? `export { used } from "../shared/loaded";\n`
+        : `export { used } from "./linked/loaded";\n`,
+      // Relative to the directory the test changes to, "src/**" is this file.
+      "elsewhere/src/decoy.ts": `export const decoy = 1;\n`,
+      "a.test.ts": `import { expect, test } from "bun:test";
+import { used } from "./src/index";
+
+test("a", () => {
+  process.chdir("elsewhere");
+  expect(used()).toBe(1);
+});
+`,
+    });
+    if (!isWindows) {
+      // shared/loaded.ts through a directory, which the test imports it by, and
+      // shared/unused.ts through a file, which the list finds it by a second time.
+      symlinkSync(path.join(String(dir), "shared"), path.join(String(dir), "src", "linked"), "dir");
+      symlinkSync(path.join(String(dir), "shared", "unused.ts"), path.join(String(dir), "src", "alias.ts"));
+      symlinkSync(path.join(String(dir), "shared", "loaded.ts"), path.join(String(dir), "src", "loaded-alias.ts"));
+    }
+    const { rows, stderr, exitCode } = await run(String(dir), ...lcovFlags);
+    expect(stderr).toContain("1 pass");
+    expect(rows).toEqual([
+      "shared/loaded.ts | 50.00 | 66.67 | 4",
+      "shared/unused.ts | 0.00 | 0.00 | 1",
+      "src/index.ts | 100.00 | 100.00 |",
+    ]);
+    // Written where the run started, with the paths it started with.
+    expect(Object.keys(lcovRecords(String(dir)))).toEqual(["shared/loaded.ts", "shared/unused.ts", "src/index.ts"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("a --parallel run that --bail stops reports the files its tests loaded", async () => {
+    using dir = tempDir("cov-collect-from", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncollectCoverageFrom = ["src/**"]\n`,
+      "src/used.ts": project["src/used.ts"],
+      "src/unused.ts": unused,
+      "a.test.ts": `import { expect, test } from "bun:test";
+import { used } from "./src/used";
+
+test("fails", () => {
+  expect(used()).toBe(2);
+});
+`,
+      "b.test.ts": `import { test } from "bun:test";\ntest("b", () => {});\n`,
+    });
+    const [stopped, finished] = await Promise.all([
+      run(String(dir), "--coverage", "--parallel=2", "--bail"),
+      run(String(dir), "--coverage", "--parallel=2"),
+    ]);
+    expect(stopped.stderr).toContain("Bailed out after 1 failure");
+    expect({ rows: stopped.rows, exitCode: stopped.exitCode }).toEqual({
+      rows: ["src/used.ts | 50.00 | 66.67 | 4"],
+      exitCode: 1,
+    });
+    expect({ rows: finished.rows, exitCode: finished.exitCode }).toEqual({
+      rows: [unusedRow, "src/used.ts | 50.00 | 66.67 | 4"],
+      exitCode: 1,
+    });
+  });
+
+  test.concurrent("comments, coverageIgnoreSourcemaps and // @bun apply to a file that nothing loaded", async () => {
+    const files = (config: string) => ({
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncollectCoverageFrom = ["src/**"]\n${config}`,
+      "src/hints.ts": `export function kept() {
+  return 1;
+}
+/* v8 ignore next */
+export function ignored() {
+  const inner = () => 2;
+  return inner();
+}
+export const value = 1; /* v8 ignore next */
+/* v8 ignore start */
+export const a = 1;
+/* v8 ignore stop */
+export const last = 3;
+`,
+      "src/whole-file.ts": `/* v8 ignore file */
+export const ignored = 1;
+`,
+      // The transpiler leaves this one as it is. Its last line has no end
+      // and a function on it.
+      "src/prebuilt.js": `// @bun
+export function first() {
+  return 1;
+}
+export const second = () => 2;`,
+      "only.test.ts": `import { test } from "bun:test";\ntest("loads nothing", () => {});\n`,
+    });
+    using mapped = tempDir("cov-collect-from", files(""));
+    using unmapped = tempDir("cov-collect-from", files("coverageIgnoreSourcemaps = true\n"));
+    const [withMaps, withoutMaps] = await Promise.all([
+      run(String(mapped), ...lcovFlags),
+      run(String(unmapped), ...lcovFlags),
+    ]);
+    expect([withMaps.exitCode, withoutMaps.exitCode]).toEqual([0, 0]);
+    expect(lcovRecords(String(mapped))).toEqual({
+      "src/hints.ts": { functions: "0/1", lines: "0/3", listed: [1, 2, 13] },
+      // Without a source map a last line that does not end is on no line.
+      "src/prebuilt.js": { functions: "0/1", lines: "0/4", listed: [1, 2, 3, 4] },
+    });
+    // The lines are those of the transpiled text, which a comment cannot name.
+    expect(Object.keys(lcovRecords(String(unmapped)))).toEqual([
+      "src/hints.ts",
+      "src/prebuilt.js",
+      "src/whole-file.ts",
+    ]);
+    expect(withoutMaps.rows.find(row => row.startsWith("src/prebuilt.js"))).toBe("src/prebuilt.js | 0.00 | 0.00 | 1-4");
+  });
+
+  test.concurrent("says what is wrong with the list", async () => {
+    using dir = tempDir("cov-collect-from", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      "number.toml": `[test]\ncollectCoverageFrom = 1\n`,
+      "empty.toml": `[test]\ncollectCoverageFrom = ["src/**", ""]\n`,
+      "src/unused.ts": unused,
+      "only.test.ts": `import { test } from "bun:test";\ntest("loads nothing", () => {});\n`,
+    });
+    const [number, empty, emptyFlag, noFile, rootDir] = await Promise.all([
+      run(String(dir), "--coverage", "--config=number.toml"),
+      run(String(dir), "--coverage", "--config=empty.toml"),
+      run(String(dir), "--coverage", "--collect-coverage-from="),
+      run(String(dir), "--coverage", "--collect-coverage-from=source/**"),
+      run(String(dir), "--coverage", "--collect-coverage-from=<rootDir>/src/**"),
+    ]);
+    expect(number.stderr).toContain("collectCoverageFrom must be a string or array of strings");
+    expect(empty.stderr).toContain("collectCoverageFrom patterns cannot be empty strings");
+    expect(emptyFlag.stderr).toContain("error: --collect-coverage-from expects a glob pattern");
+    expect([number.exitCode, empty.exitCode, emptyFlag.exitCode]).toEqual([1, 1, 1]);
+    // A list that names nothing is more likely a mistake than a project without files.
+    expect(noFile.stderr).toContain("warn: No file matches collectCoverageFrom\n---");
+    expect({ rows: noFile.rows, exitCode: noFile.exitCode }).toEqual({ rows: [], exitCode: 0 });
+    expect({ rows: rootDir.rows, exitCode: rootDir.exitCode }).toEqual({ rows: [unusedRow], exitCode: 0 });
+  });
+
+  // What a file reports when nothing loads it, next to what it reports when a
+  // test imports it and calls nothing of it, and when a test calls all of it.
+  const shapes = {
+    "functions.ts": `export function a(x: number) {
+  // A comment and an empty line in the function.
+
+  return x + 1;
+}
+export function b(x: number) {
+  return x + 2;
+}
+`,
+    "class-field.ts": `export class WithField {
+  field = 1;
+  method() {
+    return this.field;
+  }
+}
+`,
+    "class-method.ts": `export class WithMethod {
+  method() {
+    return 1;
+  }
+}
+`,
+    "no-functions.ts": `export const one = 1;
+export const two = one + 1;
+`,
+    "commonjs.cjs": `function a(x) {
+  return x + 1;
+}
+function b(x) {
+  return x + 2;
+}
+module.exports = { a, b };
+`,
+    "last-line.ts": `export function a(x: number) {
+  return x; }
+export const one = 1;
+`,
+    "async-generator.ts": `export async function a() {
+  return 1;
+}
+export function* b() {
+  yield 1;
+}
+`,
+    "nested.ts": `export function outer() {
+  function inner() {
+    return () => 1;
+  }
+  return inner;
+}
+export const arrow = () => {
+  return 2;
+};
+`,
+    "types.ts": `export interface OnlyTypes {
+  name: string;
+}
+`,
+  };
+  const callEverything = `
+import * as functions from "./src/functions";
+import { WithField } from "./src/class-field";
+import { WithMethod } from "./src/class-method";
+import * as noFunctions from "./src/no-functions";
+import * as commonjs from "./src/commonjs.cjs";
+import * as lastLine from "./src/last-line";
+import * as asyncGenerator from "./src/async-generator";
+import * as nested from "./src/nested";
+import "./src/types";
+
+export async function callEverything() {
+  return [
+    functions.a(1),
+    functions.b(1),
+    new WithField().method(),
+    new WithMethod().method(),
+    noFunctions.two,
+    commonjs.a(1),
+    commonjs.b(1),
+    lastLine.a(1),
+    await asyncGenerator.a(),
+    [...asyncGenerator.b()],
+    nested.outer()()(),
+    nested.arrow(),
+  ];
+}
+`;
+
+  test.concurrent(
+    "a file that nothing loaded has the functions of one that is imported and the lines of one that ran",
+    async () => {
+      const files = (testFile: string) => ({
+        "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncollectCoverageFrom = ["src/**"]\n`,
+        ...Object.fromEntries(Object.entries(shapes).map(([name, source]) => [`src/${name}`, source])),
+        "call-everything.ts": callEverything,
+        "shapes.test.ts": testFile,
+      });
+      using nothingLoaded = tempDir(
+        "cov-collect-from",
+        files(`import { test } from "bun:test";\ntest("loads nothing", () => {});\n`),
+      );
+      using nothingCalled = tempDir(
+        "cov-collect-from",
+        files(`import { test } from "bun:test";\nimport "./call-everything";\ntest("calls nothing", () => {});\n`),
+      );
+      using everythingCalled = tempDir(
+        "cov-collect-from",
+        files(`import { expect, test } from "bun:test";
+import { callEverything } from "./call-everything";
+test("calls everything", async () => {
+  expect(await callEverything()).toHaveLength(12);
+});
+`),
+      );
+      const dirs = [nothingLoaded, nothingCalled, everythingCalled].map(String);
+      const runs = await Promise.all(dirs.map(dir => run(dir, ...lcovFlags)));
+      expect(runs.map(({ exitCode }) => exitCode)).toEqual([0, 0, 0]);
+      const [unloaded, imported, called] = dirs.map(lcovRecords);
+
+      const names = Object.keys(shapes).filter(name => name !== "types.ts");
+      expect(Object.keys(unloaded)).toEqual(names.map(name => `src/${name}`).sort());
+      for (const name of names) {
+        const file = `src/${name}`;
+        const source = shapes[name as keyof typeof shapes].split("\n");
+        expect({
+          name,
+          functions: unloaded[file].functions,
+          lines: unloaded[file].lines.split("/")[0],
+          linesOfARunThatAreMissing: called[file].listed.filter(line => !unloaded[file].listed.includes(line)),
+          linesWithoutCode: unloaded[file].listed.filter(line => /^\s*(\/\/.*)?$/.test(source[line - 1])),
+        }).toEqual({
+          name,
+          functions: `0/${imported[file].functions.split("/")[1]}`,
+          lines: "0",
+          linesOfARunThatAreMissing: [],
+          linesWithoutCode: [],
+        });
+      }
+    },
+  );
 });
