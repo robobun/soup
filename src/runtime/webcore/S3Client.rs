@@ -5,7 +5,7 @@ use crate::node::types::PathLikeExt as _;
 use crate::webcore::blob::BlobExt as _;
 use crate::webcore::blob::store::S3Ext as _;
 use crate::webcore::s3::MultiPartUploadOptions;
-use crate::webcore::s3::client::{ACL, S3Credentials, StorageClass};
+use crate::webcore::s3::client::{ACL, Metadata, S3Credentials, StorageClass};
 use bun_jsc::{CallFrame, ConsoleFormatter, ErrorCode, JSGlobalObject, JSValue, JsResult};
 
 use super::s3_file as S3File;
@@ -46,6 +46,7 @@ pub(crate) trait S3CredentialsExt {
         default_acl: Option<ACL>,
         default_storage_class: Option<StorageClass>,
         default_request_payer: bool,
+        default_metadata: Option<&Metadata>,
         global: &JSGlobalObject,
     ) -> JsResult<bun_s3_signing::S3CredentialsWithOptions>;
 }
@@ -66,6 +67,7 @@ impl S3CredentialsExt for S3Credentials {
         default_acl: Option<ACL>,
         default_storage_class: Option<StorageClass>,
         default_request_payer: bool,
+        default_metadata: Option<&Metadata>,
         global: &JSGlobalObject,
     ) -> JsResult<bun_s3_signing::S3CredentialsWithOptions> {
         crate::webcore::s3::credentials_jsc::get_credentials_with_options(
@@ -75,6 +77,7 @@ impl S3CredentialsExt for S3Credentials {
             default_acl,
             default_storage_class,
             default_request_payer,
+            default_metadata,
             global,
         )
     }
@@ -252,6 +255,7 @@ pub(crate) struct S3Client {
     pub(crate) acl: Option<ACL>,
     pub(crate) storage_class: Option<StorageClass>,
     pub(crate) request_payer: bool,
+    pub(crate) metadata: Option<Metadata>,
 }
 
 impl S3Client {
@@ -283,6 +287,7 @@ impl S3Client {
             None,
             None,
             false,
+            None,
             global,
         )?;
         Ok(Box::new(S3Client {
@@ -291,6 +296,7 @@ impl S3Client {
             acl: aws_options.acl,
             storage_class: aws_options.storage_class,
             request_payer: aws_options.request_payer,
+            metadata: aws_options.metadata,
         }))
     }
 
@@ -355,6 +361,7 @@ impl S3Client {
             self.acl,
             self.storage_class,
             self.request_payer,
+            self.metadata.as_ref(),
         )
     }
 
@@ -551,6 +558,7 @@ impl S3Client {
             None,
             None,
             ptr.request_payer,
+            None,
         )?;
 
         let store = blob.store.get().as_ref().unwrap();

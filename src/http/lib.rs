@@ -1044,6 +1044,12 @@ bun_core::comptime_string_map! {
 // we always rewrite the entire HTTP request when write() returns EAGAIN
 // so we can reuse this buffer
 const MAX_REQUEST_HEADERS: usize = 256;
+// Reserve slots for default headers that may be appended after user headers
+// (Connection, User-Agent, Accept, Host, Accept-Encoding, Content-Length/Transfer-Encoding).
+const MAX_DEFAULT_HEADERS: usize = 6;
+/// How many headers of its caller a request carries. `build_request` drops
+/// the ones after that, so a caller that signs its headers has to stay below.
+pub const MAX_USER_HEADERS: usize = MAX_REQUEST_HEADERS - MAX_DEFAULT_HEADERS;
 static SHARED_REQUEST_HEADERS_BUF: bun_core::RacyCell<[picohttp::Header; MAX_REQUEST_HEADERS]> =
     bun_core::RacyCell::new([picohttp::Header::ZERO; MAX_REQUEST_HEADERS]);
 
@@ -2477,11 +2483,6 @@ impl<'a> HTTPClient<'a> {
         let mut connection_close_requested = false;
         let mut override_user_agent = false;
         let mut original_content_length: Option<&[u8]> = None;
-
-        // Reserve slots for default headers that may be appended after user headers
-        // (Connection, User-Agent, Accept, Host, Accept-Encoding, Content-Length/Transfer-Encoding).
-        const MAX_DEFAULT_HEADERS: usize = 6;
-        const MAX_USER_HEADERS: usize = MAX_REQUEST_HEADERS - MAX_DEFAULT_HEADERS;
 
         for (i, head) in header_names.iter().enumerate() {
             let name = self.header_str(*head);

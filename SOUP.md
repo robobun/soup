@@ -3493,6 +3493,132 @@ Files: `src/runtime/cli/test/CoverageInclude.rs` (new), `src/runtime/cli/test_co
 `docs/snippets/cli/test.mdx`, `docs/guides/test/migrate-from-jest.mdx`,
 `test/cli/test/coverage.test.ts`.
 
+### 2026-09-27: user-defined metadata for S3 objects
+
+An S3 object carries the key-value pairs its uploader gives it, as `x-amz-meta-*` headers, and
+Bun's S3 client could neither send nor read them. That is oven-sh/bun#17339 (21 upvotes,
+"specifically the inability to add metadata to the object" keeps several people in the thread on
+the AWS SDK), oven-sh/bun#16048 (23) and, for reading, oven-sh/bun#19301. A maintainer wrote it
+once: oven-sh/bun#26154, for the Zig tree, which its author closed unmerged in June. This is its
+API on the Rust tree, `metadata` on an upload and on what `stat()` returns:
+
+```ts
+import { s3 } from "bun";
+
+await s3.write("invoice.pdf", pdf, {
+  type: "application/pdf",
+  metadata: { customer: "1042", "reviewed-by": "ana" },
+});
+
+const { metadata } = await s3.stat("invoice.pdf");
+metadata; // { customer: "1042", "reviewed-by": "ana" }
+
+// the default of every upload of a file, or of a client
+const report = s3.file("report.csv", { metadata: { source: "nightly" } });
+await report.write(rows); // source: "nightly"
+await report.write(rows, { metadata: { source: "manual" } }); // replaced, not merged
+await report.write(rows, { metadata: {} }); // none, and so is null
+
+// a presigned upload signs them: the request has to send the same headers
+const url = s3.presign("avatar.png", {
+  method: "PUT",
+  metadata: { user: "1042" },
+});
+await fetch(url, {
+  method: "PUT",
+  headers: { "x-amz-meta-user": "1042" },
+  body,
+});
+```
+
+`write()`, `writer()`, `S3Client.write()` and `Bun.write()` to an S3 file send it, whatever the
+data is: a string or a buffer in one `PutObject`, a `Blob`, a local file, another S3 file, a
+`Response` or a stream, and in a multipart upload with `CreateMultipartUpload` and not with the
+parts. `fetch()` with `PUT` to an `s3://` URL sends the `metadata` of its `s3` option. `stat()`
+returns the `x-amz-meta-*` headers of the response without the prefix and with lowercase keys,
+`{}` for an object that has none, and builds the object when the property is read for the first
+time.
+
+Keys are header names, so they are case-insensitive and are sent in lowercase, and
+`{ Color: "red", color: "blue" }` is an error and not a coin toss. A key has to be made of the
+characters HTTP allows in a header name. A value has to be printable ASCII: a line break would be
+a header of the attacker's choice in a signed request, and for other characters a client and a
+server have to agree on the bytes of a header, which the S3 emulation of the tests and Bun do not
+(a value in UTF-8 is a `SignatureDoesNotMatch`). botocore refuses such values too
+(`validate_ascii_metadata`). A `Map` or a `Headers` is refused, because it has no properties and
+would upload as nothing. All of this throws before a request is sent. What Bun does not check is
+the size. Amazon S3 stops at 2 KB of keys and values, other services at other sizes, so the
+`MetadataTooLarge` of the service is what the caller gets.
+
+The signature is where the work is. Signature Version 4 signs the headers in the order of their
+names, so the metadata sits between `x-amz-date` and `x-amz-request-payer`, sorted, and it signs a
+value without the spaces around it and with one space for every run of spaces (`"  a   b "` is
+signed as `a b` and sent as written). The list of signed headers and the canonical request are
+each written by one function for requests with and without metadata, and a request without it
+pays one `Option` check: the fixed buffers stay, and only a request with metadata moves the
+canonical request to the heap, since 2 KB of metadata next to a session token do not fit in the
+4 KB that were enough until now. `SignResult` still holds its 11 headers in an array, and the
+metadata headers are added to the request in `execute_simple_s3_request`, the function that every
+upload of the S3 client passes through. In a presigned URL they are signed headers
+(`X-Amz-SignedHeaders=host;x-amz-meta-user`), as in #26154 and in botocore, and only for `PUT` and
+`POST`: the download link of a file that has metadata does not ask its reader for headers. The AWS
+SDK for JavaScript moves them into the query string instead, where the uploader does not have to
+know them. That would be a second mode, and the emulation does not read metadata from a query
+string, so it could not have been tested here.
+
+Differences from #26154: no limit of 32 entries and no 2 KB check in the client, values that are
+not ASCII and keys that repeat are refused, `stat()` does not hold a strong reference to an object
+that nobody may read, and a presigned `GET` leaves the metadata out.
+
+The tests run against the S3 server that upstream added the day before
+(`test/packages/s3-server`, oven-sh/bun#44054). It verifies the signature of every request, so a
+header that is signed in the wrong place, or a value that is signed as written, is a 403 there as
+it would be at Amazon. One test talks to a raw socket, because the emulation answers with
+lowercase header names and `stat()` has to read `X-Amz-Meta-Customer` too.
+
+A review pass (three readers: the signing, the plumbing, and the docs, types and tests) found
+what follows, and all of it is fixed in this commit. `fetch()` to an `s3://` URL sent the metadata
+for a stream and dropped it for a string. The HTTP client sends the first 250 headers of a request
+and drops the rest without a word, so 300 small keys, which fit in 2 KB, were signed and not all
+sent: a 403 for valid input, or an upload that loses keys on a server that reads a missing header
+as an empty one. The limit is now a constant of the HTTP client, and `metadata` takes the 238 keys
+that fit next to the other headers of an upload. `metadata: null` kept the default where the rule
+of the repo is that `undefined` keeps it and `null` turns it off. The JSDoc said "no control
+characters" for what is "printable ASCII". One test read an object that the test before it had
+made, the helpers picked the last request of an operation and not of a key, and the test for
+percent-encoding compared the URL and never sent a request.
+
+Not done. Values in other scripts are not written as RFC 2047 encoded words, which is what Amazon
+S3 decodes, and the encoded words it returns are not decoded: `stat()` gives the header as it
+came. `Bun.write()` has none of the S3 options in its types, `metadata` included, so the docs show
+it with the metadata of the file. The retry of a failed upload sends the metadata again, by
+reading, and no test makes an upload fail once.
+
+Three older bugs turned up on the way and were reported, not fixed here. `writer()` without
+arguments ignores the `storageClass`, `partSize`, `queueSize` and `retry` of its file, and
+`writer()` never sends `x-amz-acl`. `contentDisposition` and `contentEncoding` given to `file()`,
+which is the form the JSDoc shows, are dropped by a later `write()`. And `fetch()` to an `s3://`
+URL with a body that is not a stream ignores `acl`, `storageClass` and `requestPayer`.
+
+Rebase notes: 41 patches onto oven-sh/bun a4f1429148, nothing dropped, two conflicts, both from
+oven-sh/bun#44086 ("Say the platform once"), which removes the `#[cfg]` attributes that repeat the
+gate of the item around them and with that takes one level of indentation out of
+`CopyFile::run_async`. The `append` patch of 2026-08-29 adds three conditions to that function
+and a parameter to `write_bytes_to_file_fast`, and the watch-path patch of 2026-09-24 adds a field
+to `ChangeEvent`. Both were put on the new shape without their own repeated attributes, and their
+tests pass (the `--watch-path` tests need `--timeout 60000` on a debug build on this machine: each
+restarts a debug bun three times). The fork's three workflows were green after yesterday's push.
+
+Files: `src/s3_signing/metadata.rs` (new), `src/s3_signing/credentials.rs` (`sign_request`,
+`SignedHeaders`, `CanonicalRequest`, `SignOptions`, `S3CredentialsWithOptions`),
+`src/s3_signing/lib.rs`, `src/runtime/webcore/s3/credentials_jsc.rs` (`get_metadata`),
+`src/runtime/webcore/s3/{simple_request,multipart,client}.rs`,
+`src/runtime/webcore/{Blob,S3File,S3Client,S3Stat,fetch,Response}.rs`,
+`src/runtime/webcore/blob/Store.rs`, `src/runtime/api/{BunObject.rs,S3Stat.classes.ts}`,
+`src/jsc/webcore_types.rs` (the S3 blob store), `src/http/lib.rs` (`MAX_USER_HEADERS` is public),
+`packages/bun-types/s3.d.ts`, `docs/runtime/s3.mdx`, `test/js/bun/s3/s3-metadata.test.ts` (new),
+`test/integration/bun-types/fixture/s3.ts`.
+
 ## Dropped
 
 Nothing yet.
