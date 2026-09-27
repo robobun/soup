@@ -240,9 +240,7 @@ extern "C" uint32_t Bun__EncoderStringTable__slotForUTF16(JSC::EncoderStringTabl
     return table->slotFor(StringImpl::create8BitIfPossible(std::span { chars, length }).get());
 }
 
-// Parses `inputSourceCode` and generates the unlinked code of all of it (nested functions down to `depth`). Null on a
-// parse error. The caller holds the bytecode VM's lock.
-static JSC::UnlinkedCodeBlock* generateUnlinkedCodeForBytecodeCache(JSC::VM& vm, const BunString* sourceProviderURL, const BunString* inputSourceCode, bool isModule, uint32_t depth, bool optimize, JSC::SourceCode& sourceCode, JSC::SourceCodeKey& key)
+JSC::UnlinkedCodeBlock* generateUnlinkedCodeForBytecodeCache(JSC::VM& vm, const BunString* sourceProviderURL, const BunString* inputSourceCode, bool isModule, uint32_t depth, bool optimize, JSC::SourceCode& sourceCode, JSC::SourceCodeKey& key)
 {
     sourceCode = JSC::makeSource(inputSourceCode->toWTFString(), toSourceOrigin(sourceProviderURL->toWTFString(), false), JSC::SourceTaintedOrigin::Untainted);
     EvalContextType evalContextType = EvalContextType::None;

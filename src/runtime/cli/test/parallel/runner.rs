@@ -41,6 +41,7 @@ pub(crate) fn run_as_coordinator(
     files: &[Interned],
     ctx: Command::Context,
     coverage_opts: &mut CodeCoverageOptions,
+    coverage_include: Option<&mut crate::cli::test::coverage_include::Run>,
 ) -> crate::Result<bool> {
     // SAFETY: caller guarantees `vm` is a valid live VM pointer for the duration.
     // Kept as a raw pointer; dereferenced at each use site to sidestep borrowck
@@ -218,7 +219,13 @@ pub(crate) fn run_as_coordinator(
 
     aggregate::replay_test_records(&mut coord);
     if coverage_opts.enabled {
-        aggregate::write_coverage_report(&mut coord, coverage_opts);
+        aggregate::write_coverage_report(
+            &mut coord,
+            // SAFETY: see vm_ptr note above.
+            unsafe { &mut *vm_ptr },
+            coverage_opts,
+            coverage_include,
+        );
     }
     if let Some(code) = coord.aborted {
         coord.reporter.write_reports_if_needed();

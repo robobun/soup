@@ -201,14 +201,230 @@ impl<'a> Report<'a> {
             fold(&mut generator.function_blocks);
         }
 
+        // `SavedSourceMap::get` hands out an `Arc`, so the ref is released when `source_map` drops.
+        let source_map: Option<std::sync::Arc<ParsedSourceMap>> = if ignore_sourcemap_ {
+            None
+        } else {
+            bun_jsc::VirtualMachine::VirtualMachine::get()
+                .as_mut()
+                .source_mappings()
+                .get(byte_range_mapping.source_url.slice())
+        };
+
         Some(bun_core::handle_oom(
             byte_range_mapping.generate_report_from_blocks(
                 &generator.blocks,
                 &generator.function_blocks,
-                ignore_sourcemap_,
+                source_map.as_deref(),
                 ignored_lines,
             ),
         ))
+    }
+}
+
+/// How JavaScriptCore is given the transpiled text of a file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Module,
+    /// A script that is one function expression, the wrapper Bun puts around
+    /// a CommonJS module.
+    CommonJs,
+}
+
+/// Why the functions of a text cannot be listed.
+#[derive(Debug)]
+pub enum Unreadable {
+    /// JavaScriptCore does not parse the text.
+    DoesNotParse,
+    /// An array or object literal is nested more than [`DEEPEST_LITERAL`] deep.
+    NestedTooDeeply,
+}
+
+/// Held while files that nothing loaded are reported. Their functions are
+/// read in a JSC VM of this thread that runs no code and is apart from the one
+/// that ran the tests. Dropping this frees that VM.
+pub struct NeverExecutedPass {
+    _on_this_thread: core::marker::PhantomData<*mut ()>,
+}
+
+impl NeverExecutedPass {
+    pub fn begin() -> Self {
+        Self {
+            _on_this_thread: core::marker::PhantomData,
+        }
+    }
+
+    /// What JSC lists as the functions of a source that is loaded and of which
+    /// no function ran: the functions its top-level code declares. `text` is
+    /// `generated_text` as JSC reads it, so the ranges count its code units.
+    fn functions(
+        &self,
+        source_url: &[u8],
+        generated_text: &[u8],
+        text: &bun_core::String,
+        kind: SourceKind,
+    ) -> Result<Vec<BasicBlockRange>, Unreadable> {
+        extern "C" fn collect(
+            functions: &mut Vec<BasicBlockRange>,
+            ranges: *const BasicBlockRange,
+            len: usize,
+        ) {
+            if len == 0 {
+                return;
+            }
+            // SAFETY: `ranges[..len]` is a C array that is live for this call.
+            functions.extend_from_slice(unsafe { core::slice::from_raw_parts(ranges, len) });
+        }
+
+        if literal_depth(generated_text) > DEEPEST_LITERAL {
+            return Err(Unreadable::NestedTooDeeply);
+        }
+
+        let mut functions: Vec<BasicBlockRange> = Vec::new();
+        let source_url = bun_core::String::borrow_utf8(source_url);
+        // SAFETY: the strings and `functions` outlive the call, and the
+        // callback runs before it returns.
+        let parsed = unsafe {
+            CodeCoverage__withFunctionsOfText(
+                &source_url,
+                text,
+                kind == SourceKind::CommonJs,
+                (&raw mut functions).cast::<c_void>(),
+                collect,
+            )
+        };
+        if parsed {
+            Ok(functions)
+        } else {
+            Err(Unreadable::DoesNotParse)
+        }
+    }
+}
+
+/// JSC's parser reads an array or object literal that is nested past its
+/// stack limit again as a pattern, at every level, which takes time and memory
+/// without end. A load of such a file does that too. The pass must not do it
+/// for a file that nothing loads, and no code is nested like this.
+pub const DEEPEST_LITERAL: usize = 256;
+
+/// How deep `[` and `{` go in `text`, strings left out.
+fn literal_depth(text: &[u8]) -> usize {
+    let mut depth: usize = 0;
+    let mut deepest: usize = 0;
+    let mut bytes = text.iter();
+    while let Some(&byte) = bytes.next() {
+        match byte {
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b'"' | b'\'' | b'`' => {
+                while let Some(&inside) = bytes.next() {
+                    if inside == b'\\' {
+                        bytes.next();
+                    } else if inside == byte {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    deepest
+}
+
+impl Drop for NeverExecutedPass {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            safe fn Bun__destroyBytecodeCacheVM();
+        }
+        Bun__destroyBytecodeCacheVM();
+    }
+}
+
+impl Report<'static> {
+    /// The report of a file that nothing loaded, from the text a load would
+    /// hand to JSC and the source map of that text. Every line the text maps
+    /// to is executable and did not run. The functions are those of the
+    /// top-level code, which are the ones a load lists before it runs any of
+    /// them. A function in a function is listed once the outer one runs, for
+    /// a loaded file too.
+    ///
+    /// `None`: nothing in the file can run (types, comments, nothing at all).
+    pub fn never_executed(
+        pass: &NeverExecutedPass,
+        source_url: &[u8],
+        generated_text: &[u8],
+        source_map: Option<&ParsedSourceMap>,
+        kind: SourceKind,
+        ignore_sourcemap: bool,
+        ignored_lines: Option<&Bitset>,
+    ) -> Result<Option<Report<'static>>, Unreadable> {
+        // JSC's ranges and the source map's columns count the code units of this string.
+        let text = bun_core::String::clone_utf8(generated_text);
+        let mapping = ByteRangeMapping::compute(&text, 0, 0, Utf8Bytes::Owned(source_url.to_vec()));
+        mapping
+            .never_executed(
+                pass,
+                generated_text,
+                &text,
+                if ignore_sourcemap { None } else { source_map },
+                kind,
+                ignored_lines,
+            )
+            .map(|report| report.map(Report::into_owned))
+    }
+}
+
+impl ByteRangeMapping {
+    fn never_executed(
+        &self,
+        pass: &NeverExecutedPass,
+        generated_text: &[u8],
+        text: &bun_core::String,
+        source_map: Option<&ParsedSourceMap>,
+        kind: SourceKind,
+        ignored_lines: Option<&Bitset>,
+    ) -> Result<Option<Report<'_>>, Unreadable> {
+        let mapping = self;
+        // JSC's ranges include their end. An empty text has no range.
+        let whole_text = BasicBlockRange {
+            start_offset: 0,
+            end_offset: c_int::try_from(mapping.executable_units.bit_length())
+                .unwrap_or(c_int::MAX)
+                - 1,
+            has_executed: false,
+            execution_count: 0,
+        };
+        let lines =
+            bun_core::handle_oom(mapping.convert(&[whole_text], &[], source_map, ignored_lines));
+        if lines.report.executable_lines.count() == 0 {
+            return Ok(None);
+        }
+
+        // The lines are known from the whole text, so this conversion is for
+        // the functions alone.
+        let listed = pass.functions(mapping.source_url.slice(), generated_text, text, kind)?;
+        let functions =
+            bun_core::handle_oom(mapping.convert(&[], &listed, source_map, ignored_lines));
+
+        let mut report = Report {
+            functions: functions.report.functions,
+            functions_which_have_executed: functions.report.functions_which_have_executed,
+            ..lines.report
+        };
+        if let Some(ignored) = lines.ignored_lines {
+            bun_core::handle_oom(report.ignore_lines(
+                ignored,
+                &functions.function_lines,
+                &lines.stmt_first_lines,
+            ));
+        }
+        if report.executable_lines.count() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(report))
     }
 }
 
@@ -811,6 +1027,13 @@ unsafe extern "C" {
         ctx: *mut c_void,
         cb: extern "C" fn(&mut Generator, *const BasicBlockRange, usize, usize),
     ) -> bool;
+    fn CodeCoverage__withFunctionsOfText(
+        source_url: &bun_core::String,
+        text: &bun_core::String,
+        is_commonjs: bool,
+        ctx: *mut c_void,
+        cb: extern "C" fn(&mut Vec<BasicBlockRange>, *const BasicBlockRange, usize),
+    ) -> bool;
 }
 
 /// What JSC recorded for one file, under each of its SourceIDs.
@@ -870,6 +1093,17 @@ pub struct BasicBlockRange {
     end_offset: c_int,
     has_executed: bool,
     execution_count: usize,
+}
+
+/// What `ByteRangeMapping::convert` makes of JSC's ranges, before the ignored
+/// lines leave the report.
+struct Converted<'a, 'i> {
+    report: Report<'a>,
+    /// The lines to ignore, when they number the lines the report numbers.
+    ignored_lines: Option<&'i Bitset>,
+    /// For `Report::ignore_lines`. Empty when nothing is ignored.
+    function_lines: Vec<(u32, u32)>,
+    stmt_first_lines: Vec<u32>,
 }
 
 pub struct ByteRangeMapping {
@@ -941,22 +1175,35 @@ impl ByteRangeMapping {
         thread_map_opt()
     }
 
-    pub(crate) fn generate_report_from_blocks(
-        &self,
+    /// `source_map` is the one saved for the text the ranges count code units of. `None` counts
+    /// the lines of that text.
+    pub(crate) fn generate_report_from_blocks<'a>(
+        &'a self,
         blocks: &[BasicBlockRange],
         function_blocks: &[BasicBlockRange],
-        ignore_sourcemap: bool,
+        source_map: Option<&ParsedSourceMap>,
         ignored_lines: Option<&Bitset>,
-    ) -> Result<Report<'_>, bun_alloc::AllocError> {
+    ) -> Result<Report<'a>, bun_alloc::AllocError> {
+        let Converted {
+            mut report,
+            ignored_lines,
+            function_lines,
+            stmt_first_lines,
+        } = self.convert(blocks, function_blocks, source_map, ignored_lines)?;
+        if let Some(ignored) = ignored_lines {
+            report.ignore_lines(ignored, &function_lines, &stmt_first_lines)?;
+        }
+        Ok(report)
+    }
+
+    fn convert<'a, 'i>(
+        &'a self,
+        blocks: &[BasicBlockRange],
+        function_blocks: &[BasicBlockRange],
+        source_map: Option<&ParsedSourceMap>,
+        ignored_lines: Option<&'i Bitset>,
+    ) -> Result<Converted<'a, 'i>, bun_alloc::AllocError> {
         let source_url = self.source_url.slice();
-        let source_map: Option<std::sync::Arc<ParsedSourceMap>> = if ignore_sourcemap {
-            None
-        } else {
-            bun_jsc::VirtualMachine::VirtualMachine::get()
-                .as_mut()
-                .source_mappings()
-                .get(source_url)
-        };
 
         let mut blocks: Vec<CountedRange> =
             blocks.iter().filter_map(CountedRange::from_jsc).collect();
@@ -984,7 +1231,7 @@ impl ByteRangeMapping {
         let counts = ExecutionCounts::new(&blocks, &functions);
         let mut lines = LineCounts::default();
 
-        if let Some(source_map) = source_map.as_deref() {
+        if let Some(source_map) = source_map {
             let mut previous_original = None;
             source_map.for_each_mapping(|mapping| {
                 // The printer repeats a mapping at column 0 of a line that starts without one.
@@ -1018,7 +1265,7 @@ impl ByteRangeMapping {
 
         // A function the source does not have, such as the CommonJS wrapper, is a range of JSC's
         // like any function.
-        if let Some(source_map) = source_map.as_deref() {
+        if let Some(source_map) = source_map {
             functions.retain(|function| {
                 let (line, column) = self.line_and_column_of(function.range.start);
                 source_map.find_mapping(line, column).is_some()
@@ -1035,7 +1282,6 @@ impl ByteRangeMapping {
         let mut function_lines: Vec<(u32, u32)> = Vec::new();
         let mut stmt_first_lines: Vec<u32> = Vec::new();
         if ignored_lines.is_some() {
-            let source_map = source_map.as_deref();
             function_lines.extend(functions.iter().map(|function| {
                 let range = function.range;
                 let first = if self.is_whole_source(range) {
@@ -1055,20 +1301,21 @@ impl ByteRangeMapping {
         let (functions, functions_which_have_executed) = split_executed(&functions)?;
         let (stmts, stmts_which_have_executed) = split_executed(&blocks)?;
 
-        let mut report = Report {
-            source_url: Cow::Borrowed(source_url),
-            functions,
-            executable_lines,
-            lines_which_have_executed,
-            line_hits: lines.hits(),
-            stmts,
-            functions_which_have_executed,
-            stmts_which_have_executed,
-        };
-        if let Some(ignored) = ignored_lines {
-            report.ignore_lines(ignored, &function_lines, &stmt_first_lines)?;
-        }
-        Ok(report)
+        Ok(Converted {
+            report: Report {
+                source_url: Cow::Borrowed(source_url),
+                functions,
+                executable_lines,
+                lines_which_have_executed,
+                line_hits: lines.hits(),
+                stmts,
+                functions_which_have_executed,
+                stmts_which_have_executed,
+            },
+            ignored_lines,
+            function_lines,
+            stmt_first_lines,
+        })
     }
 
     /// Without a source map, the function Bun wraps a CommonJS module in (code units
