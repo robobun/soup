@@ -271,6 +271,7 @@ pub(crate) fn construct_s3_file_with_s3_credentials_and_options(
     default_acl: Option<s3::ACL>,
     default_storage_class: Option<s3::StorageClass>,
     default_request_payer: bool,
+    default_metadata: Option<&s3::Metadata>,
 ) -> JsResult<Blob> {
     let mut aws_options = <s3::S3Credentials>::get_credentials_with_options(
         default_credentials,
@@ -279,6 +280,7 @@ pub(crate) fn construct_s3_file_with_s3_credentials_and_options(
         default_acl,
         default_storage_class,
         default_request_payer,
+        default_metadata,
         global,
     )?;
 
@@ -288,7 +290,7 @@ pub(crate) fn construct_s3_file_with_s3_credentials_and_options(
         default_credentials.clone()
     };
     let store = blob::Store::init_s3(path, None, credentials).expect("oom");
-    finish_s3_blob(global, store, &aws_options, options)
+    finish_s3_blob(global, store, aws_options, options)
 }
 
 pub(crate) fn construct_s3_file_with_s3_credentials(
@@ -304,11 +306,12 @@ pub(crate) fn construct_s3_file_with_s3_credentials(
         None,
         None,
         false,
+        None,
         global,
     )?;
     let credentials = std::mem::take(&mut aws_options.credentials);
     let store = blob::Store::init_s3(path, None, credentials).expect("oom");
-    finish_s3_blob(global, store, &aws_options, options)
+    finish_s3_blob(global, store, aws_options, options)
 }
 
 /// Shared constructor epilogue: copies the parsed per-request settings onto
@@ -317,7 +320,7 @@ pub(crate) fn construct_s3_file_with_s3_credentials(
 fn finish_s3_blob(
     global: &JSGlobalObject,
     store: RefPtr<Store>,
-    aws_options: &s3::S3CredentialsWithOptions,
+    aws_options: s3::S3CredentialsWithOptions,
     options: Option<JSValue>,
 ) -> JsResult<Blob> {
     let s3 = Store::data_mut(&store).as_s3_mut();
@@ -325,6 +328,7 @@ fn finish_s3_blob(
     s3.acl = aws_options.acl;
     s3.storage_class = aws_options.storage_class;
     s3.request_payer = aws_options.request_payer;
+    s3.metadata = aws_options.metadata;
 
     let blob = Blob::init_with_store(store, global);
     if let Some(opts) = options {
@@ -443,6 +447,7 @@ impl S3BlobStatTask {
                     stat_result.etag,
                     stat_result.content_type,
                     stat_result.last_modified,
+                    stat_result.headers,
                     global,
                 ) {
                     Ok(b) => (*b).to_js(global),
@@ -609,6 +614,11 @@ pub(crate) fn get_presign_url_from(
             content_md5: None,
             search_params: None,
             content_encoding: None,
+            // Headers the request has to send, and only an upload has them.
+            metadata: credentials_with_options
+                .metadata
+                .as_ref()
+                .filter(|_| matches!(method, Method::PUT | Method::POST)),
         },
         Some(bun_s3_signing::SignQueryOptions { expires }),
     ) {

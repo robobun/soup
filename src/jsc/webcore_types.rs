@@ -836,6 +836,9 @@ pub mod store {
         pub acl: Option<bun_s3_signing::ACL>,
         pub storage_class: Option<bun_s3_signing::StorageClass>,
         pub request_payer: bool,
+        /// The `metadata` the file was made with: what an upload sends when
+        /// its own options have none.
+        pub metadata: Option<bun_s3_signing::Metadata>,
     }
 
     impl S3 {
@@ -850,6 +853,11 @@ pub mod store {
                     .credentials
                     .as_ref()
                     .map(|c| c.estimated_size())
+                    .unwrap_or(0)
+                + self
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.estimated_size())
                     .unwrap_or(0)
         }
 
@@ -882,6 +890,7 @@ pub mod store {
                 acl: None,
                 storage_class: None,
                 request_payer: false,
+                metadata: None,
             }
         }
     }

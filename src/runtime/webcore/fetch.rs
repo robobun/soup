@@ -1747,6 +1747,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                         None,
                         None,
                         false,
+                        None,
                         global_this,
                     )?;
                 }
@@ -1820,6 +1821,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                 headers.as_ref().and_then(|h| h.get_content_encoding()),
                 proxy_url,
                 credentials_with_options.request_payer,
+                credentials_with_options.metadata.take(),
                 Some(s3_stream_wrapper_resolve),
                 bun_core::heap::into_raw(s3_stream).cast::<libc::c_void>(),
             )?;
@@ -1830,10 +1832,16 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             method = Method::PUT;
         }
 
+        // Only an upload has metadata to send.
+        let metadata = credentials_with_options
+            .metadata
+            .as_ref()
+            .filter(|_| method == Method::PUT);
         let mut result = match credentials_with_options.credentials.sign_request::<false>(
             &SignOptions {
                 path: url.s3_path(),
                 method,
+                metadata,
                 ..Default::default()
             },
             None,
@@ -1891,6 +1899,12 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             }
         } else {
             set_headers(&mut headers, result.headers());
+        }
+        // Signed with the request, and not among `result.headers()`.
+        if let (Some(metadata), Some(headers)) = (metadata, &mut headers) {
+            for entry in metadata.entries() {
+                headers.append(entry.name(), entry.value());
+            }
         }
     }
 

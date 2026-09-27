@@ -15,6 +15,7 @@ pub(crate) use crate::webcore::s3::download_stream::S3HttpDownloadStreamingTask;
 pub(crate) use crate::webcore::s3::multipart::MultiPartUpload;
 pub(crate) use crate::webcore::s3::multipart_options::MultiPartUploadOptions;
 pub(crate) use bun_s3_signing::acl::ACL;
+pub(crate) use bun_s3_signing::metadata::Metadata;
 pub(crate) use bun_s3_signing::storage_class::StorageClass;
 
 pub(crate) use bun_s3_signing::error as Error;
@@ -263,6 +264,7 @@ pub(crate) fn list_objects(
             acl: None,
             storage_class: None,
             request_payer: false,
+            metadata: None,
         },
         None,
     ) {
@@ -382,6 +384,7 @@ pub(crate) fn upload(
     acl: Option<ACL>,
     storage_class: Option<StorageClass>,
     request_payer: bool,
+    metadata: Option<&Metadata>,
     callback: fn(S3UploadResult, *mut c_void) -> JsResult<()>,
     callback_context: *mut c_void,
 ) -> JsResult<()> {
@@ -398,6 +401,7 @@ pub(crate) fn upload(
             acl,
             storage_class,
             request_payer,
+            metadata,
             ..Default::default()
         },
         s3_simple_request::Callback::Upload(callback),
@@ -418,6 +422,7 @@ pub(crate) fn writable_stream(
     content_encoding: Option<&[u8]>,
     storage_class: Option<StorageClass>,
     request_payer: bool,
+    metadata: Option<Metadata>,
 ) -> JsResult<JSValue> {
     // Local callback wrapper. `uploaded` and `path` are read off the upload (see `MultiPartUpload::callback`).
     fn wrapper_callback(
@@ -504,6 +509,7 @@ pub(crate) fn writable_stream(
         acl: None,
         storage_class,
         request_payer,
+        metadata,
         credentials,
         poll_ref: JsCell::new(KeepAlive::init()),
         abort_handle: bun_jsc::AbortHandle::for_owner::<MultiPartUpload>(),
@@ -815,6 +821,7 @@ pub(crate) fn upload_stream(
     content_encoding: Option<&[u8]>,
     proxy: Option<&[u8]>,
     request_payer: bool,
+    metadata: Option<Metadata>,
     callback: Option<fn(S3UploadResult, *mut c_void)>,
     callback_context: *mut c_void,
 ) -> JsResult<JSValue> {
@@ -924,6 +931,7 @@ pub(crate) fn upload_stream(
         acl,
         storage_class,
         request_payer,
+        metadata,
         credentials,
         poll_ref: JsCell::new(KeepAlive::init()),
         abort_handle: bun_jsc::AbortHandle::for_owner::<MultiPartUpload>(),
@@ -1175,6 +1183,7 @@ fn download_stream(
             content_encoding: None,
             acl: None,
             storage_class: None,
+            metadata: None,
         },
         None,
     ) {

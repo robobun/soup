@@ -264,6 +264,7 @@ impl S3Ext for S3 {
             self.acl,
             self.storage_class,
             self.request_payer,
+            self.metadata.as_ref(),
             global_object,
         )
     }

@@ -15,6 +15,7 @@ use bun_picohttp as picohttp;
 use bun_s3_signing::acl::ACL;
 use bun_s3_signing::credentials::{S3Credentials, SignOptions, SignResult};
 use bun_s3_signing::error::{S3Error, get_sign_error_code_and_message};
+use bun_s3_signing::metadata::Metadata;
 use bun_s3_signing::storage_class::StorageClass;
 use bun_threading::thread_pool;
 use bun_url::URL;
@@ -35,6 +36,8 @@ pub(crate) struct S3StatSuccess<'a> {
     pub(crate) last_modified: &'a [u8],
     /// format: text/plain, contentType is not owned and need to be copied if used after this callback
     pub(crate) content_type: &'a [u8],
+    /// The headers of the response, for its `x-amz-meta-*` ones. Not owned.
+    pub(crate) headers: &'a [picohttp::Header],
 }
 
 pub(crate) enum S3StatResult<'a> {
@@ -328,6 +331,7 @@ impl S3HttpSimpleTask {
                             etag: response.headers.get(b"etag").unwrap_or(b""),
                             last_modified: response.headers.get(b"last-modified").unwrap_or(b""),
                             content_type: response.headers.get(b"content-type").unwrap_or(b""),
+                            headers: response.headers.list,
                             size: response
                                 .headers
                                 .get(b"content-length")
@@ -536,6 +540,8 @@ pub(crate) struct S3SimpleRequestOptions<'a> {
     pub(crate) acl: Option<ACL>,
     pub(crate) storage_class: Option<StorageClass>,
     pub(crate) request_payer: bool,
+    /// For the request that creates the object: PutObject or CreateMultipartUpload.
+    pub(crate) metadata: Option<&'a Metadata>,
 }
 
 impl<'a> Default for S3SimpleRequestOptions<'a> {
@@ -553,6 +559,7 @@ impl<'a> Default for S3SimpleRequestOptions<'a> {
             acl: None,
             storage_class: None,
             request_payer: false,
+            metadata: None,
         }
     }
 }
@@ -615,6 +622,7 @@ pub(crate) fn execute_simple_s3_request(
             acl: options.acl,
             storage_class: options.storage_class,
             request_payer: options.request_payer,
+            metadata: options.metadata,
             content_hash: None,
             content_md5: None,
             content_type: None,
@@ -635,7 +643,7 @@ pub(crate) fn execute_simple_s3_request(
         }
     };
 
-    let headers = 'brk: {
+    let mut headers = 'brk: {
         let mut header_buffer = [picohttp::Header::ZERO; SignResult::MAX_HEADERS + 1];
         if let Some(range_) = &options.range {
             let _headers =
@@ -654,6 +662,12 @@ pub(crate) fn execute_simple_s3_request(
             break 'brk Headers::from_pico_http_headers(result.headers());
         }
     };
+    // Signed with the request, and not among `result.headers()`.
+    if let Some(metadata) = options.metadata {
+        for entry in metadata.entries() {
+            headers.append(entry.name(), entry.value());
+        }
+    }
 
     let mut poll_ref = KeepAlive::init();
     poll_ref.ref_(bun_io::posix_event_loop::get_vm_ctx(
