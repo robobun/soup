@@ -2,6 +2,7 @@ use bun_io::Write as _;
 
 use crate::cli::Command;
 use crate::cli::test::changed_files_filter as ChangedFilesFilter;
+use crate::cli::test::coverage_include;
 use crate::cli::test::json_reporter::JsonReporter;
 use crate::cli::test::last_failed::LastFailed;
 use crate::cli::test::parallel_runner as ParallelRunner;
@@ -25,8 +26,8 @@ use bun_sys::{self, Fd, File};
 // Debug log scope for test-runner entrypoint loading.
 bun_output::declare_scope!(bun_test, hidden);
 
-mod coverage {
-    pub(super) use bun_sourcemap_jsc::code_coverage::ignore_hints::{self, IgnoreHints};
+pub(crate) mod coverage {
+    pub(crate) use bun_sourcemap_jsc::code_coverage::ignore_hints::{self, IgnoreHints};
     pub(super) use bun_sourcemap_jsc::code_coverage::{
         ByteRangeMapping, Fraction, Report as CodeCoverageReport, lcov, text,
     };
@@ -40,7 +41,7 @@ mod coverage {
         bun_core::order(a.source_url.slice(), b.source_url.slice())
     }
 
-    pub(super) fn is_ignored(
+    pub(crate) fn is_ignored(
         opts: &bun_options_types::code_coverage_options::CodeCoverageOptions,
         relative_dir: &[u8],
         source_url: &[u8],
@@ -1591,43 +1592,71 @@ impl CommandLineReporter {
         &mut self,
         vm: &mut VirtualMachine,
         opts: &mut CodeCoverageOptions,
+        include: Option<&coverage_include::Run>,
     ) {
         let _trace = bun::perf::trace("TestCommand.printCodeCoverage");
         if ByteRangeMapping::map().is_none_or(|m| {
             // SAFETY: see `for_each_coverage_report`.
             unsafe { m.as_ref() }.is_empty()
-        }) {
+        }) && !include.is_some_and(coverage_include::Run::adds_files)
+        {
             return;
         }
         let mut reports: Vec<CodeCoverageReport<'static>> = Vec::new();
         Self::for_each_coverage_report(vm, opts, |report| reports.push(report.into_owned()));
-        if let Err(err) = print_coverage_reports(opts, &reports) {
+        if let Err(err) = finish_coverage_reports(vm, opts, include, reports, &|| false) {
             Output::err(err, "Failed to write lcov.info", ());
             Global::exit(1);
         }
     }
 }
 
-/// Write the `--coverage` text table to stderr and/or `lcov.info` for
-/// `reports` (sorted by path), and set `opts.fractions.failing`. The serial
-/// runner passes this process's reports; the `--parallel` coordinator passes
-/// reports merged from every worker. Errors only from writing `lcov.info`.
-pub(crate) fn print_coverage_reports(
+/// The one way to the coverage report. The serial runner passes this
+/// process's reports; the `--parallel` coordinator passes reports merged from
+/// every worker. With `collectCoverageFrom` (`include`) they become the
+/// reports of the files the list names before they are printed.
+/// `interrupted` is asked between two files that nothing loaded.
+/// Errors only from writing `lcov.info`.
+pub(crate) fn finish_coverage_reports(
+    vm: &mut VirtualMachine,
     opts: &mut CodeCoverageOptions,
+    include: Option<&coverage_include::Run>,
+    mut reports: Vec<CodeCoverageReport<'static>>,
+    interrupted: &dyn Fn() -> bool,
+) -> bun_sys::Result<coverage_include::Completed> {
+    let relative_dir = match include {
+        Some(run) => {
+            let completed = coverage_include::complete(run, vm, opts, &mut reports, interrupted);
+            if completed == coverage_include::Completed::Interrupted {
+                return Ok(completed);
+            }
+            run.root()
+        }
+        None => FileSystem::get().top_level_dir,
+    };
+    print_coverage_reports(opts, relative_dir, &reports)?;
+    Ok(coverage_include::Completed::Yes)
+}
+
+/// Write the `--coverage` text table to stderr and/or `lcov.info` for
+/// `reports` (sorted by path), and set `opts.fractions.failing`.
+fn print_coverage_reports(
+    opts: &mut CodeCoverageOptions,
+    relative_dir: &[u8],
     reports: &[CodeCoverageReport<'_>],
 ) -> bun_sys::Result<()> {
     if Output::enable_ansi_colors_stderr() {
-        print_coverage_reports_::<true>(opts, reports)
+        print_coverage_reports_::<true>(opts, relative_dir, reports)
     } else {
-        print_coverage_reports_::<false>(opts, reports)
+        print_coverage_reports_::<false>(opts, relative_dir, reports)
     }
 }
 
 fn print_coverage_reports_<const COLORS: bool>(
     opts: &mut CodeCoverageOptions,
+    relative_dir: &[u8],
     reports: &[CodeCoverageReport<'_>],
 ) -> bun_sys::Result<()> {
-    let relative_dir = FileSystem::get().top_level_dir;
     let thresholds = opts.fractions;
 
     let fractions: Vec<Fraction> = reports.iter().map(|r| r.fraction(&thresholds)).collect();
@@ -1739,7 +1768,10 @@ fn write_lcov_report(
 
     let mut fs = crate::node::fs::NodeFS::default();
     let _ = fs.mkdir_recursive(&crate::node::fs::args::Mkdir {
-        path: crate::node::PathLike::borrowed(&opts.reports_directory),
+        // Where the file below goes, whatever the working directory is now.
+        path: crate::node::PathLike::borrowed(resolve_path::join_abs_string::<
+            bun_path::platform::Auto,
+        >(relative_dir, &[&opts.reports_directory])),
         always_return_none: true,
         recursive: true,
         ..Default::default()
@@ -1813,17 +1845,20 @@ extern "C" fn BunTest__shouldGenerateCodeCoverage(test_name_str: &bun_core::Stri
     }
 
     if let Some(runner) = jest::Jest::runner() {
-        if runner.test_options.coverage.skip_test_files {
-            let name_without_extension = &slice[0..slice.len() - ext.len()];
-            for suffix in scanner::TEST_NAME_SUFFIXES {
-                if strings::ends_with(name_without_extension, suffix) {
-                    return false;
-                }
-            }
+        if runner.test_options.coverage.skip_test_files && has_test_file_name(slice) {
+            return false;
         }
     }
 
     true
+}
+
+/// Whether `coverageSkipTestFiles` leaves the file out.
+pub(crate) fn has_test_file_name(path: &[u8]) -> bool {
+    let name_without_extension = &path[0..path.len() - bun_path::extension(path).len()];
+    scanner::TEST_NAME_SUFFIXES
+        .iter()
+        .any(|suffix| strings::ends_with(name_without_extension, suffix))
 }
 
 pub(crate) struct TestCommand;
@@ -2482,6 +2517,11 @@ impl TestCommand {
         }
 
         let mut coverage_options: CodeCoverageOptions = ctx.test_options.coverage.clone();
+        let mut coverage_include = coverage_include::Run::capture(
+            &coverage_options,
+            test_files.len(),
+            ctx.test_options.changed.is_some(),
+        );
         let mut ran_parallel = false;
 
         crate::cli::watch_path::start(vm, &ctx.debug.watch_paths);
@@ -2509,6 +2549,7 @@ impl TestCommand {
                     test_files,
                     &mut *ctx,
                     &mut coverage_options,
+                    coverage_include.as_mut(),
                 )?;
             } else {
                 Self::run_all_tests(&mut reporter, vm, test_files);
@@ -2665,7 +2706,11 @@ impl TestCommand {
             pretty_error!("\n");
 
             if coverage_options.enabled && !ran_parallel {
-                reporter.generate_code_coverage(vm, &mut coverage_options);
+                reporter.generate_code_coverage(
+                    vm,
+                    &mut coverage_options,
+                    coverage_include.as_ref(),
+                );
             }
 
             // `Summary` is `Copy`; take a value snapshot so the `&mut` from

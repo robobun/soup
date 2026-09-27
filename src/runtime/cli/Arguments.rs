@@ -612,6 +612,9 @@ pub(crate) const TEST_ONLY_PARAMS: &[ParamType] = &[
         "--coverage-dir <STR>             Directory for coverage files. Defaults to 'coverage'."
     ),
     parse_param!(
+        "--collect-coverage-from <STR>... Glob patterns for the files the coverage report is about, including files that no test loaded."
+    ),
+    parse_param!(
         "--bail <NUMBER>?                 Exit the test suite after \\<NUMBER\\> failures. If you do not specify a number, it defaults to 1."
     ),
     parse_param!(
@@ -1875,6 +1878,22 @@ fn parse_test_command_options(args: &clap::Args<clap::Help>, ctx: Context<'_>) {
 
     if let Some(dir) = args.option(b"--coverage-dir") {
         ctx.test_options.coverage.reports_directory = Box::<[u8]>::from(dir);
+    }
+
+    if !args.options(b"--collect-coverage-from").is_empty() {
+        if args
+            .options(b"--collect-coverage-from")
+            .iter()
+            .any(|pattern| pattern.is_empty())
+        {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r>: --collect-coverage-from expects a glob pattern, e.g. --collect-coverage-from='src/**/*.ts'"
+            );
+            Global::exit(1);
+        }
+        ctx.test_options.coverage.collect_from =
+            slice_to_owned(args.options(b"--collect-coverage-from"));
+        ctx.test_options.collect_coverage_from_cli = true;
     }
 
     if !args.options(b"--path-ignore-patterns").is_empty() {

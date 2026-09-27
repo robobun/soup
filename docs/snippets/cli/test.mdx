@@ -81,6 +81,11 @@ bun test <patterns>
   Directory for coverage files. Defaults to <code>coverage</code>
 </ParamField>
 
+<ParamField path="--collect-coverage-from" type="string">
+  Glob patterns for the files the coverage report is about, including files that no test loaded. Repeatable. Replaces{" "}
+  <code>collectCoverageFrom</code> in <code>bunfig.toml</code>
+</ParamField>
+
 ### Snapshots
 
 <ParamField path="--update-snapshots" type="boolean">

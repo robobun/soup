@@ -6,8 +6,10 @@
 namespace JSC {
 class Structure;
 class Identifier;
+class SourceCode;
 class SourceCodeKey;
 class SourceProvider;
+class UnlinkedCodeBlock;
 } // namespace JSC
 
 #include <JavaScriptCore/CachedBytecode.h>
@@ -24,6 +26,11 @@ class GlobalObject;
 
 // A provider that wraps another one has a SourceID of its own, which `bun test --coverage` has to learn of.
 void addCodeCoverageSourceID(JSC::VM&, JSC::SourceProvider& provider);
+// This thread's VM for generating bytecode that nothing runs, made on first use. Bun__destroyBytecodeCacheVM frees it.
+JSC::VM& vmForBytecodeCache();
+// Parses `inputSourceCode` and generates the unlinked code of all of it (nested functions down to `depth`). Null on a
+// parse error. The caller holds the bytecode VM's lock.
+JSC::UnlinkedCodeBlock* generateUnlinkedCodeForBytecodeCache(JSC::VM&, const BunString* sourceProviderURL, const BunString* inputSourceCode, bool isModule, uint32_t depth, bool optimize, JSC::SourceCode&, JSC::SourceCodeKey&);
 JSC::SourceOrigin toSourceOrigin(const String& sourceURL, bool isBuiltin);
 class SourceProvider final : public JSC::SourceProvider {
     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(SourceProvider);

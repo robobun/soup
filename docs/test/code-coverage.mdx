@@ -41,7 +41,7 @@ To enable coverage reporting by default, add this to your `bunfig.toml`:
 coverage = true
 ```
 
-By default, coverage reports exclude test files and use sourcemaps. Both are configurable in `bunfig.toml`.
+By default, coverage reports cover the files your tests load, exclude test files and use sourcemaps. All three are configurable in `bunfig.toml`.
 
 ```toml title="bunfig.toml" icon="settings"
 [test]
@@ -130,6 +130,59 @@ jobs:
           file: ./coverage/lcov.info
 ```
 
+## Choosing the Files to Cover
+
+By default the report is about the files your tests load. A source file that no test imports is not in it, so it lowers nothing and is easy to miss. `collectCoverageFrom` names the files the report is about:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+collectCoverageFrom = ["src/**", "!src/generated/**"]
+```
+
+```bash terminal icon="terminal"
+bun test --coverage
+
+-------------------|---------|---------|-------------------
+File               | % Funcs | % Lines | Uncovered Line #s
+-------------------|---------|---------|-------------------
+All files          |   33.33 |   33.33 |
+ src/billing.ts    |    0.00 |    0.00 | 1-4,7-19,22
+ src/cart.ts       |  100.00 |  100.00 |
+ src/legacy/tax.js |    0.00 |    0.00 | 1-2,5-9
+-------------------|---------|---------|-------------------
+```
+
+With the list set, the report has:
+
+- **every file the list names**, whether a test loaded it or not. A file that nothing loaded has none of its lines and none of its functions covered, counts towards `All files` and has to pass `coverageThreshold` like any other.
+- **no other file.** A file that a test loads and that the list does not name is left out.
+
+The patterns are relative to the directory `bun test` runs in, and a file outside of it is never in the list. Bun asks the patterns in order and the last one that matches decides, as Jest does: a pattern that starts with `!` takes files out, and a list of only `!` patterns names every file that none of them takes out. The patterns themselves are [`Bun.Glob`](/runtime/glob) patterns (`*`, `**`, `?`, `[ab]`, `{a,b}`), so the extended syntax of Jest's matcher, such as `+(a|b)`, is not read. A `./` or `<rootDir>/` in front of a pattern is.
+
+The same list can be passed on the command line, where it replaces the one in `bunfig.toml`:
+
+```bash terminal icon="terminal"
+bun test --coverage --collect-coverage-from 'src/**' --collect-coverage-from '!src/generated/**'
+```
+
+### How Bun Reports a File That Nothing Loaded
+
+Bun does not load the file. It transpiles it the way a load does and reads the lines and the functions from the result:
+
+- Code in the file never runs.
+- The lines are the lines that have code. Comments, empty lines and types are not counted, and a file that has nothing else (a `.d.ts` file, a module of interfaces) is not in the report.
+- The functions are those at the top level of the file, such as exported functions and the methods of a class. A function inside another function is counted once the outer one has run, which is also how Bun counts in a file that is loaded.
+- Only files that Bun reads as JavaScript or TypeScript by their extension are reported. Other files the list names, a `.vue` file that a plugin loads for example, are left out.
+- [Macros](/bundler/macros) do not run, so a file that calls one cannot be reported. Neither can a file with a syntax error. Bun prints a warning with the name of the file and leaves it out:
+
+  ```txt
+  warn: Failed to collect coverage from src/draft.ts:12:3: Unexpected }
+  ```
+
+`node_modules`, [test files](#skip-test-files), `coveragePathIgnorePatterns` and [comments that ignore code](#ignoring-code-with-comments) apply to these files as they do to loaded ones.
+
+Files that nothing loaded are added when the run ran at least one test file and got to its end. They are not added to a run that selects no test file (an empty `--shard`), to a run with `--changed`, or to a `--parallel` run that `--bail` or a crash cut short. Those runs report the files the tests loaded, filtered by the list.
+
 ## Excluding Files from Coverage
 
 ### Skip Test Files
@@ -161,7 +214,7 @@ coveragePathIgnorePatterns = [
 ]
 ```
 
-The option accepts glob patterns and works like Jest's `collectCoverageFrom` ignore patterns. Bun excludes files matching any of the patterns from coverage calculation and reporting in both text and LCOV output.
+The option accepts glob patterns. Bun excludes files matching any of the patterns from coverage calculation and reporting in both text and LCOV output, including the files [`collectCoverageFrom`](#choosing-the-files-to-cover) names.
 
 #### Common Use Cases
 
@@ -257,6 +310,7 @@ coverageIgnoreSourcemaps = true  # default false
 
 By default, coverage reports:
 
+- **Include** the files the tests loaded, and no file that nothing loaded (name the files to cover with `collectCoverageFrom`)
 - **Exclude** `node_modules` directories
 - **Exclude** files loaded with non-JS/TS loaders (for example `.css`, `.txt`) unless you specify a custom JS loader
 - **Exclude** test files themselves (include them with `coverageSkipTestFiles = false`)
@@ -416,23 +470,21 @@ Coverage is only one metric. Also consider:
 
 ### Coverage Not Showing for Some Files
 
-If files aren't appearing in coverage reports, your tests might not import them. Coverage only tracks files that are loaded.
+If files aren't appearing in coverage reports, your tests might not import them. By default the report is about the files that are loaded. To see the files that no test imports, name the files to cover:
 
-```ts title="test.ts" icon="/icons/typescript.svg"
-// Make sure to import the modules you want to test
-import { myFunction } from "../src/my-module";
-
-test("my function works", () => {
-  expect(myFunction()).toBeDefined();
-});
+```toml title="bunfig.toml" icon="settings"
+[test]
+collectCoverageFrom = ["src/**"]
 ```
+
+See [Choosing the files to cover](#choosing-the-files-to-cover).
 
 ### False Coverage Reports
 
 If you see coverage reports that don't match your expectations:
 
 1. Check if source maps are working correctly
-2. Verify file patterns in `coveragePathIgnorePatterns`
+2. Verify file patterns in `collectCoverageFrom` and `coveragePathIgnorePatterns`
 3. Ensure test files import the code to test
 
 ### Performance Issues with Large Codebases

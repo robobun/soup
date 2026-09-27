@@ -3292,6 +3292,207 @@ Files: `src/install/lockfile/merge_conflict.rs` (new), `src/install/lockfile.rs`
 `src/install/{migration,pnpm,yarn}.rs` (the new field), `docs/pm/lockfile.mdx`,
 `docs/pm/cli/install.mdx`, `test/cli/install/bun-lock.test.ts`.
 
+### 2026-09-26: `collectCoverageFrom`, coverage for the files that no test loads
+
+`bun test --coverage` reports the files the tests loaded. A source file that no test imports is not
+in the table and not in `lcov.info`, lowers nothing, and passes every `coverageThreshold`, so the
+report of a project with one test file and a hundred untested modules can say 100%. That is
+oven-sh/bun#5928 (93 upvotes, open since 2023, the most of any coverage issue), and the workaround in
+the thread is a test that imports everything, which runs every module's side effects and calls the
+result 40% covered. Jest has `collectCoverageFrom`, Vitest `coverage.include`, c8 `--all`. The name
+and the rules here are Jest's, since the `[test]` section already speaks Jest
+(`coveragePathIgnorePatterns`, `coverageThreshold`):
+
+```toml
+[test]
+collectCoverageFrom = ["src/**", "!src/generated/**"]
+```
+
+```sh
+bun test --coverage
+# -------------------|---------|---------|-------------------
+# File               | % Funcs | % Lines | Uncovered Line #s
+# -------------------|---------|---------|-------------------
+# All files          |   33.33 |   33.33 |
+#  src/billing.ts    |    0.00 |    0.00 | 1-4,7-19,22
+#  src/cart.ts       |  100.00 |  100.00 |
+#  src/legacy/tax.js |    0.00 |    0.00 | 1-2,5-9
+# -------------------|---------|---------|-------------------
+
+# the same list for one run; it replaces the one in bunfig.toml
+bun test --coverage --collect-coverage-from 'src/**' --collect-coverage-from '!src/generated/**'
+```
+
+With the list set the report is about exactly the files the list names. A file that nothing loaded
+is in it with no line and no function covered, counts towards `All files` and has to pass
+`coverageThreshold`; a file that a test loads and the list does not name is left out. Patterns are
+relative to the directory `bun test` runs in, are asked in order, and the last one that matches
+decides; `!` takes files out, and a list of only `!` patterns names everything none of them takes
+out. `node_modules`, `coverageSkipTestFiles`, `coveragePathIgnorePatterns` and the ignore comments of
+2026-09-16 apply to the new rows as they do to the old ones. Without `--coverage` the list does
+nothing, and without the list nothing changes.
+
+Where it lives and how a row is made was decided before any code was written, by a design review
+that put six designs next to each other (the mechanism of the closed community PR
+oven-sh/bun#27694, which counts physical lines, among them):
+
+- One place. The serial runner and the `--parallel` coordinator each collected their reports and
+  called the printer. Both now hand them to one function, `finish_coverage_reports`, which is the
+  only caller of the printer, and with a list set that function first makes the reports complete
+  (`src/runtime/cli/test/CoverageInclude.rs`). It runs once per run in the process that prints,
+  after the workers' reports are merged, where the command line, `bunfig.toml` and `--config` are
+  all known. Workers do not know of the list and no flag is forwarded to them, so serial,
+  `--isolate` and `--parallel` apply one list in one way. A run without the list pays one
+  `is_none()`.
+- The file is not loaded. It is read, parsed and printed the way the module loader does it (a copy
+  of the VM's transpiler, as the transpiler thread pool makes one, with macros off and without the
+  transpiler cache, the watcher or the linker), so code in it never runs: the test suite has a
+  never-loaded file that calls `process.exit(3)`.
+- Lines come from the source map. The printed text counts as one block that never ran, and the
+  converter that loaded files go through maps it to lines. So the lines are the lines that have
+  code; comments, empty lines and types are not among them, and a file with nothing else (a
+  `.d.ts`, a module of interfaces, an empty file) has no row. The source map is kept next to the
+  file for the length of the call and is not stored where the loader stores its maps.
+- Functions come from JavaScriptCore, without running anything. A new read-only C++ function
+  parses the printed text and generates the bytecode of the top level only
+  (`recursivelyGenerateUnlinkedCodeBlockForModuleProgram`, which `bun build --bytecode` already
+  uses), and lists the ranges JSC registers when it loads a file: the source's own range and the
+  function declarations and expressions of the top-level code, and for CommonJS those of the
+  wrapper function. That is the count of a file that a test imports without calling anything,
+  as long as the import itself calls nothing with functions in it; a test compares the two for
+  nine shapes of file. It happens in the thread's bytecode VM, not in the VM that ran the tests,
+  which a guard frees when the last file is done.
+- A function that never ran makes a loaded file count every line from its first to its last,
+  comments and empty lines too. That widening is not applied to a file that nothing loaded: its
+  lines are already known from the whole text, so they are the lines a run of the whole file would
+  report (the same test checks that none is missing and none is a comment).
+- What is looked for. The walk starts below the directory each pattern begins with (`src` for
+  `src/**/*.ts`, the root for `**/*.ts` or a list of `!` patterns), does not enter `node_modules`
+  and `.git`, and keeps the files Bun reads as JavaScript or TypeScript by their extension. A
+  `.vue` file that a plugin would load is left out without a word: a list like `src/**` names
+  every stylesheet and image too.
+- One row per file. A file is known by device and inode, so one that a test imports through a
+  symlinked directory, or that the walk finds a second time through a link, has the one row of
+  the file that was loaded and not a second one at 0%.
+- The root is the directory the run started in, taken before the first test file runs. A test that
+  calls `process.chdir()` does not move what `src/**` means or how the rows are spelled.
+- Files that nothing loaded are added when the run ran at least one test file and got to its end.
+  An empty `--shard` or a `--changed` that selects nothing loads nothing and exits 0 today, and
+  would fail any threshold if every source file turned up at 0%; a run that `--bail` or a crash
+  cut short does not know what the rest would have loaded. Those runs, and every run with
+  `--changed`, get the loaded files filtered by the list and nothing else. Under `--parallel`,
+  Ctrl-C during the pass stops it between two files and exits with the signal's code.
+
+A file the list names that Bun cannot transpile (a syntax error, a call to a macro) gets one line
+and no row, and the exit code stays what it was, which is what Jest and Vitest do. A list that
+names no file at all gets a line too, since an empty report passes every threshold:
+
+```
+warn: Failed to collect coverage from src/draft.ts:12:3: Unexpected }
+warn: No file matches collectCoverageFrom
+```
+
+A review pass on the first version (six readers, one per area, each with the debug build, and one
+skeptic per finding who had to make it happen again before it counted) reported 43 findings and
+confirmed all of them. What they changed:
+
+- A crash. A `// @bun` file, or any file under `coverageIgnoreSourcemaps`, whose last line holds a
+  function and has no newline made the converter index a slice at `u32::MAX`. Upstream panics the
+  same way when a test imports such a file (reported through the hand-off); the guard the
+  source-map arm already had is now in the other arm too, since this feature hands it files that
+  nothing ever loaded.
+- Which file is which. The first version asked the resolver how the loader would spell each file
+  the walk found. The resolver answers from directory listings it cached earlier in the run, by
+  lowercased name, and rewrites `x.js` to `x.ts`: a file a test wrote during the run had no row, a
+  valid `c.ts` next to a new `c.js` was parsed as JavaScript and warned about, and `util.ts` next
+  to an imported `Util.ts` was dropped in a serial run and reported under `--parallel`. A file is
+  now known by device and inode, the loaded ones and the found ones alike, so a path through a
+  symlink or in another case is the same file, and the row has the path the walk found.
+- What the walk finds. The glob walker silently finds nothing for a pattern with a `/` inside
+  braces (`{src/generated,lib}/**`) and gives up at the first directory it cannot open, so a
+  `coverageThreshold` that should fail passed. The walk now takes `**/*` below the directories
+  the patterns begin with, goes on after a directory that cannot be read (with a warning), and
+  the matcher that judges loaded files judges every file found.
+- What has a row. A module of types that ends in `export {}` had a row of one uncovered line and
+  failed thresholds; that is decided on the syntax tree now (no statement but types, directives
+  and empty exports). `*` matched the `..` of a file outside the project, which kept a loaded
+  file from there in the report: a path outside the root is in no list.
+- `lcov.info` could not be written (ENOENT, exit 1) after a test changed directory, because the
+  directory was made relative to the new one and the file opened relative to the old one.
+- Memory. The line table of every file leaked (LeakSanitizer), and JSC's parser cache kept the
+  text of every file until the pass ended (27 MB to 196 MB for 2,000 files of 70 KB). Both are
+  freed per file.
+- A hang that is not this feature's, and that it must not add: JSC's parser takes time and
+  memory without end for an array or object literal nested past its stack limit (about 5,600
+  levels in a release build; `import` of a file with a literal 5,000 deep does not finish on
+  upstream either). The pass refuses a text with literals nested more than 256 deep, with a
+  warning.
+- Ten sentences in the docs that were not true, among them that the function count equals that
+  of an imported file (it is the count of the top-level code; a function that runs during the
+  load adds the ones inside it), that the patterns are Jest's (the order rules are; the globs are
+  `Bun.Glob`'s, and `<rootDir>/` and `./` in front of a pattern are now read), and what a run
+  stopped by `--bail` prints.
+- Tests that could not fail: the symlink test passed with the spelling step taken out, the
+  `.d.ts` fixture had no row under any name, nothing covered the ignore comments,
+  `coverageIgnoreSourcemaps`, `// @bun`, the order of the warnings, the errors for a bad list, or a
+  `--parallel` run that `--bail` stops. Fifteen tests now; each fails on released Bun.
+
+Left as found: for a file without `import`, `export`, `require` or `module`, the kind of module
+decides whether Bun's CommonJS wrapper counts as a function. The pass goes by the extension and
+then by `"type"` in package.json; the loader's `import` path goes by package.json alone and its
+`require` path by the extension, so `lcov.info` can say `FNF:2` where a load says `FNF:3` (the
+table and the thresholds are not affected). A syntax error that only JavaScriptCore finds (an
+invalid regular expression) is warned about without its line. Under `--parallel --config`, the
+workers read `bunfig.toml` and not the file `--config` names (upstream, reported), so a file a
+worker left out for a reason of its own shows up as never loaded.
+
+Cost, on a release build of this tree (Linux x64, a shared machine with a load average near 500, so
+wall time is rough; `strace`, `perf` and `valgrind` could not be installed): the best of 20 runs
+over 1,000 files that nothing loaded (50 lines and 3 functions each) took 262 ms with the list and
+14 ms without, which is a quarter of a millisecond a file; the medians on that machine were 789 and
+183 ms, and peak memory was 4 MB higher. A run without the list reads no file and no directory it
+did not read before. In the binary the new code is about 30 KB by the linker map
+(`finish_coverage_reports` with what is inlined into it 19 KB, `Report::never_executed` 3 KB, the
+C++ reader 2 KB, the sort 4 KB); there is no build of the tree without the patch to give the exact
+difference.
+
+Not done, and known: files loaded only in a `Worker` or a child process are files that nothing
+loaded (they already have no row today). With `--changed` the pass is skipped where Vitest narrows
+it to the changed files; that needs the changed set out of `ChangedFilesFilter`. A run of zero test
+files prints no report where Vitest prints one at 0%, which needs a decision on
+`--pass-with-no-tests` against `coverageThreshold` first. Each `--shard` job reports the files it
+did not load at 0%, so an `lcov.info` merged from shards can keep a few lines of a covered file at 0
+(the lines of a never-loaded record are those of the whole text, about 4% more than a load reports).
+A `// @bun` file is reported by the lines of its text, the pragma's line included. The pass is
+serial on the main thread, and under `--parallel` Ctrl-C is only seen between two files. And whether
+a file that does not transpile should fail the run instead of warning is a question for a
+maintainer: upstream's review rules say that what the user asked for by name fails loudly, Jest and
+Vitest say otherwise, and it is one branch either way.
+
+Rebase notes: 40 patches onto oven-sh/bun 36cd1514ec, one conflict. Upstream reworked how a
+coverage report is put together the day before (oven-sh/bun#43158 counts every load of a file, so
+`Report::generate` now folds the blocks of several SourceIDs and calls the converter itself), which
+is the function the ignore comments of 2026-09-16 thread their argument through; that patch was
+re-ported onto the new shape, and its tests and upstream's 13 new ones pass together. The WebKit
+upgrade of the same day (oven-sh/bun#43882) made `CString::data()` a `char8_t` pointer, which broke
+two lines of the `bun:sqlite` `db.function()` patch of 2026-08-31 at compile time; they use
+`legacyCStringPointer()` now, as upstream's own calls to SQLite do. Nothing dropped, and the fork's
+workflows were green after yesterday's push. This patch builds on the 2026-09-16 one in two places
+(the `ignored_lines` argument of the converter and `ignore_hints::scan`); without that patch, drop
+the argument and the three lines in `CoverageInclude.rs` that read the hints.
+
+Files: `src/runtime/cli/test/CoverageInclude.rs` (new), `src/runtime/cli/test_command.rs`
+(`finish_coverage_reports`, `has_test_file_name`),
+`src/runtime/cli/test/parallel/{aggregate,runner}.rs`, `src/sourcemap_jsc/CodeCoverage.rs`
+(`Report::never_executed`, `NeverExecutedPass`, the converter takes its source map as an argument),
+`src/jsc/bindings/CodeCoverage.cpp` (`CodeCoverage__withFunctionsOfText`),
+`src/jsc/bindings/ZigSourceProvider.{cpp,h}`,
+`src/options_types/{code_coverage_options,context}.rs`, `src/runtime/cli/Arguments.rs`,
+`src/bunfig/bunfig.rs`, `src/runtime/cli/mod.rs`, `completions/{bun-cli.json,bun.zsh}`,
+`docs/test/code-coverage.mdx`, `docs/test/configuration.mdx`, `docs/runtime/bunfig.mdx`,
+`docs/snippets/cli/test.mdx`, `docs/guides/test/migrate-from-jest.mdx`,
+`test/cli/test/coverage.test.ts`.
+
 ## Dropped
 
 Nothing yet.
