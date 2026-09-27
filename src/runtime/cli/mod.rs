@@ -97,6 +97,11 @@ pub(crate) mod test {
     #[path = "LastFailed.rs"]
     pub(crate) mod last_failed;
 
+    /// `collectCoverageFrom`: the files the coverage report is about, loaded
+    /// or not.
+    #[path = "CoverageInclude.rs"]
+    pub(crate) mod coverage_include;
+
     /// `bun test --parallel`: a coordinator hands test files to worker processes. `runner` has the entry points.
     pub(crate) mod parallel {
         #[path = "aggregate.rs"]

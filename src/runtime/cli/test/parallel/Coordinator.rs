@@ -45,6 +45,9 @@ pub(crate) struct Coordinator<'a> {
     pub(crate) children_of_workers: Option<ChildrenOfWorkers>,
     pub(crate) max_worker_peak_rss_mb: u32,
     pub(crate) scale_up_after_ms: i64,
+    /// A worker crashed while it ran a file. `collectCoverageFrom` adds no
+    /// files to the report of such a run.
+    pub(crate) worker_crashed: bool,
     pub(crate) spawned_count: usize,
     pub(crate) aborted: Option<u32>,
     pub(crate) stop_reason: Option<StopReason>,
@@ -617,6 +620,7 @@ impl<'a> Coordinator<'a> {
                     let message = "worker process crashed before reporting results";
                     self.reporter
                         .record_file_result(self.schedule.path(file), true);
+                    self.worker_crashed = true;
                     self.count_unfinished(file, ("(worker crashed)", message), Some(ran_ms));
                     self.bail_out_if_due();
                 }
