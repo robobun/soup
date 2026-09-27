@@ -36,6 +36,10 @@ pub struct CodeCoverageOptions {
     pub fail_on_low_coverage: bool,
     /// Populated from CLI/bunfig.
     pub ignore_patterns: Vec<Box<[u8]>>,
+    /// `collectCoverageFrom`, in the order given: globs of the files the
+    /// report is about, whether a test loaded them or not. Empty: the files
+    /// that were loaded.
+    pub collect_from: Vec<Box<[u8]>>,
 }
 
 impl Default for CodeCoverageOptions {
@@ -52,6 +56,7 @@ impl Default for CodeCoverageOptions {
             enabled: false,
             fail_on_low_coverage: false,
             ignore_patterns: Vec::new(),
+            collect_from: Vec::new(),
         }
     }
 }
