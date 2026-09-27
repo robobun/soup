@@ -11,6 +11,7 @@ use bun_ptr::{AliasableBox, RefPtr};
 pub(crate) use crate::webcore::s3::download_stream::S3HttpDownloadStreamingTask;
 pub(crate) use bun_s3_signing::MultiPartUploadOptions;
 pub(crate) use bun_s3_signing::acl::ACL;
+pub(crate) use bun_s3_signing::metadata::Metadata;
 pub(crate) use bun_s3_signing::storage_class::StorageClass;
 
 pub(crate) use bun_s3_signing::error as Error;
@@ -259,6 +260,7 @@ pub(crate) fn list_objects(
             acl: None,
             storage_class: None,
             request_payer: false,
+            metadata: None,
         },
         None,
     ) {
@@ -360,6 +362,7 @@ pub(crate) fn upload(
     acl: Option<ACL>,
     storage_class: Option<StorageClass>,
     request_payer: bool,
+    metadata: Option<&Metadata>,
     callback: s3_simple_request::OnUpload,
 ) -> JsResult<()> {
     bun_removable_features::removable_definition!(S3Client, upload);
@@ -376,6 +379,7 @@ pub(crate) fn upload(
             acl,
             storage_class,
             request_payer,
+            metadata,
             ..Default::default()
         },
         s3_simple_request::Callback::Upload(callback),
@@ -394,6 +398,7 @@ pub(crate) fn writable_stream(
     content_encoding: Option<&[u8]>,
     storage_class: Option<StorageClass>,
     request_payer: bool,
+    metadata: Option<Metadata>,
 ) -> JsResult<JSValue> {
     bun_removable_features::removable_definition!(S3Client, writable_stream);
     let target = Target {
@@ -406,6 +411,7 @@ pub(crate) fn writable_stream(
         acl: None,
         storage_class,
         request_payer,
+        metadata,
     };
     let sink = NetworkSinkWrapperRef(NetworkSink::new(cx, target, options, Owed::Nothing));
     Ok(JSSink::<NetworkSink>::create_object(
@@ -450,6 +456,7 @@ pub(crate) fn upload_stream(
     content_encoding: Option<&[u8]>,
     proxy: Option<&[u8]>,
     request_payer: bool,
+    metadata: Option<Metadata>,
     callback: Option<Box<dyn FnOnce(S3UploadResult<'_>)>>,
 ) -> JsResult<JSValue> {
     bun_removable_features::removable_definition!(S3Client, upload_stream);
@@ -486,6 +493,7 @@ pub(crate) fn upload_stream(
         acl,
         storage_class,
         request_payer,
+        metadata,
     };
     let promise = bun_jsc::JSPromiseStrong::init(cx.global());
     let end_promise_value = promise.value();
@@ -616,6 +624,7 @@ fn download_stream(
             content_encoding: None,
             acl: None,
             storage_class: None,
+            metadata: None,
         },
         None,
     ) {

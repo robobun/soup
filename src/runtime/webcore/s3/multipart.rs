@@ -10,7 +10,7 @@ use bun_jsc::{GlobalRef, JSGlobalObject, JSPromise, JSPromiseStrong, JSValue, Js
 use bun_ptr::RefPtr;
 use bun_s3_signing::error::S3Error;
 use bun_s3_signing::upload::{Request, Step, Upload};
-use bun_s3_signing::{ACL, MultiPartUploadOptions, S3Credentials, StorageClass};
+use bun_s3_signing::{ACL, Metadata, MultiPartUploadOptions, S3Credentials, StorageClass};
 use bun_sys as sys;
 
 use crate::webcore::BlobSizeType;
@@ -60,6 +60,8 @@ pub(crate) struct Target {
     pub(crate) acl: Option<ACL>,
     pub(crate) storage_class: Option<StorageClass>,
     pub(crate) request_payer: bool,
+    /// Sent with the request that creates the object, which is not a part's.
+    pub(crate) metadata: Option<Metadata>,
 }
 
 /// What is left to report besides the pending `flush()` and `end()`.
@@ -162,6 +164,7 @@ impl NetworkSink {
             options.content_encoding = target.content_encoding.as_deref();
             options.acl = target.acl;
             options.storage_class = target.storage_class;
+            options.metadata = target.metadata.as_ref();
         }
         let context = match request {
             // The store bills the parts, so this goes out for a context that stopped too.
