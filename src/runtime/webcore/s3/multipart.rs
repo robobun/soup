@@ -106,6 +106,7 @@ use bun_ptr::RefPtr;
 use bun_s3_signing::acl::ACL;
 use bun_s3_signing::credentials::S3Credentials;
 use bun_s3_signing::error::S3Error;
+use bun_s3_signing::metadata::Metadata;
 use bun_s3_signing::storage_class::StorageClass;
 
 // File-level mods are declared flat in `webcore.rs` via `#[path]`, so `super`
@@ -135,6 +136,8 @@ pub struct MultiPartUpload {
     pub(crate) acl: Option<ACL>,
     pub(crate) storage_class: Option<StorageClass>,
     pub(crate) request_payer: bool,
+    /// Sent with the request that creates the object, which is not a part's.
+    pub(crate) metadata: Option<Metadata>,
     pub(crate) credentials: RefPtr<S3Credentials>,
     pub poll_ref: JsCell<KeepAlive>,
     /// An upload waits for its script to write more, which the script of a `Bun.ModuleGraph` that
@@ -476,6 +479,7 @@ impl MultiPartUpload {
                             acl: self_.acl,
                             storage_class: self_.storage_class,
                             request_payer: self_.request_payer,
+                            metadata: self_.metadata.as_ref(),
                             ..Default::default()
                         },
                         s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
@@ -972,6 +976,7 @@ impl MultiPartUpload {
                     acl: self.acl,
                     storage_class: self.storage_class,
                     request_payer: self.request_payer,
+                    metadata: self.metadata.as_ref(),
                     ..Default::default()
                 },
                 s3_simple_request::S3Callback::Download(Self::start_multi_part_request_result),
@@ -1113,6 +1118,7 @@ impl MultiPartUpload {
                     acl: self.acl,
                     storage_class: self.storage_class,
                     request_payer: self.request_payer,
+                    metadata: self.metadata.as_ref(),
                     ..Default::default()
                 },
                 s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),

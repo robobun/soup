@@ -9,6 +9,7 @@ use bun_picohttp::Header as PicoHeader;
 use bun_ptr::{RefCount, RefPtr};
 
 use super::acl::ACL;
+use super::metadata::Metadata;
 use super::storage_class::StorageClass;
 
 bun_core::declare_scope!(AWS, visible);
@@ -452,6 +453,9 @@ impl S3Credentials {
 
         let amz_day = &amz_date[0..8];
         let request_payer = sign_options.request_payer;
+        let metadata = sign_options
+            .metadata
+            .filter(|metadata| !metadata.is_empty());
         let header_key = SignedHeadersKey {
             content_disposition: content_disposition.is_some(),
             content_encoding: content_encoding.is_some(),
@@ -462,10 +466,15 @@ impl S3Credentials {
             storage_class: storage_class.is_some(),
         };
         let mut signed_headers_buf = [0u8; 256];
-        let signed_headers: &[u8] = if sign_query {
-            b"host"
-        } else {
-            SignedHeaders::get(header_key, &mut signed_headers_buf)
+        let signed_headers_with_metadata: Vec<u8>;
+        let signed_headers: &[u8] = match metadata {
+            Some(metadata) => {
+                signed_headers_with_metadata =
+                    SignedHeaders::with_metadata(header_key, sign_query, metadata);
+                &signed_headers_with_metadata
+            }
+            None if sign_query => b"host",
+            None => SignedHeaders::get(header_key, &mut signed_headers_buf),
         };
 
         let service_name: &str = "s3";
@@ -579,7 +588,18 @@ impl S3Credentials {
                     );
                 }
 
+                // `;` between the names is `%3B` in a query string.
+                let mut signed_headers_encoded_buffer: Vec<u8> = Vec::new();
+                let encoded_signed_headers: &[u8] = if metadata.is_some() {
+                    signed_headers_encoded_buffer.resize(signed_headers.len() * 3, 0);
+                    encode_uri_component::<true>(signed_headers, &mut signed_headers_encoded_buffer)
+                        .map_err(|_| SignError::FailedToGenerateSignature)?
+                } else {
+                    signed_headers
+                };
+
                 // Build query parameters in alphabetical order for AWS Signature V4 canonical request
+                let canonical_with_metadata: Vec<u8>;
                 let canonical: &[u8] = 'brk_canonical: {
                     let mut query_parts: Vec<Vec<u8>> = Vec::with_capacity(13);
 
@@ -604,7 +624,10 @@ impl S3Credentials {
                     if let Some(token) = encoded_session_token {
                         query_parts.push(alloc_print!("X-Amz-Security-Token={}", BStr::new(token)));
                     }
-                    query_parts.push(alloc_print!("X-Amz-SignedHeaders=host"));
+                    query_parts.push(alloc_print!(
+                        "X-Amz-SignedHeaders={}",
+                        BStr::new(encoded_signed_headers)
+                    ));
                     if let Some(cd) = encoded_content_disposition {
                         query_parts.push(alloc_print!(
                             "response-content-disposition={}",
@@ -628,6 +651,28 @@ impl S3Credentials {
                             query_string.push(b'&');
                         }
                         query_string.extend_from_slice(part);
+                    }
+
+                    if let Some(metadata) = metadata {
+                        let mut request = alloc_print!(
+                            "{}\n{}\n{}\nhost:{}\n",
+                            method_name,
+                            BStr::new(normalized_path),
+                            BStr::new(&query_string),
+                            BStr::new(&host)
+                        );
+                        for entry in metadata.entries() {
+                            request.extend_from_slice(entry.name());
+                            request.push(b':');
+                            request.extend(entry.canonical_value());
+                            request.push(b'\n');
+                        }
+                        request.push(b'\n');
+                        request.extend_from_slice(signed_headers);
+                        request.push(b'\n');
+                        request.extend_from_slice(aws_content_hash);
+                        canonical_with_metadata = request;
+                        break 'brk_canonical &canonical_with_metadata;
                     }
 
                     break 'brk_canonical buf_print(
@@ -698,7 +743,10 @@ impl S3Credentials {
                     "X-Amz-Signature={}",
                     HexLower(&signature[0..DIGESTED_HMAC_256_LEN])
                 ));
-                url_query_parts.push(alloc_print!("X-Amz-SignedHeaders=host"));
+                url_query_parts.push(alloc_print!(
+                    "X-Amz-SignedHeaders={}",
+                    BStr::new(encoded_signed_headers)
+                ));
                 if let Some(cd) = encoded_content_disposition {
                     url_query_parts.push(alloc_print!(
                         "response-content-disposition={}",
@@ -733,8 +781,17 @@ impl S3Credentials {
                 )
                 .into_boxed_slice();
             } else {
+                // The metadata does not fit in `tmp_buffer` next to a session token.
+                let mut canonical_with_metadata: Vec<u8> = Vec::new();
+                let canonical_buffer: &mut [u8] = match metadata {
+                    Some(metadata) => {
+                        canonical_with_metadata.resize(tmp_buffer.len() + metadata.signed_len(), 0);
+                        &mut canonical_with_metadata
+                    }
+                    None => &mut tmp_buffer,
+                };
                 let canonical = CanonicalRequest::format(
-                    &mut tmp_buffer,
+                    canonical_buffer,
                     header_key,
                     method_name.as_bytes(),
                     normalized_path,
@@ -746,6 +803,7 @@ impl S3Credentials {
                     acl,
                     aws_content_hash,
                     &amz_date,
+                    metadata,
                     session_token,
                     storage_class,
                     signed_headers,
@@ -1070,6 +1128,9 @@ pub struct SignOptions<'a> {
     pub acl: Option<ACL>,
     pub storage_class: Option<StorageClass>,
     pub request_payer: bool,
+    /// Signed as headers, in a presigned URL too: the request has to carry
+    /// each entry. [`SignResult::headers`] does not list them.
+    pub metadata: Option<&'a Metadata>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1227,6 +1288,7 @@ impl<'a> Default for SignOptions<'a> {
             acl: None,
             storage_class: None,
             request_payer: false,
+            metadata: None,
         }
     }
 }
@@ -1246,6 +1308,9 @@ pub struct S3CredentialsWithOptions {
     pub content_encoding: Option<bun_core::Utf8Bytes<'static>>,
     /// indicates if requester pays for the request (for requester pays buckets)
     pub request_payer: bool,
+    /// The `metadata` of the options, or else the one of the file or the
+    /// client. An empty one is there to replace that with nothing.
+    pub metadata: Option<Metadata>,
     /// indicates if the credentials have changed
     pub changed_credentials: bool,
 }
@@ -1273,38 +1338,59 @@ impl SignedHeaders {
     // Could switch to a build.rs-generated static table if profiling shows this matters.
     fn get(key: SignedHeadersKey, buf: &mut [u8; 256]) -> &[u8] {
         let mut n = 0usize;
-        macro_rules! push {
-            ($s:expr) => {{
-                let s: &[u8] = $s;
-                buf[n..n + s.len()].copy_from_slice(s);
-                n += s.len();
-            }};
+        Self::write(key, None, |s| {
+            buf[n..n + s.len()].copy_from_slice(s);
+            n += s.len();
+        });
+        &buf[..n]
+    }
+
+    /// A presigned URL signs `host` and the metadata.
+    fn with_metadata(key: SignedHeadersKey, sign_query: bool, metadata: &Metadata) -> Vec<u8> {
+        let mut list = Vec::with_capacity(256 + metadata.signed_len());
+        if sign_query {
+            list.extend_from_slice(b"host");
+            Self::write_metadata(metadata, |s| list.extend_from_slice(s));
+        } else {
+            Self::write(key, Some(metadata), |s| list.extend_from_slice(s));
         }
+        list
+    }
+
+    fn write(key: SignedHeadersKey, metadata: Option<&Metadata>, mut push: impl FnMut(&[u8])) {
         if key.content_disposition {
-            push!(b"content-disposition;");
+            push(b"content-disposition;");
         }
         if key.content_encoding {
-            push!(b"content-encoding;");
+            push(b"content-encoding;");
         }
         if key.content_md5 {
-            push!(b"content-md5;");
+            push(b"content-md5;");
         }
-        push!(b"host;");
+        push(b"host;");
         if key.acl {
-            push!(b"x-amz-acl;");
+            push(b"x-amz-acl;");
         }
-        push!(b"x-amz-content-sha256;x-amz-date");
+        push(b"x-amz-content-sha256;x-amz-date");
+        if let Some(metadata) = metadata {
+            Self::write_metadata(metadata, &mut push);
+        }
         if key.request_payer {
-            push!(b";x-amz-request-payer");
+            push(b";x-amz-request-payer");
         }
         if key.session_token {
-            push!(b";x-amz-security-token");
+            push(b";x-amz-security-token");
         }
         if key.storage_class {
-            push!(b";x-amz-storage-class");
+            push(b";x-amz-storage-class");
         }
-        // SAFETY: n <= 256 by construction.
-        unsafe { core::slice::from_raw_parts(buf.as_ptr(), n) }
+    }
+
+    fn write_metadata(metadata: &Metadata, mut push: impl FnMut(&[u8])) {
+        for entry in metadata.entries() {
+            push(b";");
+            push(entry.name());
+        }
     }
 }
 
@@ -1329,6 +1415,7 @@ impl CanonicalRequest {
         acl: Option<&[u8]>,
         hash: &[u8],
         date: &[u8],
+        metadata: Option<&Metadata>,
         session_token: Option<&[u8]>,
         storage_class: Option<&[u8]>,
         signed_headers: &[u8],
@@ -1368,6 +1455,16 @@ impl CanonicalRequest {
             BStr::new(hash),
             BStr::new(date)
         );
+        if let Some(metadata) = metadata {
+            for entry in metadata.entries() {
+                w!("{}:", BStr::new(entry.name()));
+                for byte in entry.canonical_value() {
+                    *c.buf.get_mut(c.at).ok_or(core::fmt::Error)? = byte;
+                    c.at += 1;
+                }
+                w!("\n");
+            }
+        }
         if key.request_payer {
             w!("x-amz-request-payer:requester\n");
         }
