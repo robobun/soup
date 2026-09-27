@@ -405,6 +405,53 @@ declare module "bun" {
     requestPayer?: boolean;
 
     /**
+     * User-defined metadata to store with the object. Each entry is sent as
+     * an `x-amz-meta-<key>` header of the upload, and {@link S3File.stat}
+     * returns them.
+     *
+     * Keys are case-insensitive and are stored in lowercase. A key has to be
+     * a valid HTTP header name and a value has to be printable ASCII, so
+     * encode other text, for example with `encodeURIComponent()`. Bun throws
+     * for other keys and values, for two keys that differ only in case, and
+     * for more than 238 keys. Amazon S3 accepts up to 2 KB of keys and values
+     * for one object.
+     *
+     * The metadata of a file or of a client is the default of its uploads
+     * and of its presigned uploads. The `metadata` of a call replaces it,
+     * and `{}` or `null` uploads with none. Only an upload uses it.
+     *
+     * In a presigned URL the metadata is signed as headers: a `PUT` or a
+     * `POST` to that URL has to send the same `x-amz-meta-*` headers.
+     *
+     * @see https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html#UserMetadata
+     *
+     * @example
+     * ```ts
+     * await s3.write("invoice.pdf", data, {
+     *   metadata: { customer: "1042", "reviewed-by": "ana" },
+     * });
+     *
+     * const { metadata } = await s3.stat("invoice.pdf");
+     * metadata.customer; // "1042"
+     * ```
+     *
+     * @example
+     * ```ts
+     * // The browser sends the headers the URL was signed with
+     * const url = s3.presign("avatar.png", {
+     *   method: "PUT",
+     *   metadata: { user: "1042" },
+     * });
+     * await fetch(url, {
+     *   method: "PUT",
+     *   headers: { "x-amz-meta-user": "1042" },
+     *   body,
+     * });
+     * ```
+     */
+    metadata?: Record<string, string> | null | undefined;
+
+    /**
      * @deprecated The size of the internal buffer in bytes. Defaults to 5 MiB. Use `partSize` and `queueSize` instead.
      */
     highWaterMark?: number;
@@ -467,6 +514,18 @@ declare module "bun" {
     lastModified: Date;
     etag: string;
     type: string;
+    /**
+     * The user-defined metadata of the object: its `x-amz-meta-*` headers,
+     * without the prefix and with the keys in lowercase. An object that has
+     * none gets `{}`. A value is what the service sent and is not decoded.
+     *
+     * @example
+     * ```ts
+     * const { metadata } = await s3.file("invoice.pdf").stat();
+     * metadata.customer; // "1042"
+     * ```
+     */
+    metadata: Record<string, string>;
   }
 
   /**
