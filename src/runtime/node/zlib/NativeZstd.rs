@@ -641,11 +641,40 @@ mod _impl {
             *avail_out = u32::try_from(self.output.size - self.output.pos).expect("int cast");
         }
 
+        /// Node's `ZstdDecompressContext::GetErrorInfo` without `rejectGarbageAfterEnd`: https://github.com/nodejs/node/blob/v26.10.0/src/node_zlib.cc#L1913-L1937
+        fn input_ended_inside_frame(&self) -> bool {
+            // A compressor keeps no frame state, and a handle that `init()` did not set up decoded nothing.
+            if self.mode != NodeMode::ZSTD_DECOMPRESS || self.state.is_none() {
+                return false;
+            }
+            // With a full output buffer the caller writes again, and that write gets the result.
+            if self.flush != c::ZSTD_e_end as c_int
+                || self.decode.contains(DecodeState::FRAME_COMPLETE)
+                || self.input.pos != self.input.size
+                || self.output.pos == self.output.size
+            {
+                return false;
+            }
+            // Fewer than 4 bytes after a complete frame do not show that a frame began, so node ignores them.
+            !(self
+                .decode
+                .contains(DecodeState::DECODING_FRAME_AFTER_COMPLETE)
+                && self.frame_prefix_size < 4)
+        }
+
         pub(crate) fn get_error_info(&mut self) -> Error {
             // Compute result, then clear `remaining`, then return.
             let err = c::ZSTD_getErrorCode(self.remaining as usize);
             let result = if err == 0 {
-                Error::OK
+                if self.input_ended_inside_frame() {
+                    Error::init(
+                        c"unexpected end of file".as_ptr(),
+                        bun_zlib::ReturnCode::BufError as c_int,
+                        c"Z_BUF_ERROR".as_ptr(),
+                    )
+                } else {
+                    Error::OK
+                }
             } else {
                 Error {
                     err: err as c_int,

@@ -121,6 +121,14 @@ const iterChild = await promisify(execFile)(
         "frame, frame": [a, b],
         "frame, frame with a wrong checksum": [a, wrongChecksum],
       },
+      "the end of the input": {
+        "no chunk": [],
+        "an empty chunk": [Buffer.alloc(0)],
+        "a frame without its last byte": [a.subarray(0, -1)],
+        "a frame, a frame without its last byte": [a, b.subarray(0, -1)],
+        "a frame, 4 bytes of a magic number": [a, b.subarray(0, 4)],
+        "a frame, 3 bytes of a magic number": [a, b.subarray(0, 3)],
+      },
     };
     const result = decode => decode().then(
       output => Buffer.from(output).toString("latin1"),
@@ -328,5 +336,233 @@ describe("zstd: input after a complete frame", () => {
       "frame, frame": ["ab", "ab"],
       "frame, frame with a wrong checksum": [checksumWrong, checksumWrong],
     });
+  });
+});
+
+// With finishFlush ZSTD_e_end, which is the default, the input must end where a frame ends.
+describe("zstd: the end of the input", () => {
+  const { ZSTD_e_continue, ZSTD_e_flush } = zlib.constants;
+  const unexpectedEnd = zstdError("unexpected end of file", "Z_BUF_ERROR", -5);
+  const payload = Buffer.alloc(192, "hello world ");
+  const text = payload.toString("latin1");
+  const frame = zlib.zstdCompressSync(payload);
+  const truncated = frame.subarray(0, -10);
+  const checksummed = zlib.zstdCompressSync(payload, { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } });
+  const withoutChecksumByte = checksummed.subarray(0, -1);
+  const withoutChecksum = checksummed.subarray(0, -4);
+  // A compressor that got a flush and no end gives whole blocks, and not the last block of the frame.
+  const flushed = zlib.zstdCompressSync(payload, { finishFlush: ZSTD_e_flush });
+  const empty = Buffer.alloc(0);
+  const flushEnd = (decoder: Decoder) => decoder.flush(ZSTD_e_end);
+  const failed = (payloads: number, bytesWritten: number) => ({
+    output: text.repeat(payloads),
+    events: [unexpectedEnd],
+    bytesWritten,
+  });
+
+  describe("inside a frame", () => {
+    // After the input, each row has the number of payloads that the input gives before it ends:
+    // with the input in one write, and with each byte in a write of its own. Then it has that number
+    // and bytesWritten for a write of the input that has ZSTD_e_end. A write that fails gives no
+    // output and counts no bytes.
+    const inputs: [string, Buffer, number, number, [number, number]][] = [
+      ["no input", empty, 0, 0, [0, 0]],
+      ["a frame without its last 10 bytes", truncated, 0, 0, [0, 0]],
+      ["2 bytes of a magic number", magic.subarray(0, 2), 0, 0, [0, 0]],
+      ["a skippable frame without its last 2 bytes", skippable.subarray(0, -2), 0, 0, [0, 0]],
+      ["a frame without the last byte of its checksum", withoutChecksumByte, 1, 1, [1, withoutChecksumByte.length]],
+      ["a frame without its checksum", withoutChecksum, 1, 0, [1, withoutChecksum.length]],
+      ["the output of a compressor that did not end", flushed, 1, 0, [1, flushed.length]],
+      ["a frame and a frame without its last 10 bytes", Buffer.concat([frame, truncated]), 1, 1, [1, frame.length]],
+      ["a frame and 4 bytes of a magic number", Buffer.concat([frame, magic]), 1, 1, [1, frame.length]],
+      [
+        "two frames and 4 bytes of a skippable magic number",
+        Buffer.concat([frame, frame, skippable.subarray(0, 4)]),
+        2,
+        2,
+        [2, 2 * frame.length],
+      ],
+    ];
+    for (const [name, input, payloads, payloadsBytewise, finishing] of inputs) {
+      test(`${name} is an error`, async () => {
+        assert.deepStrictEqual(
+          thrownBy(() => zlib.zstdDecompressSync(input)),
+          unexpectedEnd,
+        );
+        assert.deepStrictEqual(await rejectionOf(promisify(zlib.zstdDecompress)(input)), unexpectedEnd);
+        assert.deepStrictEqual(processChunks([[input, ZSTD_e_end]]), { output: "", error: unexpectedEnd });
+        assert.deepStrictEqual(
+          processChunks([
+            [input, ZSTD_e_continue],
+            [empty, ZSTD_e_end],
+          ]),
+          { output: text.repeat(payloads), error: unexpectedEnd },
+        );
+        assert.deepStrictEqual(await decode([d => d.end(input)]), failed(payloads, input.length));
+        assert.deepStrictEqual(
+          await decode([...bytewise(input), end]),
+          failed(payloadsBytewise, Math.max(input.length - 1, 0)),
+        );
+        for (const chunkSize of [zlib.constants.Z_MIN_CHUNK, payload.length]) {
+          assert.deepStrictEqual(await decode([input, end], { flush: ZSTD_e_end, chunkSize }), failed(...finishing));
+        }
+      });
+
+      test(`${name} is not an error with another finishFlush`, async () => {
+        for (const finishFlush of [ZSTD_e_flush, ZSTD_e_continue]) {
+          const options = { finishFlush, chunkSize: zlib.constants.Z_MIN_CHUNK };
+          assert.strictEqual(zlib.zstdDecompressSync(input, options).toString("latin1"), text.repeat(payloads));
+          assert.strictEqual(
+            (await promisify(zlib.zstdDecompress)(input, options)).toString("latin1"),
+            text.repeat(payloads),
+          );
+          assert.deepStrictEqual(
+            await decode([d => d.end(input)], options),
+            ended(text.repeat(payloads), input.length),
+          );
+        }
+      });
+    }
+
+    const orders: [string, Operation[], zlib.ZstdOptions | undefined, number, number][] = [
+      ["end() with no write", [end], undefined, 0, 0],
+      ["flush(ZSTD_e_end) before the first write", [flushEnd, end], undefined, 0, 0],
+      ["flush(ZSTD_e_end) after the input", [truncated, flushEnd, end], undefined, 0, truncated.length],
+      ["options.flush = ZSTD_e_end", [truncated.subarray(0, 10), end], { flush: ZSTD_e_end }, 0, 0],
+      ["a write that waits for its callback", [written(truncated), end], undefined, 0, truncated.length],
+      ["a frame and the input in one tick", [frame, truncated, end], undefined, 1, frame.length],
+      [
+        "a magic number in two writes after a frame",
+        [frame, magic.subarray(0, 2), magic.subarray(2), end],
+        undefined,
+        1,
+        frame.length + 2,
+      ],
+      ["reset() after a frame", [written(frame), reset, end], undefined, 1, frame.length],
+    ];
+    for (const [name, operations, options, payloads, bytesWritten] of orders) {
+      test(`${name}: the stream gives the error`, async () => {
+        assert.deepStrictEqual(await decode(operations, options), failed(payloads, bytesWritten));
+      });
+    }
+
+    test("after a frame, the output of the input comes before the error", async () => {
+      const options = { chunkSize: payload.length };
+      for (const input of [withoutChecksumByte, withoutChecksum, flushed]) {
+        assert.deepStrictEqual(await decode([frame, input, end], options), failed(2, frame.length + input.length));
+      }
+      assert.deepStrictEqual(await decode([frame, truncated, end], options), failed(1, frame.length));
+    });
+
+    test("the blocks that are complete come out before the error", async () => {
+      const block = 128 * 1024;
+      const big = zlib.zstdCompressSync(Buffer.alloc(8 * block, "hello world "));
+      const cut = big.subarray(0, -10);
+      // The shortest input that gives the first block ends where that block ends.
+      let oneBlock = empty;
+      for (let length = 1; oneBlock.length === 0; length++) {
+        const output = zlib.zstdDecompressSync(big.subarray(0, length), { finishFlush: ZSTD_e_flush });
+        if (output.length === block) oneBlock = big.subarray(0, length);
+      }
+      const sizes = ({ output, ...rest }: Awaited<ReturnType<typeof decode>>) => ({ ...rest, output: output.length });
+      for (const [input, output] of [
+        [cut, 7 * block],
+        [oneBlock, block],
+      ] as [Buffer, number][]) {
+        const expected = { events: [unexpectedEnd], bytesWritten: input.length, output };
+        assert.deepStrictEqual(sizes(await decode([input, end])), expected);
+        // In the next two orders the write of the input has ZSTD_e_end, and it fills output chunks before it ends.
+        assert.deepStrictEqual(sizes(await decode([empty, input, end])), expected);
+        assert.deepStrictEqual(sizes(await decode([d => d.end(input)], { flush: ZSTD_e_end })), expected);
+      }
+    });
+
+    test("a stream that stops inside a frame gives no error", async () => {
+      const stopped = { output: "", events: [], bytesWritten: truncated.length };
+      assert.deepStrictEqual(await decode([written(truncated), d => d.destroy()]), stopped);
+      assert.deepStrictEqual(await decode([written(truncated), d => d.close()]), stopped);
+    });
+
+    test("the finishFlush of the stream at the time of end() decides", async () => {
+      const lenient = (decoder: any) => (decoder._finishFlushFlag = ZSTD_e_flush);
+      assert.deepStrictEqual(await decode([lenient, d => d.end(truncated)]), ended("", truncated.length));
+    });
+
+    // Node aborts on a write before init(), so this test is for bun only.
+    test("a handle that init() did not set up reports nothing", { skip: typeof Bun === "undefined" }, () => {
+      const Handle = (zlib.createZstdDecompress() as any)._handle.constructor;
+      const handle = new Handle(zlib.constants.ZSTD_DECOMPRESS);
+      const errors: string[] = [];
+      handle.onerror = (message: string, errno: number, code: string) => errors.push(code);
+      handle.writeSync(ZSTD_e_end, null, 0, 0, new Uint8Array(64), 0, 64);
+      assert.deepStrictEqual(errors, []);
+    });
+
+    test("zlib/iter gives the error", () => {
+      const { keys, ...error } = unexpectedEnd;
+      assert.deepStrictEqual(iterResults["the end of the input"], {
+        "no chunk": [error, error],
+        "an empty chunk": [error, error],
+        "a frame without its last byte": [error, error],
+        "a frame, a frame without its last byte": [error, error],
+        "a frame, 4 bytes of a magic number": [error, error],
+        "a frame, 3 bytes of a magic number": ["a", "a"],
+      });
+    });
+  });
+
+  describe("where a frame ends", () => {
+    const twice = text.repeat(2);
+    // Fewer than 4 bytes after a frame do not show that a frame began.
+    const tails: [string, Buffer][] = [
+      ["nothing", empty],
+      ["1 byte of a magic number", magic.subarray(0, 1)],
+      ["2 bytes of a magic number", magic.subarray(0, 2)],
+      ["3 bytes of a magic number", magic.subarray(0, 3)],
+      ["1 byte of a skippable magic number", skippable.subarray(0, 1)],
+      ["2 bytes of a skippable magic number", skippable.subarray(0, 2)],
+      ["3 bytes of a skippable magic number", skippable.subarray(0, 3)],
+    ];
+    for (const [name, tail] of tails) {
+      test(`${name} after the last frame is not an error`, async () => {
+        for (const [frames, output] of [
+          [[frame], text],
+          [[frame, frame], twice],
+          [[frame, skippable], text],
+        ] as [Buffer[], string][]) {
+          const input = Buffer.concat([...frames, tail]);
+          for (const chunkSize of [zlib.constants.Z_DEFAULT_CHUNK, zlib.constants.Z_MIN_CHUNK, payload.length]) {
+            const options = { chunkSize };
+            assert.strictEqual(zlib.zstdDecompressSync(input, options).toString("latin1"), output);
+            assert.deepStrictEqual(processChunks([[input, ZSTD_e_end]]), { output });
+            assert.deepStrictEqual(await decode([d => d.end(input)], options), ended(output, input.length));
+            assert.deepStrictEqual(await decode([...bytewise(input), end], options), ended(output, input.length));
+            assert.deepStrictEqual(
+              await decode([input, end], { ...options, flush: ZSTD_e_end }),
+              ended(output, input.length),
+            );
+          }
+        }
+      });
+    }
+
+    const orders: [string, Operation[], string, number][] = [
+      ["flush(ZSTD_e_end) between two frames", [frame, flushEnd, frame, end], twice, 2 * frame.length],
+      ["20 times flush(ZSTD_e_end)", [frame, ...Array(20).fill(flushEnd), end], text, frame.length],
+      ["20 empty writes", [frame, ...Array(20).fill(empty), end], text, frame.length],
+      [
+        "reset() inside a frame, and then a frame",
+        [written(truncated), reset, frame, end],
+        text,
+        truncated.length + frame.length,
+      ],
+    ];
+    for (const [name, operations, output, bytesWritten] of orders) {
+      test(`${name} is not an error`, async () => {
+        for (const chunkSize of [zlib.constants.Z_DEFAULT_CHUNK, zlib.constants.Z_MIN_CHUNK]) {
+          assert.deepStrictEqual(await decode(operations, { chunkSize }), ended(output, bytesWritten));
+        }
+      });
+    }
   });
 });
