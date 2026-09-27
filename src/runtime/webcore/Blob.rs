@@ -1343,6 +1343,7 @@ impl BlobExt for Blob {
                 aws_options.content_encoding.as_deref(),
                 None,
                 aws_options.request_payer,
+                aws_options.metadata.clone(),
                 None,
                 core::ptr::null_mut(),
             );
@@ -1575,6 +1576,7 @@ impl BlobExt for Blob {
                     content_encoding_str.as_ref().map(|s| s.slice()),
                     credentials_with_options.storage_class,
                     credentials_with_options.request_payer,
+                    credentials_with_options.metadata,
                 );
             }
 
@@ -1588,6 +1590,7 @@ impl BlobExt for Blob {
                 None,
                 None,
                 s3.request_payer,
+                s3.metadata.clone(),
             );
         }
 
@@ -4296,6 +4299,7 @@ fn write_file_with_empty_source_to_destination(
                 aws_options.acl,
                 aws_options.storage_class,
                 aws_options.request_payer,
+                aws_options.metadata.as_ref(),
                 Wrapper::resolve,
                 bun_core::heap::into_raw(Box::new(Wrapper {
                     promise,
@@ -4506,6 +4510,7 @@ pub(crate) fn write_file_with_source_destination(
                             aws_options.content_encoding.as_deref(),
                             None,
                             aws_options.request_payer,
+                            aws_options.metadata.clone(),
                             None,
                             core::ptr::null_mut(),
                         );
@@ -4567,6 +4572,7 @@ pub(crate) fn write_file_with_source_destination(
                         aws_options.acl,
                         aws_options.storage_class,
                         aws_options.request_payer,
+                        aws_options.metadata.as_ref(),
                         Wrapper::resolve,
                         bun_core::heap::into_raw(Box::new(Wrapper {
                             store: source_store.clone(),
@@ -4605,6 +4611,7 @@ pub(crate) fn write_file_with_source_destination(
                         aws_options.content_encoding.as_deref(),
                         None,
                         aws_options.request_payer,
+                        aws_options.metadata.clone(),
                         None,
                         core::ptr::null_mut(),
                     );
@@ -4899,6 +4906,7 @@ pub(crate) fn write_file_internal(
                                 aws_options.content_encoding.as_deref(),
                                 None,
                                 aws_options.request_payer,
+                                aws_options.metadata.clone(),
                                 None,
                                 core::ptr::null_mut(),
                             )?));
