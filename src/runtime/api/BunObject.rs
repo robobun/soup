@@ -1388,6 +1388,7 @@ fn get_s3_default_client(global_this: &JSGlobalObject, _: &JSObject) -> JsResult
         None,
         None,
         false,
+        None,
         global_this,
     ) {
         Ok(v) => v,
@@ -1401,6 +1402,7 @@ fn get_s3_default_client(global_this: &JSGlobalObject, _: &JSObject) -> JsResult
         acl: aws_options.acl,
         storage_class: aws_options.storage_class,
         request_payer: aws_options.request_payer,
+        metadata: None,
     };
     let js_client = <S3Client as bun_jsc::JsClass>::to_js(client, global_this);
     js_client.ensure_still_alive();
