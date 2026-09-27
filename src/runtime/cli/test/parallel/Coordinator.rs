@@ -73,6 +73,9 @@ pub(crate) struct Coordinator<'a> {
     pub(crate) bail: u32,
     pub(crate) dots: bool,
     pub(crate) files_done: u32,
+    /// A worker crashed while it ran a file. `collectCoverageFrom` adds no
+    /// files to the report of such a run.
+    pub(crate) worker_crashed: bool,
     pub(crate) spawned_count: u32,
     pub(crate) live_workers: u32,
     pub(crate) aborted: Option<u32>,
@@ -1099,6 +1102,7 @@ impl<'a> Coordinator<'a> {
         self.reporter.summary().files += 1;
         self.reporter
             .record_file_result(self.files[file_idx as usize].as_bytes(), true);
+        self.worker_crashed = true;
         self.mark_cut_short(
             file_idx,
             bun_core::time::milli_timestamp() - dispatched_at,

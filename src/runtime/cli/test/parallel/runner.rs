@@ -57,6 +57,7 @@ pub(crate) fn run_as_coordinator(
     files: &[Interned],
     ctx: Command::Context,
     coverage_opts: &mut CodeCoverageOptions,
+    coverage_include: Option<&mut crate::cli::test::coverage_include::Run>,
 ) -> crate::Result<bool> {
     // SAFETY: env loader is initialized before the test runner runs.
     let env = unsafe { &mut *vm.transpiler.env };
@@ -215,6 +216,7 @@ pub(crate) fn run_as_coordinator(
         last_header_idx: None,
         frame: Frame::default(),
         files_done: 0,
+        worker_crashed: false,
         spawned_count: 0,
         live_workers: 0,
         aborted: None,
@@ -255,7 +257,7 @@ pub(crate) fn run_as_coordinator(
 
     aggregate::replay_test_records(&mut coord);
     if coverage_opts.enabled {
-        aggregate::write_coverage_report(&mut coord, coverage_opts);
+        aggregate::write_coverage_report(&mut coord, vm.as_mut(), coverage_opts, coverage_include);
     }
     if let Some(code) = coord.aborted {
         coord.reporter.write_reports_if_needed();
