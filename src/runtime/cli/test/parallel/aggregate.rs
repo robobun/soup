@@ -1,17 +1,21 @@
 //! Builds the single JUnit or JSON document and the coverage report from the
 //! per-file data workers stream over IPC, once `drive()` completes.
 
+use core::sync::atomic::Ordering;
+
 use bun_collections::index_sort;
 use bun_core::Output;
+use bun_jsc::virtual_machine::VirtualMachine;
 use bun_options_types::code_coverage_options::CodeCoverageOptions;
 use bun_sourcemap_jsc::code_coverage::Report;
 
-use super::coordinator::{Coordinator, FileTestRecords};
+use super::coordinator::{Coordinator, FileTestRecords, abort_handler};
 use super::frame::Reader;
 use super::runner;
+use crate::cli::test::coverage_include;
 use crate::cli::test::json_reporter::JsonReporter;
 use crate::test_command::{
-    JunitReporter, TestCaseReport, TestFailure, junit_file_name, print_coverage_reports,
+    JunitReporter, TestCaseReport, TestFailure, finish_coverage_reports, junit_file_name,
 };
 use crate::test_runner::execution::Result as TestResult;
 
@@ -88,18 +92,44 @@ fn replay_into(
     }
 }
 
-pub(crate) fn write_coverage_report(coord: &mut Coordinator, opts: &mut CodeCoverageOptions) {
+pub(crate) fn write_coverage_report(
+    coord: &mut Coordinator,
+    vm: &VirtualMachine,
+    opts: &mut CodeCoverageOptions,
+    mut include: Option<&mut coverage_include::Run>,
+) {
     let mut merged = core::mem::take(&mut coord.coverage_files);
     let mut reports: Vec<Report<'static>> = Vec::with_capacity(merged.count());
     for m in merged.values_mut() {
         reports.push(bun_core::handle_oom(core::mem::take(m).finish()));
     }
-    if reports.is_empty() {
+    if let Some(run) = include.as_deref_mut()
+        && (coord.aborted.is_some()
+            || coord.stop_reason.is_some()
+            || coord.worker_crashed
+            || coord.schedule.has_queued()
+            || coord.schedule.running().next().is_some())
+    {
+        run.ended_early();
+    }
+    let include = include.as_deref();
+    if reports.is_empty() && !include.is_some_and(coverage_include::Run::adds_files) {
         return;
     }
     index_sort::sort_slice_unstable_by(&mut reports, |a, b| a.source_url.cmp(&b.source_url));
-    if let Err(err) = print_coverage_reports(opts, &reports) {
-        Output::err(err, "Failed to write lcov.info", ());
-        coord.aborted.get_or_insert(1);
+    // SIGINT and SIGTERM only set a flag while the coordinator runs.
+    let interrupted = || abort_handler::ABORT_SIGNAL.load(Ordering::Acquire) != 0;
+    match finish_coverage_reports(vm, opts, include, reports, &interrupted) {
+        Ok(coverage_include::Completed::Yes) => {}
+        Ok(coverage_include::Completed::Interrupted) => {
+            let signal = abort_handler::ABORT_SIGNAL.load(Ordering::Acquire);
+            coord
+                .aborted
+                .get_or_insert_with(|| u32::from(bun_sys::SignalCode(signal as u8).to_exit_code()));
+        }
+        Err(err) => {
+            Output::err(err, "Failed to write lcov.info", ());
+            coord.aborted.get_or_insert(1);
+        }
     }
 }
