@@ -177,6 +177,42 @@ for (let i = 0; i < 10; i++) {
 await writer.end();
 ```
 
+### Metadata
+
+To store your own key-value pairs with an object, pass `metadata` to an upload. Bun sends each entry as an `x-amz-meta-<key>` header, and `stat()` returns them.
+
+```ts s3.ts icon="/icons/typescript.svg"
+await s3file.write(pdfData, {
+  type: "application/pdf",
+  metadata: { customer: "1042", "reviewed-by": "ana" },
+});
+
+const { metadata } = await s3file.stat();
+metadata.customer; // "1042"
+metadata["reviewed-by"]; // "ana"
+```
+
+`write()`, `writer()` and `S3Client.write()` take `metadata`, and a multipart upload sends it once, with the request that creates the upload. `fetch()` with `method: "PUT"` to an `s3://` URL takes it in its `s3` option. Requests that do not upload ignore it.
+
+The metadata given to `file()` or to `new S3Client()` is the default of the uploads of that file or client, `Bun.write()` to the file and [presigned uploads](#presigning-an-upload-with-metadata) included. The `metadata` of a call replaces the default and does not merge with it, so `{}` or `null` uploads without metadata.
+
+```ts s3.ts icon="/icons/typescript.svg"
+const invoice = s3.file("invoice.pdf", { metadata: { customer: "1042" } });
+
+await invoice.write(pdfData); // customer: "1042"
+await invoice.write(pdfData, { metadata: { draft: "yes" } }); // draft: "yes"
+await invoice.write(pdfData, { metadata: {} }); // no metadata
+```
+
+- Keys are case-insensitive. S3 stores them in lowercase, and `stat()` returns them in lowercase. Two keys that differ only in case, such as `Color` and `color`, are an error.
+- A key has to be a valid HTTP header name (letters, digits and ``!#$%&'*+-.^_`|~``), and a value has to be a string of printable ASCII characters. Encode other text, for example with `encodeURIComponent()`.
+- The spaces at the start and at the end of a value are not part of it: `" draft "` is stored as `"draft"`.
+- One object can have 238 keys.
+- Bun throws for what these rules do not allow before it sends a request.
+- Amazon S3 accepts up to 2 KB of keys and values for one object and answers `MetadataTooLarge` for more. Other services have other limits, so Bun does not check the size.
+- An upload replaces the object and its metadata. The metadata of an earlier upload does not stay.
+- `stat()` returns a value as the service sent it. Amazon S3 sends a value that another client stored with other characters than ASCII as an [RFC 2047](https://datatracker.ietf.org/doc/html/rfc2047) encoded word, such as `=?UTF-8?B?Y2Fmw6k=?=`.
+
 ---
 
 ## Presigning URLs
@@ -266,6 +302,24 @@ const url = s3file.presign({
   // method: "HEAD",
   // method: "POST",
   // method: "PUT",
+});
+```
+
+### Presigning an upload with metadata
+
+A presigned `PUT` or `POST` URL signs its [`metadata`](#metadata) as headers of the upload. The request to that URL has to send the same `x-amz-meta-*` headers, and S3 answers `403 SignatureDoesNotMatch` when one is missing or has another value. That is also true for the metadata that the file or the client has as its default. URLs for the other methods do not have it.
+
+```ts s3.ts icon="/icons/typescript.svg"
+const url = s3file.presign({
+  method: "PUT",
+  metadata: { user: "1042" },
+});
+
+// On the client
+await fetch(url, {
+  method: "PUT",
+  headers: { "x-amz-meta-user": "1042" },
+  body: file,
 });
 ```
 
@@ -825,10 +879,15 @@ const stat = await S3Client.stat("my-file.txt", credentials);
 {
   etag: "\"7a30b741503c0b461cc14157e2df4ad8\"",
   lastModified: 2025-01-07T00:19:10.000Z,
+  metadata: {
+    customer: "1042",
+  },
   size: 1024,
   type: "text/plain;charset=utf-8",
 }
 ```
+
+`metadata` has the [user-defined metadata](#metadata) of the object, and is `{}` for an object that has none.
 
 ### `S3Client.delete` (static)
 

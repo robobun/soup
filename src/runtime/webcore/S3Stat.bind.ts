@@ -6,6 +6,7 @@ export const S3Stat = b.class({
   proto: {
     etag: { getter: b.string, cache: true },
     lastModified: { getter: b.f64.asDate, cache: true },
+    metadata: { getter: b.record(b.string.utf8), cache: true },
     size: { getter: b.u64, cache: true },
     type: { getter: b.string, cache: true },
   },
