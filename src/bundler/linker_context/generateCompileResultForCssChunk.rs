@@ -61,6 +61,8 @@ pub(crate) fn generate_compile_result_for_css_chunk(
         indent: blocks.indent,
         ..Default::default()
     };
+    // `post_process_css_chunk` places the ones that are not printed here.
+    let license_comments = c.options.legal_comments == crate::options::LegalComments::Inline;
 
     let source_index = match &css_import.kind {
         CssImportOrderKind::Layers(layers) => {
@@ -108,7 +110,10 @@ pub(crate) fn generate_compile_result_for_css_chunk(
                     .input_files
                     .items_unique_key_for_additional_file(),
             };
-            let options = printer_options(minifies_anything(c));
+            let options = PrinterOptions {
+                license_comments,
+                ..printer_options(minifies_anything(c))
+            };
             let writer = &mut allocating_writer;
             let mut printer = new_printer(c, arena, writer, &options, Some(import_info));
             let printed = sheet.header_to_css(&mut printer, None).and_then(|()| {
