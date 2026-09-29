@@ -104,6 +104,8 @@ fn generate_compile_result_for_css_chunk_impl(
     if !c.options.minify_whitespace && !css.rules.v.is_empty() {
         allocating_writer.extend(core::iter::repeat_n(b' ', blocks.indent as usize));
     }
+    // `post_process_css_chunk` places the ones that are not printed here.
+    let license_comments = c.options.legal_comments == crate::options::LegalComments::Inline;
 
     match &css_import.kind {
         CssImportOrderKind::Layers(_) | CssImportOrderKind::ExternalPath(_) => {
@@ -151,6 +153,7 @@ fn generate_compile_result_for_css_chunk_impl(
                     || c.options.minify_syntax
                     || c.options.minify_identifiers,
                 indent: blocks.indent,
+                license_comments,
                 ..Default::default()
             };
             match css.to_css_with_writer(
