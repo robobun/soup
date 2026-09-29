@@ -2307,7 +2307,7 @@ pub struct StyleSheet<'bump, AtRule> {
     /// A list of top-level rules within the style sheet.
     pub rules: CssRuleList<'bump, AtRule>,
     pub(crate) sources: Vec<Box<[u8]>>,
-    pub(crate) license_comments: Vec<&'bump [u8]>,
+    pub license_comments: Vec<&'bump [u8]>,
     /// [`ParserOptions::css_modules`] of the parse.
     pub(crate) css_modules: Option<css_modules::Config>,
     /// [`ParserOptions::flags`] of the parse.
@@ -2444,11 +2444,13 @@ mod stylesheet_impl {
         ) -> Result<(), PrintErr> {
             // #[cfg(feature = "sourcemap")] if printer.source_map.is_some() { ... }
 
-            for comment in &self.license_comments {
-                printer.write_str("/*")?;
-                printer.write_comment(comment)?;
-                printer.write_str("*/")?;
-                printer.newline()?;
+            if printer.license_comments {
+                for comment in &self.license_comments {
+                    printer.write_str("/*")?;
+                    printer.write_comment(comment)?;
+                    printer.write_str("*/")?;
+                    printer.newline()?;
+                }
             }
 
             if let Some(config) = &self.css_modules {

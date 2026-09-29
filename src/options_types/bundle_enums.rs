@@ -68,6 +68,58 @@ bun_core::comptime_string_map! {
     };
 }
 
+/// `legalComments`: where `/*!` and `//!` comments go (in CSS: `/*!` at the start of a stylesheet).
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum LegalComments {
+    /// Drop them.
+    None,
+    /// Keep them where they are in the code.
+    #[default]
+    Inline,
+    /// Move them to the end of the output file.
+    Eof,
+    /// Move them to `<output file>.LEGAL.txt` and end the output file with a comment that names it.
+    Linked,
+    /// Move them to `<output file>.LEGAL.txt`.
+    External,
+}
+
+impl LegalComments {
+    pub const MAP: __ComptimeStringMap_LEGAL_COMMENTS_MAP =
+        __ComptimeStringMap_LEGAL_COMMENTS_MAP(());
+
+    /// What [`Self::from_string`] accepts, for error messages.
+    pub const ONE_OF: &'static str = "\"none\", \"inline\", \"eof\", \"linked\", \"external\"";
+
+    pub fn from_string(slice: &[u8]) -> Option<LegalComments> {
+        Self::MAP.get(slice).copied()
+    }
+
+    /// The printer takes them out of the code and returns them.
+    #[inline]
+    pub fn is_extracted(self) -> bool {
+        matches!(self, Self::Eof | Self::Linked | Self::External)
+    }
+
+    /// They go to a file of their own, next to the output file.
+    #[inline]
+    pub fn has_external_files(self) -> bool {
+        matches!(self, Self::Linked | Self::External)
+    }
+}
+
+bun_core::comptime_string_map! {
+    #[doc(hidden)]
+    pub static LEGAL_COMMENTS_MAP: LegalComments = {
+        b"none" => LegalComments::None,
+        b"inline" => LegalComments::Inline,
+        b"eof" => LegalComments::Eof,
+        b"linked" => LegalComments::Linked,
+        b"external" => LegalComments::External,
+    };
+}
+
 #[derive(Default)]
 pub struct WindowsOptions {
     pub hide_console: bool,

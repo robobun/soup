@@ -28,6 +28,8 @@ pub struct PrinterOptions<'a> {
     pub pseudo_classes: Option<PseudoClasses<'a>>,
     /// The indent of the output, for text that goes inside a block.
     pub indent: u32,
+    /// Whether to print `StyleSheet::license_comments`.
+    pub license_comments: bool,
 }
 
 impl<'a> PrinterOptions<'a> {
@@ -45,6 +47,7 @@ impl<'a> PrinterOptions<'a> {
             },
             pseudo_classes: None,
             indent: 0,
+            license_comments: true,
         }
     }
 }
@@ -113,6 +116,7 @@ pub struct Printer<'a> {
     pub(crate) line: u32,
     pub(crate) col: u32,
     pub(crate) minify: bool,
+    pub(crate) license_comments: bool,
     pub(crate) targets: Targets,
     pub(crate) vendor_prefix: css::VendorPrefix,
     /// True while nested rules are being re-serialized for a non-final vendor
@@ -232,6 +236,7 @@ impl<'a> Printer<'a> {
         Printer {
             dest,
             minify: options.minify,
+            license_comments: options.license_comments,
             targets: options.targets,
             pseudo_classes: options.pseudo_classes,
             import_info,

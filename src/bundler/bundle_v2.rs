@@ -2811,6 +2811,16 @@ pub mod bv2_impl {
                 }
             }
 
+            if this.transpiler.options.legal_comments.has_external_files()
+                && this.transpiler.options.compile_mode != options::CompileMode::None
+            {
+                this.transpiler.log_mut().add_error(
+                    None,
+                    bun_ast::Loc::EMPTY,
+                    "Linked and external legal comments are not supported when compiling to a single file. Use \"eof\", \"inline\" or \"none\"",
+                );
+            }
+
             // Read now, once and in full (a pipe will do): a path that is wrong fails the build here, before anything
             // is parsed, not after the link.
             if this.transpiler.options.bytecode
@@ -7531,10 +7541,9 @@ pub mod bv2_impl {
         fn default() -> Self {
             CompileResult::Javascript {
                 source_index: 0,
-                result: bun_js_printer::PrintResult::Result(bun_js_printer::PrintResultSuccess {
-                    code: Box::new([]),
-                    source_map: None,
-                }),
+                result: bun_js_printer::PrintResult::Result(
+                    bun_js_printer::PrintResultSuccess::default(),
+                ),
                 module_info: None,
             }
         }
