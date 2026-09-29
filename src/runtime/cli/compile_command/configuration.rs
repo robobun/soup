@@ -246,6 +246,7 @@ fn apply_bundler_options(ctx: &ContextData, this_transpiler: &mut Transpiler<'st
         .options
         .global_name
         .clone_from(&ctx.bundler_options.global_name);
+    this_transpiler.options.legal_comments = ctx.bundler_options.legal_comments;
     this_transpiler.options.drop = ctx.args.drop.clone().into();
     {
         let flags: Vec<&[u8]> = ctx.args.feature_flags.iter().map(|s| &**s).collect();

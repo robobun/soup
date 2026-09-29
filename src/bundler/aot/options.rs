@@ -19,8 +19,8 @@ use super::paths::{absolute_path, relative_path, report_long_path};
 use crate::bun_fs::PathName;
 use crate::bundle_v2::FileMap;
 use crate::options::{
-    AllowUnresolved, BundleOptions, DEFAULT_WILDCARD_PATTERNS, Format, PackagesOption,
-    PathTemplate, PlaceholderField, Target, jsx,
+    AllowUnresolved, BundleOptions, DEFAULT_WILDCARD_PATTERNS, Format, LegalComments,
+    PackagesOption, PathTemplate, PlaceholderField, Target, jsx,
 };
 
 pub(crate) struct OptionsInput<'r, 'i, 'a> {
@@ -106,6 +106,7 @@ fn report_unsupported_options(options: &BundleOptions<'_>, log: &mut Log) -> boo
         bytecode_order: _, compile_target_builtins: _, metafile: _, metafile_json_path: _,
         metafile_markdown_path: _, serve_plugins: _, bunfig_path: _, unwrap_commonjs_packages: _,
         supports_multiple_outputs: _, rewrite_jest_for_tests: _, code_coverage: _, debugger: _,
+        legal_comments,
     } = options;
 
     let is_development_server = framework.is_some() || !dev_server.is_null() || *hot_module_reloading;
@@ -122,6 +123,7 @@ fn report_unsupported_options(options: &BundleOptions<'_>, log: &mut Log) -> boo
         (!macro_remap.is_empty()).then_some("the \"macros\" map of bunfig.toml"),
         inject.as_ref().is_some_and(|list| !list.is_empty()).then_some("inject"),
         react_compiler_parse_test_pragmas.then_some("reactCompilerParseTestPragmas"),
+        legal_comments_argument(*legal_comments),
         (!global_name.is_empty()).then_some("--global-name"),
         is_development_server.then_some("a development server"),
         is_other_command.then_some("this command"),
@@ -143,6 +145,15 @@ fn format_argument(format: Format) -> Option<&'static str> {
         Format::Cjs => Some("--format=cjs"),
         Format::Iife => Some("--format=iife"),
         Format::InternalBakeDev => Some("a development server"),
+    }
+}
+
+// A single executable has no file beside it for the comments, and no place for a comment that names one.
+fn legal_comments_argument(legal_comments: LegalComments) -> Option<&'static str> {
+    match legal_comments {
+        LegalComments::None | LegalComments::Inline | LegalComments::Eof => None,
+        LegalComments::Linked => Some("--legal-comments=linked"),
+        LegalComments::External => Some("--legal-comments=external"),
     }
 }
 
