@@ -89,6 +89,9 @@ pub struct Chunk<'a> {
     /// the source map comment. The metafile reports it as `outputs[..].bytes`.
     pub(crate) final_output_size: usize,
 
+    /// The `.LEGAL.txt` file of this chunk (`legalComments` is `linked` or `external`). Empty: no file.
+    pub(crate) external_legal_comments: Box<[u8]>,
+
     /// Pack boolean flags to reduce padding overhead.
     /// Previously 3 separate bool fields caused ~21 bytes of padding waste.
     pub(crate) flags: Flags,
@@ -197,6 +200,7 @@ impl Default for Chunk<'_> {
             nested_scopes_to_rename: Vec::new(),
             compile_results_for_chunk: CompileResultSlots::default(),
             final_output_size: 0,
+            external_legal_comments: Box::default(),
             flags: Flags::default(),
         }
     }
