@@ -887,6 +887,90 @@ test.concurrent("bun build widens [hash] names that would otherwise collide", as
   expect(exitCode).toBe(0);
 });
 
+describe.concurrent("--legal-comments", () => {
+  const source = `/*! (c) entry */\nconsole.log("ran");\n//! last line\n`;
+
+  async function build(dir: string, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build", ...args],
+      env: bunEnv,
+      cwd: dir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test("--outdir gets the file of linked comments", async () => {
+    using dir = tempDir("legal-comments-outdir", { "in.js": source });
+    const { stdout, stderr, exitCode } = await build(String(dir), "in.js", "--outdir=dist", "--legal-comments=linked");
+    expect(stderr).toBe("");
+    expect(stdout).toContain("in.js.LEGAL.txt");
+    expect(fs.readdirSync(path.join(String(dir), "dist")).sort()).toEqual(["in.js", "in.js.LEGAL.txt"]);
+    expect(await Bun.file(path.join(String(dir), "dist", "in.js.LEGAL.txt")).text()).toBe(
+      "/*! (c) entry */\n//! last line\n",
+    );
+    expect(await Bun.file(path.join(String(dir), "dist", "in.js")).text()).toEndWith(
+      'console.log("ran");\n/*! For license information please see in.js.LEGAL.txt */\n',
+    );
+    expect(exitCode).toBe(0);
+  });
+
+  test.each([
+    ["none", `console.log("ran");\n`],
+    ["inline", `/*! (c) entry */\nconsole.log("ran");\n//! last line\n`],
+    ["eof", `console.log("ran");\n/*! (c) entry */\n//! last line\n`],
+  ])("--no-bundle with %s", async (mode, expected) => {
+    using dir = tempDir("legal-comments-no-bundle", { "in.js": source });
+    const { stdout, stderr, exitCode } = await build(String(dir), "--no-bundle", "in.js", `--legal-comments=${mode}`);
+    expect({ stdout, stderr }).toEqual({ stdout: expected, stderr: "" });
+    expect(exitCode).toBe(0);
+  });
+
+  test.each([
+    ["none", `.a {\n  color: red;\n}\n`],
+    ["inline", `/*! (c) entry */\n/*! (c) entry */\n.a {\n  color: red;\n}\n`],
+    ["eof", `.a {\n  color: red;\n}\n/*! (c) entry */\n`],
+  ])("--no-bundle with %s, css", async (mode, expected) => {
+    using dir = tempDir("legal-comments-no-bundle-css", {
+      "in.css": `/*! (c) entry */\n/*! (c) entry */\n.a { color: red }\n`,
+    });
+    const { stderr, exitCode } = await build(
+      String(dir),
+      "--no-bundle",
+      "in.css",
+      "--outdir=dist",
+      `--legal-comments=${mode}`,
+    );
+    expect(stderr).toBe("");
+    const css = await Bun.file(path.join(String(dir), "dist", "in.css")).text();
+    expect(css).toBe(expected);
+    expect(exitCode).toBe(0);
+  });
+
+  test.each([
+    [["--legal-comments=bottom"], `Invalid legal comments setting: "bottom"`],
+    [["--legal-comments=linked"], "cannot use linked or external legal comments without --outdir"],
+    [["--legal-comments=linked", "--outfile=out.js"], "cannot use linked or external legal comments without --outdir"],
+    [
+      ["--legal-comments=external", "--no-bundle", "--outdir=dist"],
+      "linked and external legal comments are only supported when bundling",
+    ],
+    [
+      ["--legal-comments=external", "--compile", "--outfile=dist/app"],
+      "Linked and external legal comments are not supported when compiling to a single file",
+    ],
+    [["--legal-comments=none", "--app"], "--legal-comments is not supported with --app"],
+  ])("%j is an error", async (args, message) => {
+    using dir = tempDir("legal-comments-error", { "in.js": source });
+    const { stdout, stderr, exitCode } = await build(String(dir), "in.js", ...args);
+    expect({ stdout, stderr }).toEqual({ stdout: "", stderr: expect.stringContaining(message) });
+    expect(fs.readdirSync(String(dir))).toEqual(["in.js"]);
+    expect(exitCode).toBe(1);
+  });
+});
+
 describe("CLI argument error messages", () => {
   test("--format with an unrecognized value echoes the value back", async () => {
     using dir = tempDir("build-format-err", { "in.js": "console.log(1)" });

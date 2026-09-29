@@ -3,7 +3,7 @@
 //!    chunk indexing remains the same:
 //!
 //!    1. chunks
-//!    2. sourcemaps, bytecode, and module_info
+//!    2. sourcemaps, bytecode, module_info, and legal comments
 //!    3. additional output files
 //!
 //!    We can calculate the space ahead of time and avoid having to do something
@@ -130,21 +130,22 @@ impl OutputFileList {
             0
         };
 
+        let legal_comments_count: usize = chunks
+            .iter()
+            .filter(|chunk| !chunk.external_legal_comments.is_empty())
+            .count();
+
         let additional_output_files_count: usize = if c.options.compile_mode.is_standalone_html() {
             0
         } else {
             parse_graph.additional_output_files.len()
         };
+        let supplementary_file_count =
+            source_map_count + bytecode_count + module_info_count + legal_comments_count;
         (
-            u32::try_from(
-                chunks.len()
-                    + source_map_count
-                    + bytecode_count
-                    + module_info_count
-                    + additional_output_files_count,
-            )
-            .unwrap(),
-            u32::try_from(source_map_count + bytecode_count + module_info_count).expect("int cast"),
+            u32::try_from(chunks.len() + supplementary_file_count + additional_output_files_count)
+                .unwrap(),
+            u32::try_from(supplementary_file_count).expect("int cast"),
         )
     }
 

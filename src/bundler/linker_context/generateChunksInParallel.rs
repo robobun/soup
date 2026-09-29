@@ -23,6 +23,7 @@ use crate::LinkerContext;
 use crate::linker_context::generate_compile_result_for_css_chunk::generate_compile_result_for_css_chunk;
 use crate::linker_context::generate_compile_result_for_html_chunk::generate_compile_result_for_html_chunk;
 use crate::linker_context::generate_compile_result_for_js_chunk::generate_compile_result_for_js_chunk;
+use crate::linker_context::legal_comments;
 use crate::linker_context::output_file_list_builder::OutputFileList as OutputFileListBuilder;
 use crate::linker_context::prepare_css_asts_for_chunk::{
     PrepareCssAstTask, prepare_css_asts_for_chunk,
@@ -1013,6 +1014,38 @@ pub(crate) fn generate_chunks_in_parallel<const IS_DEV_SERVER: bool>(
                 chunk.final_rel_path.as_ref()
             });
 
+            let legal_comments_output_file: Option<options::OutputFile> = if chunk
+                .external_legal_comments
+                .is_empty()
+            {
+                None
+            } else {
+                let output_path =
+                    strings::concat(&[&chunk.final_rel_path, legal_comments::FILE_EXTENSION]);
+                if c.options.legal_comments == options::LegalComments::Linked {
+                    code_result.buffer =
+                        legal_comments::append_link(&code_result.buffer, public_path, &output_path);
+                }
+                let comments = core::mem::take(&mut chunk.external_legal_comments);
+                Some(options::OutputFile::init(options::OutputFileInit {
+                    hash: chunk
+                        .template
+                        .placeholder
+                        .hash
+                        .map(|_| chunk.template.content_hash(bun_wyhash::hash(&comments))),
+                    data: options::OutputFileData::Buffer { data: comments },
+                    loader: Loader::File,
+                    input_loader: Loader::File,
+                    output_path,
+                    output_kind: options::OutputKind::Asset,
+                    input_path: strings::concat(&[&input_path[..], legal_comments::FILE_EXTENSION]),
+                    side: None,
+                    entry_point_index: None,
+                    is_executable: false,
+                    ..Default::default()
+                }))
+            };
+
             match chunk.content.sourcemap(c.options.source_maps) {
                 tag @ (SourceMapOption::External | SourceMapOption::Linked) => {
                     let output_source_map = chunk
@@ -1263,6 +1296,10 @@ pub(crate) fn generate_chunks_in_parallel<const IS_DEV_SERVER: bool>(
             } else {
                 None
             };
+
+            if let Some(f) = legal_comments_output_file {
+                output_files.insert_for_sourcemap_or_bytecode(f)?;
+            }
 
             let output_kind = c.chunk_output_kind(chunk);
 

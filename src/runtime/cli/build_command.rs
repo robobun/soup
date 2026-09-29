@@ -74,6 +74,12 @@ impl BuildCommand {
         }
 
         if ctx.bundler_options.bake {
+            if ctx.bundler_options.legal_comments != options::LegalComments::Inline {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> --legal-comments is not supported with --app"
+                );
+                Global::exit(1);
+            }
             return crate::bake::production::build_command(ctx);
         }
 
@@ -193,6 +199,21 @@ impl BuildCommand {
             Global::exit(1);
         }
 
+        if ctx.bundler_options.legal_comments.has_external_files() {
+            if ctx.bundler_options.transform_only {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> linked and external legal comments are only supported when bundling"
+                );
+                Global::exit(1);
+            }
+            if ctx.bundler_options.outdir.is_empty() && !ctx.bundler_options.compile {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> cannot use linked or external legal comments without --outdir"
+                );
+                Global::exit(1);
+            }
+        }
+
         let mut outfile: &[u8] = &ctx.bundler_options.outfile;
         let output_to_stdout = !ctx.bundler_options.compile
             && outfile.is_empty()
@@ -248,6 +269,7 @@ impl BuildCommand {
             .options
             .global_name
             .clone_from(&ctx.bundler_options.global_name);
+        this_transpiler.options.legal_comments = ctx.bundler_options.legal_comments;
         this_transpiler.options.drop = ctx.args.drop.clone().into();
         {
             let flags: Vec<&[u8]> = ctx.args.feature_flags.iter().map(|s| &**s).collect();

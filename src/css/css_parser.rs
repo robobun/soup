@@ -2461,11 +2461,13 @@ mod stylesheet_impl {
             // #[cfg(feature = "sourcemap")] { printer.sources = Some(&self.sources); }
             // #[cfg(feature = "sourcemap")] if printer.source_map.is_some() { ... }
 
-            for comment in &self.license_comments {
-                printer.write_str("/*")?;
-                printer.write_comment(comment)?;
-                printer.write_str("*/")?;
-                printer.newline()?;
+            if printer.license_comments {
+                for comment in &self.license_comments {
+                    printer.write_str("/*")?;
+                    printer.write_comment(comment)?;
+                    printer.write_str("*/")?;
+                    printer.newline()?;
+                }
             }
 
             if let Some(config) = &self.css_modules {

@@ -1,6 +1,7 @@
 use crate::LinkerContext;
 use crate::analyze_transpiled_module::ModuleInfo;
 use crate::bundle_v2::bake_types::{HmrRuntimeSide, get_hmr_runtime};
+use crate::linker_context::legal_comments::LegalCommentList;
 use crate::linker_context_mod::{GenerateChunkCtx, LinkerOptionsMode};
 use crate::mal_prelude::*;
 use crate::options;
@@ -416,10 +417,7 @@ pub(crate) fn post_process_js_chunk(
 
         break 'brk CompileResult::Javascript {
             source_index: Index::INVALID.value(),
-            result: PrintResult::Result(js_printer::PrintResultSuccess {
-                code: Box::default(),
-                source_map: None,
-            }),
+            result: PrintResult::Result(js_printer::PrintResultSuccess::default()),
             module_info: None,
         };
     };
@@ -617,6 +615,8 @@ pub(crate) fn post_process_js_chunk(
     let emit_targets_in_commands =
         show_comments && c.framework.is_some_and(|fw| fw.server_components.is_some());
 
+    let mut legal_comments = LegalCommentList::default();
+
     let sources: &[bun_ast::Source] = c.parse_graph().input_files.items_source();
     let targets: &[options::Target] = c.parse_graph().ast.items_target();
     for (compile_result_index, compile_result) in compile_results.iter().enumerate() {
@@ -629,7 +629,15 @@ pub(crate) fn post_process_js_chunk(
             j.push_owned(core::mem::take(&mut preload_registration).into_boxed_slice());
         }
 
-        // TODO: extracated legal comments
+        if let CompileResult::Javascript {
+            result: PrintResult::Result(printed),
+            ..
+        } = compile_result
+        {
+            for comment in &printed.legal_comments {
+                legal_comments.add(source_index, &sources[source_index as usize].path, comment);
+            }
+        }
 
         // Add a comment with the file path before the file contents
         if show_comments
@@ -824,7 +832,18 @@ pub(crate) fn post_process_js_chunk(
     }
 
     j.ensure_newline_at_end();
-    // TODO: maybeAppendLegalComments
+    let external_legal_comments = match c.options.legal_comments {
+        options::LegalComments::None | options::LegalComments::Inline => Box::default(),
+        options::LegalComments::Eof => {
+            let at_end = legal_comments.to_end_of_file();
+            line_offset.advance(&at_end);
+            j.push_owned(at_end.into_boxed_slice());
+            Box::default()
+        }
+        options::LegalComments::Linked | options::LegalComments::External => {
+            legal_comments.to_external_file().into_boxed_slice()
+        }
+    };
 
     if !c.options.footer.is_empty() {
         if newline_before_comment {
@@ -852,6 +871,7 @@ pub(crate) fn post_process_js_chunk(
 
     // TODO: meta contents
 
+    chunk.external_legal_comments = external_legal_comments;
     chunk.isolated_hash = c.generate_isolated_hash(chunk, worker_arena);
     chunk
         .flags
@@ -1379,10 +1399,7 @@ pub(crate) fn generate_entry_point_tail_js<'a>(
     if stmts.is_empty() {
         return CompileResult::Javascript {
             source_index,
-            result: PrintResult::Result(js_printer::PrintResultSuccess {
-                code: Box::default(),
-                source_map: None,
-            }),
+            result: PrintResult::Result(js_printer::PrintResultSuccess::default()),
             module_info: None,
         };
     }

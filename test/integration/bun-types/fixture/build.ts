@@ -37,6 +37,17 @@ Bun.build({
 
 Bun.build({
   entrypoints: ["hey"],
+  legalComments: "linked",
+});
+
+Bun.build({
+  entrypoints: ["hey"],
+  // @ts-expect-error
+  legalComments: true,
+});
+
+Bun.build({
+  entrypoints: ["hey"],
   plugins: [
     {
       name: "my-terrible-plugin",
