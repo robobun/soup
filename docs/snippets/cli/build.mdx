@@ -65,6 +65,12 @@ bun build <entry points>
   Add a footer to the output (e.g. <code>// built with bun!</code>)
 </ParamField>
 
+<ParamField path="--legal-comments" type="string" default="inline">
+  Where the <code>/*!</code> and <code>//!</code> comments go. One of <code>inline</code>, <code>none</code>,{" "}
+  <code>eof</code>, <code>linked</code>, or <code>external</code>. <code>linked</code> and <code>external</code> write a{" "}
+  <code>.LEGAL.txt</code> file next to each output file and need <code>--outdir</code>
+</ParamField>
+
 <ParamField path="--format" type="string" default="esm">
   Module format of the output bundle. One of <code>esm</code>, <code>cjs</code>, or <code>iife</code>. Defaults to{" "}
   <code>cjs</code> when <code>--bytecode</code> is used.
