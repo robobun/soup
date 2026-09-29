@@ -135,6 +135,7 @@ pub(crate) mod js_bundler {
         pub(crate) packages: options::PackagesOption,
         pub(crate) format: options::Format,
         pub(crate) global_name: OwnedString,
+        pub(crate) legal_comments: options::LegalComments,
         pub(crate) bytecode: bool,
         pub(crate) bytecode_depth: u32,
         pub(crate) optimize_bytecode: bool,
@@ -207,6 +208,7 @@ pub(crate) mod js_bundler {
                 packages: options::PackagesOption::Bundle,
                 format: options::Format::Esm,
                 global_name: OwnedString::default(),
+                legal_comments: options::LegalComments::Inline,
                 bytecode: false,
                 bytecode_depth: u32::MAX,
                 optimize_bytecode: true,
@@ -882,6 +884,15 @@ pub(crate) mod js_bundler {
             if let Some(slice) = config.get_optional_slice(global_this, b"globalName")? {
                 this.global_name.append_slice_exact(slice.slice())?;
                 drop(slice);
+            }
+
+            if let Some(legal_comments) = config.get_optional_enum_from_map(
+                global_this,
+                "legalComments",
+                &options::LegalComments::MAP,
+                options::LegalComments::ONE_OF,
+            )? {
+                this.legal_comments = legal_comments;
             }
 
             if let Some(hot) = config.get_boolean_loose(global_this, "splitting")? {

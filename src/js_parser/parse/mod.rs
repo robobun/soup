@@ -1479,7 +1479,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         loop {
             for comment in p.lexer.comments_to_preserve_before.iter() {
                 let loc = p.lexer.loc();
-                stmts.push(p.s(S::Comment { text: comment.text }, loc));
+                let text = comment_text_without_indent(p.arena, p.lexer.contents, comment);
+                stmts.push(p.s(S::Comment { text }, loc));
             }
             p.lexer.comments_to_preserve_before.clear();
 
@@ -1735,4 +1736,47 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             async_range.loc,
         ))
     }
+}
+
+/// A block comment without the indentation of the source: the printer indents every line again.
+fn comment_text_without_indent(
+    arena: &bun_alloc::Arena,
+    contents: &[u8],
+    comment: &G::Comment,
+) -> js_ast::StoreStr {
+    let text = comment.text.slice();
+    if !text.starts_with(b"/*") {
+        return comment.text;
+    }
+    let Some(first_line_len) = strings::index_of_char_usize(text, b'\n') else {
+        return comment.text;
+    };
+
+    let before = &contents[..(comment.loc.start.max(0) as usize).min(contents.len())];
+    let line_start = strings::last_index_of_any(before, b"\r\n").map_or(0, |i| i + 1);
+    let mut indent = before[line_start..]
+        .iter()
+        .filter(|&&byte| byte & 0xC0 != 0x80)
+        .count();
+    for line in strings::split(&text[first_line_len + 1..], b"\n") {
+        if indent == 0 {
+            return comment.text;
+        }
+        let line_indent = line
+            .iter()
+            .take_while(|&&byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        indent = indent.min(line_indent);
+    }
+    if indent == 0 {
+        return comment.text;
+    }
+
+    let mut without_indent: Vec<u8> = Vec::with_capacity(text.len());
+    without_indent.extend_from_slice(&text[..first_line_len]);
+    for line in strings::split(&text[first_line_len + 1..], b"\n") {
+        without_indent.push(b'\n');
+        without_indent.extend_from_slice(&line[indent..]);
+    }
+    js_ast::StoreStr::new(arena.alloc_slice_copy(&without_indent))
 }

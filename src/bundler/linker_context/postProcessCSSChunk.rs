@@ -3,7 +3,8 @@ use bun_collections::MultiArrayList;
 use bun_core::string_joiner::{StringJoiner, Watcher};
 use bun_sourcemap::{LineColumnOffset, LineColumnOffsetOptional};
 
-use crate::chunk::IntermediateOutput;
+use crate::chunk::{Content, CssImportOrderKind, IntermediateOutput};
+use crate::linker_context::legal_comments::LegalCommentList;
 use crate::linker_context_mod::{GenerateChunkCtx, LinkerOptionsMode};
 use crate::thread_pool;
 use crate::{Chunk, CompileResultForSourceMap, Index, options};
@@ -53,9 +54,24 @@ pub(crate) fn post_process_css_chunk(
         MultiArrayList::default();
     bun_core::handle_oom(compile_results_for_source_map.set_capacity(compile_results.len()));
 
+    let mut legal_comments = LegalCommentList::default();
+
     let sources: &[bun_ast::Source] = c.parse_graph().input_files.items_source();
-    for compile_result in compile_results.iter() {
+    for (i, compile_result) in compile_results.iter().enumerate() {
         let source_index = compile_result.source_index();
+
+        if c.options.legal_comments.is_extracted()
+            && let Content::Css(css) = &chunk.content
+            && matches!(
+                css.imports_in_chunk_in_order[i].kind,
+                CssImportOrderKind::SourceIndex(_)
+            )
+        {
+            for comment in &css.asts[i].license_comments {
+                let path = &sources[source_index as usize].path;
+                legal_comments.add_css(source_index, path, comment);
+            }
+        }
 
         if c.options.mode == LinkerOptionsMode::Bundle
             && !c.options.minify_whitespace
@@ -128,6 +144,18 @@ pub(crate) fn post_process_css_chunk(
 
     // Make sure the file ends with a newline
     j.ensure_newline_at_end();
+    let external_legal_comments = match c.options.legal_comments {
+        options::LegalComments::None | options::LegalComments::Inline => Box::default(),
+        options::LegalComments::Eof => {
+            let at_end = legal_comments.to_end_of_file();
+            line_offset.advance(&at_end);
+            j.push_owned(at_end.into_boxed_slice());
+            Box::default()
+        }
+        options::LegalComments::Linked | options::LegalComments::External => {
+            legal_comments.to_external_file().into_boxed_slice()
+        }
+    };
 
     // SAFETY: `worker.arena` set by `Worker::create`, outlives the worker step.
     let alloc = worker.arena();
@@ -142,6 +170,7 @@ pub(crate) fn post_process_css_chunk(
         bun_core::handle_oom(c.break_output_into_pieces(alloc, &mut j, ctx.chunks.len() as u32));
     // TODO: meta contents
 
+    chunk.external_legal_comments = external_legal_comments;
     chunk.isolated_hash = c.generate_isolated_hash(chunk, alloc);
     // chunk.flags.is_executable = is_executable;
 

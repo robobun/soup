@@ -3619,6 +3619,167 @@ Files: `src/s3_signing/metadata.rs` (new), `src/s3_signing/credentials.rs` (`sig
 `packages/bun-types/s3.d.ts`, `docs/runtime/s3.mdx`, `test/js/bun/s3/s3-metadata.test.ts` (new),
 `test/integration/bun-types/fixture/s3.ts`.
 
+### 2026-09-29: `legalComments`, where the license comments of a bundle go
+
+A comment that starts with `/*!` or `//!` is a legal comment: the license or the copyright notice
+of a package, which a bundler has to keep. Bun kept them, minified or not, in the place where they
+were in the code, and that was all it could do. oven-sh/bun#8727 asks for esbuild's
+`--legal-comments` ("to have the licence exported to another file or to be removed completely"),
+oven-sh/bun#9795 for the same from `Bun.build` (18 upvotes). A maintainer answered both: the
+comments "are already extracted and emitted but we are missing a `--legal-comments` flag to control
+what happens here", and "most of the work for this would be to just copy esbuild's implementation".
+The linker had the two places marked (`// TODO: extracated legal comments`,
+`// TODO: maybeAppendLegalComments`), the esbuild comparison page said "Not supported", and 13 tests
+ported from esbuild were skipped with "legalComments not implemented in bun build". This is the
+option, with esbuild's five values:
+
+```sh
+bun build ./src/index.ts --outdir ./dist --minify --legal-comments=linked
+```
+
+```ts
+await Bun.build({
+  entrypoints: ["./src/index.ts"],
+  outdir: "./dist",
+  minify: true,
+  legalComments: "linked", // "none" | "inline" | "eof" | "linked" | "external"
+});
+```
+
+```txt
+dist/index.js            ends with /*! For license information please see index.js.LEGAL.txt */
+dist/index.js.LEGAL.txt
+
+/*! my-app (c) 2026 Acme, Inc. */
+
+Bundled license information:
+
+pkg-a/index.js:
+pkg-b/lib/b.js:
+  /*!
+   * Copyright (c) Someone
+   * Released under the MIT license
+   */
+```
+
+`inline` is what Bun did and stays the default. `none` removes the comments. `eof` moves them to
+the end of each output file, after the wrapper of the format and before the `footer`. `linked` and
+`external` write them to `<output file>.LEGAL.txt`, one more output with `kind: "asset"` and the
+hash of its content (in `outputs` too when there is no `outdir`), and `linked` ends the output
+file with a comment that names it, before the `sourceMappingURL` comment and with the `publicPath`
+when there is one. An output file that has no legal comments gets no file and no comment. In the
+three modes that move them, a text that several files of the project repeat is there once per
+output file, and the comments of a file under `node_modules` are listed under the path of that file
+in its package (what follows the last `node_modules`), because a notice that does not name its
+package would read as the license of the whole bundle. Files with the same comments share one
+entry. With `eof` that list is one comment, in which `(*` and `*)` stand for `/*` and `*/`. All of
+this is esbuild's behaviour, and for the same input the text is the same: compared with esbuild
+0.21.5, the version in the repo's `node_modules`, the end of the file and the `.LEGAL.txt` file
+differ only in the shared entries, which esbuild has had since evanw/esbuild#4139. CSS works the
+same way for the comments that Bun's CSS parser keeps, the `/*!` comments at the start of a
+stylesheet.
+
+How it is built follows esbuild too. The printer is the one place that prints an `S::Comment`, and
+the parser makes that statement for legal comments only, so `js_printer::Options::legal_comments`
+decides there: print it, drop it, or keep the text and return it with the code
+(`PrintResultSuccess::legal_comments`, in the order of the source and each text once). That way a
+comment in a function that tree shaking removes goes with the function, and the source map is that
+of the code that is really there. `post_process_js_chunk` collects what the part ranges of a chunk
+returned, in the order of the code, and `legalComments.rs` writes the end of the file or the
+`.LEGAL.txt` file. For CSS the linker reads `StyleSheet::license_comments` and tells the CSS printer
+not to print them. The file is written where the source map of a chunk is written, on both paths
+(to disk and in memory), and is counted in `OutputFileList` like it. `print_ast`, which prints a
+whole file for `bun build --no-bundle` and for the runtime, appends what it took out, so
+`--no-bundle` has `none`, `inline` and `eof`. The `[hash]` in the name of a chunk covers the
+`.LEGAL.txt` file and the mode, because the file is named after the chunk and the comment of
+`linked` is added after the content is hashed. A build that does not use the option allocates
+nothing for it: it pays one `match` for each legal comment it prints, and a check for "no comments"
+per printed file and per chunk.
+
+One part is not behind the option, and it is the one change to the output of a build that does not
+set it. A legal comment of several lines kept the indentation it had in the source and got the
+indentation of the output on top, so a comment inside a function came out as
+
+```js
+function f() {
+  /*!
+   * twice as deep as it was
+   */
+}
+```
+
+and moved to the end of the file it would have kept four spaces of a function that is no longer
+around it. The parser now takes the source indentation off the lines after the first
+(`comment_text_without_indent`, esbuild's `CommentTextWithoutIndent`: the column of the `/*` in
+code points, or less when a line starts before it), and allocates only for a comment that has
+something to take off. In the 16 MB that `test/bundler/bytecode-portability/libraries.js` bundles,
+real packages with more than 70 legal comments, this changes no byte. The version of the runtime
+transpiler cache is not raised: an entry that an older build wrote differs in the spaces inside a
+comment.
+
+Differences from esbuild, all on purpose. The default is `inline` where esbuild bundles with
+`eof`: a change of default is a separate decision. `</script` and `</style` in a comment are not
+escaped, because Bun escapes them where it writes a chunk into an HTML file and nowhere else, not
+in a string either. A `*/` in the `//!` comment of a package, in the path of a package or in the
+public path is written as `* /` where it would end the comment that Bun puts around it. esbuild
+prints it as it is and the output is a syntax error. A file whose parts are printed in several
+ranges is listed once. `linked` and `external` are an error with `compile` (there is no file next
+to a chunk that lives in an executable or in an HTML file), with `--no-bundle` and with `--app`,
+and the CLI wants `--outdir` for them, as it does for an external source map.
+
+A review pass (three readers: the printer, the parser and the list, then the output files, CSS and
+the checks of the options, then docs, types and tests; every finding was checked by a second
+reader) found what follows, and all of it is fixed in this commit. The comment of `linked` was
+escaped in two halves, so a public path that ends with `*` in front of a name that starts with `/`
+ended the comment early. Two files with the same path in their packages, such as two versions of
+one package under different parents, were one entry with the comments of both: the entries are by
+file now, as in esbuild. `bun build --app` ignored the flag in silence. The `.LEGAL.txt` output had
+the hash `00000000`. `--no-bundle` kept the `\r` of a CSS comment that the bundler takes out. The
+help text lost a word in angle brackets to the formatter of the help. The docs named React in their
+example, whose license Bun does not keep, and did not say which comments are not legal comments.
+The three tests of closing tags ran under esbuild's names with the opposite of esbuild's
+expectation: they are `todo` with esbuild's expectation again, and the behaviour of Bun has its own
+tests. Two assertions could not tell the feature from its absence. Comments of several lines in
+`src/` are one line each now.
+
+Not done. `@license` and `@preserve` do not make a legal comment in Bun yet, which is how React and
+lodash mark theirs. That is an open upstream PR (oven-sh/bun#41013) and is left to it, so that this
+commit and that PR do not touch the same lines: the option handles whatever the parser calls a legal
+comment. The same PR keeps a legal comment that is written in front of an `import()` in the same
+statement, which the parser drops today in every mode. Of the 13 ported tests 7 run. The other 6
+stay `todo` with the expectations of current esbuild, and a comment above them names the three
+reasons: `@license` and `@preserve`, CSS comments that are not at the start of a stylesheet, and
+the closing tags. The metafile does not list the `.LEGAL.txt` files (it does not list source maps
+either). `Bun.Transpiler` has no such option. U+2028, U+2029 and a `\r` without `\n` do not count
+as the end of a line when the indentation is taken off.
+
+One older bug turned up and was reported, not fixed here: `bun build src/in.js
+--outfile=dist/out.js` writes into `src/` as soon as the build has a second output file, a linked
+source map for example. It is the reason why the CLI wants `--outdir` for a `.LEGAL.txt` file.
+
+Rebase notes: 42 patches onto oven-sh/bun 9f70da0741, no conflicts, nothing dropped. The fork's
+three workflows were green after the last push, which was on 2026-09-27. One older soup mismatch
+is still open: `test/bundler/bundler_bytecode_portable.test.ts` pins the hashes of whole bundles,
+and three of them (`all.js`, `libraries.js`, `happy-dom`) contain the `__toESM` helper, in which
+the `bytes` loader patch of 2026-09-10 adds a condition. That line is the only difference between
+what the released bun and this build print for `libraries.js`, so the snapshot belongs to that
+patch and not to this one. It is not updated yet: the test needs a quarter of an hour on a debug
+build.
+
+Files: `src/options_types/bundle_enums.rs` (`LegalComments`), `src/options_types/{lib,context}.rs`,
+`src/js_printer/lib.rs` (`Options::legal_comments`, `PrintResultSuccess::legal_comments`,
+`print_ast`), `src/js_parser/parse/mod.rs` (`comment_text_without_indent`),
+`src/bundler/linker_context/legalComments.rs` (new),
+`src/bundler/linker_context/{postProcessJSChunk,postProcessCSSChunk,generateCompileResultForCssChunk,generateChunksInParallel,writeOutputFilesToDisk,OutputFileListBuilder,generateCodeForFileInChunkJS}.rs`,
+`src/bundler/{Chunk,LinkerContext,bundle_v2,options,transpiler,lib}.rs`,
+`src/css/{printer,css_parser}.rs` (`PrinterOptions::license_comments`),
+`src/runtime/cli/{Arguments,build_command}.rs`,
+`src/runtime/api/{JSBundler,js_bundle_completion_task}.rs`, `packages/bun-types/bun.d.ts`,
+`docs/bundler/{index,esbuild,minifier}.mdx`, `docs/snippets/cli/build.mdx`,
+`completions/bun-cli.json`, `test/bundler/bundler_comments.test.ts`, `test/bundler/cli.test.ts`,
+`test/bundler/bun-build-api.test.ts`, `test/bundler/esbuild/default.test.ts`,
+`test/bundler/expectBundled.ts`, `test/integration/bun-types/fixture/build.ts`.
+
 ## Dropped
 
 Nothing yet.

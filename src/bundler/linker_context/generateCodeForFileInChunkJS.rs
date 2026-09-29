@@ -967,10 +967,7 @@ pub fn generate_code_for_file_in_chunk_js<'r, 'src>(
     let out_stmts: &mut [Stmt] = out_stmts.slice_mut();
 
     if out_stmts.is_empty() {
-        return PrintResult::Result(PrintResultSuccess {
-            code: Box::new([]),
-            source_map: None,
-        });
+        return PrintResult::Result(PrintResultSuccess::default());
     }
 
     // `get_source` returns `&'static Source` (parse_graph SoA is append-only and

@@ -1377,6 +1377,8 @@ pub struct Options<'a> {
     /// Module type of the file being printed. `Esm` prints `__toESM(.., 1)`, which ignores `__esModule`.
     pub input_module_type: bundle_opts::ModuleType,
     pub module_type: bundle_opts::Format,
+    /// Where an `S::Comment` goes: into the code, nowhere, or into `PrintResultSuccess::legal_comments`.
+    pub legal_comments: bundle_opts::LegalComments,
 
     // /// Used for cross-module inlining of import items when bundling
     // const_values: Ast.ConstValuesMap = .{},
@@ -1449,6 +1451,7 @@ impl<'a> Default for Options<'a> {
             require_or_import_meta_for_source_callback: RequireOrImportMetaCallback::default(),
             input_module_type: bundle_opts::ModuleType::Unknown,
             module_type: bundle_opts::Format::Esm,
+            legal_comments: bundle_opts::LegalComments::Inline,
             ts_enums: None,
             import_member_bindings: None,
             has_dynamic_import_items: false,
@@ -1573,9 +1576,12 @@ pub enum PrintResult {
     Err(crate::Error),
 }
 
+#[derive(Default)]
 pub struct PrintResultSuccess {
     pub code: Box<[u8]>,
     pub source_map: Option<SourceMap::Chunk>,
+    /// What `Options::legal_comments` took out of `code`, in source order, each text once.
+    pub legal_comments: Vec<Box<[u8]>>,
 }
 
 // do not make this a packed struct
@@ -1699,6 +1705,9 @@ pub(crate) mod __gated_printer {
         pub(crate) was_lazy_export: bool,
         // Always carried; gated at call sites with MAY_HAVE_MODULE_INFO.
         pub(crate) module_info: Option<&'a mut analyze_transpiled_module::ModuleInfo>,
+
+        /// See `Options::legal_comments`.
+        pub(crate) extracted_legal_comments: bun_collections::StringSet,
 
         /// Arena for transient allocations during printing (rope flattening,
         /// UTF-16→UTF-8 transcoding).
@@ -5414,7 +5423,18 @@ pub(crate) mod __gated_printer {
             let new_tag = stmt.data.tag();
 
             match &stmt.data {
+                // The parser makes one for a legal comment and for nothing else.
                 StmtData::SComment(s) => {
+                    match self.options.legal_comments {
+                        bundle_opts::LegalComments::Inline => {}
+                        bundle_opts::LegalComments::None => return Ok(()),
+                        bundle_opts::LegalComments::Eof
+                        | bundle_opts::LegalComments::Linked
+                        | bundle_opts::LegalComments::External => {
+                            self.extract_legal_comment(s.text.slice());
+                            return Ok(());
+                        }
+                    }
                     self.print_indent();
                     self.add_source_mapping(stmt.loc);
                     self.print_indented_comment(s.text.slice());
@@ -7008,6 +7028,37 @@ pub(crate) mod __gated_printer {
             }
         }
 
+        /// Line endings become those of the output, as in `print_indented_comment`.
+        fn extract_legal_comment(&mut self, text: &[u8]) {
+            if !strings::contains_char(text, b'\r') {
+                bun_core::handle_oom(self.extracted_legal_comments.insert(text));
+                return;
+            }
+            let mut unix = Vec::with_capacity(text.len());
+            for (i, &byte) in text.iter().enumerate() {
+                if byte == b'\r' && matches!(text.get(i + 1), Some(b'\n') | None) {
+                    continue;
+                }
+                unix.push(byte);
+            }
+            bun_core::handle_oom(self.extracted_legal_comments.insert(&unix));
+        }
+
+        /// `print_ast` prints a whole file, so what was taken out of it goes to its end.
+        pub(crate) fn print_extracted_legal_comments(&mut self) {
+            if self.extracted_legal_comments.is_empty() {
+                return;
+            }
+            let comments = core::mem::take(&mut self.extracted_legal_comments);
+            if self.writer.written() > 0 && self.writer.prev_char() != b'\n' {
+                self.print(b"\n");
+            }
+            for comment in comments.keys() {
+                self.print(&**comment);
+                self.print(b"\n");
+            }
+        }
+
         pub(crate) fn init(
             writer: W,
             bump: &'a bun_alloc::Arena,
@@ -7040,6 +7091,7 @@ pub(crate) mod __gated_printer {
                 stack_overflowed: false,
                 was_lazy_export: false,
                 module_info: None,
+                extracted_legal_comments: bun_collections::StringSet::new(),
             }
         }
 
@@ -7883,6 +7935,7 @@ pub fn print_ast<'a, W: WriterTrait, const ASCII_ONLY: bool, const GENERATE_SOUR
             printer.print_semicolon_if_needed();
         }
     }
+    printer.print_extracted_legal_comments();
     printer.check_stack_overflow()?;
 
     let have_module_info = PrinterType::<W, ASCII_ONLY, GENERATE_SOURCE_MAP>::MAY_HAVE_MODULE_INFO
@@ -8139,11 +8192,13 @@ pub(crate) fn print_with_writer_and_platform<
         None
     };
 
+    let legal_comments = printer.extracted_legal_comments.keys().to_vec();
     let mut buffer: MutableString = printer.writer.take_buffer();
 
     PrintResult::Result(PrintResultSuccess {
         code: buffer.take_slice().into(),
         source_map,
+        legal_comments,
     })
 }
 

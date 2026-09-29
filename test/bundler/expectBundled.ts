@@ -628,9 +628,6 @@ function expectBundled(
     );
   }
 
-  if (!ESBUILD && legalComments) {
-    throw new UnsupportedOptionError("legalComments not implemented in bun build");
-  }
   for (const [name, value] of Object.entries({
     alias,
     entryPointsAdvanced,
@@ -882,6 +879,7 @@ function expectBundled(
               drop?.length && drop.map(x => ["--drop=" + x]),
               features?.length && features.map(x => ["--feature=" + x]),
               globalName && `--global-name=${globalName}`,
+              legalComments && `--legal-comments=${legalComments}`,
               jsx.runtime && ["--jsx-runtime", jsx.runtime],
               jsx.factory && ["--jsx-factory", jsx.factory],
               jsx.fragment && ["--jsx-fragment", jsx.fragment],
@@ -908,7 +906,6 @@ function expectBundled(
               deprecatedNamespaceObjectSetters === false && `--no-deprecated-namespace-object-setters`,
               // inject && inject.map(x => ["--inject", path.join(root, x)]),
               // jsx.preserve && "--jsx=preserve",
-              // legalComments && `--legal-comments=${legalComments}`,
               // treeShaking === false && `--no-tree-shaking`, // ??
               keepNames && `--keep-names`,
               // mainFields && `--main-fields=${mainFields}`,
@@ -1249,6 +1246,7 @@ function expectBundled(
           banner,
           format,
           globalName,
+          legalComments,
           footer,
           root: outbase,
           packages,

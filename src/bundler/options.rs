@@ -324,6 +324,7 @@ impl TargetExt for Target {
 }
 
 pub use bun_options_types::Format;
+pub use bun_options_types::LegalComments;
 pub use bun_options_types::WindowsOptions;
 
 /// `globalName` names where the exports of an IIFE bundle go: a variable (`MyLib`) or a
@@ -1293,6 +1294,7 @@ pub struct BundleOptions<'a> {
     pub output_format: Format,
     /// `globalName`: the text of the option, see [`parse_global_name`]. Empty when unset.
     pub global_name: Box<[u8]>,
+    pub legal_comments: LegalComments,
 
     pub(crate) tsconfig_override: Option<Box<[u8]>>,
     pub target: Target,
@@ -1541,6 +1543,7 @@ impl<'a> BundleOptions<'a> {
             production: self.production,
             output_format: self.output_format,
             global_name: self.global_name.clone(),
+            legal_comments: self.legal_comments,
             tsconfig_override: self.tsconfig_override.clone(),
             target: self.target,
             main_fields: self.main_fields.clone(),
@@ -1803,6 +1806,7 @@ impl<'a> BundleOptions<'a> {
             production: false,
             output_format: Format::Esm,
             global_name: Box::default(),
+            legal_comments: LegalComments::Inline,
             tsconfig_override: None,
             main_fields: owned_string_list(Target::default_main_fields_map()[Target::Browser]),
             allow_unresolved: AllowUnresolved::All,

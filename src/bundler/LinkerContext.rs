@@ -34,7 +34,7 @@ use bun_ast::SideEffects;
 use bun_resolver::Resolver;
 
 use crate::Graph::Graph;
-use crate::options::{CompileMode, Format, Loader, SourceMapOption, Target};
+use crate::options::{CompileMode, Format, LegalComments, Loader, SourceMapOption, Target};
 use crate::{
     AdditionalFile, BundleV2, Chunk, CompileResultForSourceMap, ContentHasher, ImportTracker,
     LinkerGraph, MangledProps, PartRange, StableRef, WrapKind,
@@ -1436,6 +1436,7 @@ pub struct LinkerOptions {
     /// `globalName`, parsed (`options::parse_global_name`): what an entry point's IIFE is
     /// assigned to. Empty when unset.
     pub(crate) global_name: Vec<Box<[u8]>>,
+    pub(crate) legal_comments: LegalComments,
     pub(crate) ignore_dce_annotations: bool,
     pub(crate) emit_dce_annotations: bool,
     pub(crate) deprecated_namespace_object_setters: bool,
@@ -1489,6 +1490,7 @@ impl Default for LinkerOptions {
             bytecode_order: None,
             output_format: Format::Esm,
             global_name: Vec::new(),
+            legal_comments: LegalComments::Inline,
             ignore_dce_annotations: false,
             emit_dce_annotations: true,
             deprecated_namespace_object_setters: true,
@@ -2044,6 +2046,12 @@ impl<'a> LinkerContext<'a> {
         hasher.write(&chunk.output_source_map.mappings);
         hasher.write(&chunk.output_source_map.suffix);
 
+        // The file of legal comments is named after the chunk too, and `linked` adds a comment after this hash.
+        if !chunk.external_legal_comments.is_empty() {
+            hasher.write(&chunk.external_legal_comments);
+            hasher.write(&[self.options.legal_comments as u8]);
+        }
+
         hasher.digest()
     }
 
@@ -2449,6 +2457,7 @@ impl<'a> LinkerContext<'a> {
             minify_syntax: self.options.minify_syntax,
             input_module_type: ast.module_type,
             module_type: self.options.output_format,
+            legal_comments: self.options.legal_comments,
             print_dce_annotations: self.options.emit_dce_annotations,
             has_run_symbol_renamer: true,
 
