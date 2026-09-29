@@ -3846,6 +3846,15 @@
           "multiple": false
         },
         {
+          "name": "legal-comments",
+          "description": "Where /*! and //! comments go: 'inline', 'none', 'eof', 'linked' or 'external'",
+          "hasValue": true,
+          "valueType": "val",
+          "defaultValue": "inline",
+          "required": false,
+          "multiple": false
+        },
+        {
           "name": "format",
           "description": "Specifies the module format to build to. \"esm\", \"cjs\" and \"iife\" are supported. Defaults to \"esm\".",
           "hasValue": true,

@@ -3374,6 +3374,17 @@ pub mod bv2_impl {
                 }
             }
 
+            this.linker.options.legal_comments = this.transpiler.options.legal_comments;
+            if this.transpiler.options.legal_comments.has_external_files()
+                && this.transpiler.options.compile_mode != options::CompileMode::None
+            {
+                this.transpiler.log_mut().add_error(
+                    None,
+                    bun_ast::Loc::EMPTY,
+                    "Linked and external legal comments are not supported when compiling to a single file. Use \"eof\", \"inline\" or \"none\"",
+                );
+            }
+
             this.linker.options.minify_syntax = this.transpiler.options.minify_syntax;
             this.linker.options.minify_identifiers = this.transpiler.options.minify_identifiers;
             this.linker.options.minify_whitespace = this.transpiler.options.minify_whitespace;
@@ -8150,10 +8161,9 @@ pub mod bv2_impl {
         fn default() -> Self {
             CompileResult::Javascript {
                 source_index: 0,
-                result: bun_js_printer::PrintResult::Result(bun_js_printer::PrintResultSuccess {
-                    code: Box::new([]),
-                    source_map: None,
-                }),
+                result: bun_js_printer::PrintResult::Result(
+                    bun_js_printer::PrintResultSuccess::default(),
+                ),
                 module_info: None,
             }
         }

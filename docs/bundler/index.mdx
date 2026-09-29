@@ -1349,6 +1349,82 @@ A footer added to the final bundle. This can be a comment block for a license or
   </Tab>
 </Tabs>
 
+### legalComments
+
+A legal comment is a comment that starts with `/*!` or `//!`. Packages use legal comments for a license or a copyright notice that has to stay with the code. The minifier keeps legal comments. `legalComments` sets where Bun puts them.
+
+| Value        | Where Bun puts the legal comments                                                                   |
+| ------------ | --------------------------------------------------------------------------------------------------- |
+| `"inline"`   | Where they are in the code. This is the default.                                                    |
+| `"none"`     | Nowhere. Bun removes them.                                                                          |
+| `"eof"`      | At the end of each output file.                                                                     |
+| `"linked"`   | In a `.LEGAL.txt` file next to each output file. The output file ends with a comment that names it. |
+| `"external"` | In a `.LEGAL.txt` file next to each output file. The output file does not mention it.               |
+
+<Tabs>
+  <Tab title="JavaScript">
+    ```ts title="build.ts" icon="/icons/typescript.svg"
+    await Bun.build({
+      entrypoints: ['./index.tsx'],
+      outdir: './out',
+      minify: true,
+      legalComments: 'linked',
+    })
+    ```
+  </Tab>
+  <Tab title="CLI">
+    ```bash terminal icon="terminal"
+    bun build ./index.tsx --outdir ./out --minify --legal-comments=linked
+    ```
+  </Tab>
+</Tabs>
+
+Bun does not treat every license comment as a legal comment:
+
+- A comment that is marked with `@license` or `@preserve` and does not start with `/*!` or `//!` is not a legal comment. Bun removes it like any other comment.
+- In CSS, the legal comments are the `/*!` comments at the start of a stylesheet. Bun removes a `/*!` comment that follows a rule.
+
+With `"eof"`, `"linked"`, and `"external"`, Bun writes the legal comments of an output file as one list:
+
+- Bun keeps a text that several files of your project repeat once per output file. The license header of each source file is an example.
+- Bun lists the comments of a file in `node_modules` under the path of that file in its package. A notice that does not name its package then cannot read as the license of the whole bundle.
+- Packages with the same comments share one entry.
+
+```txt title="out/index.js.LEGAL.txt" icon="file-lines"
+/*! my-app (c) 2026 Acme, Inc. */
+
+Bundled license information:
+
+left-pad/index.js:
+right-pad/index.js:
+  /*!
+   * Copyright (c) the authors
+   * Released under the MIT license
+   */
+```
+
+With `"eof"`, the same list is the last thing in the output file, before the [`footer`](#footer):
+
+```js title="out/index.js" icon="/icons/javascript.svg"
+/*! my-app (c) 2026 Acme, Inc. */
+/*! Bundled license information:
+
+left-pad/index.js:
+right-pad/index.js:
+  (*!
+   * Copyright (c) the authors
+   * Released under the MIT license
+   *)
+*/
+```
+
+The `.LEGAL.txt` file is one of the [outputs](#outputs) of the build, with `kind: "asset"`. Bun writes no `.LEGAL.txt` file and no comment for an output file that has no legal comments. The comment of `"linked"` comes before the `sourceMappingURL` comment and starts with the [`publicPath`](#publicpath) if you set one.
+
+- Tree shaking removes a legal comment together with the code around it.
+- On the CLI, `"linked"` and `"external"` need `--outdir`.
+- `"linked"` and `"external"` fail the build with [`compile`](/bundler/executables) and with `--no-bundle`. Use `"eof"` instead.
+- Bun defaults to `"inline"`. esbuild defaults to `"eof"` when it bundles.
+
 ### drop
 
 Removes function calls from a bundle. For example, `--drop=console` removes all calls to `console.log`. Bun also removes the arguments to dropped calls, even if they have side effects. Dropping `debugger` removes all `debugger` statements.
@@ -2020,6 +2096,13 @@ interface BuildConfig {
    * `// made with bun!`
    */
   footer?: string;
+  /**
+   * Where the comments that start with `/*!` or `//!` go.
+   * `"linked"` and `"external"` write them to `<output file>.LEGAL.txt`.
+   *
+   * @default "inline"
+   */
+  legalComments?: "none" | "inline" | "eof" | "linked" | "external";
 
   /**
    * Drop function calls to matching property accesses.

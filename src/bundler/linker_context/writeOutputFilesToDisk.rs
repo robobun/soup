@@ -11,6 +11,7 @@ use bun_wyhash::hash;
 
 use crate::LinkerContext;
 use crate::chunk::{Content, Flags as ChunkFlags, ReferencePathStyle, SourceMapShiftTracking};
+use crate::linker_context::legal_comments;
 use crate::linker_context::output_file_list_builder::OutputFileList;
 use crate::linker_context_mod::debug;
 use crate::options::{self, Loader, OutputFile, SourceMapOption};
@@ -291,6 +292,58 @@ pub(crate) fn write_output_files_to_disk(
             &chunk.final_rel_path
         });
 
+        let legal_comments_output_file: Option<OutputFile> =
+            if chunk.external_legal_comments.is_empty() {
+                None
+            } else {
+                let output_path =
+                    strings::concat(&[&chunk.final_rel_path, legal_comments::FILE_EXTENSION]);
+                if c.options.legal_comments == options::LegalComments::Linked {
+                    code_result.buffer =
+                        legal_comments::append_link(&code_result.buffer, public_path, &output_path);
+                }
+
+                if let Err(e) = bun_sys::File::write_file(
+                    bun_sys::Fd::from_std_dir(&root_dir),
+                    paths::resolve_path::z(&output_path, &mut pathbuf),
+                    &chunk.external_legal_comments,
+                ) {
+                    c.log_mut().add_sys_error(
+                        &e,
+                        format_args!(
+                            "writing legal comments for chunk {}",
+                            quote(&chunk.final_rel_path)
+                        ),
+                    );
+                    return Err(crate::Error::WriteFailed);
+                }
+
+                Some(OutputFile::init(OutputFileInit {
+                    output_path,
+                    input_path: strings::concat(&[&input_path, legal_comments::FILE_EXTENSION]),
+                    loader: Loader::File,
+                    input_loader: Loader::File,
+                    output_kind: options::OutputKind::Asset,
+                    size: Some(chunk.external_legal_comments.len()),
+                    data: OutputFileData::Saved(0),
+                    side: None,
+                    entry_point_index: None,
+                    is_executable: false,
+                    hash: chunk.template.placeholder.hash.map(|_| {
+                        chunk
+                            .template
+                            .content_hash(hash(&chunk.external_legal_comments))
+                    }),
+                    source_map_index: None,
+                    bytecode_index: None,
+                    module_info_index: None,
+                    display_size: 0,
+                    referenced_css_chunks: Box::default(),
+                    source_index: IndexOptional::NONE,
+                    bake_extra: BakeExtra::default(),
+                }))
+            };
+
         match chunk.content.sourcemap(c.options.source_maps) {
             tag @ (SourceMapOption::External | SourceMapOption::Linked) => {
                 let output_source_map = chunk
@@ -525,6 +578,10 @@ pub(crate) fn write_output_files_to_disk(
         } else {
             None
         };
+
+        if let Some(f) = legal_comments_output_file {
+            output_files.insert_for_sourcemap_or_bytecode(f)?;
+        }
 
         let output_kind = c.chunk_output_kind(chunk);
 

@@ -4099,6 +4099,43 @@ declare module "bun" {
     footer?: string;
 
     /**
+     * Where the legal comments go. A legal comment starts with `/*!` or
+     * `//!`. In CSS, the legal comments are the `/*!` comments at the start
+     * of a stylesheet. A comment that is only marked with `@license` or
+     * `@preserve` is not a legal comment. Minification keeps legal comments.
+     *
+     * - `"inline"`: they stay where they are in the code
+     * - `"none"`: they are removed
+     * - `"eof"`: they move to the end of the output file. A text that several
+     *   files repeat is there once, and the comments of a file in
+     *   `node_modules` are listed under the path of that file in its package
+     * - `"linked"`: they move to `<output file>.LEGAL.txt`, which is one more
+     *   entry of {@link BuildOutput.outputs} with `kind: "asset"`, and the
+     *   output file ends with a comment that names that file
+     * - `"external"`: like `"linked"`, without the comment
+     *
+     * `"linked"` and `"external"` write no file for an output that has no
+     * legal comments, and fail the build together with `compile`.
+     *
+     * CLI: `--legal-comments`
+     *
+     * @default "inline"
+     *
+     * @example
+     * ```ts
+     * await Bun.build({
+     *   entrypoints: ["./src/index.ts"],
+     *   outdir: "./dist",
+     *   minify: true,
+     *   legalComments: "linked",
+     * });
+     * // dist/index.js.LEGAL.txt: the legal comments of the bundle
+     * // dist/index.js: ends with "For license information please see index.js.LEGAL.txt"
+     * ```
+     */
+    legalComments?: "none" | "inline" | "eof" | "linked" | "external";
+
+    /**
      * Drop function calls to matching property accesses.
      */
     drop?: string[];

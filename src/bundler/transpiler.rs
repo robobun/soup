@@ -2339,6 +2339,7 @@ impl<'a> Transpiler<'a> {
             minify_identifiers: self.options.minify_identifiers,
             import_meta_ref: ast.import_meta_ref,
             print_dce_annotations: self.options.emit_dce_annotations,
+            legal_comments: self.options.legal_comments,
             runtime_transpiler_cache,
             hmr_ref: ast.wrapper_ref,
             mangled_props: None,
@@ -2426,6 +2427,7 @@ impl<'a> Transpiler<'a> {
             inline_require_and_import_errors: false,
             import_meta_ref: ast.import_meta_ref,
             print_dce_annotations: self.options.emit_dce_annotations,
+            legal_comments: self.options.legal_comments,
             runtime_transpiler_cache,
             module_info,
             hmr_ref: ast.wrapper_ref,
@@ -3088,11 +3090,13 @@ impl<'a> Transpiler<'a> {
             return None;
         }
         let symbols = bun_ast::symbol::Map::init_list(vec![extra.symbols]);
+        let legal_comments = self.options.legal_comments;
         let result = match sheet.to_css(
             alloc,
             &bun_css::PrinterOptions {
                 targets: bun_css::Targets::for_bundler_target(self.options.target),
                 minify: self.options.minify_whitespace,
+                license_comments: legal_comments == options::LegalComments::Inline,
                 ..bun_css::PrinterOptions::default()
             },
             None,
@@ -3109,8 +3113,23 @@ impl<'a> Transpiler<'a> {
                 return None;
             }
         };
+        let mut code = result.code;
+        if legal_comments.is_extracted() {
+            let mut comments = bun_collections::StringSet::new();
+            for comment in &sheet.license_comments {
+                let comment = crate::linker_context::legal_comments::css_comment(comment);
+                bun_core::handle_oom(comments.insert(&comment));
+            }
+            if !comments.is_empty() && code.last().is_some_and(|&last| last != b'\n') {
+                code.push(b'\n');
+            }
+            for comment in comments.keys() {
+                code.extend_from_slice(comment);
+                code.push(b'\n');
+            }
+        }
         Some(crate::output_file::Value::Buffer {
-            bytes: result.code.into_boxed_slice(),
+            bytes: code.into_boxed_slice(),
         })
     }
 

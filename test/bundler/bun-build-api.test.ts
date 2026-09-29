@@ -474,6 +474,126 @@ describe("Bun.build", () => {
     ).toThrow();
   });
 
+  test("legalComments: the file of linked comments is an output", async () => {
+    using dir = tempDir("bun-build-api-legal-comments", {
+      "entry.js": `/*! (c) entry */\nconsole.log("ran");\n`,
+    });
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "entry.js")],
+      legalComments: "linked",
+    });
+    expect(
+      build.outputs.map(({ path, kind, loader, type, sourcemap }) => ({ path, kind, loader, type, sourcemap })),
+    ).toEqual([
+      {
+        path: "./entry.js",
+        kind: "entry-point",
+        loader: "jsx",
+        type: "text/javascript;charset=utf-8",
+        sourcemap: null,
+      },
+      {
+        path: "./entry.js.LEGAL.txt",
+        kind: "asset",
+        loader: "file",
+        type: "text/plain;charset=utf-8",
+        sourcemap: null,
+      },
+    ]);
+    expect(await build.outputs[0].text()).toEndWith(
+      'console.log("ran");\n/*! For license information please see entry.js.LEGAL.txt */\n',
+    );
+    expect(await build.outputs[1].text()).toBe("/*! (c) entry */\n");
+  });
+
+  test("legalComments: a chunk without legal comments has no file", async () => {
+    using dir = tempDir("bun-build-api-legal-comments-none", {
+      "with.js": `/*! (c) with */\nconsole.log("with");\n`,
+      "without.js": `/* (c) without */\nconsole.log("without");\n`,
+    });
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "with.js"), join(String(dir), "without.js")],
+      outdir: join(String(dir), "out"),
+      legalComments: "linked",
+    });
+    expect(build.outputs.map(output => path.relative(join(String(dir), "out"), output.path)).sort()).toEqual([
+      "with.js",
+      "with.js.LEGAL.txt",
+      "without.js",
+    ]);
+    expect(readdirSync(join(String(dir), "out")).sort()).toEqual(["with.js", "with.js.LEGAL.txt", "without.js"]);
+    expect(readFileSync(join(String(dir), "out", "without.js"), "utf8")).toEndWith('console.log("without");\n');
+  });
+
+  test("legalComments: linked, with a linked source map and no outdir", async () => {
+    using dir = tempDir("bun-build-api-legal-comments-sourcemap", {
+      "entry.js": `/*! (c) entry */\nconsole.log("ran");\n`,
+    });
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "entry.js")],
+      sourcemap: "linked",
+      legalComments: "linked",
+    });
+    expect(build.outputs.map(({ path, kind }) => ({ path, kind }))).toEqual([
+      { path: "./entry.js", kind: "entry-point" },
+      { path: "./entry.js.map", kind: "sourcemap" },
+      { path: "./entry.js.LEGAL.txt", kind: "asset" },
+    ]);
+    const code = await build.outputs[0].text();
+    expect(code).toEndWith(
+      "\n/*! For license information please see entry.js.LEGAL.txt */\n//# sourceMappingURL=entry.js.map\n",
+    );
+    expect(code).not.toContain("(c) entry");
+    expect(await build.outputs[2].text()).toBe("/*! (c) entry */\n");
+    expect(build.outputs[2].hash).not.toBe(build.outputs[0].hash);
+    expect(build.outputs[2].hash).toMatch(/^[0-9a-z]{8}$/);
+    expect(build.outputs[2].hash).not.toBe("00000000");
+  });
+
+  test("legalComments: the [hash] of a chunk follows the file of its legal comments", async () => {
+    using dir = tempDir("bun-build-api-legal-comments-hash", {});
+    const entry = join(String(dir), "entry.js");
+    async function paths(comment: string, legalComments: "none" | "linked" | "external") {
+      await Bun.write(entry, `/*! ${comment} */\nconsole.log("ran");\n`);
+      const build = await Bun.build({ entrypoints: [entry], naming: "[name]-[hash].[ext]", legalComments });
+      return build.outputs.map(output => output.path);
+    }
+
+    const external = await paths("(c) 2026", "external");
+    expect(external).toEqual([expect.stringMatching(/^\.\/entry-\w+\.js$/), external[0] + ".LEGAL.txt"]);
+    expect(await paths("(c) 2026", "external")).toEqual(external);
+
+    const chunks = [
+      external,
+      await paths("(c) 2027", "external"),
+      await paths("(c) 2026", "linked"),
+      await paths("(c) 2026", "none"),
+    ].map(outputs => outputs[0]);
+    expect(new Set(chunks).size).toBe(4);
+  });
+
+  test("legalComments: invalid values", async () => {
+    using dir = tempDir("bun-build-api-legal-comments-invalid", {
+      "entry.js": `/*! (c) entry */\nconsole.log("ran");\n`,
+    });
+    const entrypoints = [join(String(dir), "entry.js")];
+    expect(() => Bun.build({ entrypoints, legalComments: "bottom" as any })).toThrow(
+      'legalComments must be one of "none", "inline", "eof", "linked", "external"',
+    );
+    expect(() => Bun.build({ entrypoints, legalComments: true as any })).toThrow("legalComments must be a string");
+
+    const compiled = await buildNoThrow({
+      entrypoints,
+      legalComments: "external",
+      compile: { outfile: join(String(dir), "app") },
+    });
+    expect(compiled.success).toBe(false);
+    expect(compiled.logs.map(log => log.message)).toEqual([
+      'Linked and external legal comments are not supported when compiling to a single file. Use "eof", "inline" or "none"',
+    ]);
+    expect(readdirSync(String(dir))).toEqual(["entry.js"]);
+  });
+
   test("returns errors properly", async () => {
     Bun.gc(true);
     const build = await buildNoThrow({

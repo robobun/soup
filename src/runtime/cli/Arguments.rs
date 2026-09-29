@@ -482,6 +482,9 @@ pub(crate) const BUILD_ONLY_PARAMS: &[ParamType] = concat_params!(
             "--footer <STR>                   Add a footer to the bundled output such as // built with bun!"
         ),
         parse_param!(
+            "--legal-comments <STR>           Where /*! and //! comments go: 'inline' (default), 'none', 'eof', 'linked' or 'external'. The last two write a .LEGAL.txt file next to each output file"
+        ),
+        parse_param!(
             "--format <STR>                   Specifies the module format to build to. \"esm\", \"cjs\" and \"iife\" are supported. Defaults to \"esm\", or \"cjs\" with --bytecode."
         ),
         parse_param!(
@@ -2191,6 +2194,18 @@ fn parse_build_command_options(
 
     if let Some(global_name) = args.option(b"--global-name") {
         ctx.bundler_options.global_name = global_name.into();
+    }
+
+    if let Some(setting) = args.option(b"--legal-comments") {
+        let Some(legal_comments) = options::LegalComments::from_string(setting) else {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r>: Invalid legal comments setting: \"{}\". Expected one of {}",
+                BStr::new(setting),
+                options::LegalComments::ONE_OF,
+            );
+            Global::crash();
+        };
+        ctx.bundler_options.legal_comments = legal_comments;
     }
 
     let minify_flag = args.flag(b"--minify") || production;
