@@ -18,6 +18,7 @@ export default b.declarations(
     "__tracePointStart",
     "__tracePointStop",
     "gc",
+    "localStorage",
     "process.noDeprecation",
     "process.noProcessWarnings",
     "process.pendingDeprecation",

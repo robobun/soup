@@ -276,6 +276,28 @@ const checkThrownDom =
     }
   };
 
+// For the wpt-webstorage fixture, which takes the assert_* globals from here. Mirrors
+// testharness.js assert_throws_quotaexceedederror_impl for the form its files use, (func,
+// requested, quota): QuotaExceededError is an interface of its own, a DOMException with the
+// `quota` and `requested` attributes, and the thrown object has to be an instance.
+const checkThrownQuotaExceeded =
+  (requested: number | null, quota: number | null): ThrownCheck =>
+  (e: any, context, description) => {
+    if (typeof e !== "object" || e === null) {
+      fail(`${context}: ${description ?? ""} threw ${format_value(e)}, not an object`);
+    }
+    for (const [prop, expected] of Object.entries({ code: 22, name: "QuotaExceededError", requested, quota })) {
+      if (!(prop in e && e[prop] == expected)) {
+        fail(
+          `${context}: ${description ?? ""} threw ${format_value(e)} that is not a correct QuotaExceededError: property ${prop} is equal to ${format_value(e[prop])}, expected ${format_value(expected)}`,
+        );
+      }
+    }
+    if (e.constructor !== (globalThis as any).QuotaExceededError) {
+      fail(`${context}: ${description ?? ""} threw an exception from the wrong global`);
+    }
+  };
+
 function assertThrows(context: string, check: ThrownCheck, fn: () => unknown, description?: string) {
   try {
     fn();
@@ -301,6 +323,12 @@ const assert_throws_exactly = (expected: unknown, fn: () => unknown, description
   assertThrows("assert_throws_exactly", checkThrownExactly(expected), fn, description);
 const assert_throws_dom = (name: string, fn: () => unknown, description?: string) =>
   assertThrows("assert_throws_dom", checkThrownDom(name), fn, description);
+const assert_throws_quotaexceedederror = (
+  fn: () => unknown,
+  requested: number | null,
+  quota: number | null,
+  description?: string,
+) => assertThrows("assert_throws_quotaexceedederror", checkThrownQuotaExceeded(requested, quota), fn, description);
 const promise_rejects_js = (_t: unknown, ctor: any, promise: Promise<unknown>, description?: string) =>
   promiseRejects("promise_rejects_js", checkThrownJs(ctor), promise, description);
 const promise_rejects_exactly = (_t: unknown, expected: unknown, promise: Promise<unknown>, description?: string) =>
@@ -582,6 +610,7 @@ g.assert_unreached = assert_unreached;
 g.assert_throws_js = assert_throws_js;
 g.assert_throws_exactly = assert_throws_exactly;
 g.assert_throws_dom = assert_throws_dom;
+g.assert_throws_quotaexceedederror = assert_throws_quotaexceedederror;
 g.promise_rejects_js = promise_rejects_js;
 g.promise_rejects_exactly = promise_rejects_exactly;
 g.promise_rejects_dom = promise_rejects_dom;

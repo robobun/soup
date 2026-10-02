@@ -641,6 +641,7 @@ export const tablesReadByNobody: readonly string[] = [
   "JSStatementSyncIteratorPrototypeTableValues", // sqlite/NodeSqlite.cpp
   "JSStatementSyncPrototypeTableValues", // sqlite/NodeSqlite.cpp
   "JSStatsPrototypeTableValues", // NodeFSStatBinding.cpp
+  "JSStoragePrototypeTableValues", // sqlite/JSStorage.cpp
   "JSWasmStreamingCompilerPrototypeTableValues", // webcore/JSWasmStreamingCompiler.cpp
   "JSX509CertificatePrototypeTableValues", // JSX509CertificatePrototype.cpp
   "NodeVMModulePrototypeTableValues", // NodeVMModule.cpp
