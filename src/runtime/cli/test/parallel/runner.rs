@@ -366,6 +366,9 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Argv> {
         argv.push(&flag);
     }
     argv.flag("--smol", runtime.smol);
+    if let Some(file) = crate::cli::Bun__Node__LocalStorageFile.get() {
+        argv.push(&[b"--localstorage-file=", &**file].concat());
+    }
     argv.flag(
         "--experimental-http2-fetch",
         runtime.experimental_http2_fetch,
