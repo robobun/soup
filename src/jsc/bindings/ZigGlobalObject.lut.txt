@@ -30,6 +30,7 @@
   navigator                       GlobalObject::m_navigatorObject                      CellProperty
   performance                     GlobalObject::m_performanceObject                    CellProperty
   process                         GlobalObject::m_processObject                        CellProperty
+  sessionStorage                  GlobalObject::m_sessionStorage                       CellProperty
 
   Blob                            Bun::Bindgen::Generated::Blob::getBlobConstructor PropertyCallback
   Buffer                          GlobalObject::m_JSBufferClassStructure               ClassStructure
@@ -41,6 +42,7 @@
   ResolveError                    Bun::Bindgen::Generated::ResolveMessage::getResolveMessageConstructor PropertyCallback
   ResolveMessage                  Bun::Bindgen::Generated::ResolveMessage::getResolveMessageConstructor PropertyCallback
   Response                        Bun::Bindgen::Generated::Response::getResponseConstructor PropertyCallback
+  Storage                         GlobalObject::m_JSStorageClassStructure              DontEnum|ClassStructure
   TextDecoder                     Bun::Bindgen::Generated::TextDecoder::getTextDecoderConstructor PropertyCallback
 
   AbortController                 AbortControllerConstructorCallback                   PropertyCallback

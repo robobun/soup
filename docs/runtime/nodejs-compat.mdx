@@ -441,7 +441,7 @@ The following list covers the globals implemented by Node.js and Bun's compatibi
 
 ### [`Storage`](https://developer.mozilla.org/en-US/docs/Web/API/Storage)
 
-🔴 Not implemented. Bun has no `Storage`, `localStorage` or `sessionStorage` globals.
+🟡 `Storage` and `sessionStorage` are implemented. `localStorage` is a global only when [`--localstorage-file`](/runtime/web-apis#web-storage) names the file it is kept in. Without the flag it is not defined, where Node.js defines it as `undefined` and prints a warning. The file has the format of Node.js, so the two can share one. A relative path is resolved against the directory the process started in, where Node.js resolves it when `localStorage` is first used, and the flag applies to every `Worker`, whatever its `execArgv` says. Missing `--no-webstorage`, the `QuotaExceededError` class (the error is a `DOMException` with that name) and `--experimental-storage-inspection`.
 
 ### [`SubtleCrypto`](https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto)
 
