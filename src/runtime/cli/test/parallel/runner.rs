@@ -379,6 +379,11 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Box<[bun_spawn
     if ctx.runtime_options.smol {
         argv.push(lit(b"--smol\0"));
     }
+    if let Some(file) = crate::cli::Bun__Node__LocalStorageFile.get() {
+        let mut flag = b"--localstorage-file=".to_vec();
+        flag.extend_from_slice(file);
+        argv.push(dupe_z(&flag));
+    }
     if ctx.runtime_options.experimental_http2_fetch {
         argv.push(lit(b"--experimental-http2-fetch\0"));
     }
