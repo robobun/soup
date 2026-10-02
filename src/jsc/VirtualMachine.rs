@@ -468,6 +468,7 @@ unsafe extern "C" {
     safe fn Process__dispatchOnExit(global: &JSGlobalObject, code: u8);
     safe fn Bun__closeAllSQLiteDatabasesForTermination(global: &JSGlobalObject);
     safe fn Bun__closeAllNodeSqliteDatabasesForTermination(global: &JSGlobalObject);
+    safe fn Bun__closeWebStorageForTermination(global: &JSGlobalObject);
     safe fn Bun__WebView__closeAllForTermination();
     safe fn Zig__GlobalObject__prepareForDestruction(global: &JSGlobalObject);
     safe fn Zig__GlobalObject__forbidExecution(global: &JSGlobalObject);
@@ -2357,6 +2358,7 @@ impl VirtualMachine {
     fn close_sqlite_databases_for_exit(&self) {
         Bun__closeAllSQLiteDatabasesForTermination(self.global());
         Bun__closeAllNodeSqliteDatabasesForTermination(self.global());
+        Bun__closeWebStorageForTermination(self.global());
     }
 
     /// Tear down this thread's VM: the one sequence both a finished worker

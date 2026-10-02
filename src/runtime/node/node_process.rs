@@ -108,6 +108,15 @@ pub(crate) extern "C" fn Bun__Node__getRedirectWarnings() -> bun_core::String {
     }
 }
 
+/// `--localstorage-file=<path>` value; `Dead` when unset.
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn Bun__Node__getLocalStorageFile() -> bun_core::String {
+    match crate::cli::Bun__Node__LocalStorageFile.get() {
+        Some(path) => bun_core::String::clone_utf8(path),
+        None => bun_core::String::DEAD,
+    }
+}
+
 /// `--disable-warning` entries as `[ptr, len]` pairs into caller-provided buffers; returns
 /// the count. `bufs`/`lens` may be null when `cap == 0` to query the count. Entries
 /// borrow the CLI-owned Vec (never mutated after argument parsing).

@@ -590,6 +590,7 @@ public:
     V(public, LazyClassStructure, m_JSNodeSqliteSessionClassStructure)                                       \
     V(public, LazyClassStructure, m_JSNodeSqliteLimitsClassStructure)                                        \
     V(public, LazyClassStructure, m_JSNodeSqliteTagStoreClassStructure)                                      \
+    V(public, LazyClassStructure, m_JSStorageClassStructure)                                                 \
     V(private, LazyClassStructure, m_NapiClassStructure)                                                     \
     V(private, LazyClassStructure, m_callSiteStructure)                                                      \
     V(public, LazyClassStructure, m_JSBufferClassStructure)                                                  \
@@ -679,6 +680,8 @@ public:
     V(public, LazyPropertyOfGlobalObject<JSObject>, m_cryptoObject)                                          \
     V(public, LazyPropertyOfGlobalObject<JSObject>, m_navigatorObject)                                       \
     V(public, LazyPropertyOfGlobalObject<JSObject>, m_performanceObject)                                     \
+    V(public, LazyPropertyOfGlobalObject<JSObject>, m_localStorage)                                          \
+    V(public, LazyPropertyOfGlobalObject<JSObject>, m_sessionStorage)                                        \
     V(public, LazyPropertyOfGlobalObject<Bun::Process>, m_processObject)                                     \
     V(public, LazyPropertyOfGlobalObject<CustomGetterSetter>, m_lazyStackCustomGetterSetter)                 \
     V(public, LazyPropertyOfGlobalObject<Structure>, m_ServerRouteListStructure)                             \

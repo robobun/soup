@@ -442,6 +442,13 @@ pub(crate) static Bun__Node__RedirectWarnings: std::sync::OnceLock<Box<[u8]>> =
     std::sync::OnceLock::new();
 
 #[allow(non_upper_case_globals)]
+/// `--localstorage-file=<path>`: the SQLite file behind `localStorage`, as an
+/// absolute path, or `:memory:`. Unset means there is no `localStorage`. Set
+/// once during CLI parse.
+pub(crate) static Bun__Node__LocalStorageFile: std::sync::OnceLock<Box<[u8]>> =
+    std::sync::OnceLock::new();
+
+#[allow(non_upper_case_globals)]
 /// `--disable-warning=<code-or-type>` (repeatable) — warnings whose `code`
 /// or `name` matches an entry are suppressed. Set once during CLI parse.
 pub(crate) static Bun__Node__DisabledWarnings: std::sync::OnceLock<Vec<Box<[u8]>>> =

@@ -3780,6 +3780,184 @@ Files: `src/options_types/bundle_enums.rs` (`LegalComments`), `src/options_types
 `test/bundler/bun-build-api.test.ts`, `test/bundler/esbuild/default.test.ts`,
 `test/bundler/expectBundled.ts`, `test/integration/bun-types/fixture/build.ts`.
 
+### 2026-10-01: Web Storage: `sessionStorage`, `localStorage` and `Storage`
+
+Node.js has had the Web Storage API without a flag since version 25, Deno has it, and every
+browser does. Bun's compatibility page said "🔴 Not implemented. Bun has no `Storage`,
+`localStorage` or `sessionStorage` globals", oven-sh/bun#19115 asks for it and lists the ponyfills
+people use meanwhile, and `bun --localstorage-file=x app.js` took Node's flag without a word and
+then threw `ReferenceError: localStorage is not defined`. Now:
+
+```ts
+// always there, kept in memory, one per Worker
+sessionStorage.setItem("theme", "dark");
+sessionStorage.theme; // "dark"
+Object.keys(sessionStorage); // ["theme"]
+sessionStorage instanceof Storage; // true
+```
+
+```ts counter.ts
+// there when --localstorage-file names the file to keep it in
+const runs = Number(localStorage.getItem("runs") ?? 0) + 1;
+localStorage.setItem("runs", String(runs));
+console.log(`run ${runs}`);
+```
+
+```sh
+$ bun --localstorage-file=./local-storage.db counter.ts
+run 1
+$ bun --localstorage-file=./local-storage.db counter.ts
+run 2
+$ node --localstorage-file=./local-storage.db counter.ts   # the same file
+run 3
+$ bun test --localstorage-file=:memory:                    # a localStorage that is not written anywhere
+```
+
+`Storage` is the interface of the HTML specification: `length`, `key()`, `getItem()`,
+`setItem()`, `removeItem()`, `clear()`, and every item as a property, so `storage.theme`,
+`storage.theme = "dark"`, `delete storage.theme`, `"theme" in storage`, `Object.keys()`,
+`JSON.stringify()` and a spread all do what they do in a browser. Keys and values are strings and
+are kept code unit for code unit: the empty string, a NUL and a lone surrogate come back as they
+went in. A storage holds 10 MB of keys and values, two bytes a code unit, and the write that would
+go past that throws a `DOMException` named `QuotaExceededError` (code 22) and changes nothing.
+`new Storage()` throws, and so do `Object.freeze()`, `seal()` and `preventExtensions()` of a
+storage.
+
+The file is an SQLite database with the schema of Node.js, statement for statement: the two tables,
+the three triggers that keep the quota, keys and values as blobs of UTF-16 code units, WAL. So
+`--localstorage-file` means the same file to both runtimes. That was checked with Node.js 26.3.0 in
+both directions, with an empty key and a lone surrogate among the items, and a test does it again
+wherever a `node` of version 25 or later is installed. Several processes can have the file open
+(SQLite's locking, a busy timeout of three seconds), and a process sees what another one wrote the
+next time it looks: no lookup on a storage is ever answered from a cache, neither Bun's own nor the
+inline caches of the JIT. A `Worker` opens the same file and has a `sessionStorage` of its own. The
+file is made the first time `localStorage` is used, not when the process starts. A process that
+exits closes the databases of its main thread, which leaves one file with no `-wal` and `-shm`
+beside it. A `Worker` that is still running at that moment keeps its connection, and then the two
+files stay until the next open takes them in, as after a kill. A file that cannot be opened, or
+that has tables of these names with something else in them, is an `ERR_INVALID_STATE` error of the
+operation that needed it, with Node's messages for a malformed file.
+
+Where it differs from Node.js, on purpose:
+
+- Without `--localstorage-file`, `localStorage` is not a property of the global object at all,
+  which is what it was in Bun until today: `typeof localStorage` is `"undefined"`,
+  `"localStorage" in globalThis` is `false`. Node 26 defines a getter that returns `undefined` and
+  prints an `ExperimentalWarning` the first time anything reads it. Every program that only asks
+  `typeof localStorage !== "undefined"` to find out where it runs would start to print that warning
+  under Bun, and `"localStorage" in globalThis` would start to say yes to something that is not
+  there.
+- A relative path is resolved against the directory the process started in. Node resolves it when
+  `localStorage` is first used, so a `process.chdir()` before that moves Node's file and not Bun's.
+- The two globals are plain properties and can be assigned, `globalThis.localStorage = mock`,
+  which is what test setups do. In Node they are accessors.
+- It follows WebIDL where Node's interceptors do not. A symbol is an ordinary property with its
+  attributes (the one subtest of the Web Platform Tests that Node lists as failing,
+  `symbol-props.window.js` "defineProperty not configurable", passes). An item whose name a
+  property of the prototype chain has, `"length"` or `"getItem"`, is not a property of the storage:
+  it is not listed by `Object.getOwnPropertyNames()`, and `delete storage.getItem` leaves it, where
+  Node lists it and removes it. `getItem()` and `removeItem()` reach it either way.
+- `PRAGMA optimize` is not run when the file is opened. Node runs it, and the `ANALYZE` it can
+  start does not wait for a connection that is writing, so the first use of a file while another
+  process wrote to it failed at once with "database is locked", in Node 26.3 too. The switch of a
+  new file to WAL has the same impatience, and that one is retried for the three seconds.
+
+The class is native (`JSStorage`, a JavaScriptCore object with the hooks of a "legacy platform
+object": get, set, define, delete and list own properties, and prevent extensions). The hooks start
+from what WebKit's bindings generator writes for an interface with a named getter, setter and
+deleter, with three changes. The generated setter leaves a name alone that the prototype chain has,
+the specification and the Web Platform Tests give every string to the setter, and this does what
+the specification says. The generated list of own properties has every item, this one leaves out
+the hidden ones. And the visibility check looks at the prototype chain before it looks for the
+item, because the first is a hash lookup and the second is a query, so `localStorage.getItem(...)`
+never asks the database whether there is an item called "getItem". The storage itself is Node's
+`node_webstorage.cc` on the SQLite that `bun:sqlite` and `node:sqlite` already use, the one library
+of the process (the system's, loaded on demand, on macOS), with the statements prepared once per
+storage and reset after every use: a statement that is left stepped keeps its read transaction, and
+with it a snapshot in which the writes of other processes do not show. The database operations
+return errors and never throw, so that a lookup the engine makes for itself (a `VMInquiry`) can
+drop an error where a script's lookup throws it.
+
+What it costs a program that does not use it: two entries in the static table of the global object,
+which is generated at build time. Nothing is allocated at startup, SQLite is not opened (or, on
+macOS, loaded) until the first operation on a storage, and `localStorage` is one more property of
+the global object only in a process that was started with the flag.
+
+Tests. `test/js/third_party/wpt-webstorage` runs the 21 Web Platform Tests files for the interface
+that need no document (1238 subtests), in a child process that has the flag. Two subtests are
+listed as expected failures: they ask for the new `QuotaExceededError` interface with `quota` and
+`requested`, which Bun does not have. The fixture has its own `test()`, the synchronous one of
+`testharness.js`, and takes the assertions from the shim that upstream's `wpt-streams` uses, which
+got the one assertion those two subtests call. `test/js/web/storage/storage.test.ts` has what the
+suite does not: the globals, the flag, the file and its schema read back with `bun:sqlite`, two
+live processes, six processes that use a new file at the same moment, a Worker, the quota, files
+that are malformed (the cases of Node's `test-webstorage.js`, and its check that a failed open does
+not leak the connection), `bun test` with the flag, with and without `--parallel`, and a loop that
+runs a lookup through the optimizing tiers of the JIT and then changes the item. Both files pass on
+the debug build with address sanitizer, and with JavaScriptCore's exception check validation on.
+The machine this was built on was very busy with other work (a load average in the hundreds on
+sixteen cores), and there the tests of `storage.test.ts` that start processes needed
+`--max-concurrency=3` to stay under the default timeout of five seconds. Earlier in the day, on the
+same machine with less on it, the file passed as it is in six seconds.
+
+A review pass (three readers: the C++, the behaviour against the specification and Node, then docs,
+types and tests) found what follows, and all of it is fixed in this commit, the behaviours with
+tests. A write that went over the quota from a script of a `node:vm` context made the exception
+with the wrong kind of global object and wrote past the end of it. The visibility check asked the
+prototype chain in a mode in which JavaScript must not run, and a lazy property of `Bun` or
+`process` is made by JavaScript: `Object.setPrototypeOf(sessionStorage, Bun)` and one lookup
+aborted the process. `Object.freeze(localStorage)` did not throw and turned every item into the
+string `"undefined"`, on disk, because a descriptor that has no value was given to the setter.
+The triggers call `OCTET_LENGTH()`, which SQLite has had since 3.43, and macOS 13 has 3.39, where
+every write would have failed: a library that does not have the function is now given one, which
+was tried against SQLite 3.38.5. An array with a storage in its prototype chain read its holes from
+it with `array[1]` and not with `join()` or `slice()`. `bun test --parallel` did not pass the flag
+to its workers. `--localstorage-file=` without a value was ignored where Node exits with an error.
+The first use of a file failed when another process was writing to it (the `PRAGMA optimize`
+above). The first version of the Web Platform Tests fixture ran the bodies of the tests after their
+file had been evaluated, so the 1076 subtests that `storage_setitem.window.js` registers in a loop
+over a `var` all tested the last string of the loop. And the docs said that both storages are
+shared by everything in the process, which is not true of a `sessionStorage` and a Worker.
+
+Not done. `--no-webstorage`, Node's switch to turn it off. The `QuotaExceededError` class.
+`StorageEvent`, which is for other documents. A `bunfig.toml` key for the file. The flag is for the
+whole process: the `execArgv` of a `Worker` cannot give it another file, as it can in Node. Under
+`bun test --isolate` the connection of a finished test file stays open until its global object is
+collected. Node's own `test/parallel/test-webstorage.js` is not in the tree because it pins things
+that Bun does differently or does not have. Built and run on Linux x64 only: the macOS path (the
+`lazy_sqlite3.h` include that `NodeSqlite.cpp` uses, and the function for old libraries) and
+Windows were not compiled here, and on Windows the path is given to SQLite as it is, without the
+`\\?\` prefix that Node adds for paths longer than 260 characters.
+
+Two things are older than this commit and were reported, not fixed here. `toMatchSnapshot()` and
+the diff of `toEqual()` list the properties of an object without asking the object, so they print a
+storage as `Storage {}`. And a method that `spyOn()` replaced on an object that only inherited it
+stays on the object as an own property after `mockRestore()`, which on a storage shows up in
+`Object.keys()`: spy on `Storage.prototype`.
+
+A design check was started before the code (where should it live, a native class or a TypeScript
+builtin with a `Proxy` as in Deno) and was stopped after five hours without a verdict, so the
+choice of the native class is this commit's own: it is where upstream has been moving (the streams
+rewrite, `node:sqlite`), and `JSSharedEnvMap` is the precedent for such an object in the tree.
+
+Rebase notes: 43 patches onto oven-sh/bun 4b02e1031d, which was upstream's main when the day's run
+started, two textual conflicts, nothing dropped. Upstream appended tests to
+`test/cli/hot/hot.test.ts` where the `.env` patch of 2026-08-23 appends its own, and
+oven-sh/bun#43571 ("honor If-Range") added a field to `RequestContext` in the three places where
+the compression patch of 2026-09-04 adds `encoding`. Both sides were kept, and the `--hot` `.env`
+test, the compression tests and upstream's If-Range tests pass on the rebased build. The fork's
+three workflows were green after the last push, which was on 2026-09-29.
+
+Files: `src/jsc/bindings/sqlite/JSStorage.cpp`, `src/jsc/bindings/sqlite/JSStorage.h` (new),
+`src/jsc/bindings/ZigGlobalObject.{cpp,h,lut.txt}`,
+`src/jsc/bindings/webcore/{DOMIsoSubspaces,DOMClientIsoSubspaces}.h`,
+`src/runtime/cli/{Arguments,mod}.rs` (`--localstorage-file`), `src/runtime/node/node_process.rs`,
+`src/runtime/cli/test/parallel/runner.rs`, `src/jsc/VirtualMachine.rs` (the exit hook),
+`scripts/build/unified.ts`, `docs/runtime/web-apis.mdx`, `docs/runtime/nodejs-compat.mdx`,
+`docs/snippets/cli/run.mdx`, `test/js/web/storage/storage.test.ts` (new),
+`test/js/third_party/wpt-webstorage/` (new), `test/js/third_party/wpt-testharness-shim.ts`,
+`test/integration/bun-types/fixture/globals.ts`.
+
 ## Dropped
 
 Nothing yet.

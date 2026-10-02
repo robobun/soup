@@ -28,6 +28,7 @@ public:
     GCClient::IsoSubspace* m_clientSubspaceForNodeSqliteSession { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForNodeSqliteLimits { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForNodeSqliteTagStore { nullptr };
+    GCClient::IsoSubspace* m_clientSubspaceForStorage { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForJSSinkConstructor { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForJSSinkController { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForJSSink { nullptr };
