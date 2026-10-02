@@ -141,6 +141,7 @@
 #include "BunMarkdownMeta.h"
 #include "JSSQLStatement.h"
 #include "sqlite/NodeSqlite.h"
+#include "sqlite/JSStorage.h"
 #include "JSStringDecoder.h"
 #include "ModuleGraph.h"
 #include "JSTextEncoder.h"
@@ -1363,6 +1364,14 @@ JSC_DEFINE_CUSTOM_GETTER(getEventSourceConstructor, (JSGlobalObject * lexicalGlo
     return JSValue::encode(globalObject->internalModuleRegistry()->requireId(globalObject, vm, Bun::InternalModuleRegistry::Field::InternalEventSource));
 }
 
+// `localStorage` is a property of the global object only when `--localstorage-file` names the
+// file it is stored in, so it is not in the static table.
+JSC_DEFINE_CUSTOM_GETTER(getLocalStorage, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue, PropertyName))
+{
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+    return JSValue::encode(globalObject->m_localStorage.getInitializedOnMainThread(globalObject));
+}
+
 JSC_DEFINE_HOST_FUNCTION(functionGetSelf,
     (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
@@ -2358,6 +2367,16 @@ void GlobalObject::finishCreation(VM& vm)
              init.setStructure(structure);
              init.setConstructor(constructor);
          } },
+        { OBJECT_OFFSETOF(GlobalObject, m_JSStorageClassStructure), [](LazyClassStructure::Initializer& init) {
+             auto* prototype = Bun::JSStoragePrototype::create(
+                 init.vm, init.global, Bun::JSStoragePrototype::createStructure(init.vm, init.global, init.global->objectPrototype()));
+             auto* structure = Bun::JSStorage::createStructure(init.vm, init.global, prototype);
+             auto* constructor = Bun::JSStorageConstructor::create(
+                 init.vm, init.global, Bun::JSStorageConstructor::createStructure(init.vm, init.global, init.global->functionPrototype()), prototype);
+             init.setPrototype(prototype);
+             init.setStructure(structure);
+             init.setConstructor(constructor);
+         } },
         { OBJECT_OFFSETOF(GlobalObject, m_JSFFIFunctionStructure), [](LazyClassStructure::Initializer& init) {
              init.setStructure(Zig::JSFFIFunction::createStructure(init.vm, init.global, init.global->functionPrototype()));
          } },
@@ -2567,6 +2586,14 @@ void GlobalObject::finishCreation(VM& vm)
                  jsNontrivialString(init.vm, "Navigator"_s), PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly);
 
              init.set(obj);
+         } },
+        { OBJECT_OFFSETOF(GlobalObject, m_sessionStorage), [](const LazyProperty<JSGlobalObject, JSObject>::Initializer& init) {
+             auto* globalObject = static_cast<Zig::GlobalObject*>(init.owner);
+             init.set(Bun::JSStorage::create(init.vm, globalObject->m_JSStorageClassStructure.get(globalObject), ":memory:"_s));
+         } },
+        { OBJECT_OFFSETOF(GlobalObject, m_localStorage), [](const LazyProperty<JSGlobalObject, JSObject>::Initializer& init) {
+             auto* globalObject = static_cast<Zig::GlobalObject*>(init.owner);
+             init.set(Bun::JSStorage::create(init.vm, globalObject->m_JSStorageClassStructure.get(globalObject), Bun::localStorageFile()));
          } },
         { OBJECT_OFFSETOF(GlobalObject, m_bunObject), [](const LazyProperty<JSGlobalObject, JSObject>::Initializer& init) {
              init.set(Bun::createBunObject(init.vm, init.owner));
@@ -3066,6 +3093,8 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onerror"_s), JSC::CustomGetterSetter::create(vm, globalOnError, setGlobalOnError), 0);
 
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "EventSource"_s), JSC::CustomGetterSetter::create(vm, getEventSourceConstructor, nullptr), PropertyAttribute::CustomValue | 0);
+    if (!Bun::localStorageFile().isNull())
+        putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "localStorage"_s), JSC::CustomGetterSetter::create(vm, getLocalStorage, nullptr), PropertyAttribute::CustomValue | 0);
 
     // ----- Extensions to Built-in objects -----
 

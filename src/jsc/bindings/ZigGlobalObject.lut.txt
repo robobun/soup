@@ -30,6 +30,7 @@
   navigator                       GlobalObject::m_navigatorObject                      CellProperty
   performance                     GlobalObject::m_performanceObject                    CellProperty
   process                         GlobalObject::m_processObject                        CellProperty
+  sessionStorage                  GlobalObject::m_sessionStorage                       CellProperty
 
   Blob                            GlobalObject::m_generatedLazyClasses[Zig::GlobalObject::GeneratedLazyClassJSBlob]                               ClassStructure
   Buffer                          GlobalObject::m_JSBufferClassStructure               ClassStructure
@@ -41,6 +42,7 @@
   ResolveError                    GlobalObject::m_generatedLazyClasses[Zig::GlobalObject::GeneratedLazyClassJSResolveMessage]                     ClassStructure
   ResolveMessage                  GlobalObject::m_generatedLazyClasses[Zig::GlobalObject::GeneratedLazyClassJSResolveMessage]                     ClassStructure
   Response                        GlobalObject::m_generatedLazyClasses[Zig::GlobalObject::GeneratedLazyClassJSResponse]                           ClassStructure
+  Storage                         GlobalObject::m_JSStorageClassStructure              DontEnum|ClassStructure
   TextDecoder                     GlobalObject::m_generatedLazyClasses[Zig::GlobalObject::GeneratedLazyClassJSTextDecoder]                        ClassStructure
 
   AbortController                 AbortControllerConstructorCallback                   PropertyCallback

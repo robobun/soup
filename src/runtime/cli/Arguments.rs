@@ -267,6 +267,9 @@ const RUNTIME_PARAMS_: &[ParamType] = &[
     parse_param!(
         "--disable-warning <STR>...        Silence specific process warnings by code or type"
     ),
+    parse_param!(
+        "--localstorage-file <STR>         The file that localStorage is stored in. Without it there is no localStorage"
+    ),
     parse_param!("--title <STR>                     Set the process title"),
     parse_param!(
         "--zero-fill-buffers                Boolean to force Buffer.allocUnsafe(size) to be zero-filled."
@@ -1514,6 +1517,29 @@ pub(crate) fn parse(cmd: CommandTag, ctx: Context<'_>) -> crate::Result<api::Tra
                 let _ = cli::Bun__Node__DisabledWarnings
                     .set(disabled.iter().map(|e| Box::from(*e)).collect());
             }
+        }
+        if let Some(file) = args.option(b"--localstorage-file") {
+            if file.is_empty() {
+                let argv0 = bun_core::argv().get(0).unwrap_or(bun_core::zstr!("bun"));
+                bun_core::pretty_errorln!(
+                    "{}: --localstorage-file= requires an argument",
+                    BStr::new(argv0.as_bytes())
+                );
+                Output::flush();
+                Global::exit(9);
+            }
+            // SQLite's name for a database that is not a file.
+            let location: Box<[u8]> = if file == b":memory:" {
+                file.into()
+            } else {
+                let mut spill = Vec::new();
+                Box::from(resolve_path::join_abs_string_spill::<platform::Auto>(
+                    ctx.args.absolute_working_dir.as_deref().unwrap(),
+                    &mut spill,
+                    &[file],
+                ))
+            };
+            let _ = cli::Bun__Node__LocalStorageFile.set(location);
         }
         if let Some(title) = args.option(b"--title") {
             // Static is `Mutex<Option<Box<[u8]>>>` so `process.title = "..."`
