@@ -29,6 +29,7 @@ public:
     GCClient::IsoSubspace* m_clientSubspaceForNodeSqliteSession { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForNodeSqliteLimits { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForNodeSqliteTagStore { nullptr };
+    GCClient::IsoSubspace* m_clientSubspaceForStorage { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForStringDecoder { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForPendingVirtualModuleResult { nullptr };
     GCClient::IsoSubspace* m_clientSubspaceForCallSite { nullptr };

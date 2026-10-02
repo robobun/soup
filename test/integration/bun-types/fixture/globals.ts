@@ -381,6 +381,17 @@ import.meta.glob(1);
 // @ts-expect-error unknown option
 import.meta.glob("./*.ts", { lazy: true });
 
+// Web Storage
+sessionStorage.setItem("theme", "dark");
+expectType<string | null>(sessionStorage.getItem("theme"));
+expectType<string | null>(localStorage.key(0));
+expectType<number>(localStorage.length);
+localStorage.removeItem("theme");
+sessionStorage.clear();
+expectAssignable<Storage>(localStorage);
+// @ts-expect-error a value is a string
+sessionStorage.setItem("theme", 1);
+
 // @ts-expect-error this interface is defined top level in globals.d.ts so we
 // are making sure that .d.ts is a module and that anything top level doesn't
 // leak to userland
