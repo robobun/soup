@@ -1929,6 +1929,8 @@ export default b.declarations(
   b.method("AbortSignal.prototype.onabort", eventHandlerAttributeKeptIn("AbortSignal.onabort", receiver)),
   b.static("onerror", b.property(b.any, { setter: eventHandlerAttribute(globalObject).setter })),
   b.static("onmessage", b.property(b.any, { setter: eventHandlerAttribute(globalObject).setter })),
+  // --localstorage-file adds it (ZigGlobalObject.cpp): the static table, which has sessionStorage, does not have it.
+  b.static("localStorage", b.property(b.any)),
   // A class of the library (src/js/internal/event_source.ts) that native code loads where the global is first read.
   b.static("EventSource", b.property(b.any)),
   b.fn("addEventListener", listenerRegistration(globalObject)),

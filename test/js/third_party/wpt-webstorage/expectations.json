@@ -1,0 +1,6 @@
+{
+  "failures": {
+    "storage_local_setitem_quotaexceedederr.window.js :: Throws QuotaExceededError when the quota has been exceeded": "FAIL: the QuotaExceededError interface (a DOMException subclass with `quota` and `requested`) is not implemented. What is thrown is a DOMException with the name QuotaExceededError and the code 22",
+    "storage_session_setitem_quotaexceedederr.window.js :: Throws QuotaExceededError when the quota has been exceeded": "FAIL: the QuotaExceededError interface (a DOMException subclass with `quota` and `requested`) is not implemented. What is thrown is a DOMException with the name QuotaExceededError and the code 22"
+  }
+}
