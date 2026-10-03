@@ -215,6 +215,8 @@ pub(crate) mod scan_command;
 #[path = "script_or_command.rs"]
 pub(crate) mod script_or_command;
 mod short_run;
+#[path = "trusted_publishing.rs"]
+pub(crate) mod trusted_publishing;
 pub(crate) mod typescript_libs;
 #[path = "unlink_command.rs"]
 pub(crate) mod unlink_command;
