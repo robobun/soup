@@ -38,6 +38,10 @@ use crate::ZStr;
 // Declarations
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Set on a GitHub Actions job that has `permissions: id-token: write`: the bearer and the URL of the request for an
+// OIDC id token of the job.
+new!(pub ACTIONS_ID_TOKEN_REQUEST_TOKEN: string, "ACTIONS_ID_TOKEN_REQUEST_TOKEN", {});
+new!(pub ACTIONS_ID_TOKEN_REQUEST_URL: string, "ACTIONS_ID_TOKEN_REQUEST_URL", {});
 new!(pub AGENT: string, "AGENT", {});
 new!(pub BUN_AGENT_RULE_DISABLED: boolean, "BUN_AGENT_RULE_DISABLED", { default: false });
 // A compiled executable decodes ALL of its embedded bytecode at exit and writes one digest line per module here: for
@@ -182,6 +186,8 @@ new!(pub BUN_INTERNAL_WEBVIEW_HOST: string, "BUN_INTERNAL_WEBVIEW_HOST", {});
 new!(pub NODE_PENDING_DEPRECATION: string, "NODE_PENDING_DEPRECATION", {});
 new!(pub NODE_PRESERVE_SYMLINKS_MAIN: boolean, "NODE_PRESERVE_SYMLINKS_MAIN", { default: false });
 new!(pub NODE_USE_SYSTEM_CA: boolean, "NODE_USE_SYSTEM_CA", { default: false });
+// An OIDC id token for npm trusted publishing, from a CI that hands it over in the environment (GitLab CI, CircleCI).
+new!(pub NPM_ID_TOKEN: string, "NPM_ID_TOKEN", {});
 new!(pub npm_lifecycle_event: string, "npm_lifecycle_event", {});
 new!(pub PATH: string, "PATH", {});
 new!(pub REPL_ID: boolean, "REPL_ID", { default: false });

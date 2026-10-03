@@ -924,6 +924,339 @@ describe.concurrent("credentials in the registry url", () => {
   });
 });
 
+describe.concurrent("trusted publishing (OIDC)", () => {
+  const idToken = "id-token-of-the-ci-job";
+  const publishToken = "publish-token-from-the-exchange";
+  const refused = () => Response.json({ message: "OIDC token exchange error - package not found" }, { status: 404 });
+
+  // One server is GitHub's id token endpoint and the registry. It records every request, so a test can assert
+  // exactly what `bun publish` sent, in which order, and with which credential.
+  function trustedPublishingMock(
+    responses: {
+      idToken?: () => Response;
+      exchange?: () => Response;
+      packument?: () => Response;
+      put?: () => Response;
+    } = {},
+  ) {
+    const requests: { method: string; path: string; authorization: string | null }[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const { pathname, search } = new URL(req.url);
+        requests.push({ method: req.method, path: pathname + search, authorization: req.headers.get("authorization") });
+        if (pathname === "/id-token") {
+          return responses.idToken?.() ?? Response.json({ value: idToken });
+        }
+        if (pathname.startsWith("/-/npm/v1/oidc/token/exchange/package/")) {
+          return responses.exchange?.() ?? Response.json({ token: publishToken }, { status: 201 });
+        }
+        if (req.method === "PUT") {
+          return responses.put?.() ?? new Response("OK", { status: 200 });
+        }
+        return responses.packument?.() ?? new Response("Not Found", { status: 404 });
+      },
+    });
+    return {
+      requests,
+      port: server.port,
+      url: `http://localhost:${server.port}/`,
+      // What a GitHub Actions job with `permissions: id-token: write` has in its environment.
+      githubActions: {
+        GITHUB_ACTIONS: "true",
+        ACTIONS_ID_TOKEN_REQUEST_URL: `http://localhost:${server.port}/id-token?api-version=2.0`,
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: "github-request-token",
+      },
+      [Symbol.dispose]: () => server.stop(true),
+    };
+  }
+
+  // No credentials and no CI identity from the machine that runs the tests.
+  const cleanEnv = {
+    ...env,
+    NPM_CONFIG_TOKEN: undefined,
+    BUN_CONFIG_TOKEN: undefined,
+    NPM_ID_TOKEN: undefined,
+    GITHUB_ACTIONS: undefined,
+    ACTIONS_ID_TOKEN_REQUEST_URL: undefined,
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: undefined,
+  };
+
+  const packageDirFor = (name: string, files: Record<string, string> = {}) =>
+    tempDir("publish-oidc", { "package.json": JSON.stringify({ name, version: "1.0.0" }), ...files });
+
+  const exchangeOf = (name: string, authorization = `Bearer ${idToken}`) => ({
+    method: "POST",
+    path: `/-/npm/v1/oidc/token/exchange/package/${name}`,
+    authorization,
+  });
+  const needAuth = "error: missing authentication (run `bunx npm login`)\n";
+
+  test("GitHub Actions: requests an id token for the registry, exchanges it, and publishes with the result", async () => {
+    using mock = trustedPublishingMock();
+    using dir = packageDirFor("oidc-github-pkg");
+
+    const { out, err, exitCode } = await publish(
+      { ...cleanEnv, ...mock.githubActions },
+      String(dir),
+      "--registry",
+      mock.url,
+    );
+    expect(err).not.toContain("error:");
+    expect(out).toContain("Auth: trusted publishing (OIDC)\n");
+    expect(out).toContain(" + oidc-github-pkg@1.0.0");
+    expect(mock.requests).toEqual([
+      {
+        method: "GET",
+        path: "/id-token?api-version=2.0&audience=npm%3Alocalhost",
+        authorization: "Bearer github-request-token",
+      },
+      exchangeOf("oidc-github-pkg"),
+      { method: "PUT", path: "/oidc-github-pkg", authorization: `Bearer ${publishToken}` },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test.each([
+    ["where the CI puts it in the environment (GitLab CI, CircleCI)", false],
+    ["on GitHub Actions, where it replaces the request", true],
+  ])("NPM_ID_TOKEN is the id token %s", async (_, onGitHubActions) => {
+    using mock = trustedPublishingMock();
+    using dir = packageDirFor("oidc-env-pkg");
+
+    const { out, err, exitCode } = await publish(
+      { ...cleanEnv, ...(onGitHubActions ? mock.githubActions : {}), NPM_ID_TOKEN: "id-token-from-the-environment" },
+      String(dir),
+      "--registry",
+      mock.url,
+    );
+    expect(err).not.toContain("error:");
+    expect(out).toContain(" + oidc-env-pkg@1.0.0");
+    expect(mock.requests).toEqual([
+      exchangeOf("oidc-env-pkg", "Bearer id-token-from-the-environment"),
+      { method: "PUT", path: "/oidc-env-pkg", authorization: `Bearer ${publishToken}` },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a scoped package is exchanged at the registry of its scope, under its escaped name", async () => {
+    using defaultRegistry = trustedPublishingMock();
+    using scopeRegistry = trustedPublishingMock();
+    using dir = packageDirFor("@oidc/scoped-pkg", {
+      "bunfig.toml": `[install]\ncache = false\nregistry = "${defaultRegistry.url}"\n\n[install.scopes]\n"@oidc" = "${scopeRegistry.url}"\n`,
+    });
+
+    const { out, err, exitCode } = await publish({ ...cleanEnv, NPM_ID_TOKEN: idToken }, String(dir));
+    expect(err).not.toContain("error:");
+    expect(out).toContain(" + @oidc/scoped-pkg@1.0.0");
+    expect(defaultRegistry.requests).toEqual([]);
+    expect(scopeRegistry.requests).toEqual([
+      exchangeOf("@oidc%2fscoped-pkg"),
+      { method: "PUT", path: "/@oidc%2fscoped-pkg", authorization: `Bearer ${publishToken}` },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("the exchange is requested at the root of the registry's host, where npm requests it", async () => {
+    using mock = trustedPublishingMock();
+    using dir = packageDirFor("oidc-prefix-pkg");
+
+    const { out, err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "--registry",
+      `${mock.url}npm/registry/`,
+    );
+    expect(err).not.toContain("error:");
+    expect(out).toContain(" + oidc-prefix-pkg@1.0.0");
+    expect(mock.requests).toEqual([
+      exchangeOf("oidc-prefix-pkg"),
+      { method: "PUT", path: "/npm/registry/oidc-prefix-pkg", authorization: `Bearer ${publishToken}` },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("the exchanged token comes before a configured one", async () => {
+    using mock = trustedPublishingMock();
+    using dir = packageDirFor("oidc-placeholder-pkg");
+
+    const { out, err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "--registry",
+      `http://:XXXXX-XXXXX-XXXXX-XXXXX@localhost:${mock.port}/`,
+    );
+    expect(err).not.toContain("error:");
+    expect(out).toContain("Auth: trusted publishing (OIDC)\n");
+    expect(mock.requests).toEqual([
+      exchangeOf("oidc-placeholder-pkg"),
+      { method: "PUT", path: "/oidc-placeholder-pkg", authorization: `Bearer ${publishToken}` },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a refused exchange falls back to the configured token and says nothing", async () => {
+    using mock = trustedPublishingMock({ exchange: refused });
+    using dir = packageDirFor("oidc-fallback-pkg");
+
+    const { out, err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "--registry",
+      `http://:configured-token@localhost:${mock.port}/`,
+    );
+    expect(err).toBe("");
+    expect(out).not.toContain("Auth:");
+    expect(out).toContain(" + oidc-fallback-pkg@1.0.0");
+    expect(mock.requests).toEqual([
+      exchangeOf("oidc-fallback-pkg"),
+      { method: "PUT", path: "/oidc-fallback-pkg", authorization: "Bearer configured-token" },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a refused exchange with nothing configured fails with the registry's reason", async () => {
+    using mock = trustedPublishingMock({ exchange: refused });
+    using dir = packageDirFor("oidc-refused-pkg");
+
+    const { err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "--registry",
+      mock.url,
+    );
+    expect(err).toBe(
+      needAuth +
+        `note: trusted publishing (OIDC) failed: localhost:${mock.port} answered the token exchange for "oidc-refused-pkg" with HTTP 404: OIDC token exchange error - package not found\n`,
+    );
+    expect(mock.requests).toEqual([exchangeOf("oidc-refused-pkg")]);
+    expect(exitCode).toBe(1);
+  });
+
+  test("a refused exchange is reported when the registry then rejects the configured token", async () => {
+    using mock = trustedPublishingMock({
+      exchange: refused,
+      put: () => Response.json({ error: "invalid token" }, { status: 401 }),
+    });
+    using dir = packageDirFor("oidc-rejected-pkg");
+
+    const { err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "--registry",
+      `http://:XXXXX-XXXXX-XXXXX-XXXXX@localhost:${mock.port}/`,
+    );
+    expect(err).toStartWith(
+      `note: trusted publishing (OIDC) failed: localhost:${mock.port} answered the token exchange for "oidc-rejected-pkg" with HTTP 404: OIDC token exchange error - package not found\n`,
+    );
+    expect(err).toContain(`401 Unauthorized: http://localhost:${mock.port}/oidc-rejected-pkg`);
+    expect(err).toContain(" - invalid token");
+    expect(mock.requests).toEqual([
+      exchangeOf("oidc-rejected-pkg"),
+      { method: "PUT", path: "/oidc-rejected-pkg", authorization: "Bearer XXXXX-XXXXX-XXXXX-XXXXX" },
+    ]);
+    expect(exitCode).toBe(1);
+  });
+
+  test("a GitHub Actions job without the id-token permission sends nothing", async () => {
+    using mock = trustedPublishingMock();
+    using dir = packageDirFor("oidc-no-permission-pkg");
+
+    const { err, exitCode } = await publish(
+      { ...cleanEnv, GITHUB_ACTIONS: "true" },
+      String(dir),
+      "--registry",
+      mock.url,
+    );
+    expect(err).toBe(needAuth);
+    expect(mock.requests).toEqual([]);
+    expect(exitCode).toBe(1);
+  });
+
+  test("an id token request that GitHub Actions refuses is reported, and nothing is sent to the registry", async () => {
+    using mock = trustedPublishingMock({ idToken: () => new Response("Forbidden", { status: 403 }) });
+    using dir = packageDirFor("oidc-no-id-token-pkg");
+
+    const { err, exitCode } = await publish(
+      { ...cleanEnv, ...mock.githubActions },
+      String(dir),
+      "--registry",
+      mock.url,
+    );
+    expect(err).toBe(
+      needAuth + "note: trusted publishing (OIDC) failed: GitHub Actions answered the id token request with HTTP 403\n",
+    );
+    expect(mock.requests).toEqual([
+      {
+        method: "GET",
+        path: "/id-token?api-version=2.0&audience=npm%3Alocalhost",
+        authorization: "Bearer github-request-token",
+      },
+    ]);
+    expect(exitCode).toBe(1);
+  });
+
+  test("--dry-run does the exchange and stops before the upload", async () => {
+    using mock = trustedPublishingMock();
+    using dir = packageDirFor("oidc-dry-run-pkg");
+
+    const { out, err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "--dry-run",
+      "--registry",
+      mock.url,
+    );
+    expect(err).not.toContain("error:");
+    expect(out).toContain("Auth: trusted publishing (OIDC)\n");
+    expect(out).toContain(" + oidc-dry-run-pkg@1.0.0 (dry-run)");
+    expect(mock.requests).toEqual([exchangeOf("oidc-dry-run-pkg")]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a tarball is published the same way", async () => {
+    using mock = trustedPublishingMock();
+    using dir = packageDirFor("oidc-tarball-pkg");
+    await pack(String(dir), cleanEnv);
+
+    const { out, err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "./oidc-tarball-pkg-1.0.0.tgz",
+      "--registry",
+      mock.url,
+    );
+    expect(err).not.toContain("error:");
+    expect(out).toContain(" + oidc-tarball-pkg@1.0.0");
+    expect(mock.requests).toEqual([
+      exchangeOf("oidc-tarball-pkg"),
+      { method: "PUT", path: "/oidc-tarball-pkg", authorization: `Bearer ${publishToken}` },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("--tolerate-republish asks for the published versions with the exchanged token", async () => {
+    using mock = trustedPublishingMock({
+      packument: () => Response.json({ name: "oidc-republish-pkg", versions: { "1.0.0": {} } }),
+    });
+    using dir = packageDirFor("oidc-republish-pkg");
+
+    const { err, exitCode } = await publish(
+      { ...cleanEnv, NPM_ID_TOKEN: idToken },
+      String(dir),
+      "--tolerate-republish",
+      "--registry",
+      mock.url,
+    );
+    expect(err).toContain("Registry already knows about version 1.0.0; skipping.");
+    expect(mock.requests).toEqual([
+      exchangeOf("oidc-republish-pkg"),
+      { method: "GET", path: "/oidc-republish-pkg", authorization: `Bearer ${publishToken}` },
+    ]);
+    expect(exitCode).toBe(0);
+  });
+});
+
 describe("lifecycle scripts", async () => {
   const script = `const fs = require("fs");
     fs.writeFileSync(process.argv[2] + ".txt", \`
