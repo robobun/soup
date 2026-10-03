@@ -49,6 +49,7 @@ fn json_get_string_cloned<'b>(
 
 use crate::Command;
 use crate::cli::pack_command::{self as pack};
+use crate::cli::trusted_publishing;
 
 pub(crate) struct ReadmeInfo {
     pub filename: Vec<u8>,
@@ -836,14 +837,39 @@ impl PublishCommand {
     }
 
     fn publish(ctx: &Context<'_>) -> Result<(), PublishError> {
-        let registry = ctx.manager.scope_for_package_name(&ctx.package_name);
+        let configured = ctx.manager.scope_for_package_name(&ctx.package_name);
+
+        // npm's order: a token the registry issues to this CI job comes before the configured credentials, which a CI
+        // setup step fills with a placeholder when it has no secret to put there.
+        let mut trusted_publishing_failure: Option<Box<[u8]>> = None;
+        let trusted_scope = match trusted_publishing::exchange(configured, &ctx.package_name)? {
+            trusted_publishing::Exchange::Token(token) => {
+                let mut scope = configured.clone();
+                scope.token = token;
+                Some(scope)
+            }
+            trusted_publishing::Exchange::Failed(reason) => {
+                trusted_publishing_failure = Some(reason);
+                None
+            }
+            trusted_publishing::Exchange::NotOffered => None,
+        };
+        let registry = trusted_scope.as_ref().unwrap_or(configured);
         let registry_url = registry.url.url();
 
         if registry.token.is_empty()
             && registry.auth.is_empty()
             && (registry_url.password.is_empty() || registry_url.username.is_empty())
         {
-            return Err(PublishError::NeedAuth);
+            return Err(PublishError::NeedAuth {
+                trusted_publishing_failure,
+            });
+        }
+
+        if ctx.manager.options.log_level.is_verbose()
+            && let Some(reason) = trusted_publishing_failure.take()
+        {
+            trusted_publishing::print_failure(&reason);
         }
 
         let tolerate_republish = ctx.manager.options.publish_config.tolerate_republish;
@@ -880,6 +906,9 @@ impl PublishCommand {
             },
             bstr::BStr::new(strings::without_trailing_slash(&registry_href)),
         );
+        if trusted_scope.is_some() {
+            bun_core::pretty!("<b><blue>Auth<r>: trusted publishing (OIDC)\n");
+        }
 
         // dry-run stops here
         if ctx.manager.options.dry_run {
@@ -945,6 +974,11 @@ impl PublishCommand {
 
         match res.status_code() {
             400..=u32::MAX => {
+                // The registry turned the configured credentials down, and they were the second choice.
+                if let Some(reason) = &trusted_publishing_failure {
+                    trusted_publishing::print_failure(reason);
+                }
+
                 let prompt_for_otp = 'prompt_for_otp: {
                     if res.status_code() != 401 {
                         break 'prompt_for_otp false;
@@ -2061,7 +2095,10 @@ pub(crate) enum PublishError {
     #[error("OutOfMemory")]
     OutOfMemory,
     #[error("NeedAuth")]
-    NeedAuth,
+    NeedAuth {
+        /// Why trusted publishing produced no token, when it was tried.
+        trusted_publishing_failure: Option<Box<[u8]>>,
+    },
 }
 bun_core::oom_from_alloc!(PublishError);
 
@@ -2069,8 +2106,13 @@ impl PublishError {
     fn report_and_crash(self) -> ! {
         match self {
             PublishError::OutOfMemory => bun_core::out_of_memory(),
-            PublishError::NeedAuth => {
+            PublishError::NeedAuth {
+                trusted_publishing_failure,
+            } => {
                 Output::err_generic("missing authentication (run <cyan>`bunx npm login`<r>)", ());
+                if let Some(reason) = trusted_publishing_failure {
+                    trusted_publishing::print_failure(&reason);
+                }
                 Global::crash();
             }
         }

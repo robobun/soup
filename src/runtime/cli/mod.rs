@@ -400,6 +400,8 @@ pub(crate) mod publish_command;
 pub(crate) mod remove_command;
 #[path = "scan_command.rs"]
 pub(crate) mod scan_command;
+#[path = "trusted_publishing.rs"]
+pub(crate) mod trusted_publishing;
 mod typescript_libs;
 #[path = "unlink_command.rs"]
 pub(crate) mod unlink_command;

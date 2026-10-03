@@ -3958,6 +3958,123 @@ Files: `src/jsc/bindings/sqlite/JSStorage.cpp`, `src/jsc/bindings/sqlite/JSStora
 `test/js/third_party/wpt-webstorage/` (new), `test/js/third_party/wpt-testharness-shim.ts`,
 `test/integration/bun-types/fixture/globals.ts`.
 
+### 2026-10-02: npm trusted publishing (OIDC) for `bun publish`
+
+With npm's [trusted publishing](https://docs.npmjs.com/trusted-publishers) a CI job publishes
+without a stored token. The job shows the registry an OIDC id token, the registry knows which
+workflow of which repository may publish the package, and it answers with a publish token that
+lives for minutes. Long-lived npm tokens have been going away since 2025, so this is how a release
+workflow is meant to authenticate now. `bun publish` did not do it: on a job with
+`id-token: write` and no token it sent nothing and stopped with `error: missing authentication`
+(oven-sh/bun#22423), and the workflow needed `npm publish` for that one step. Now:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+steps:
+  - uses: actions/checkout@v4
+  - uses: oven-sh/setup-bun@v2
+  - run: bun install --frozen-lockfile
+  - run: bun publish
+```
+
+```sh
+bun publish
+# Tag: latest
+# Access: default
+# Registry: https://registry.npmjs.org/
+# Auth: trusted publishing (OIDC)
+#
+#  + my-package@1.0.0
+```
+
+The steps are those of the npm CLI (`lib/utils/oidc.js` and `lib/commands/publish.js`, read on its
+`latest` branch while this was written):
+
+1. The id token is `NPM_ID_TOKEN` when that is set, which is how GitLab CI (`id_tokens:`) and
+   CircleCI hand it over. Otherwise, on GitHub Actions, it is requested: a GET of
+   `$ACTIONS_ID_TOKEN_REQUEST_URL` with `audience=npm:<hostname of the registry>` added and
+   `$ACTIONS_ID_TOKEN_REQUEST_TOKEN` as the bearer. A job has those two variables only with the
+   `id-token: write` permission.
+2. The exchange is `POST /-/npm/v1/oidc/token/exchange/package/<name>` at the host of the registry
+   that the package goes to (the registry of its scope for a scoped package), with the id token as
+   the bearer and the name escaped as in the publish URL (`@scope%2fname`). Like npm, it asks at
+   the root of the host even when the registry URL has a path.
+3. The token in the answer is used for the upload, for the version lookup of
+   `--tolerate-republish` before it, and for an OTP retry.
+
+The exchange comes before configured credentials and replaces them when it succeeds, which is npm's
+order. The reason is the placeholder: `actions/setup-node` writes `_authToken=${NODE_AUTH_TOKEN}`
+and sets the variable to `XXXXX-XXXXX-XXXXX-XXXXX` when there is no secret, so "a token is
+configured" says little in CI. When the registry refuses the exchange, the configured credentials
+are used and nothing is printed. When there are none, or the registry then rejects them, the error
+carries the registry's reason. npm shows that only with `--verbose`, and it is the first thing one
+needs when a trusted publisher is set up wrong:
+
+```
+error: missing authentication (run `bunx npm login`)
+note: trusted publishing (OIDC) failed: registry.npmjs.org answered the token exchange for "my-package" with HTTP 404: OIDC token exchange error - package not found
+```
+
+`--dry-run` does the exchange and stops before the upload, as in npm, so a dry run in the release
+workflow tells whether the trusted publisher is right. `bun publish <tarball>` takes the same path.
+
+Where it differs from npm:
+
+- npm runs this only when `ci-info` says GitHub Actions, GitLab or CircleCI. Here `NPM_ID_TOKEN`
+  is enough wherever it is set, so a CI that npm's registry starts to accept needs no new release
+  of Bun. The request for a token is made on GitHub Actions only, as in npm.
+- npm prints nothing about a failed exchange below `--verbose`. Bun prints the one `note:` above
+  when the publish fails, and with `--verbose` also when it goes on with the configured token.
+- The `Auth:` line of the summary is new.
+- npm turns provenance on after a successful exchange from a public repository. Bun has no
+  `--provenance` (oven-sh/bun#30522 is open upstream for it), so a package that is published this
+  way has no attestation. The docs say so.
+
+What a publish that does not use it pays: two environment lookups, no allocation and no request.
+Requests are made only when an id token is on offer: one (the exchange) with `NPM_ID_TOKEN`, two
+on a GitHub Actions job with `id-token: write`. A job that has the permission for another reason
+and publishes with an ordinary token makes those two requests, gets a 404 from the exchange and
+goes on with its token, which is what it does with npm.
+
+The code is `src/runtime/cli/trusted_publishing.rs` (the two requests, and the sentence for each
+way they can fail) and about forty lines in `publish()`. The registry scope of the package is
+cloned with the exchanged token in it, so the upload, the lookup and the OTP flow read the token
+where they read a configured one, and nothing below `publish()` changed. The flow and the test plan
+follow oven-sh/bun#29374 by David Gilman, which did this for the Zig tree and was closed as stale
+when the tree became Rust. That PR tried the exchange only when no credentials were configured.
+This one tries it first, for the placeholder reason above.
+
+Tests are in `test/cli/install/bun-publish.test.ts`, next to the other tests that use a mock
+registry. One `Bun.serve` is GitHub's token endpoint and the registry, it records every request,
+and each test asserts the whole list: method, path and credential. They cover GitHub Actions end
+to end, `NPM_ID_TOKEN` with and without GitHub Actions around it, a scoped package with a scope
+registry, a registry URL with a path, a configured placeholder token, the three ways to fail with
+their exact stderr, a job without the permission (no request at all), `--dry-run`, a tarball and
+`--tolerate-republish`. With the released binary 13 of the 14 fail. The one that passes is the job
+without the permission, which must behave as before.
+
+Not done, and not checked. Provenance, as said above. It was not run against registry.npmjs.org,
+which needs a real package and a real CI identity: the requests are the ones the npm CLI makes,
+and the registry's answers are mocked. The two requests do not go through a proxy, like the upload
+itself. Built and tested on Linux x64 only. A design check was started twice before the code was
+written and both runs were cut off when the machine restarted, so the choices above are this
+commit's own, made against npm's source. No separate review pass read the diff either, for the
+same reason: the machine this was built on lost the work twice and spent hours unable to write to
+its disk, and the commit landed about twenty hours after the day's run began.
+
+Rebase notes: 44 patches onto oven-sh/bun 519963edc8, two textual conflicts, nothing dropped.
+oven-sh/bun#41985 appended a unit test at the end of `src/bun_core/string/immutable.rs`, where the
+"did you mean" patch of 2026-08-28 appends its own, and both were kept. oven-sh/bun#44352 shortened
+the error conversion on the line of `src/jsc/VirtualMachine.rs` where the `bun serve` patch of
+2026-09-19 renames the call it makes, and the renamed call got upstream's `?`. The rebased stack
+builds, and the fork's three workflows were green after the last push.
+
+Files: `src/runtime/cli/trusted_publishing.rs` (new), `src/runtime/cli/publish_command.rs`,
+`src/runtime/cli/mod.rs`, `src/bun_core/env_var.rs`, `docs/pm/cli/publish.mdx`,
+`test/cli/install/bun-publish.test.ts`.
+
 ## Dropped
 
 Nothing yet.

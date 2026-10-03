@@ -126,6 +126,69 @@ bun publish --otp 123456
   other automated workflows.
 </Note>
 
+## Trusted publishing
+
+`bun publish` supports npm [trusted publishing](https://docs.npmjs.com/trusted-publishers). A CI job proves its identity to the registry with an OIDC id token, and the registry answers with a short-lived token that can publish that one package. You store no npm token in the CI.
+
+Add a trusted publisher to the package on npmjs.com, then run `bun publish` from the workflow that it names. On GitHub Actions the job needs the `id-token: write` permission:
+
+```yaml .github/workflows/publish.yml icon="file-code"
+name: Publish
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun publish
+```
+
+On a CI that hands the id token over in the environment, such as GitLab CI and CircleCI, put it in `NPM_ID_TOKEN`. Its audience is `npm:` followed by the hostname of the registry:
+
+```yaml .gitlab-ci.yml icon="file-code"
+publish:
+  id_tokens:
+    NPM_ID_TOKEN:
+      aud: "npm:registry.npmjs.org"
+  script:
+    - bun install --frozen-lockfile
+    - bun publish
+```
+
+When the CI offers an id token, `bun publish` asks the registry that the package is published to (the registry of its scope, if one is configured) to exchange it, and prints `Auth: trusted publishing (OIDC)` when the publish uses the result:
+
+```txt
+Tag: latest
+Access: default
+Registry: https://registry.npmjs.org/
+Auth: trusted publishing (OIDC)
+
+ + my-package@1.0.0
+```
+
+The exchange comes before a configured token, as it does in npm. If the registry refuses it, Bun publishes with the configured token. If there is none, or the registry rejects that one too, the error ends with the reason the registry gave for refusing the exchange:
+
+```txt
+error: missing authentication (run `bunx npm login`)
+note: trusted publishing (OIDC) failed: registry.npmjs.org answered the token exchange for "my-package" with HTTP 404: OIDC token exchange error - package not found
+```
+
+`--dry-run` does the exchange and stops before the upload, so it checks the trusted publisher without publishing anything. Outside of CI nothing changes: without `NPM_ID_TOKEN`, and without the two `ACTIONS_ID_TOKEN_REQUEST_*` variables of a GitHub Actions job, `bun publish` sends no extra request.
+
+<Note>
+  `bun publish` does not create a provenance attestation. The npm CLI creates one for every trusted publish of a public
+  package from a public repository. A package that Bun publishes this way has none.
+</Note>
+
 ## `publishConfig`
 
 Besides `access` and `tag`, the `publishConfig` field of `package.json` can replace parts of the manifest that is published. A package in a monorepo can point `main`, `types` and `exports` at its TypeScript sources, so the other workspaces and the editor see changes without a build, and at the build output for everyone who installs it from the registry.
