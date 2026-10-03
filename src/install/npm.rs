@@ -388,6 +388,16 @@ pub mod registry {
             self.declared_in_npmrc = other.declared_in_npmrc;
         }
 
+        /// This scope with a token that the registry issued to this process for its credential
+        /// (`bun publish` with trusted publishing). The caller has checked the token.
+        pub fn with_issued_token(&self, token: Box<[u8]>) -> Scope {
+            debug_assert!(!http::async_http::breaks_header_line(&token));
+            let mut scope = self.clone();
+            scope.token = token;
+            scope.declared_in_npmrc = false;
+            scope
+        }
+
         pub(crate) fn set_token_from_env(&mut self, key: &[u8], token: &[u8]) -> crate::Result<()> {
             if http::async_http::breaks_header_line(token) {
                 return Err(refuse_credential(format_args!("${}", bstr::BStr::new(key))));
