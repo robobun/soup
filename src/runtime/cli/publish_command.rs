@@ -31,6 +31,7 @@ use bun_install::dependency::{self, TagExt as _};
 use crate::Command;
 use crate::cli::cli_dupe;
 use crate::cli::pack_command::{self as pack, PackError};
+use crate::cli::trusted_publishing;
 
 pub(crate) struct ReadmeInfo {
     pub filename: Vec<u8>,
@@ -541,7 +542,10 @@ impl PublishCommand {
                 let version = dependency::without_build_tag(version);
                 bun_core::handle_oom(manager.options.apply_publish_config(&root, &bump, &name));
                 let registry = manager.scope_for_package_name(&name);
-                Self::require_credentials(registry);
+                // An id token is traded for a publish token per package, in `publish`.
+                if !trusted_publishing::is_offered() {
+                    Self::require_credentials(registry, None);
+                }
                 let exists = Self::check_package_version_exists(manager, &name, version, registry);
                 bun_core::handle_oom(manager.options.set_publish_target(&cli_target));
                 if exists {
@@ -702,9 +706,16 @@ impl PublishCommand {
         manager.options.do_.recursive() || !manager.options.filter_patterns.is_empty()
     }
 
-    fn require_credentials(registry: &Npm::Registry::Scope) {
+    /// `trusted_publishing_failure`: why trusted publishing produced no token, when it was tried.
+    fn require_credentials(
+        registry: &Npm::Registry::Scope,
+        trusted_publishing_failure: Option<&[u8]>,
+    ) {
         if registry.authorization_parts(&registry.url.url()).is_none() {
             Output::err_generic("missing authentication (run <cyan>`bunx npm login`<r>)", ());
+            if let Some(reason) = trusted_publishing_failure {
+                trusted_publishing::print_failure(reason);
+            }
             Global::crash();
         }
     }
@@ -748,10 +759,29 @@ impl PublishCommand {
     /// Returns false if `--tolerate-republish` is set and the registry already had this
     /// `name@version`, so nothing was sent.
     fn publish(manager: &PackageManager, ctx: &Context) -> Result<bool, AllocError> {
-        let registry = manager.scope_for_package_name(&ctx.package_name);
+        let configured = manager.scope_for_package_name(&ctx.package_name);
+
+        // npm's order: a token the registry issues to this CI job comes before the configured credentials, which a CI
+        // setup step fills with a placeholder when it has no secret to put there.
+        let mut trusted_publishing_failure: Option<Box<[u8]>> = None;
+        let trusted_scope = match trusted_publishing::exchange(configured, &ctx.package_name)? {
+            trusted_publishing::Exchange::Token(token) => Some(configured.with_issued_token(token)),
+            trusted_publishing::Exchange::Failed(reason) => {
+                trusted_publishing_failure = Some(reason);
+                None
+            }
+            trusted_publishing::Exchange::NotOffered => None,
+        };
+        let registry = trusted_scope.as_ref().unwrap_or(configured);
         let registry_url = registry.url.url();
 
-        Self::require_credentials(registry);
+        Self::require_credentials(registry, trusted_publishing_failure.as_deref());
+
+        if manager.options.log_level.is_verbose()
+            && let Some(reason) = trusted_publishing_failure.take()
+        {
+            trusted_publishing::print_failure(&reason);
+        }
 
         if manager.options.publish_config.tolerate_republish {
             let version_without_build_tag = dependency::without_build_tag(&ctx.package_version);
@@ -781,6 +811,9 @@ impl PublishCommand {
             (manager.options.publish_config.access).map_or("default", Access::as_str),
             bun_fmt::escape_control_chars(strings::without_trailing_slash(&registry_href)),
         );
+        if trusted_scope.is_some() {
+            bun_core::pretty!("<b><blue>Auth<r>: trusted publishing (OIDC)\n");
+        }
 
         if manager.options.dry_run {
             return Ok(true);
@@ -810,6 +843,11 @@ impl PublishCommand {
 
         if res.status_code() < 400 {
             return Ok(true);
+        }
+
+        // The registry turned the configured credentials down, and they were the second choice.
+        if let Some(reason) = &trusted_publishing_failure {
+            trusted_publishing::print_failure(reason);
         }
 
         let prompt_for_otp = 'prompt_for_otp: {
