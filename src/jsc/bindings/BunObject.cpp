@@ -369,6 +369,12 @@ static JSValue createBunJWT(VM& vm, Zig::GlobalObject* globalObject)
     RELEASE_AND_RETURN(scope, BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalJwt, "Bun.JWT"));
 }
 
+static JSValue createBunQueue(VM& vm, Zig::GlobalObject* globalObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    RELEASE_AND_RETURN(scope, BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalQueue, "Bun.Queue", "Queue"_s));
+}
+
 JSValue constructBunFetchObject(VM& vm, JSObject* bunObject)
 {
     JSFunction* fetchFn = JSFunction::create(vm, bunObject->globalObject(), 1, "fetch"_s, JSC::removableFunction<Bun::Feature::Fetch, JSC::RemovedFeatureStub::Throw, Bun::Bindgen::Generated::Fetch::jsFetch>(), ImplementationVisibility::Public, NoIntrinsic);
@@ -462,6 +468,7 @@ static JSValue constructBunSQLObject(VM& vm, JSObject* bunObject)
     return checkedBunObjectValue(vm, bunObject, createBunSQLConstructor);
 }
 static JSValue constructBunJWTObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunJWT); }
+static JSValue constructBunQueueObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunQueue); }
 
 static JSValue constructDNSObject(VM& vm, JSObject* bunObject)
 {
@@ -1043,6 +1050,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     MD4                                            Bun::Bindgen::Generated::CryptoHasher::getMD4Constructor            DontDelete|PropertyCallback
     MD5                                            Bun::Bindgen::Generated::CryptoHasher::getMD5Constructor            DontDelete|PropertyCallback
     ModuleGraph                                    constructModuleGraphObject                                          DontDelete|ReadOnly|PropertyCallback
+    Queue                                          constructBunQueueObject                                             DontDelete|PropertyCallback
     SHA1                                           Bun::Bindgen::Generated::CryptoHasher::getSHA1Constructor           DontDelete|PropertyCallback
     SHA224                                         Bun::Bindgen::Generated::CryptoHasher::getSHA224Constructor         DontDelete|PropertyCallback
     SHA256                                         Bun::Bindgen::Generated::CryptoHasher::getSHA256Constructor         DontDelete|PropertyCallback
