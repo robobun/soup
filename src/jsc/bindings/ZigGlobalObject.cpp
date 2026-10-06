@@ -3527,6 +3527,23 @@ void GlobalObject::reload()
 {
     auto& vm = this->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
+
+    // The consumers of Bun.Queue were started by the modules that are about to be evaluated again.
+    // They stop here, as the jobs of Bun.cron do. Otherwise every reload adds a consumer, and the
+    // ones of before go on running the code of before.
+    if (JSValue queueModule = internalModuleRegistry()->internalField(Bun::InternalModuleRegistry::Field::InternalQueue).get(); queueModule && queueModule.isObject()) {
+        JSValue stopConsumers = queueModule.getObject()->get(this, Identifier::fromString(vm, "stopConsumers"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        JSC::CallData callData = JSC::getCallData(stopConsumers);
+        if (callData.type != JSC::CallData::Type::None) {
+            NakedPtr<JSC::Exception> returnedException = nullptr;
+            JSC::profiledCall(this, ProfilingReason::API, stopConsumers, callData, jsUndefined(), JSC::ArgList(), returnedException);
+            RETURN_IF_EXCEPTION(scope, );
+            if (returnedException) [[unlikely]]
+                this->reportUncaughtExceptionAtEventLoop(this, returnedException.get());
+        }
+    }
+
     this->clearModuleRegistry();
     RETURN_IF_EXCEPTION(scope, );
 

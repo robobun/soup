@@ -9559,6 +9559,303 @@ declare module "bun" {
     parse(expression: CronWithAutocomplete, relativeDate?: Date | number, options?: CronOptions): Date | null;
   };
 
+  /**
+   * A message queue kept in a SQLite database: in memory, or in a file that
+   * several processes can share.
+   *
+   * A message stays in the queue until a consumer acknowledges it. Delivery is
+   * at least once: a message whose consumer threw, or whose process died, is
+   * delivered again.
+   *
+   * The methods and their names follow
+   * [Cloudflare Queues](https://developers.cloudflare.com/queues/configuration/javascript-apis/).
+   *
+   * @example
+   * ```ts
+   * const emails = new Bun.Queue<{ to: string }>("emails", { path: "./queue.sqlite" });
+   *
+   * emails.consume(async batch => {
+   *   for (const message of batch.messages) {
+   *     await sendWelcomeEmail(message.body.to);
+   *     message.ack();
+   *   }
+   * });
+   *
+   * await emails.send({ to: "ada@example.com" });
+   * await emails.send({ to: "grace@example.com" }, { delaySeconds: 60 });
+   * ```
+   *
+   * @category Utilities
+   */
+  class Queue<Body = unknown> implements Disposable, AsyncDisposable {
+    /**
+     * @param name The name of the queue. One database holds any number of queues.
+     */
+    constructor(name: string, options?: Queue.Options);
+
+    /** The name this queue was made with. */
+    readonly name: string;
+
+    /**
+     * Add a message to the queue.
+     *
+     * The promise resolves when the message is written to the database.
+     *
+     * @example
+     * ```ts
+     * await queue.send({ userId: 42 });
+     * await queue.send({ userId: 42 }, { delaySeconds: 600 });
+     * await queue.send(new Map([["a", 1]]), { contentType: "v8" });
+     * ```
+     */
+    send(body: Body, options?: Queue.SendOptions): Promise<void>;
+
+    /**
+     * Add several messages to the queue in one transaction: all of them are
+     * sent, or none.
+     *
+     * @example
+     * ```ts
+     * await queue.sendBatch([{ body: "a" }, { body: "b", delaySeconds: 5 }]);
+     * ```
+     */
+    sendBatch(messages: Iterable<Queue.MessageSendRequest<Body>>, options?: Queue.SendBatchOptions): Promise<void>;
+
+    /**
+     * How many messages are in the queue, whether they wait, are delayed, or
+     * are being handled right now.
+     */
+    metrics(): Promise<Queue.Metrics>;
+
+    /**
+     * Deliver the messages of this queue to `handler`, in batches.
+     *
+     * When the handler returns, or the promise it returns is fulfilled, every
+     * message of the batch that was not retried is acknowledged and leaves the
+     * queue. When it throws, or the promise is rejected, every message that was
+     * not acknowledged is retried.
+     *
+     * A consumer keeps the process alive until it is stopped, like a server.
+     *
+     * @example
+     * ```ts
+     * const consumer = queue.consume(
+     *   async batch => {
+     *     for (const message of batch.messages) {
+     *       await handle(message.body);
+     *       message.ack();
+     *     }
+     *   },
+     *   { maxRetries: 5, retryDelay: attempts => 2 ** attempts, deadLetterQueue: "failed" },
+     * );
+     *
+     * await consumer.stop();
+     * ```
+     */
+    consume(
+      handler: (batch: Queue.MessageBatch<Body>) => unknown,
+      options?: Queue.ConsumerOptions<Body>,
+    ): Queue.Consumer;
+
+    /**
+     * Stop the consumers that were started from this object and close it.
+     *
+     * The promise resolves when the batches that were being handled are done.
+     * The messages stay in the queue.
+     */
+    close(): Promise<void>;
+
+    /** Calls {@link Queue.close} without waiting for it. */
+    [Symbol.dispose](): void;
+    /** Calls {@link Queue.close}. */
+    [Symbol.asyncDispose](): Promise<void>;
+  }
+
+  namespace Queue {
+    interface Options {
+      /**
+       * The SQLite file the queue is kept in. It is created when it does not
+       * exist, and switched to WAL mode. A relative path is resolved against
+       * the current directory.
+       *
+       * Without a path, or with `":memory:"`, the queue is kept in memory: it
+       * is shared by every `Bun.Queue` of this name in the same thread (in
+       * the same `Bun.ModuleGraph`, for code that runs in one), and gone when
+       * the process exits.
+       */
+      path?: string;
+    }
+
+    /**
+     * How the body of a message is stored.
+     *
+     * - `"json"` (the default): `JSON.stringify()` and `JSON.parse()`
+     * - `"text"`: a string, as it is
+     * - `"bytes"`: an `ArrayBuffer` or a view of one, delivered as a `Uint8Array`
+     * - `"v8"`: anything the structured clone algorithm can copy, for example a
+     *   `Date`, a `Map` or a `BigInt`. The bytes are JavaScriptCore's, like
+     *   those of `serialize()` in `bun:jsc`.
+     */
+    type ContentType = "json" | "text" | "bytes" | "v8";
+
+    interface SendOptions {
+      /** @default "json" */
+      contentType?: ContentType;
+      /**
+       * The number of seconds before the message can be delivered. A fraction
+       * is fine.
+       *
+       * @default 0
+       */
+      delaySeconds?: number;
+    }
+
+    interface SendBatchOptions {
+      /** The delay for every message of the batch that has none of its own. */
+      delaySeconds?: number;
+    }
+
+    interface MessageSendRequest<Body = unknown> {
+      body: Body;
+      /** @default "json" */
+      contentType?: ContentType;
+      /** The number of seconds before the message can be delivered. */
+      delaySeconds?: number;
+    }
+
+    interface Metrics {
+      /** The number of messages in the queue. */
+      backlogCount: number;
+      /** The size of their bodies, in bytes. */
+      backlogBytes: number;
+      /** When the oldest of them was sent, in milliseconds since the epoch. `0` for an empty queue. */
+      oldestMessageTimestamp: number;
+    }
+
+    interface RetryOptions {
+      /**
+       * The number of seconds before the message is delivered again. Defaults
+       * to the `retryDelay` of the consumer.
+       */
+      delaySeconds?: number;
+    }
+
+    interface Message<Body = unknown> {
+      /** A unique ID that the queue gave the message when it was sent. */
+      readonly id: string;
+      /** When the message was sent. */
+      readonly timestamp: Date;
+      readonly body: Body;
+      /** How many times the message has been delivered, this time included. Starts at 1. */
+      readonly attempts: number;
+      /**
+       * Acknowledge the message: it leaves the queue, whatever the handler
+       * does after this. It is written to the database before `ack()`
+       * returns.
+       */
+      ack(): void;
+      /**
+       * Have the message delivered again, whatever the handler does after this.
+       * It counts as one of the `maxRetries`, and is written to the database
+       * before `retry()` returns.
+       */
+      retry(options?: RetryOptions): void;
+    }
+
+    /**
+     * The first `ack()`, `retry()`, `ackAll()` or `retryAll()` that reaches a
+     * message decides it. Calls after that do nothing for that message.
+     */
+    interface MessageBatch<Body = unknown> {
+      /** The name of the queue. */
+      readonly queue: string;
+      readonly messages: readonly Message<Body>[];
+      /** Acknowledge every message of the batch that is not decided yet. */
+      ackAll(): void;
+      /** Retry every message of the batch that is not decided yet. */
+      retryAll(options?: RetryOptions): void;
+    }
+
+    interface ConsumerOptions<Body = unknown> {
+      /**
+       * The largest number of messages in one batch.
+       *
+       * @default 10
+       */
+      maxBatchSize?: number;
+      /**
+       * The number of seconds to wait for a batch to fill up before a smaller
+       * one is delivered. With `0` whatever is there is delivered at once.
+       *
+       * @default 0
+       */
+      maxBatchTimeout?: number;
+      /**
+       * How many times a message is delivered again after a delivery that
+       * failed. A message that used them up goes to `deadLetterQueue`, or is
+       * deleted when there is none.
+       *
+       * @default 3
+       */
+      maxRetries?: number;
+      /**
+       * The number of seconds before a message is delivered again, or a
+       * function that returns it for the number of deliveries so far.
+       *
+       * @default 0
+       *
+       * @example
+       * ```ts
+       * queue.consume(handler, { retryDelay: attempts => 2 ** attempts });
+       * ```
+       */
+      retryDelay?: number | ((attempts: number) => number);
+      /**
+       * How many batches the handler works on at the same time.
+       *
+       * @default 1
+       */
+      maxConcurrency?: number;
+      /**
+       * The name of the queue, in the same database, that gets the messages
+       * that used up their retries.
+       */
+      deadLetterQueue?: string;
+      /**
+       * The number of seconds after which the messages of a consumer that
+       * disappeared are delivered again. A consumer that is alive keeps the
+       * messages it works on for as long as the handler takes.
+       *
+       * @default 30
+       */
+      visibilityTimeout?: number;
+      /**
+       * Called with the error when the handler throws or rejects, and with
+       * any error of the queue itself, for which there is no `batch`.
+       *
+       * Without it the error is printed with `console.error()`. The consumer
+       * keeps running either way.
+       */
+      onError?: (error: unknown, batch?: MessageBatch<Body>) => void;
+    }
+
+    interface Consumer extends Disposable, AsyncDisposable {
+      /**
+       * Deliver no more batches. The promise resolves when the batches that
+       * were being handled are done and their outcome is written. If the
+       * database cannot be written then, `onError` is told and those messages
+       * are delivered again later.
+       *
+       * A handler can call this on its own consumer.
+       */
+      stop(): Promise<void>;
+      /** Keep the process alive while this consumer runs (the default). */
+      ref(): this;
+      /** Let the process exit while this consumer runs. */
+      unref(): this;
+    }
+  }
+
   /** Utility type for any process from {@link Bun.spawn()} with both stdout and stderr set to `"pipe"` */
   type ReadableSubprocess = Subprocess<any, "pipe", "pipe">;
   /** Utility type for any process from {@link Bun.spawn()} with stdin set to `"pipe"` */

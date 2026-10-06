@@ -128,7 +128,8 @@
               "/runtime/sql",
               "/runtime/sqlite",
               "/runtime/s3",
-              "/runtime/redis"
+              "/runtime/redis",
+              "/runtime/queue"
             ]
           },
           {

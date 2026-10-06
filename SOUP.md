@@ -4075,6 +4075,224 @@ Files: `src/runtime/cli/trusted_publishing.rs` (new), `src/runtime/cli/publish_c
 `src/runtime/cli/mod.rs`, `src/bun_core/env_var.rs`, `docs/pm/cli/publish.mdx`,
 `test/cli/install/bun-publish.test.ts`.
 
+### 2026-10-06: `Bun.Queue`, a message queue on SQLite
+
+"Run this job now or in ten minutes, run it again with a delay when it fails, and do not lose it
+when the process restarts" takes a queue library and a Redis or a Postgres today. oven-sh/bun#10931
+asks for the queue to be built in ("a simple task queue like Deno queues, which might work on top
+of sqlite"). With 96 upvotes it was the most wanted open request that nobody had a pull request
+for: the one attempt, oven-sh/bun#22678 for the Zig tree, kept its jobs in memory, had no retries
+and was closed unfinished. Now:
+
+```ts
+const emails = new Bun.Queue<{ to: string }>("emails", {
+  path: "./queue.sqlite",
+});
+
+emails.consume(
+  async batch => {
+    for (const message of batch.messages) {
+      await sendWelcomeEmail(message.body.to);
+      message.ack();
+    }
+  },
+  {
+    maxRetries: 5,
+    retryDelay: attempts => 2 ** attempts,
+    deadLetterQueue: "emails-failed",
+  },
+);
+
+await emails.send({ to: "ada@example.com" });
+await emails.send({ to: "grace@example.com" }, { delaySeconds: 600 });
+```
+
+The API is that of Cloudflare Queues, which is where upstream's newer APIs come from (`Bun.cron`,
+and the `Bun.DurableObject` of oven-sh/bun#42984): `send(body, { delaySeconds, contentType })`,
+`sendBatch()`, `metrics()`, and a handler that gets a `MessageBatch` whose messages have `id`,
+`timestamp`, `body`, `attempts`, `ack()` and `retry({ delaySeconds })`, with `ackAll()` and
+`retryAll()` on the batch. A handler that returns acknowledges what it did not retry, and one that
+throws retries what it did not acknowledge. The consumer settings of a `wrangler.toml` are the
+options of `consume()`: `maxBatchSize`, `maxBatchTimeout`, `maxRetries`, `retryDelay`,
+`maxConcurrency`, `deadLetterQueue`. The four content types are Cloudflare's too, JSON by default,
+`"v8"` for what only the structured clone algorithm can copy. The names and the rules were taken
+from Cloudflare's documentation and from workerd's `queue.c++` as they were on the day.
+
+Without a `path` the queue is in memory, shared by name inside the thread, and gone with the
+process. With one it is a SQLite file that any number of processes send to and consume from. A
+consumer keeps the process alive until `stop()`, which waits for the batches in flight, or
+`unref()`. `bun --hot` stops the consumers of the modules it is about to evaluate again, as it
+stops the jobs of `Bun.cron`: without that, the consumer of the previous version of the code kept
+taking the messages. Inside a `Bun.ModuleGraph` a queue is the graph's, as upstream's rule for
+everything a graph opens says: a graph has a connection of its own to a file, its queues in memory
+are not the host's, the timers and the handler of its consumers run in its context, and a consumer
+whose graph was disposed ends without a word.
+
+How it works. A message is one row of one table, `bun_queue(seq, queue, id, content_type, sent_at,
+visible_at, attempts, lease, bytes, body)`, and the row is deleted when the message is
+acknowledged. `visible_at` is when it may next be delivered: the end of its delay, of its retry
+delay, or of the lease of the consumer that has it. A consumer takes the messages with
+`visible_at <= now` in one `UPDATE ... RETURNING`, which sets a lease of `visibilityTimeout`
+seconds (30), counts the attempt and writes a random token, and every later write carries
+`AND lease = <token>`. So two consumers never get the same row, a message whose process was killed
+is simply there again when the lease has run out, and a consumer that lost its lease cannot
+acknowledge a message that somebody else has by then. A consumer that is alive extends its leases
+every third of the timeout, however long the handler takes. A message that was delivered
+`maxRetries + 1` times goes to the dead-letter queue (the row changes its queue and keeps its id
+and its timestamp) or is deleted, also when every one of those deliveries ended with the death of
+a process. `ack()` and `retry()` are written before they return, so a process that dies in the
+middle of a batch has kept what it acknowledged. SQLite cannot tell another process that a row
+arrived, so a consumer of a file reads the index every 100 milliseconds. In one thread, `send()`
+wakes the consumers of the queue. A write that SQLite refuses, because another program held the
+file for longer than the busy timeout of five seconds, is kept and written again later, with a
+growing pause between the tries, and reported once.
+
+The file is in WAL mode with `synchronous = NORMAL`: what `send()` resolved for survives the death
+of the process, and after a power failure the file is intact and can miss the last moments. The
+docs say that.
+
+Where it differs from Cloudflare, all of it listed in the docs. `maxBatchTimeout` is 0, not 5
+seconds, since five seconds before a lone job runs is not what one expects of a local queue, and
+`maxConcurrency` is 1. `ack()` and `retry()` take effect when they are called, where workerd
+collects them until the handler has returned. `send()` resolves to nothing, not to the metrics.
+The size of a message, of a batch and of a delay have no limit of their own, and durations can be
+fractions of a second. `retryDelay` can be a function of the attempts, `visibilityTimeout` and
+`onError` are new for a handler, and a handler error without `onError` is printed with
+`console.error()` and does not end the process.
+
+It is a TypeScript builtin on `bun:sqlite` (`src/js/internal/queue.ts`, 1,100 lines), loaded the
+first time `Bun.Queue` is read, the way `Bun.SQL` and this fork's `Bun.JWT` are. Two pieces are
+C++: the lazy property, and six lines in `GlobalObject::reload()` that call the module's
+`stopConsumers` if the module was ever loaded.
+
+What it costs. A program that does not use it: one more entry in the static table of the `Bun`
+object, the module in the binary (about 30 KB of source before minification in the debug build),
+and on a `--hot` reload one read of an internal field. A program that does, measured with the
+module's own source run as a user module on the released bun 1.4.3 on this machine (twelve
+cores, a virtual disk): `send()` to a file is as fast as a single-row `INSERT` was at the time,
+25,000 to 47,000 a second over the day with the bare `INSERT` at 30,000 to 50,000, and about
+200,000 a second in memory. `sendBatch()` of 100 wrote 150,000 to 370,000 messages a second to a
+file. A consumer with a handler that does nothing took 30,000 to 47,000 messages a second from a
+file in batches of 10 and 60,000 to 100,000 in batches of 100. `ack()` for each message in a loop
+makes each one a write of its own, about 15,000 a second from a file. `ackAll()` and the end of
+the handler are one write for the batch. A consumer of a file that has nothing to do wakes ten
+times a second, which was 5 to 7 milliseconds of processor time per second, most of it the waking
+itself. These are numbers of the JavaScript and the SQL, not of a release build of this commit,
+which was not made.
+
+Tests are `test/js/bun/queue/queue.test.ts`, 50 of them, all of which fail on the released
+binary: order and batches, the content types, delays, retries and their delays, dead letters, who
+wins between `ack()`, `retry()`, `ackAll()` and `retryAll()`, `maxConcurrency`,
+`maxBatchTimeout`, `stop()` and `close()` from outside and from inside a handler, validation, a
+file read back with `bun:sqlite`, rows that another program wrote, a lease that is extended, six
+processes that open one new file at the same moment (450 messages, none lost, none twice), a
+consumer process that is killed twice with SIGKILL and the message that then becomes a dead
+letter, a `Worker`, a `Bun.ModuleGraph` that is disposed, `bun --hot`, a database that refuses a
+write (a trigger stands in for it), and what keeps the process alive. Eleven of them are for
+what the reviews below found. Ten of those, and the `--hot` test, were run against the code with
+the fix taken out, and failed. The eleventh, that `ack()` is written before it returns, is for a
+fault that two readers measured. The types have a fixture,
+`test/integration/bun-types/fixture/queue.ts`.
+
+A design check was started before the code (where it should live: a TypeScript builtin, a native
+class on sqlite3 as in oven-sh/bun#42984, a layer on `Bun.redis`, or only a recipe in the docs, and
+which of Cloudflare's, Deno's and BullMQ's shapes). It was stopped after two hours and twenty
+minutes with 32 of about 150 of its agents done and no verdict, so the choices are this commit's
+own. The builtin was written as a user module first, and the multi-process and the crash
+behaviour were tried with the released binary before anything went into the tree.
+
+A review pass (four readers: the delivery logic, the SQL and several processes, the C++ and the
+tests, the docs and the types; the first of them returned nothing) found what follows, and all of
+it is fixed in this commit, the behaviours with tests. A handler without an `await` that called
+`stop()` on its own consumer did not end the round of deliveries: the handler ran for every
+message that was waiting, the consumer released its database twice, and the next `send()` on the
+same file said "Database has closed". The same from `onError`. A consumer whose handler held up
+the thread for longer than a lease took its own message a second time when a `send()` woke it
+before its timer did. The lease of a claim was measured from before the wait for the write lock,
+so with a lease shorter than that wait two processes could get one message. `ack()` was written
+in the microtask after the call, where the docs said at once: it is written before it returns
+now. `metrics()` read the body of every message to add up their sizes, 60 to 70 milliseconds for
+a thousand messages of 256 KB by the reader's measurement: the table has the size in a column of
+its own and the body as its last column now. A `maxBatchSize` of 2^63 or more passed the
+validation and then failed in SQL for ever, in a loop without a pause: it has to be a safe
+integer, and a consumer whose database does not answer waits between its tries, longer each time.
+A transaction that SQLite had already rolled back (a full disk) reported the failed `ROLLBACK` and
+not the error. `Bun.Queue` was missing from upstream's test that wants every property of `Bun`
+classified for `Bun.ModuleGraph`, which asked the question that the per-graph stores above answer.
+In the tests: a test that depended on 200 milliseconds not passing between two lines, two
+timeouts that were shorter than the ones CI gives, queue names that a second run in the same
+process got again, handlers that waited for ever when an assertion failed before them, and child
+processes that nobody ended when a test timed out. In the docs: a `Map` sent as JSON is not
+refused but arrives as `{}`, a batch is in the order of sending and not of becoming deliverable,
+a handler that blocks for most of a lease is enough for a second delivery, and so is a second
+consumer in the same process, and a queue in the application's own database needs a warning.
+
+A second pass, two readers over the code as it was after those fixes, found more, fixed here as
+well. The pause that lets the event loop run during a long backlog never happened: its ten
+milliseconds were counted anew by every round of deliveries, and the next round starts from a
+microtask, before any timer. 20,000 waiting messages and a handler without an `await` kept a
+`setInterval` from ticking for two seconds. `close()` did not wait for a consumer that was already
+stopping, and a second `close()` resolved before the first. A handler ran in the
+`AsyncLocalStorage` context of whoever had sent the message, and so did every later delivery
+from the timers armed there. A consumer that was stopping did not try a failed write again until
+its last batch ended, by which time the lease of an acknowledged message could be over. In
+memory, a batch that waited to fill did not notice the messages whose delay ended meanwhile.
+`onError` could stop the consumer from a place where a timer was armed right after. The consumer
+trusted `batch.messages` and `message.attempts`, which a handler can assign to. And four things
+had no test that failed without them: the check of the lease in every write, the transaction of
+`sendBatch()`, the whole path of a write that fails, and that pause. The readers ran the module
+through 2,000 rounds with injected `SQLITE_BUSY` and a matrix of 192 re-entrant calls, and found
+no lost wakeup, no store released twice and no handler called after `stop()` had resolved.
+
+Not done, and not checked.
+
+- A `send()` cannot be part of a transaction of the application, on any connection. On the
+  application's own database file it is worse than that: called while the application's
+  connection in the same thread has a write transaction open, it waits five seconds for a lock
+  that cannot be released and fails. The docs say so. Taking a `bun:sqlite` `Database` instead of
+  a path is the follow-up.
+- A claim and a retry change the size of the row (`lease` is NULL or a number), and SQLite then
+  writes the row again, body included. For a body beyond a page that is the whole body in the
+  WAL for every delivery: 8.5 MB for a message of 8 MB by the reader's measurement. The docs say
+  to send a reference instead.
+- Other processes are only found by the poll every 100 milliseconds, and an idle consumer of a
+  file pays for it. Watching the WAL file would do both better.
+- The retry of `SQLITE_BUSY` around the switch of a new file to WAL is tested only by chance.
+  Without it, one to three of ten processes that made the file together failed with the released
+  binary, but the test with its six processes still passed once when the retry was taken out.
+- No priorities, no way to list, remove or purge messages, no repeating jobs (`Bun.cron` can
+  send), no Redis or Postgres behind it, no exactly-once.
+- `"v8"` bodies are JavaScriptCore's serialization, whose format belongs to the version of Bun
+  that wrote it.
+- Built and run on Linux x64 only. macOS has the system's SQLite (3.39 on macOS 13), and the SQL
+  uses nothing newer than `RETURNING` (3.35), but it was not run there, and neither on Windows.
+- Under heavy load on this machine (36 busy loops on 12 cores) the two tests that start several
+  processes ran into the default timeout of five seconds of a local `bun test`. CI passes its own,
+  longer one.
+
+One thing is older than this commit and was found on the way, not fixed here. Under `bun --hot`,
+when the entry module throws, the timers that it had armed never fire, while a server that it had
+started keeps answering. The released bun 1.4.3 does the same. The fixture of the `--hot` test
+ran into it: its watchdog timer did not end a process whose module had failed, so the fixture
+catches the error and exits by itself.
+
+Rebase notes: 45 patches onto oven-sh/bun 13a98b0dbd, nothing dropped, one conflict.
+oven-sh/bun#44473 took version 34 of the runtime transpiler cache for a change of its own, which
+is the number the `import.meta.glob()` patch of 2026-09-12 had taken, so that patch bumps it to 35
+now. The rebased stack builds and the `import.meta.glob()` tests pass. Three older patches were
+amended in place: the ones that add `Bun.INI` (2026-08-19), `Bun.CSV` (2026-08-25) and `Bun.JWT`
+(2026-09-14) now name their property in upstream's "every property of Bun is classified" test of
+`test/js/bun/module-graph/module-graph-isolation.test.ts`. Upstream added that test with
+`Bun.ModuleGraph` on 2026-09-17 (oven-sh/bun#42590), and it has failed on this stack since, which
+nobody saw because the fork's three workflows do not run it. They were green after the last push,
+which was on 2026-10-03.
+
+Files: `src/js/internal/queue.ts` (new), `src/jsc/bindings/BunObject.cpp` (the property),
+`src/jsc/bindings/ZigGlobalObject.cpp` (`GlobalObject::reload()`), `packages/bun-types/bun.d.ts`,
+`docs/runtime/queue.mdx` (new), `docs/docs.json`, `docs/runtime/bun-apis.mdx`,
+`test/js/bun/queue/queue.test.ts` (new), `test/js/bun/module-graph/module-graph-isolation.test.ts`,
+`test/integration/bun-types/fixture/queue.ts` (new).
+
 ## Dropped
 
 Nothing yet.

@@ -337,6 +337,15 @@ static JSValue constructBunJWTObject(VM& vm, JSObject* bunObject)
     RELEASE_AND_RETURN(scope, globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::InternalJwt));
 }
 
+static JSValue constructBunQueueObject(VM& vm, JSObject* bunObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* globalObject = defaultGlobalObject(bunObject->globalObject());
+    JSValue queueModule = globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::InternalQueue);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, queueModule.getObject()->get(globalObject, Identifier::fromString(vm, "Queue"_s)));
+}
+
 extern "C" JSC::EncodedJSValue JSPasswordObject__create(JSGlobalObject*);
 
 static JSValue constructPasswordObject(VM& vm, JSObject* bunObject)
@@ -936,6 +945,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     MD4                                            BunObject_lazyPropCb_wrap_MD4                                       DontDelete|PropertyCallback
     MD5                                            BunObject_lazyPropCb_wrap_MD5                                       DontDelete|PropertyCallback
     ModuleGraph                                    constructModuleGraphObject                                          DontDelete|ReadOnly|PropertyCallback
+    Queue                                          constructBunQueueObject                                             DontDelete|PropertyCallback
     SHA1                                           BunObject_lazyPropCb_wrap_SHA1                                      DontDelete|PropertyCallback
     SHA224                                         BunObject_lazyPropCb_wrap_SHA224                                    DontDelete|PropertyCallback
     SHA256                                         BunObject_lazyPropCb_wrap_SHA256                                    DontDelete|PropertyCallback

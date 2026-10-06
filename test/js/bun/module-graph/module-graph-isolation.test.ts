@@ -3836,6 +3836,7 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
     sql: "owned",
     postgres: "owned",
     ModuleGraph: "owned", // nestedGraph: a graph made by a graph's code is stopped with it
+    Queue: "owned", // its database and the timers of its consumers
     dns: "job",
     file: "job",
     write: "job",
@@ -3966,7 +3967,8 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
     postgres: "postgres",
   };
   // Terminal: module-graph-io.test.ts. FetchSession: "the connections a Bun.FetchSession it made keeps alive are closed with it".
-  const elsewhere = ["Terminal", "FetchSession"];
+  // Queue: queue.test.ts, "a Bun.ModuleGraph has queues of its own, and its consumers stop when it is disposed".
+  const elsewhere = ["Terminal", "FetchSession", "Queue"];
   const owned = Object.keys(classified).filter(name => classified[name] === "owned");
   expect(owned.filter(name => !elsewhere.includes(name) && !(kindOf[name] in kinds))).toEqual([]);
 });
