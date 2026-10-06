@@ -349,6 +349,15 @@ static JSValue constructBunJWTObject(VM& vm, JSObject* bunObject)
     RELEASE_AND_RETURN(scope, globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::InternalJwt));
 }
 
+static JSValue constructBunQueueObject(VM& vm, JSObject* bunObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* globalObject = defaultGlobalObject(bunObject->globalObject());
+    JSValue queueModule = globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::InternalQueue);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, queueModule.getObject()->get(globalObject, Identifier::fromString(vm, "Queue"_s)));
+}
+
 JSValue constructBunFetchObject(VM& vm, JSObject* bunObject)
 {
     JSFunction* fetchFn = JSFunction::create(vm, bunObject->globalObject(), 1, "fetch"_s, Bun::Bindgen::Generated::Fetch::jsFetch, ImplementationVisibility::Public, NoIntrinsic);
@@ -958,6 +967,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     MD4                                            Bun::Bindgen::Generated::CryptoHasher::getMD4Constructor            DontDelete|PropertyCallback
     MD5                                            Bun::Bindgen::Generated::CryptoHasher::getMD5Constructor            DontDelete|PropertyCallback
     ModuleGraph                                    constructModuleGraphObject                                          DontDelete|ReadOnly|PropertyCallback
+    Queue                                          constructBunQueueObject                                             DontDelete|PropertyCallback
     SHA1                                           Bun::Bindgen::Generated::CryptoHasher::getSHA1Constructor           DontDelete|PropertyCallback
     SHA224                                         Bun::Bindgen::Generated::CryptoHasher::getSHA224Constructor         DontDelete|PropertyCallback
     SHA256                                         Bun::Bindgen::Generated::CryptoHasher::getSHA256Constructor         DontDelete|PropertyCallback
