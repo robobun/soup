@@ -1,0 +1,316 @@
+---
+title: Queue
+description: A built-in message queue on SQLite, with delays, retries and dead-letter queues
+---
+
+`Bun.Queue` is a message queue kept in a SQLite database. Send a message now or with a delay, handle it in the same process or in another one, and have it delivered again when the handler fails or the process dies. There is no server to run and nothing to install.
+
+```ts title="queue.ts" icon="/icons/typescript.svg"
+const emails = new Bun.Queue<{ to: string }>("emails", { path: "./queue.sqlite" });
+
+emails.consume(async batch => {
+  for (const message of batch.messages) {
+    await sendWelcomeEmail(message.body.to);
+    message.ack();
+  }
+});
+
+await emails.send({ to: "ada@example.com" });
+await emails.send({ to: "grace@example.com" }, { delaySeconds: 60 });
+```
+
+The methods and their names follow [Cloudflare Queues](https://developers.cloudflare.com/queues/configuration/javascript-apis/): `send()`, `sendBatch()`, and a handler that gets a batch of messages with `ack()` and `retry()`. [What is different](#differences-from-cloudflare-queues) is listed at the end.
+
+---
+
+## Create a queue
+
+```ts
+// In a file. The file is created when it does not exist.
+const jobs = new Bun.Queue("jobs", { path: "./queue.sqlite" });
+
+// In memory
+const scratch = new Bun.Queue("scratch");
+```
+
+A queue has a name, and one database holds any number of queues. Two `Bun.Queue` objects with the same name and the same database are the same queue.
+
+|                                         | `path: "./queue.sqlite"`      | No `path`                    |
+| --------------------------------------- | ----------------------------- | ---------------------------- |
+| Messages after the process exits        | Kept                          | Gone                         |
+| Shared with other processes             | Yes                           | No                           |
+| Shared with [Workers](/runtime/workers) | Yes                           | No, every thread has its own |
+| A message sent in the same thread       | Delivered at once             | Delivered at once            |
+| A message sent by another process       | Delivered within about 100 ms | Does not apply               |
+
+A relative path is resolved against the current directory when the queue is made. The file is an ordinary SQLite database in [WAL mode](https://www.sqlite.org/wal.html) with one table, `bun_queue`, so you can look at a queue with any SQLite tool:
+
+```sh
+sqlite3 queue.sqlite "SELECT queue, count(*) FROM bun_queue GROUP BY queue"
+```
+
+You can give it the path of a database your application already uses. `Bun.Queue` opens its own connection, adds its table, and switches the file to WAL mode. A `send()` is not part of a transaction of yours, and it cannot wait for one: do not call `send()`, and do not make the queue, while your own connection in the same thread has a write transaction open on that file. The write would wait five seconds for a lock that cannot be released in that time, and then fail.
+
+Inside a [`Bun.ModuleGraph`](/runtime/module-graph), a queue is the graph's. Its queues in memory are not those of the host or of another graph, and `dispose()` stops the consumers that the graph's code started.
+
+<Note>
+  Keep large payloads out of the queue and send a reference to them. Each delivery rewrites the row of a message, and a
+  body of more than a few kilobytes is rewritten with it.
+</Note>
+
+---
+
+## Send messages
+
+```ts
+await queue.send({ userId: 42, action: "resize" });
+
+// Deliver in ten minutes at the earliest
+await queue.send({ userId: 42, action: "remind" }, { delaySeconds: 600 });
+
+// Several messages in one transaction: all of them are sent, or none
+await queue.sendBatch([{ body: { userId: 1 } }, { body: { userId: 2 }, delaySeconds: 5 }]);
+```
+
+`send()` and `sendBatch()` return a promise that resolves when the message is written to the database. `sendBatch()` takes any iterable, and a `delaySeconds` in its second argument applies to every message that has none of its own.
+
+### Content types
+
+A body is stored as JSON unless you say otherwise.
+
+| `contentType` | Body                                                                                                                                            | Delivered as   |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| `"json"`      | Anything `JSON.stringify()` can serialize (the default)                                                                                         | `JSON.parse()` |
+| `"text"`      | A string                                                                                                                                        | The string     |
+| `"bytes"`     | An `ArrayBuffer`, a typed array or a `DataView`                                                                                                 | A `Uint8Array` |
+| `"v8"`        | Anything the [structured clone algorithm](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm) can copy | The same value |
+
+```ts
+await queue.send(new Map([["sentAt", new Date()]]), { contentType: "v8" });
+```
+
+JSON turns a `Date` into a string and a `Map` into `{}`, and a `BigInt` or `undefined` cannot be sent as JSON at all. `"v8"` keeps all of them. It is named after Cloudflare's content type: the bytes are the ones that `serialize()` of [`bun:jsc`](/runtime/utils) writes, which only Bun reads. A body that does not fit its content type is rejected by `send()`, and nothing is stored.
+
+---
+
+## Consume messages
+
+```ts
+const consumer = queue.consume(async batch => {
+  for (const message of batch.messages) {
+    console.log(message.id, message.timestamp, message.attempts, message.body);
+  }
+});
+```
+
+`consume()` starts delivering the messages of the queue to the handler, up to `maxBatchSize` of them at a time. The messages that became deliverable first are taken first, and a batch has its messages in the order they were sent. A message has
+
+- `id`: a unique ID that the queue gave it,
+- `timestamp`: the `Date` it was sent,
+- `body`: what was sent,
+- `attempts`: how many times it has been delivered, this time included.
+
+The handler is called with no `AsyncLocalStorage` context: not the one of the code that sent the message, and not the one of the code that called `consume()`.
+
+What happens to the messages of a batch depends on how the handler ends:
+
+- **It returns**, or the promise it returns is fulfilled: the messages are acknowledged. They leave the queue.
+- **It throws**, or the promise is rejected: the messages are retried. They are delivered again, after `retryDelay`.
+
+### `ack()` and `retry()`
+
+A handler can decide each message on its own. `message.ack()` takes the message out of the queue whatever happens next, and `message.retry()` has it delivered again whatever happens next.
+
+```ts
+queue.consume(async batch => {
+  for (const message of batch.messages) {
+    const response = await fetch("https://api.example.com/jobs", {
+      method: "POST",
+      body: JSON.stringify(message.body),
+    });
+    if (response.ok) {
+      message.ack(); // done, even if a later message makes the handler throw
+    } else if (response.status === 429) {
+      message.retry({ delaySeconds: 30 }); // later, and the rest of the batch goes on
+    } else {
+      throw new Error(`${response.status} for message ${message.id}`);
+    }
+  }
+});
+```
+
+Acknowledge each message when its work is done if doing the work twice would be a problem. Without the `ack()` above, a failure on the eighth message of a batch has all ten delivered again.
+
+`batch.ackAll()` and `batch.retryAll()` do the same for every message of the batch that is not decided yet. The first of `ack()`, `retry()`, `ackAll()` and `retryAll()` that reaches a message decides it, and later calls do nothing for that message.
+
+`ack()` and `retry()` are written to the database before they return, not when the handler does. A process that dies in the middle of a batch has kept what it acknowledged.
+
+### Retries and dead-letter queues
+
+A message is delivered again at most `maxRetries` times, three by default. After that it goes to the queue named by `deadLetterQueue`, or it is deleted when there is none.
+
+```ts
+queue.consume(handler, {
+  maxRetries: 5,
+  retryDelay: attempts => 2 ** attempts, // 2, 4, 8, ... seconds
+  deadLetterQueue: "jobs-failed",
+});
+
+// A dead-letter queue is a queue like any other
+const failed = new Bun.Queue("jobs-failed", { path: "./queue.sqlite" });
+failed.consume(batch => {
+  for (const message of batch.messages) console.error("gave up on", message.id, message.body);
+});
+```
+
+`retryDelay` is a number of seconds, or a function that returns one for the number of deliveries so far. `message.retry({ delaySeconds })` and `batch.retryAll({ delaySeconds })` take precedence over it. A message that arrives in a dead-letter queue keeps its `id` and its `timestamp`, and its `attempts` start at 1 again.
+
+<Warning>Without a `deadLetterQueue`, a message that has failed `maxRetries + 1` times is deleted.</Warning>
+
+### Errors
+
+When the handler fails, the error goes to `onError` together with the batch. Without `onError` it is printed with `console.error()`. The consumer keeps running either way.
+
+```ts
+queue.consume(handler, {
+  onError(error, batch) {
+    log.error({ error, queue: batch?.queue, ids: batch?.messages.map(message => message.id) });
+  },
+});
+```
+
+`onError` is also called, without a batch, for errors of the queue itself: a database that cannot be written, or a message whose body cannot be read.
+
+### Batches and concurrency
+
+```ts
+queue.consume(handler, {
+  maxBatchSize: 100, // up to 100 messages in a batch (default 10)
+  maxBatchTimeout: 2, // wait up to 2 seconds for a batch to fill (default 0)
+  maxConcurrency: 4, // handle 4 batches at the same time (default 1)
+});
+```
+
+With the default `maxBatchTimeout` of `0` a message is delivered as soon as the consumer is free, so batches are small when the queue is nearly empty and full when it is behind. Set it when one large write is better than many small ones, for example when the handler inserts the whole batch into a database.
+
+With `maxConcurrency: 1` the batches are handled one after the other, in the order their messages became deliverable. A higher value runs the handler for several batches at once. A retried message usually goes behind the ones that were already waiting, and with a `retryDelay` of `0` it can come back first. Do not build on the order of messages.
+
+### Stop
+
+A consumer keeps the process alive, as a server does.
+
+```ts
+await consumer.stop(); // no more batches, and wait for the ones in flight
+consumer.unref(); // or: let the process exit while the consumer runs
+```
+
+`stop()` returns a promise that resolves when the batches that were being handled are done and their outcome is written. If the database cannot be written at that moment, `onError` is told, and those messages are delivered again later. `queue.close()` stops every consumer that was started from that object, and resolves the same way. A handler can call `stop()` on its own consumer. Both objects work with `using` and `await using`.
+
+```ts
+process.on("SIGTERM", async () => {
+  await consumer.stop();
+  process.exit(0);
+});
+```
+
+Under [`bun --hot`](/runtime/watch-mode), the consumers stop when Bun evaluates your modules again, and the `consume()` calls in them start new ones. A batch that is in flight at that moment finishes with the handler it started with.
+
+---
+
+## Delivery
+
+**At least once.** A message is in the queue until it is acknowledged. A consumer takes a message for `visibilityTimeout` seconds (30 by default) and extends that for as long as its handler runs. When the process of a consumer disappears, nobody extends it, and the message is delivered again to the next consumer once the time is up, with `attempts` one higher.
+
+```ts
+queue.consume(handler, { visibilityTimeout: 120 });
+```
+
+So a message can be delivered more than once: when a handler fails after it did part of its work, when a process dies before its acknowledgement is written, or when a handler blocks the event loop for most of `visibilityTimeout` while another consumer, in this process or in another one, takes messages of the same queue. If that matters, make the work idempotent, for example with `message.id` as a unique key.
+
+**Several processes.** Any number of processes can send to and consume from the same file. A message goes to one consumer. SQLite cannot notify another process, so a consumer looks for new messages every 100 milliseconds. Within one thread `send()` wakes the consumers of that queue directly.
+
+SQLite lets one connection write at a time, and a write waits for the one before it, with the thread. Between queues that wait is short. If something else keeps a write transaction open on the file for more than five seconds, `send()` rejects with `SQLITE_BUSY`, and a consumer reports the error to `onError` and writes its outcome again afterwards.
+
+**What a crash keeps.** A file-backed queue survives a crash of the process: what `send()` has resolved for is in the file. The database runs with `synchronous = NORMAL`, so after a power failure or a crash of the operating system the queue is intact, but the sends of the last moments before it can be missing.
+
+---
+
+## Metrics
+
+```ts
+const { backlogCount, backlogBytes, oldestMessageTimestamp } = await queue.metrics();
+```
+
+| Field                    | Description                                                                                    |
+| ------------------------ | ---------------------------------------------------------------------------------------------- |
+| `backlogCount`           | The number of messages in the queue: waiting, delayed, or being handled right now              |
+| `backlogBytes`           | The size of their bodies in bytes                                                              |
+| `oldestMessageTimestamp` | When the oldest of them was sent, in milliseconds since the epoch. `0` when the queue is empty |
+
+---
+
+## Reference
+
+```ts
+class Queue<Body = unknown> {
+  constructor(name: string, options?: { path?: string });
+  readonly name: string;
+  send(body: Body, options?: { contentType?: ContentType; delaySeconds?: number }): Promise<void>;
+  sendBatch(
+    messages: Iterable<{ body: Body; contentType?: ContentType; delaySeconds?: number }>,
+    options?: { delaySeconds?: number },
+  ): Promise<void>;
+  metrics(): Promise<{ backlogCount: number; backlogBytes: number; oldestMessageTimestamp: number }>;
+  consume(handler: (batch: MessageBatch<Body>) => unknown, options?: ConsumerOptions<Body>): Consumer;
+  close(): Promise<void>;
+}
+
+type ContentType = "json" | "text" | "bytes" | "v8";
+
+interface MessageBatch<Body> {
+  readonly queue: string;
+  readonly messages: readonly Message<Body>[];
+  ackAll(): void;
+  retryAll(options?: { delaySeconds?: number }): void;
+}
+
+interface Message<Body> {
+  readonly id: string;
+  readonly timestamp: Date;
+  readonly body: Body;
+  readonly attempts: number;
+  ack(): void;
+  retry(options?: { delaySeconds?: number }): void;
+}
+
+interface ConsumerOptions<Body> {
+  maxBatchSize?: number; // 10
+  maxBatchTimeout?: number; // seconds, 0
+  maxRetries?: number; // 3
+  retryDelay?: number | ((attempts: number) => number); // seconds, 0
+  maxConcurrency?: number; // 1
+  deadLetterQueue?: string;
+  visibilityTimeout?: number; // seconds, 30
+  onError?: (error: unknown, batch?: MessageBatch<Body>) => void;
+}
+
+interface Consumer {
+  stop(): Promise<void>;
+  ref(): this;
+  unref(): this;
+}
+```
+
+Every duration is in seconds, and a fraction is fine: `delaySeconds: 0.5`.
+
+### Differences from Cloudflare Queues
+
+The producer methods, the batch and the messages have the shape of Cloudflare's `Queue` binding and `queue()` handler, so that code written for one needs few changes for the other. These are the differences:
+
+- The consumer settings are options of `consume()` in camelCase (`maxBatchSize` for `max_batch_size`), not entries of a configuration file.
+- `maxBatchTimeout` is `0` by default, not 5 seconds, and `maxConcurrency` is `1`, where Cloudflare scales consumers up on its own.
+- `send()` and `sendBatch()` resolve to nothing. Cloudflare's resolve to the metrics of the queue, which `metrics()` returns here.
+- `ack()` and `retry()` take effect when they are called. On Cloudflare they take effect when the handler has returned.
+- The size of a message is limited by SQLite only (1 GB for a value), and the number of messages in a batch and the length of a delay are not limited. A message is kept until it is consumed. Cloudflare limits a message to 128 KB, a batch to 100 messages and a delay to 24 hours, and keeps a message for 4 days by default.
+- `retryDelay` can be a function. `onError`, `stop()`, `ref()` and `unref()` exist only here, and so does `visibilityTimeout` for a handler: on Cloudflare only pull consumers have a visibility timeout.
+- The handler gets the batch and nothing else: no `env`, no `ctx` and no `waitUntil()`. What it starts keeps running after it returns.
