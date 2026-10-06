@@ -56,7 +56,7 @@ new console.Console(process.stdout).log.name: refused: console.Console was not c
 typeof console.Console: refused: console.Console was not compiled into this executable because your code never uses it. To keep it, use it somewhere in your code. (bun compile differs from bun run here: https://bun.com/docs/compiler/compatibility)
 (object => Reflect.ownKeys(object).filter(key => { try { object[key]; return false; } catch { return true; } }).map(String).sort().join())(process): allowedNodeEnvironmentFlags,finalization
 (object => Reflect.ownKeys(object).filter(key => { try { object[key]; return false; } catch { return true; } }).map(String).sort().join())(console): Console
-(object => Reflect.ownKeys(object).filter(key => { try { object[key]; return false; } catch { return true; } }).map(String).sort().join())(Bun): $,JWT,SQL,postgres,sql
+(object => Reflect.ownKeys(object).filter(key => { try { object[key]; return false; } catch { return true; } }).map(String).sort().join())(Bun): $,JWT,Queue,SQL,postgres,sql
 typeof process.finalization.register: refused: process.finalization was not compiled into this executable because your code never uses it. To keep it, use it somewhere in your code. (bun compile differs from bun run here: https://bun.com/docs/compiler/compatibility)
 typeof process.allowedNodeEnvironmentFlags.has: refused: process.allowedNodeEnvironmentFlags was not compiled into this executable because your code never uses it. To keep it, use it somewhere in your code. (bun compile differs from bun run here: https://bun.com/docs/compiler/compatibility)
 typeof process.loadEnvFile: function
