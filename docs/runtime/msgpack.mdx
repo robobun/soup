@@ -1,0 +1,202 @@
+---
+title: MessagePack
+description: Encode and decode MessagePack with Bun's built-in codec
+---
+
+Bun has a built-in encoder and decoder for [MessagePack](https://msgpack.org). MessagePack is a binary format for the values JSON holds. It also has types for binary data, timestamps and 64-bit integers, and most languages have a library for it. Bun implements the codec in C++, so it needs no dependencies.
+
+```ts
+const bytes = Bun.msgpack.encode({ id: 1, tags: ["a", "b"], at: new Date("2026-10-07T08:00:00Z") });
+// Uint8Array(24). The same value is 57 bytes of JSON.
+
+Bun.msgpack.decode(bytes);
+// { id: 1, tags: ["a", "b"], at: 2026-10-07T08:00:00.000Z }
+```
+
+---
+
+## `Bun.msgpack.encode()`
+
+`encode()` takes a value and returns its bytes as a `Uint8Array`.
+
+```ts
+import { msgpack } from "bun";
+
+const bytes = msgpack.encode({
+  name: "bun",
+  size: 123456789012n,
+  icon: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+  released: new Date("2022-07-05"),
+});
+
+await Bun.write("package.msgpack", bytes);
+```
+
+Where MessagePack has no type of its own, `encode()` follows `JSON.stringify()`:
+
+- It leaves out a property whose value is `undefined`, a function or a symbol.
+- It writes nil for those values in an array.
+- It calls `toJSON()`.
+- It throws a `TypeError` for a cycle.
+
+`encode()` writes the values JSON cannot hold in their MessagePack type:
+
+| JavaScript                              | MessagePack                                                               |
+| --------------------------------------- | ------------------------------------------------------------------------- |
+| `null`, `undefined`                     | nil                                                                       |
+| `boolean`                               | bool                                                                      |
+| `number` that is a safe integer         | the smallest int format that holds it                                     |
+| any other `number`                      | float 64, including `NaN` and `Infinity`                                  |
+| `bigint`                                | uint 64 or int 64. A `RangeError` if it does not fit in 64 bits           |
+| `string`                                | str, as UTF-8                                                             |
+| `TypedArray`, `DataView`, `ArrayBuffer` | bin, with the bytes of the view                                           |
+| `Array`, `Set`                          | array                                                                     |
+| `Map`                                   | map. Keys can be of any type                                              |
+| `Date`                                  | timestamp extension. An invalid `Date` is nil                             |
+| [`Extension`](#bun-msgpack-extension)   | ext                                                                       |
+| any other object                        | map of its own enumerable string-keyed properties, in `Object.keys` order |
+
+`encode()` writes `-0` as the integer `0`, as `JSON.stringify()` does.
+
+---
+
+## `Bun.msgpack.decode()`
+
+`decode()` reads exactly one value from a `TypedArray`, `DataView`, `ArrayBuffer` or `Buffer`.
+
+```ts
+import { msgpack } from "bun";
+
+const value = msgpack.decode(await Bun.file("package.msgpack").bytes());
+// { name: "bun", size: 123456789012, icon: Uint8Array(4) [137, 80, 78, 71], released: 2022-07-05T00:00:00.000Z }
+```
+
+| MessagePack        | JavaScript                                                                                    |
+| ------------------ | --------------------------------------------------------------------------------------------- |
+| nil                | `null`                                                                                        |
+| bool               | `boolean`                                                                                     |
+| int, up to 32 bits | `number`                                                                                      |
+| int 64, uint 64    | `number` while it is a safe integer, `bigint` beyond                                          |
+| float 32, float 64 | `number`                                                                                      |
+| str                | `string`. Bytes that are not UTF-8 become U+FFFD, as for `TextDecoder`                        |
+| bin                | `Uint8Array` that shares no memory with the input                                             |
+| array              | `Array`                                                                                       |
+| map                | `Object`. A number key becomes a string, as for a property. Any other type of key is an error |
+| timestamp          | `Date`. `decode()` drops the nanoseconds beyond the millisecond                               |
+| other ext          | [`Extension`](#bun-msgpack-extension)                                                         |
+
+MessagePack does not record whether an integer was a `BigInt`. A `BigInt` that `encode()` wrote comes back as a `number` when it is a safe integer, as `size` does in the example above.
+
+`decode()` makes a map key named `__proto__` an ordinary property, as `JSON.parse()` does. The key does not change the prototype of the object.
+
+### Error handling
+
+`decode()` throws a `SyntaxError` when the input is not MessagePack, ends inside the value, or continues after it.
+
+```ts
+try {
+  Bun.msgpack.decode(new Uint8Array([0x92, 0x01]));
+} catch (error) {
+  console.error(error); // SyntaxError: Unexpected end of MessagePack data
+}
+```
+
+`decode()` checks every length against the bytes that are left before it allocates. A few bytes that announce an array of four billion elements are a `SyntaxError`, not an allocation. The stack limits how deep values can nest, and `decode()` throws a `RangeError` beyond that.
+
+---
+
+## `Bun.msgpack.decodeChunk()`
+
+In a MessagePack stream the values follow each other without a separator. `decodeChunk()` decodes the values that are complete. It reports where the first incomplete value starts, so you know which bytes to keep until more arrive.
+
+```ts
+// 1, "a", and the first two bytes of an array of two
+const chunk = new Uint8Array([0x01, 0xa1, 0x61, 0x92, 0x01]);
+
+const result = Bun.msgpack.decodeChunk(chunk);
+console.log(result.values); // [1, "a"]
+console.log(result.read); // 3, the offset of the incomplete value
+console.log(result.done); // false
+console.log(result.error); // null
+```
+
+### Return value
+
+`decodeChunk()` returns an object with four properties:
+
+| Property | Type                  | Description                                                               |
+| -------- | --------------------- | ------------------------------------------------------------------------- |
+| `values` | `unknown[]`           | The values that were complete                                             |
+| `read`   | `number`              | The offset in the input after the last complete value                     |
+| `done`   | `boolean`             | `true` if `decodeChunk()` decoded all of the input                        |
+| `error`  | `SyntaxError \| null` | Set if the input is not MessagePack at `read`. `values` has what precedes |
+
+A value that has not arrived completely is not an error. `decodeChunk()` returns the error for input that is not MessagePack and does not throw it.
+
+### Streaming example
+
+Use `read` to drop the bytes that `decodeChunk()` decoded and keep the rest:
+
+```ts
+import { msgpack } from "bun";
+
+let pending = new Uint8Array(0);
+
+Bun.listen({
+  hostname: "localhost",
+  port: 4000,
+  socket: {
+    data(socket, chunk) {
+      pending = Buffer.concat([pending, chunk]);
+      const { values, read, error } = msgpack.decodeChunk(pending);
+      if (error) return socket.end();
+
+      for (const message of values) handle(message);
+      // Keep the bytes of the value that is still arriving
+      pending = pending.subarray(read);
+    },
+  },
+});
+```
+
+`decodeChunk()` starts at the first byte of an incomplete value again on every call. For values of many megabytes that arrive in small pieces, send the length of each value before it and call `decode()` when all of its bytes are there.
+
+### Offsets
+
+Pass `start` and `end` to decode a part of the input without copying it. `read` counts from the start of the input, not from `start`.
+
+```ts
+const input = new Uint8Array([0x01, 0x02, 0x03]);
+
+Bun.msgpack.decodeChunk(input, 1).values; // [2, 3]
+Bun.msgpack.decodeChunk(input, 1, 2).read; // 2
+```
+
+---
+
+## `Bun.msgpack.Extension`
+
+A MessagePack extension is a type number from -128 to 127 and bytes. The application gives them a meaning. `decode()` returns an `Extension` for every extension type except the timestamp, and `encode()` writes an `Extension` as it was. Values that Bun has no type for survive a round trip that way.
+
+```ts
+import { msgpack } from "bun";
+
+const point = new msgpack.Extension(1, new Uint8Array(new Float64Array([1.5, -2]).buffer));
+
+const decoded = msgpack.decode(msgpack.encode({ at: point })).at;
+decoded instanceof msgpack.Extension; // true
+decoded.type; // 1
+new Float64Array(decoded.data.buffer); // Float64Array [1.5, -2]
+```
+
+MessagePack reserves the negative types. Type `-1` is the timestamp, which `decode()` returns as a `Date`.
+
+---
+
+## Differences from JSON
+
+- The bytes of a `Uint8Array` stay bytes. JSON needs base64 for them.
+- A `Date` comes back as a `Date`. JSON returns a string.
+- Integers beyond `Number.MAX_SAFE_INTEGER` stay exact, as `BigInt`.
+- `NaN`, `Infinity` and `-Infinity` stay numbers. JSON turns them into `null`.
+- `encode()` writes the entries of a `Map` and the members of a `Set`. `decode()` returns an object and an array for them.
