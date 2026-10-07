@@ -3967,6 +3967,7 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
         "isStandaloneExecutable",
         "markdown",
         "mmap",
+        "msgpack",
         "nanoseconds",
         "origin",
         "pathToFileURL",
