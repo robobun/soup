@@ -4293,6 +4293,181 @@ Files: `src/js/internal/queue.ts` (new), `src/jsc/bindings/BunObject.cpp` (the p
 `test/js/bun/queue/queue.test.ts` (new), `test/js/bun/module-graph/module-graph-isolation.test.ts`,
 `test/integration/bun-types/fixture/queue.ts` (new).
 
+### 2026-10-07: `Bun.msgpack`, MessagePack built in
+
+JSON is text. Bytes go through base64, a `Date` comes back as a string, an integer above 2^53
+comes back wrong, and the message is larger than it has to be. [MessagePack](https://msgpack.org)
+is what programs use where that matters (Redis values, WebSocket frames, msgpack-rpc, Fluentd,
+Neovim), most languages read it, and in JavaScript it has meant a dependency: msgpackr or
+@msgpack/msgpack. oven-sh/bun#12075 asks for a native one ("msgpackr is faster than JSON in Node,
+but slower in Bun"). It has 19 upvotes, no reply from a maintainer and no pull request. Upstream
+has the text formats (`Bun.TOML`, `Bun.YAML`, `Bun.JSON5`, `Bun.JSONL`, `Bun.XML`) and no binary
+one. Now:
+
+```ts
+const bytes = Bun.msgpack.encode({
+  id: 1,
+  tags: ["a", "b"],
+  at: new Date("2026-10-07T08:00:00Z"),
+});
+// Uint8Array(24). The same value is 57 bytes of JSON.
+
+Bun.msgpack.decode(bytes);
+// { id: 1, tags: ["a", "b"], at: 2026-10-07T08:00:00.000Z }
+
+// A stream: the values that are complete, and where the first incomplete one starts.
+const { values, read, error } = Bun.msgpack.decodeChunk(pending);
+pending = pending.subarray(read);
+```
+
+`encode(value)` returns a `Uint8Array`. Where MessagePack has no type of its own it does what
+`JSON.stringify()` does, so there is one set of rules to remember: a property that is `undefined`,
+a function or a symbol is left out, those values are nil in an array, `toJSON()` is called, boxed
+primitives are unwrapped, keys come in `Object.keys` order and a cycle throws a `TypeError`. What
+JSON cannot hold is written in its MessagePack type: a typed array, a `DataView` and an
+`ArrayBuffer` as bin, a `Date` as the timestamp extension (in the smallest of its three formats,
+and nil when the date is invalid, as JSON's `null`), a `BigInt` as a 64-bit integer (a
+`RangeError` beyond 64 bits), a `Map` as a map with keys of any type, a `Set` as an array, `NaN`
+and the infinities as floats. Safe integers take the smallest integer format, every other number
+is a float 64, and a lone surrogate in a string becomes U+FFFD as for `TextEncoder`.
+
+`decode(bytes)` reads exactly one value from any typed array, `DataView` or `ArrayBuffer`. A map
+is an object (number keys become strings, any other key type is an error), bin is a `Uint8Array`
+that shares no memory with the input, a timestamp is a `Date`, a 64-bit integer is a number while
+it is a safe integer and a `BigInt` beyond, bytes that are not UTF-8 become U+FFFD as for
+`TextDecoder`. Input that is not MessagePack, that ends inside the value or that goes on after it
+is a `SyntaxError` that says which.
+
+`decodeChunk(bytes, start?, end?)` is `Bun.JSONL.parseChunk` for MessagePack, with the same
+result, `{ values, read, done, error }`, and the same clamping of the offsets. A value that has
+not arrived completely is not an error, so a socket handler keeps `bytes.subarray(read)` and calls
+again. `Bun.msgpack.Extension` is a type from -128 to 127 with its bytes: `decode()` returns one
+for every extension that is not the timestamp and `encode()` writes it back as it was, so what Bun
+has no type for survives a round trip (the handles of the Neovim API, for one).
+
+The decoder is for input that nobody vouches for. Every length is checked against the bytes that
+are left before anything is allocated for it, so `dd ff ff ff ff` is a `SyntaxError` and not an
+array of four billion elements. Nesting ends with a `RangeError` where the stack does. A key named
+`__proto__` is an ordinary property, as for `JSON.parse`. The bits of a NaN in the input do not
+reach a JSValue as they are.
+
+Where it differs from the two libraries, checked against msgpackr 2.1.0 and @msgpack/msgpack 3.1.3:
+
+- `undefined` is nil, and left out as a property. msgpackr writes an extension of its own for it
+  (`d4 00 00`), @msgpack/msgpack keeps the key with nil.
+- A `BigInt` is always 64 bits. @msgpack/msgpack throws without `useBigInt64`, and without it
+  reads a 64-bit integer into a number that has lost digits. msgpackr does what Bun does.
+- `Map`, `Set` and `ArrayBuffer` are written as what they hold, as msgpackr does.
+  @msgpack/msgpack writes `{}` for all three.
+- `toJSON()` is called, so a `URL` is its string. @msgpack/msgpack does not call it.
+- A lone surrogate is U+FFFD. Both libraries write `ed a0 80`, which is not UTF-8.
+- An unknown extension is an `Extension`. msgpackr throws, @msgpack/msgpack has `ExtData`.
+- `__proto__` stays a key. msgpackr renames it to `__proto_`, @msgpack/msgpack throws.
+- The byte `0xc1` is an error. msgpackr returns an object for it.
+- bin is copied out of the input. Both libraries return a view of the input.
+
+It is C++, `src/jsc/bindings/BunMessagePack.cpp`, next to `Bun.JSONL`. The encoder takes the
+property names and offsets of an object from its structure, as `JSON.stringify` does, and falls
+back to `get` when a getter changes the object under it. It finds `toJSON` through the cache that
+JavaScriptCore keeps on the structure for `JSON.stringify`. An array whose storage is int32 or
+double is written in one loop. The first kilobyte is written on the stack, and a larger result
+becomes the `ArrayBuffer` of the `Uint8Array` without a copy. The decoder makes an object the way
+`JSON.parse` does: when the structure already has a transition for the next key, the key is
+compared with the name of that transition and the value is stored at its offset, with no lookup of
+the name. Arrays are made once, at their final length, with int32 or double storage when their
+elements allow it. Short strings that repeat inside one input are one string.
+
+Numbers, from a release build of this commit without LTO (`--profile=release --lto=off`), on the
+machine this was written on, a shared virtual machine where one measurement moves by tens of
+percent: the smallest time of two runs of `bench/msgpack/msgpack.mjs` (mitata).
+
+|                                        | `Bun.msgpack` | msgpackr | @msgpack/msgpack | JSON and TextEncoder/TextDecoder |
+| -------------------------------------- | ------------- | -------- | ---------------- | -------------------------------- |
+| encode one object, 159 bytes           | 0.83 µs       | 0.81 µs  | 7.1 µs           | 0.88 µs                          |
+| decode it                              | 0.78 µs       | 1.8 µs   | 2.3 µs           | 0.45 µs                          |
+| encode 1,000 objects, 157 KB           | 0.41 ms       | 1.23 ms  | 2.93 ms          | 0.50 ms                          |
+| decode them                            | 0.81 ms       | 2.79 ms  | 3.82 ms          | 1.03 ms                          |
+| encode 10,000 numbers                  | 68 µs         | 235 µs   | 463 µs           | 372 µs                           |
+| decode them                            | 95 µs         | 88 µs    | 147 µs           | 330 µs                           |
+| encode 1,000 ASCII strings of 64 bytes | 27 µs         | 42 µs    | 367 µs           | 40 µs                            |
+| decode them                            | 43 µs         | 82 µs    | 1.53 ms          | 75 µs                            |
+| encode 1,000 Latin-1 strings           | 33 µs         | 77 µs    | 155 µs           | 69 µs                            |
+| decode them                            | 98 µs         | 176 µs   | 395 µs           | 58 µs                            |
+| encode 1,000 strings with CJK          | 34 µs         | 62 µs    | 164 µs           | 37 µs                            |
+| decode them                            | 104 µs        | 192 µs   | 441 µs           | 62 µs                            |
+| encode 64 KB of binary                 | 22 µs         | 8 µs     | 19 µs            | 24 µs (base64)                   |
+| decode it                              | 22 µs         | 1.3 µs   | 0.7 µs           | 31 µs (base64)                   |
+
+So: objects and strings are 1.5 to 3.5 times as fast as with msgpackr in both directions, except
+that one small object is encoded at the same speed. Arrays of numbers are encoded 3.5 times as fast
+and decoded at the same speed. Large binary is slower: decoding copies the bytes where the
+libraries hand out a view of the input, and msgpackr encodes into a buffer that it keeps between
+calls. `JSON.parse` is still ahead on strings that are not ASCII, and on one small object.
+
+What a program that does not use it pays: one entry in the static table of the `Bun` object, one
+lazy class structure in the global object (16 bytes, and one more `initLater` when a global object
+is made), and 41 KB of code in the 84.9 MB release binary (the sum of the sizes of the 50 symbols
+in `Bun::MessagePack`, from `nm`).
+
+Tests are `test/js/bun/msgpack/msgpack.test.ts`, 229 of them. All fail on the released binary,
+which has no `Bun.msgpack`. They have the msgpack-test-suite of Yusuke Kawasaki (MIT, 85 values in
+233 encodings: every encoding must decode to the value, and `encode()` must write one of them),
+the exact bytes @msgpack/msgpack writes for a mixed value, input written by msgpackr, the
+boundaries of every format, the `JSON.stringify` rules one by one, getters that change the object,
+proxies, cycles, every prefix of a message (each is a `SyntaxError`), lengths that promise more
+than there is, 100,000 levels of nesting in both directions, a stream cut at every size, random
+structured values there and back, random bytes, and every error message. The debug build ran them
+with `BUN_JSC_validateExceptionChecks=1`. One test, objects of 65,535 and 65,536 properties, is
+skipped in debug builds, where making such an object takes seconds. It passes on the release
+build. The types have a fixture, `test/integration/bun-types/fixture/msgpack.ts`, and the docs
+page is `docs/runtime/msgpack.mdx`, whose examples were run.
+
+Not done, and not checked.
+
+- There are no options. No way to get a `Map` back from `decode()`, to get every 64-bit integer
+  as a `BigInt`, to write float 32, or to give an extension type a class.
+- `decodeChunk()` starts at the first byte of an incomplete value again on every call. A value of
+  many megabytes that arrives in small chunks is read that many times. A decoder that keeps its
+  place would fix it and needs an object with state.
+- A typed array that is not a `Uint8Array` is written as its bytes and comes back as a
+  `Uint8Array`. A timestamp loses what is finer than a millisecond.
+- `decode()` has no way to return bin as a view of the input, which is what makes the libraries
+  faster on large binary.
+- The decoder of an array of numbers fills a temporary list before it makes the array. Reading
+  straight into the array would need the length to be trusted, or a second pass.
+- The numbers are from one noisy machine and a build without LTO. A release build as CI ships it
+  (ThinLTO, PGO) was not made, and neither was a comparison on Node.js.
+- Built and run on Linux x64 only. The code has no platform-specific part, and it assumes, as the
+  rest of the bindings do, that typed arrays are little-endian.
+- A design check (C++ beside `Bun.JSONL`, Rust beside `Bun.TOML`, a TypeScript builtin, or only
+  a recipe in the docs) was started before the code. It had returned nothing after four and a
+  half hours and 113 of its agents, so it was stopped and the choices are this commit's own. No
+  separate review pass read the diff.
+
+Rebase notes: 46 patches onto oven-sh/bun bbdc5a519e, nothing dropped. Upstream's `bun check`
+(oven-sh/bun#44361) met five patches. Four are textual. It added `watcher_for_threads` where the
+`.env` patch of 2026-08-23 adds its function to `src/jsc/VirtualMachine.rs`, and both were kept.
+It added `check` to the chain of comparisons in `which()` that the "did you mean" patch of
+2026-08-28 had turned into the `ROOT_COMMANDS` table: `check` is a row of the table now, with
+upstream's rule that a package.json script named `check` wins as a guard, and `bun chek` gets "did
+you mean "bun check"?". It put the type check of the entry point in front of `load_entry_point` in
+`run_command.rs`, where the `--watch-path` patch of 2026-09-24 starts its watcher, which now
+starts before the check. It declared a module on the line where the trusted publishing patch of
+2026-10-02 declares its own. The fifth did not conflict and did not compile: the parser struct `P`
+got a third const generic, `SEMA`, and the `impl` block of the `import.meta.glob()` patch of
+2026-09-12 had two. That patch was amended. The rebased stack builds, and the tests of the patches
+that were touched by hand pass (`run_command.test.ts`, `watch.test.ts`, the two `import.meta.glob`
+files). The fork's three workflows were green after the last push.
+
+Files: `src/jsc/bindings/BunMessagePack.cpp` (new), `src/jsc/bindings/BunMessagePack.h` (new),
+`src/jsc/bindings/BunObject.cpp` (the property), `src/jsc/bindings/ZigGlobalObject.h` and
+`src/jsc/bindings/ZigGlobalObject.cpp` (the class structure of `Extension`),
+`packages/bun-types/bun.d.ts`, `docs/runtime/msgpack.mdx` (new), `docs/docs.json`,
+`docs/runtime/bun-apis.mdx`, `bench/msgpack/` (new), `test/js/bun/msgpack/msgpack.test.ts` (new),
+`test/js/bun/msgpack/msgpack-test-suite.json` (new),
+`test/js/bun/module-graph/module-graph-isolation.test.ts`,
+`test/integration/bun-types/fixture/msgpack.ts` (new).
+
 ## Dropped
 
 Nothing yet.

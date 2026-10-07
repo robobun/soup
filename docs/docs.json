@@ -169,6 +169,7 @@
               "/runtime/ini",
               "/runtime/csv",
               "/runtime/jsonl",
+              "/runtime/msgpack",
               "/runtime/html-rewriter",
               "/runtime/image",
               "/runtime/hashing",

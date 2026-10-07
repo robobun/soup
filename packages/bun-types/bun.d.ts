@@ -1703,6 +1703,135 @@ declare module "bun" {
   }
 
   /**
+   * [MessagePack](https://msgpack.org) related APIs.
+   *
+   * MessagePack is a binary format for what JSON holds, and for binary data,
+   * dates and 64-bit integers too. Most languages have an implementation.
+   */
+  namespace msgpack {
+    /**
+     * A MessagePack extension value: a type the application chooses and the
+     * bytes that go with it.
+     *
+     * `decode()` returns one for every extension it does not know, which is
+     * all of them except the timestamp (type `-1`, a `Date`). `encode()`
+     * writes one back as it was.
+     *
+     * @example
+     * ```js
+     * const { encode, decode, Extension } = Bun.msgpack;
+     *
+     * const bytes = encode(new Extension(5, new Uint8Array([1, 2, 3])));
+     * const extension = decode(bytes);
+     * extension.type; // 5
+     * extension.data; // Uint8Array [1, 2, 3]
+     * ```
+     */
+    class Extension {
+      /**
+       * @param type An integer from -128 to 127. MessagePack keeps the negative ones for itself.
+       * @param data The bytes. A `Uint8Array` is kept as it is. Any other view or buffer becomes a `Uint8Array` over the same memory.
+       */
+      constructor(type: number, data: NodeJS.TypedArray | DataView<ArrayBufferLike> | ArrayBufferLike);
+      type: number;
+      data: Uint8Array;
+    }
+
+    /**
+     * The result of `Bun.msgpack.decodeChunk`.
+     */
+    interface DecodeChunkResult {
+      /** The values that were complete. */
+      values: unknown[];
+      /** The offset in `input` after the last complete value. Use `input.subarray(read)` to keep the rest. */
+      read: number;
+      /** `true` if all of the input was decoded. `false` if it ends inside a value, or an error occurred. */
+      done: boolean;
+      /** A `SyntaxError` if the input is not MessagePack at `read`, otherwise `null`. A value that has not arrived completely is not an error. */
+      error: SyntaxError | null;
+    }
+
+    /**
+     * Encode a value as MessagePack.
+     *
+     * The rules are those of `JSON.stringify` where MessagePack has no type
+     * of its own: properties that are `undefined`, a function or a symbol
+     * are left out, those values are `nil` in an array, `toJSON()` is
+     * called, and a cycle throws a `TypeError`. What JSON cannot hold is
+     * written as it is:
+     *
+     * - a `TypedArray`, a `DataView` and an `ArrayBuffer` are binary
+     * - a `Date` is a timestamp
+     * - a `BigInt` is a 64-bit integer, and a `RangeError` if it needs more bits
+     * - a `Map` is a map with keys of any type, a `Set` is an array
+     * - `NaN` and `Infinity` are floats
+     * - an {@link Extension} is an extension
+     *
+     * @param value The value to encode
+     * @returns The bytes
+     *
+     * @example
+     * ```js
+     * const bytes = Bun.msgpack.encode({ id: 1, tags: ["a", "b"], at: new Date() });
+     * await Bun.write("message.msgpack", bytes);
+     * ```
+     */
+    export function encode(value: unknown): Uint8Array<ArrayBuffer>;
+
+    /**
+     * Decode one MessagePack value.
+     *
+     * - a map is an object. Its keys are strings, or numbers, which become strings
+     * - binary is a `Uint8Array` that shares no memory with `input`
+     * - a timestamp is a `Date`, without what is beyond its milliseconds
+     * - a 64-bit integer is a `number` while it is a safe integer, and a `BigInt` beyond
+     * - any other extension is an {@link Extension}
+     *
+     * @param input The bytes of exactly one value
+     * @returns The value
+     * @throws {SyntaxError} If `input` is not MessagePack, ends inside the value, or continues after it
+     *
+     * @example
+     * ```js
+     * const value = Bun.msgpack.decode(await Bun.file("message.msgpack").bytes());
+     * ```
+     */
+    export function decode(input: NodeJS.TypedArray | DataView<ArrayBufferLike> | ArrayBufferLike): unknown;
+
+    /**
+     * Decode the MessagePack values at the start of `input`, for streams.
+     *
+     * Values follow each other without a separator in a MessagePack
+     * stream. `decodeChunk` returns the ones that are complete and reports
+     * where the first incomplete one starts, so the caller can keep those
+     * bytes until more arrive. It does not throw for input that is not
+     * MessagePack: the values before it are returned with an `error`.
+     *
+     * @param input The bytes
+     * @param start Offset to start at (default: 0)
+     * @param end Offset to stop at (default: the length of `input`)
+     * @returns An object with `values`, `read`, `done` and `error`
+     *
+     * @example
+     * ```js
+     * let pending = new Uint8Array(0);
+     * for await (const chunk of stream) {
+     *   pending = Buffer.concat([pending, chunk]);
+     *   const { values, read, error } = Bun.msgpack.decodeChunk(pending);
+     *   if (error) throw error;
+     *   for (const value of values) handle(value);
+     *   pending = pending.subarray(read);
+     * }
+     * ```
+     */
+    export function decodeChunk(
+      input: NodeJS.TypedArray | DataView<ArrayBufferLike> | ArrayBufferLike,
+      start?: number,
+      end?: number,
+    ): DecodeChunkResult;
+  }
+
+  /**
    * YAML related APIs
    */
   namespace YAML {

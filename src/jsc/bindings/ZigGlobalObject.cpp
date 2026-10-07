@@ -228,6 +228,7 @@
 #include "NodeFSStatBinding.h"
 #include "NodeFSStatFSBinding.h"
 #include "NodeDirent.h"
+#include "BunMessagePack.h"
 #include "../../runtime/webview/JSWebView.h"
 
 #if !OS(WINDOWS)
@@ -2161,6 +2162,9 @@ void GlobalObject::finishCreation(VM& vm)
     static const LazyClassStructureInit lazyClassStructureInits[] = {
         { OBJECT_OFFSETOF(GlobalObject, m_JSDirentClassStructure), [](LazyClassStructure::Initializer& init) {
              Bun::initJSDirentClassStructure(init);
+         } },
+        { OBJECT_OFFSETOF(GlobalObject, m_JSMessagePackExtensionClassStructure), [](LazyClassStructure::Initializer& init) {
+             Bun::setupMessagePackExtensionClassStructure(init);
          } },
         { OBJECT_OFFSETOF(GlobalObject, m_JSX509CertificateClassStructure), [](LazyClassStructure::Initializer& init) {
              setupX509CertificateClassStructure(init);
