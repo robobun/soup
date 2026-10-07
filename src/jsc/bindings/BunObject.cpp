@@ -78,6 +78,7 @@
 #include "GeneratedYAMLObject.h"
 #include "JavaScriptCore/BunV8HeapSnapshotBuilder.h"
 #include "BunObjectModule.h"
+#include "BunMessagePack.h"
 #include "_NativeModule.h"
 #include "JSCookie.h"
 #include "JSCookieMap.h"
@@ -1031,6 +1032,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     JSON5                                          Bun::Bindgen::Generated::JSON5Object::createJSON5                   DontDelete|PropertyCallback
     JSONL                                          constructJSONLObject                                                ReadOnly|DontDelete|PropertyCallback
     markdown                                       Bun::Bindgen::Generated::MarkdownObject::createMarkdown             DontDelete|PropertyCallback
+    msgpack                                        Bun::constructMessagePackObject                                     DontDelete|PropertyCallback
     TOML                                           Bun::Bindgen::Generated::TOMLObject::createTOML                     DontDelete|PropertyCallback
     XML                                            Bun::Bindgen::Generated::XMLObject::createXML                       DontDelete|PropertyCallback
     YAML                                           Bun::Bindgen::Generated::YAMLObject::createYAML                     DontDelete|PropertyCallback

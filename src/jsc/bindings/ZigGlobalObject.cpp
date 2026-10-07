@@ -235,6 +235,7 @@
 #include "NodeFSStatBinding.h"
 #include "NodeFSStatFSBinding.h"
 #include "NodeDirent.h"
+#include "BunMessagePack.h"
 #include "../../runtime/webview/JSWebView.h"
 
 #if !OS(WINDOWS)
@@ -2467,6 +2468,9 @@ void GlobalObject::finishCreation(VM& vm)
              BUN_BEGIN_REMOVABLE_ENTRY_POINT(FsStats, Abort, void)
              Bun::initJSDirentClassStructure(init);
              BUN_END_REMOVABLE_ENTRY_POINT
+         } },
+        { OBJECT_OFFSETOF(GlobalObject, m_JSMessagePackExtensionClassStructure), [](LazyClassStructure::Initializer& init) {
+             Bun::setupMessagePackExtensionClassStructure(init);
          } },
         { OBJECT_OFFSETOF(GlobalObject, m_JSX509CertificateClassStructure), [](LazyClassStructure::Initializer& init) {
              BUN_BEGIN_REMOVABLE_ENTRY_POINT(X509, Abort, void)
