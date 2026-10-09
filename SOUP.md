@@ -4468,6 +4468,255 @@ Files: `src/jsc/bindings/BunMessagePack.cpp` (new), `src/jsc/bindings/BunMessage
 `test/js/bun/module-graph/module-graph-isolation.test.ts`,
 `test/integration/bun-types/fixture/msgpack.ts` (new).
 
+### 2026-10-09: `Bun.build({ watch: true })`, watch mode for the bundler API
+
+`bun build --watch` builds again when a file changes. `Bun.build()` had nothing like it, so a build
+that needs the JavaScript API (for plugins, most of all) could not watch. oven-sh/bun#5866 asks for
+it: open since September 2023, and with 136 upvotes the open feature request for the bundler that
+has the most. A search of the repository finds no pull request for it. The workarounds in its thread
+watch a source directory with `fs.watch` and call `Bun.build()` for every event. They know nothing
+of what the bundle imports, so a change outside that directory is missed and a change to a file that
+is in no bundle builds again. Now:
+
+```ts
+const watcher = Bun.build({
+  entrypoints: ["./src/index.tsx"],
+  outdir: "./dist",
+  plugins: [myPlugin],
+  watch: true,
+});
+
+for await (const result of watcher) {
+  if (result.success) console.log(`Built ${result.outputs.length} files`);
+  else for (const message of result.logs) console.error(message);
+}
+```
+
+With `watch: true`, `Bun.build()` returns a `BuildWatcher` in place of a promise. It is an async
+iterator of `BuildOutput`: the first build, then a build for every change. That is the shape the
+maintainer of the bundler preferred in the thread ("i like the async iterator proposal the most"),
+over a callback and over the context object of esbuild that later comments ask for. Leaving the loop
+stops the watcher. `watcher.stop()` does the same from outside, and so does `await using` at the end
+of a block. The process stays alive until then.
+
+What it does, point by point:
+
+- What is watched is every file on disk that the last build read: entry points, imports, assets,
+  files that the `onLoad` of a plugin handles. Files in `node_modules` are left out, as in the dev
+  server. The list is taken again from every build, so a file is watched from the build that first
+  imports it and no longer than the bundle imports it. A watcher whose build read no such file has
+  nothing to wait for, and ends after that build.
+- A rebuild is a complete `Bun.build()` of the same options, which is what `bun build --watch` is
+  too (it restarts the process). The options are read once, when the watcher is made, its own and
+  the ones it inherits, and arrays and plain objects in them are copied. Every build gets a copy of
+  that, so what the `setup()` of a plugin does to `build.config` is gone with its build.
+- A build that fails is a result with `success: false` and its `logs`. `throw` has no say: a
+  rejection would end a `for await` loop and leave the watcher running behind it. What makes
+  `Bun.build()` throw or reject on a rebuild is such a result too, with the error in `logs`: the
+  `setup()` or `onEnd` of a plugin that throws, the directory of the entry point that is gone. The
+  next change tries again.
+- After a failed build the watcher also waits for what was missing. For a relative import that did
+  not resolve, and for an entry point that is not there, it watches the nearest directory that
+  exists for the one name that would be the missing thing (`value`, `value.ts`, or the `index` of a
+  directory of that name) or the next step on the way to it. So "write the import, then create the
+  file" builds without a second save, and nothing else that appears in that directory does.
+- Changes that come together are one build: the watcher waits until no watched file has changed for
+  50 milliseconds. A change during a build starts the next one as soon as that one has ended.
+- `next()` returns the newest build that it has not returned yet. Builds that finished while the
+  body of the loop was busy are skipped, so a slow consumer does not fall behind. Each build is
+  returned once.
+- The watcher builds whether or not anything reads the results. `Bun.build()` rejects on failure so
+  that an error cannot go unseen, and a watcher has no promise to reject, so as long as nothing has
+  called `next()` it prints the errors of a failed build to stderr, like the command line.
+- `stop()` returns a promise. A build cannot be cancelled: one that is running writes its files, its
+  result is dropped, the promise resolves when it has ended, and only then does a loop that was
+  waiting end.
+- One error ends the watcher: a directory that cannot be watched (the inotify limit). The `next()`
+  that is waiting rejects with it, once. When none is waiting it is printed, and kept for the next
+  one.
+
+What makes it hold up, and what the review below made of the first version:
+
+- It watches directories and not files, one `fs.watch` for each directory that has an input, and an
+  event counts when it names an input. That survives an editor that saves by renaming a new file
+  over the old one, a file that is deleted and made again, and a checkout.
+- A watched directory can itself be removed, moved, or replaced by another at the same path, and the
+  watcher of the old one hears nothing after that. Linux reports it as an event named after the
+  directory. On that event, and after every build, the directory is compared with the one that is
+  watched, by inode and by time of birth: ext4 gives a directory that is made right after another
+  was removed the same inode number.
+- A file can change between the moment a build reads it and the moment it is watched (the first
+  build, and the build that first imports it). And what a failing build missed can appear while that
+  build is still running. Both are looked for when a build has ended: a file that was not watched
+  during the build and has a modification or change time after its start, or is gone, and a missing
+  name that is there after all. Either starts another build at once. That build does not look again,
+  so one that fails the same way twice is not made a third time.
+- `Bun.build()` runs the event loop while it waits for an async `setup()`. The watcher says that it
+  is building before it calls it, so an event or a timer that comes in from there waits for the
+  build, and `stop()` waits for it too.
+- A build of a watcher looks once more for an import that did not resolve, past the directory cache
+  of the resolver, the way `bun build --watch` does. Without it the first build of a script that had
+  just written a file failed two times in three in the debug build, with "Could not resolve" for a
+  file that was there (see "not done" for the rest of that cache).
+
+How it is made. The maintainer's outline in the thread was a native class that installs a
+`bun_watcher::Watcher` on `BundleV2.bun_watcher`, the way the dev server does, with the warning that
+"there are a bunch of event loop / lifetime issues". This commit does less in native code.
+`Bun.build()` looks at `watch` before it reads anything else, and with `true` hands the config to
+`src/js/internal/build_watcher.ts` (about 570 lines). That module calls the same native build for
+every rebuild through an internal function, which differs from `Bun.build()` in three things: a
+failed build resolves, an unresolved import is looked for once more, and the bundle thread copies
+the paths of `graph.input_files` into the completion task, for a failed build too, which pushes them
+into an array of the module before the promise settles. Files that were given in `files`, and files
+that a plugin made up under a path of its own, are not among them. The module watches with the
+internals of `node:fs` (not the public module, which a program may have patched). What that buys: a
+rebuild goes through `JSBundleCompletionTask` like any build, so what upstream has built around it
+holds without a line of new code: the ticket that makes VM teardown wait, the abort handles, and a
+`Bun.ModuleGraph` whose `dispose()` closes the watchers of a build its code started, because the
+context follows the code (there is a test for the last). What it costs is under "not done".
+
+What a program that does not use it pays. Every `Bun.build()` call: one lookup of the property
+`watch` on the config object. Every build: 32 bytes more in its completion task (an empty
+`Option<Strong>` and an empty `Vec`), one `bool` in `BundleV2`, and three untaken branches. The
+process: one internal module that is not loaded until a watcher is made (12.8 KB of JavaScript as
+the debug build bundles it, without comments and not minified), one host function, one function in
+C++. What that is in a release binary was not measured: no release build was made.
+
+The types are four overloads. `watch: true` gives a `BuildWatcher`, `watch: false` a promise, a
+`watch` of type `boolean` gives `Promise<BuildOutput> | BuildWatcher` so that a build script with
+`watch: isDev` does not read `result.success` from a watcher, and everything else is a
+`Promise<BuildOutput>` as before: a config typed as `BuildConfig`, `ReturnType<typeof Bun.build>`,
+`Parameters<typeof Bun.build>`. The overloads have two prices. A type error in a config now reads
+"No overload matches this call" with the error under each, at the same place as before. And a
+function that is assigned to `typeof Bun.build` has to satisfy every overload, so a typed mock such
+as `spyOn(Bun, "build").mockImplementation(async () => fake)` no longer compiles without a cast. A
+reviewer counted 8 such errors in a file of the patterns, against none before.
+
+Tests are `test/bundler/bun-build-watch.test.ts`, 36 of them, none of which runs on the released
+binary (the file fails at its import of the testing hook, and `Bun.build()` there returns a promise
+whatever `watch` is). No test waits for time to pass. `bun:internal-for-testing` tells what a
+watcher watches, which names it waits for, how many builds it has started, and calls back after
+every file system event it is told of, so a test can say "by the time the watcher heard of the last
+of these changes, no build was pending". One test measures time, in the direction a slow machine
+cannot break: a rebuild starts at least 45 ms after the last change. They cover: a change to the
+entry point and to an import in another directory, a save by rename, a syntax error and its fix, a
+first build that fails, a deleted and restored import, a directory that another is renamed over, a
+directory removed and made again, an import that does not resolve until its file is created (next to
+the importer, as the index of a directory, and two directories down one level at a time), a file
+created while the failing build runs, what does not count after a failed build (other files, a new
+directory, the temporary file of `compile`), a missing entry point, a removed and restored entry
+directory, the watch list after an import is added and removed, a write during the first build, a
+write to a new import during the rebuild that first reads it, a write during a build that is held in
+`onLoad`, a hundred writes at once, the 50 ms, own output next to the input, `node_modules`, nothing
+to watch, the newest result, each result once, `break`, `stop()` during a build, `await using`,
+plugins (virtual modules, `onLoad` of a file, `setup()` per build, an async `setup()` with a save
+inside it, `setup()` and `onEnd` that throw), the copy of the options (nested, inherited, changed by
+a plugin), invalid options, the printing of a failure nobody asked for and its end once somebody
+has, a child process that stays alive for exactly two builds, and one whose `Bun.ModuleGraph` is
+disposed. After the last change to the module the debug build ran the file three times, one of them
+with `BUN_JSC_validateExceptionChecks=1`. Before it, five times, two of those with twelve busy loops
+beside it: one of the two lost the test with the two-build child process to the 5 second default of
+a local run (the runner of CI gives a test 90). `tsc` on `src/js` and oxlint are clean, `tsc` on
+`test/` has nothing to say about the new file, and `test/internal/source-lints/` and the types test
+pass. Also run: `metafile.test.ts` and `bundler_plugin.test.ts` (131 pass), and
+`bun-build-api.test.ts`, where ten concurrent tests and a test of 400 builds hit their timeouts in
+the debug build. Run alone, the ten take between 3.3 and 5.1 seconds each against the limit of 5.
+They were not compared with a build without this commit.
+
+A review pass (four readers with the debug build, each with an area: the state machine of the
+module, the native side, real file systems and tools, and the docs, types and tests, about 360
+probes in an hour) found no crash, assertion or sanitizer report in the first version, and found it
+wrong in these ways, all of which are fixed above and have a test: a save during an async `setup()`
+started a second build inside the first (29 deep in one probe, a stack overflow at 172) and let
+`stop()` resolve early. After a failed build every new file in a watched directory started a build,
+which never ended with a `compile` that fails (it writes a temporary file next to the entry point)
+or a plugin that clears its output directory. A file created while the failing build ran was never
+seen. A directory removed and made again kept a dead watcher, because only the inode number was
+compared. A directory replaced by rename was not noticed until something else built. An `onEnd` that
+threw once, or a removed entry directory, ended the watcher for good. Inherited options were
+dropped, nested ones were not copied, and what a plugin did to the options piled up from build to
+build. A loop ended before the build that `stop()` waited for. An output spelled through a symlink
+to the source directory built for ever. The check for a change before the watch missed a deleted
+file and a file renamed into place. The testing hook could be reached from user code. Three tests
+could pass with their subject broken, and two child-process tests sat on the local timeout. The
+readers also confirmed what held: no lost update in 21 rounds of random writes, `process.exit()` and
+`worker.terminate()` in every state, a `Bun.ModuleGraph` disposed with builds waiting, no growth of
+objects or file descriptors over 300 rebuilds, and that the `Strong` in the completion task cannot
+be dropped on the bundle thread.
+
+Not done, and not checked.
+
+- A rebuild runs in the process of the build before it, and the resolver keeps what it has read
+  there. A changed `tsconfig.json` or `package.json` is not read again, a package that is installed
+  after a build failed for the lack of it stays unresolved, and `.env` values that are inlined stay
+  what they were. Two plain `Bun.build()` calls in one process show the same, on the released binary
+  too, so it is not this commit's, and it was handed to an upstream session with two reproductions.
+  Until it is fixed, those changes need the process started again, and the docs say so.
+- None of these start a build either: a change to a `tsconfig.json` or a `package.json`, a file that
+  a plugin reads on its own (esbuild has `watchFiles` and `watchDirs` for that, oven-sh/bun#4689), a
+  macro, a new file that an import would now resolve to in place of the file it found, a symlink
+  that is pointed at another file (the input is the file it pointed to), a write through another
+  hard link. There is no `rebuild()` to ask for a build by hand.
+- When a second watcher of the same directory is open (another `BuildWatcher`, or the program's own
+  `fs.watch`) and the directory is replaced, the watcher that is made for the new one hears the old
+  one: `fs.watch` reuses the watcher it has for the path. That is so for plain `fs.watch` on the
+  released binary, and not in Node.js 26. It was reported to the hand-off of this session and not
+  taken up.
+- A file that was written or renamed in the 10 ms before a build started, and was not watched yet,
+  counts as changed during it: a script that writes a file and then makes a watcher builds twice at
+  the start. The other way round, a change in the first few milliseconds of a build could be missed
+  without those 10 ms, because the kernel stamps files with a clock that lags by up to a tick.
+- `await watcher.stop()` inside a plugin callback of the watcher's own build never resolves: the
+  build waits for the callback. The docs and types say to call it without `await` there.
+- There are no options: not the delay, not `node_modules`, no `AbortSignal`.
+- Nothing is incremental. Every rebuild parses every file, as the command line does. The request for
+  esbuild's `context()` in the thread is mostly a request for that.
+- With `check: true`, a file that only the type checker reads (a type-only import) is not an input
+  of the bundle and is not watched.
+- Under `bun --hot`, a watcher that a reloaded module made goes on, like a timer or an `fs.watch`
+  does. Stop it in the module, or keep it on `globalThis`.
+- No test makes `fs.watch` fail, so the one way a watcher ends by itself is covered by reading only.
+- Built and run on Linux x64 only. On macOS and Windows the names in events are compared without
+  regard to case (and on macOS to how an accent is composed), and the event named after a removed
+  directory is assumed to look as it does on Linux, where a directory that is replaced is also found
+  after the next build. Nobody ran either. Where `fs.watch` hears nothing (some network and
+  container mounts), neither does this.
+- A design check was started before the code (the shape of the API: async iterator, callback or
+  context object; and the layer: a native watcher on `BundleV2`, this module, or a recipe in the
+  docs). It was stopped after three and a half hours with 34 of its agents done and no verdict, so
+  the choices are this commit's own.
+
+Rebase notes: 47 patches onto oven-sh/bun e655c58032, nothing dropped, four conflicts. All four are
+with oven-sh/bun#44614, which fixed every type error in `test/` and touched 824 files. Two are in
+fixtures of the types, where upstream and a patch both add lines at the end (`Bun.semver.parse()` of
+2026-08-15 in `fixture/bun.ts`, `lines()` of 2026-08-18 in `fixture/streams.ts`): both are kept. One
+is a type annotation upstream added on a line that the `#semver:` patch of 2026-09-17 had moved into
+a helper of `bun-install-git-deps.test.ts`, and one is the import line of `bundler_comments.test.ts`
+that the `legalComments` patch of 2026-09-29 also changes. The rebased stack builds. The tests of
+the two patches with a test that was merged by hand pass (`bundler_comments.test.ts`,
+`bun-install-git-deps.test.ts`), and so do `test/internal/source-lints/` and the types test. The
+types test needed one change more: it names the line of `fixture/streams.ts` where `lines()` is an
+error under `lib.dom`, and the lines upstream added above moved that from 92 to 109, so the
+`lines()` patch is amended. Upstream's commit brought `test/` to no type errors, and says that
+nothing in CI checks it. On this stack `tsc -p test` reported 43: the 2 that upstream names as known
+for TypeScript 6, 5 in four files that no patch of this stack touches (`cli/check/check.test.ts`,
+`bun-server.test.ts`, `webkit-upgrade-dbdca7545d.test.ts`, `s3-stream-stored-error-fixture.ts`), and
+36 in the tests of ten patches. Those ten patches are amended so that the 36 are gone, which the
+type checker of `bun check` confirms for the ten files: SOCKS5 (`proxy.test.ts`, 11), Web Storage
+(6), zip (`archive.test.ts`, 5), `EventSource` (3), response compression (3), `expect.poll()` (2),
+`Bun.JWT` (2), `legalComments` (2), Web Locks (1) and S3 metadata (1). The changes are of the kind
+upstream made: `expect<unknown>(...)`, a cast, a `!`, a `@ts-expect-error` that had nothing to
+expect. The transpiled output of eight of the files is the same byte for byte before and after.
+`expect-poll.test.ts` differs by line breaks, and `eventsource.test.ts` now passes `url.href` to
+`Response.redirect()`, whose type takes no `URL`: those two files were run again and pass. The other
+eight were not run again.
+
+Files: `src/js/internal/build_watcher.ts` (new), `src/jsc/bindings/BundlerWatch.cpp` (new),
+`src/runtime/api/JSBundler.rs`, `src/runtime/api/js_bundle_completion_task.rs`,
+`src/bundler/bundle_v2.rs`, `src/js/internal-for-testing.ts`, `packages/bun-types/bun.d.ts`,
+`docs/bundler/index.mdx`, `docs/bundler/esbuild.mdx`, `test/bundler/bun-build-watch.test.ts` (new),
+`test/integration/bun-types/fixture/build.ts`.
+
 ## Dropped
 
 Nothing yet.

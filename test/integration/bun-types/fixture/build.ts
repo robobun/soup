@@ -90,3 +90,55 @@ Bun.build({
     },
   ],
 });
+
+// Without `watch`, or with `watch: false`, Bun.build() returns a promise.
+expectType(Bun.build({ entrypoints: ["hey"] })).is<Promise<Bun.BuildOutput>>();
+expectType(Bun.build({ entrypoints: ["hey"], watch: false })).is<Promise<Bun.BuildOutput>>();
+expectType<ReturnType<typeof Bun.build>>().is<Promise<Bun.BuildOutput>>();
+expectType<Parameters<typeof Bun.build>>().is<[config: Bun.BuildConfig]>();
+
+// A config that is typed as BuildConfig still gives a promise.
+declare const buildConfig: Bun.BuildConfig;
+expectType(Bun.build(buildConfig)).is<Promise<Bun.BuildOutput>>();
+expectType(buildConfig.watch).is<boolean | undefined>();
+
+// A `watch` that is only known when the program runs gives one or the other.
+declare const watchFlag: boolean;
+expectType(Bun.build({ entrypoints: ["hey"], watch: watchFlag })).is<Promise<Bun.BuildOutput> | Bun.BuildWatcher>();
+const buildOptions = { entrypoints: ["hey"], watch: true };
+expectType(Bun.build(buildOptions)).is<Promise<Bun.BuildOutput> | Bun.BuildWatcher>();
+expectType(Bun.build({ entrypoints: ["hey"], watch: undefined })).is<Promise<Bun.BuildOutput>>();
+
+// With `watch: true` it returns a BuildWatcher.
+const buildWatcher = Bun.build({ entrypoints: ["hey"], outdir: "./dist", watch: true });
+expectType(buildWatcher).is<Bun.BuildWatcher>();
+expectType(buildWatcher.next()).is<Promise<IteratorResult<Bun.BuildOutput, undefined>>>();
+expectType(buildWatcher.return()).is<Promise<IteratorResult<Bun.BuildOutput, undefined>>>();
+expectType(buildWatcher.stop()).is<Promise<void>>();
+expectType(buildWatcher[Symbol.asyncDispose]()).is<PromiseLike<void>>();
+
+for await (const buildResult of buildWatcher) {
+  expectType(buildResult).is<Bun.BuildOutput>();
+}
+
+for await (const buildResult of Bun.build({ entrypoints: ["hey"], watch: true, plugins: [] })) {
+  expectType(buildResult.success).is<boolean>();
+}
+
+{
+  await using disposedBuildWatcher = Bun.build({ entrypoints: ["hey"], watch: true });
+  expectType(disposedBuildWatcher).is<Bun.BuildWatcher>();
+}
+
+Bun.build({
+  entrypoints: ["hey"],
+  // @ts-expect-error
+  watch: "yes",
+});
+
+Bun.build({
+  entrypoints: ["hey"],
+  watch: true,
+  // @ts-expect-error
+  globalName: ["hey"],
+});

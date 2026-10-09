@@ -13,6 +13,7 @@ use core::ptr::{self, NonNull};
 use std::io::Write as _;
 
 use bun_alloc::Arena;
+use bun_bundler::Graph::{InputFileColumns as _, InputFileFlags};
 use bun_bundler::bundle_v2::{
     BundleV2, BundleV2Result, CompletionStruct, FileMap as Bv2FileMap,
     JSBundleCompletionTask as Bv2OpaqueCompletion, JSBundlerPlugin, dispatch,
@@ -86,6 +87,15 @@ pub(crate) struct JSBundleCompletionTask {
     pub(crate) html_build_task: Option<RefPtr<html_bundle::Route>>,
 
     pub(crate) result: BundleV2Result,
+
+    /// For a build of `Bun.build({ watch: true })`: the array of `internal/build_watcher` that
+    /// `on_complete` fills with `inputs` before the promise settles. A JS handle, so like
+    /// `promise` it is only made, dereferenced and dropped on the JS thread. The bundle thread
+    /// only asks whether there is one.
+    pub(crate) watch_inputs: Option<jsc::Strong>,
+    /// The files on disk that the build read, apart from those in `node_modules`. The bundle
+    /// thread collects them when `watch_inputs` is set, whether the build succeeded or not.
+    pub(crate) inputs: Vec<Box<[u8]>>,
 
     /// intrusive queue link (UnboundedQueue)
     pub(crate) next: bun_threading::Link<JSBundleCompletionTask>,
@@ -189,6 +199,8 @@ impl JSBundleCompletionTask {
             },
             html_build_task: None,
             result: BundleV2Result::Pending,
+            watch_inputs: None,
+            inputs: Vec::new(),
             next: bun_threading::Link::new(),
             transpiler: ptr::null_mut(),
             plugins,
@@ -642,6 +654,7 @@ impl JSBundleCompletionTask {
                     Plugin::destroy(plugin.as_ptr());
                 }
                 (*this).promise = jsc::JSPromiseStrong::default();
+                (*this).watch_inputs = None;
                 (*this).bundle_ticket = None;
                 // Publish only now: from here the bundle thread may free `this`.
                 (*this)
@@ -697,6 +710,17 @@ impl JSBundleCompletionTask {
         // for `result`/`config`/`log` below.
         let promise: *mut JSPromise = this.promise.swap();
         let promise = JSPromise::opaque_mut(promise);
+
+        if let Some(watch_inputs) = this.watch_inputs.take() {
+            let array = watch_inputs.get();
+            for path in core::mem::take(&mut this.inputs) {
+                let pushed = bun_string_jsc::create_utf8_for_js(global_this, &path)
+                    .and_then(|path| array.push(global_this, path));
+                if let Err(e) = pushed {
+                    return promise.reject(global_this, Err(e));
+                }
+            }
+        }
 
         // `do_compilation` borrows `&mut self` while needing
         // `&mut output_files` from inside `self.result`. Temporarily move the
@@ -1339,6 +1363,7 @@ impl CompletionStruct for JSBundleCompletionTask {
         let mut bv2 = BundleV2::init(transpiler, None, bump, event_loop, false, worker_pool, bump)?;
 
         bv2.plugins = self.plugins();
+        bv2.recheck_unresolved_imports = self.watch_inputs.is_some();
         bv2.plugin_context = self.context;
         bv2.completion = Some(self.as_js_bundle_completion_task());
         // SAFETY: `file_map` returns a `NonNull` into `self.config.files`,
@@ -1360,6 +1385,28 @@ impl CompletionStruct for JSBundleCompletionTask {
         let run = bv2
             .run_from_js_in_new_thread(&entry_points)
             .map(|build| self.set_result(BundleV2Result::Value(build)));
+
+        if self.watch_inputs.is_some() {
+            let sources = bv2.graph.input_files.items_source();
+            let flags = bv2.graph.input_files.items_flags();
+            let files = &self.config.files;
+            self.inputs = sources
+                .iter()
+                .zip(flags)
+                .filter(|(source, flags)| {
+                    let path = &source.path;
+                    path.is_file()
+                        && !path.is_disabled
+                        && bun_paths::is_absolute(path.text)
+                        && !bun_core::strings::contains(path.text, bun_paths::NODE_MODULES_NEEDLE)
+                        && !files.contains(path.text)
+                        // What a plugin made up under a path of its own has no file to watch.
+                        && (!flags.contains(InputFileFlags::IS_LOADED_BY_PLUGIN)
+                            || bun_sys::exists(path.text))
+                })
+                .map(|(source, _)| Box::from(source.path.text))
+                .collect();
+        }
 
         // The AST-allocator pop lives in `generate_in_new_thread`.
         bv2.deinit_without_freeing_arena();

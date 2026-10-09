@@ -76,6 +76,26 @@ export const napiThreadsafeFunctionLiveCount = $newRustFunction("napi_body.rs", 
 
 export const bundlerWorkerLiveCount: () => number = $newRustFunction("JSBundler.rs", "jsWorkerLiveCount", 0);
 
+type BuildWatcherState = {
+  /** The names of the files that start a rebuild, by the directory they are in. */
+  watched: Record<string, string[]>;
+  /** After a failed build: the names that start a rebuild when they appear, by directory. */
+  missing: Record<string, string[]>;
+  /** The builds that were started. */
+  builds: number;
+  /** A build is running, or one is about to start. */
+  pending: boolean;
+  /** The file named by the last event of a watched directory. */
+  lastEvent: string | null | undefined;
+};
+
+/**
+ * What a `Bun.build({ watch: true })` watches, and what it has made of the file system events so
+ * far. With `listener`, that is also called with the state after every event from then on.
+ */
+export const buildWatcherState = (watcher: object, listener?: (state: BuildWatcherState) => void): BuildWatcherState =>
+  require("internal/build_watcher").state(watcher, listener);
+
 /** What a bytecode order file calls the code of `text`: `M <name>` and `<start> <kind> <name>` lines, or null. */
 export const bytecodeOrderNames = $newRustFunction("BytecodeOrderRecorder.rs", "namesForTesting", 3) as (
   text: string,

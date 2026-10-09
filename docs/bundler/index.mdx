@@ -11,7 +11,7 @@ Use Bun's native bundler through the `bun build` CLI command or the `Bun.build()
 
 - JS API: `await Bun.build({ entrypoints, outdir })`
 - CLI: `bun build <entry> --outdir ./out`
-- Watch: `--watch` for incremental rebuilds
+- Watch: `--watch`, or `watch: true` in the JS API, to rebuild when a file changes
 - Targets: `--target browser|bun|node`
 - Formats: `--format esm|cjs|iife` (experimental for cjs/iife)
 
@@ -149,9 +149,86 @@ root.render(
 
 Like the runtime and test runner, the bundler supports watch mode natively.
 
-```bash terminal icon="terminal"
-bun build ./index.tsx --outdir ./out --watch
+<Tabs>
+  <Tab title="JavaScript">
+    ```ts title="build.ts" icon="/icons/typescript.svg"
+    const watcher = Bun.build({
+      entrypoints: ["./index.tsx"],
+      outdir: "./out",
+      watch: true,
+    });
+
+    for await (const result of watcher) {
+      if (result.success) {
+        console.log(`Built ${result.outputs.length} files`);
+      } else {
+        for (const message of result.logs) console.error(message);
+      }
+    }
+    ```
+
+  </Tab>
+  <Tab title="CLI">
+    ```bash terminal icon="terminal"
+    bun build ./index.tsx --outdir ./out --watch
+    ```
+  </Tab>
+</Tabs>
+
+With `watch: true`, `Bun.build()` returns a `BuildWatcher` in place of a promise. It is an async iterator: the loop above runs once for the first build, and once more every time a file that went into the bundle changes and the bundle has been built again. The process stays alive until the watcher is stopped.
+
+- **What is watched** is every file on disk that the last build read: the entry points and everything they import, assets, and files that a plugin's `onLoad` handles. Files in `node_modules` are not watched. The list is taken again from every build, so a file is watched from the build that first imports it, and no longer than the bundle imports it.
+- **A rebuild is a complete build** of the same options, like a second call of `Bun.build()`. The options are read when the watcher is made, and arrays and plain objects in them are copied: changing the config later has no effect. The `setup()` function of every plugin runs again, with a fresh copy of the options in `build.config`.
+- **A build that fails** is a result with `success: false` and the errors in `logs`. The [`throw`](#logs-and-errors) option has no say here, and the watcher goes on. What a plugin throws from `setup()` or `onEnd` is in `logs` as it was thrown. After a failed build the watcher also builds again when the file that a relative import did not find, or a missing entry point, is created.
+- **Changes that come together are one rebuild.** The watcher waits until no watched file has changed for 50 milliseconds. A change that arrives while a build is running starts another one right after it.
+- **The loop gets the newest build.** If several rebuilds finish while the body of the loop is busy, the next iteration gets the last of them and the ones in between are skipped. Each build is returned once.
+
+<Note>
+  For TypeScript, `watch` has to be the literal `true` for the result to be a `BuildWatcher`. A `watch` of type
+  `boolean` gives `Promise<BuildOutput> | BuildWatcher`.
+</Note>
+
+### Stopping
+
+Leaving the loop with `break` or `return` stops the watcher. From outside the loop, call `stop()`:
+
+```ts title="build.ts" icon="/icons/typescript.svg"
+const watcher = Bun.build({
+  entrypoints: ["./index.tsx"],
+  outdir: "./out",
+  watch: true,
+});
+
+process.on("SIGINT", () => watcher.stop());
 ```
+
+`stop()` returns a promise. A build cannot be cancelled, so one that is running still writes its files. Its result is dropped, the promise resolves when it has ended, and then the loop ends. A build waits for the callbacks of its plugins, so inside one of them call `stop()` without `await`. A watcher is also an `AsyncDisposable`: `await using watcher = Bun.build({ ..., watch: true })` stops it at the end of the block.
+
+A watcher whose build read no file that can be watched (everything is in `node_modules`, or made up by a plugin) has nothing to wait for. It ends by itself after that build.
+
+### Without a loop
+
+The watcher builds whether or not anything reads its results, so this is a complete build script:
+
+```ts title="build.ts" icon="/icons/typescript.svg"
+Bun.build({
+  entrypoints: ["./index.tsx"],
+  outdir: "./out",
+  plugins: [myPlugin],
+  watch: true,
+});
+```
+
+`Bun.build()` without `watch` rejects when the build fails, so that an error cannot go unseen. A watcher has no promise to reject. As long as nothing has called `next()` (a `for await` loop does), it prints the errors of a failed build to stderr.
+
+### What does not start a rebuild
+
+- A change in `node_modules`, to a `tsconfig.json` or to a `package.json`.
+- A file that a plugin reads on its own, a module that a plugin makes up (any `namespace` other than `file`), a [macro](/bundler/macros), and a `.env` file.
+- A new file that an import would now resolve to in place of the file it found before, and a symlink that is pointed at another file.
+- A package that is installed after a build failed for the lack of it.
+
+Change one of the watched files to build again. A rebuild runs in the same process as the build before it, and the resolver keeps what it has read there: a changed `tsconfig.json` or `package.json`, a newly installed package and new values in `.env` may only be seen when the process is started again.
 
 ## Content types
 
@@ -1958,6 +2035,9 @@ if (result.logs.length > 0) {
 
 ```ts Typescript Definitions icon="/icons/typescript.svg" expandable
 interface Bun {
+  build(options: BuildOptions & { watch: true }): BuildWatcher;
+  build(options: BuildOptions & { watch: false }): Promise<BuildOutput>;
+  build(options: BuildOptions & { watch: boolean }): Promise<BuildOutput> | BuildWatcher;
   build(options: BuildOptions): Promise<BuildOutput>;
 }
 
@@ -2118,6 +2198,15 @@ interface BuildConfig {
   throw?: boolean;
 
   /**
+   * Build again every time a file that went into the bundle changes.
+   * `Bun.build()` then returns a {@link BuildWatcher} in place of a promise.
+   * Equivalent to `--watch` in the CLI.
+   *
+   * @default false
+   */
+  watch?: boolean;
+
+  /**
    * Type check the entry points and everything they import before writing any output.
    * A type error fails the build like any other build error.
    * Equivalent to `--check` in the CLI.
@@ -2139,6 +2228,14 @@ interface BuildOutput {
   outputs: BuildArtifact[];
   success: boolean;
   logs: Array<BuildMessage | ResolveMessage>;
+}
+
+/** What `Bun.build()` returns with `watch: true`: the first build, then every rebuild. */
+interface BuildWatcher extends AsyncIterableIterator<BuildOutput>, AsyncDisposable {
+  /** The newest build that no `next()` has returned yet, or the next one. */
+  next(): Promise<IteratorResult<BuildOutput, undefined>>;
+  /** Stop watching. Resolves when the build that is running has ended. */
+  stop(): Promise<void>;
 }
 
 interface BuildArtifact extends Blob {

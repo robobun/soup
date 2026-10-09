@@ -90,6 +90,10 @@ pub struct BundleV2<'a> {
     // The hot reloader (`jsc::hot_reloader::NewHotReloader<BundleV2, …>`) owns the
     // boxed `Watcher`; bundler only ever calls `Watcher::add_file` on it.
     pub bun_watcher: Option<NonNull<bun_watcher::Watcher>>,
+    /// For a build of `Bun.build({ watch: true })`, which is one of many in its process: an
+    /// import that does not resolve is looked for once more past the resolver's directory
+    /// cache, as under `bun_watcher`, before it is an error.
+    pub recheck_unresolved_imports: bool,
     pub plugins: Option<NonNull<JSBundlerPlugin>>,
     pub completion: Option<dispatch::CompletionHandle>,
     /// When this bundle's owning loop is a JS event loop (bake / dev server):
@@ -3268,6 +3272,7 @@ pub mod bv2_impl {
                     ..Default::default()
                 },
                 bun_watcher: None,
+                recheck_unresolved_imports: false,
                 plugins: None,
                 completion: None,
                 // SAFETY: `event_loop`, when set, points at the caller's live loop
@@ -6890,9 +6895,10 @@ pub mod bv2_impl {
                                 )
                             };
 
-                            // Only perform directory busting when hot-reloading is enabled
+                            // Only perform directory busting when hot-reloading is enabled,
+                            // or when the build is one of a `Bun.build({ watch: true })`.
                             if err == _resolver::Error::ModuleNotFound {
-                                if self.bun_watcher.is_some() {
+                                if self.bun_watcher.is_some() || self.recheck_unresolved_imports {
                                     if !had_busted_dir_cache {
                                         bun_core::scoped_log!(
                                             watcher,

@@ -1484,10 +1484,19 @@ pub(crate) mod js_bundler {
         pub(crate) keep_names: bool,
     }
 
-    fn build(
+    bun_jsc::jsc_abi_extern! {
+        /// `BundlerWatch.cpp`: the `BuildWatcher` that `internal/build_watcher` makes for `config`.
+        safe fn Bun__watchBuild(global_this: &JSGlobalObject, config: JSValue) -> JSValue;
+    }
+
+    /// `Bun.build(config)`, or with `watch_inputs` one build of a `Bun.build({ watch: true })`
+    /// for `internal/build_watcher`: `watch_inputs` is the array that gets the files the build
+    /// read, and a failed build resolves with `success: false` whatever `throw` says.
+    pub(super) fn build(
         global_this: &JSGlobalObject,
         context: jsc::ContextId,
         arguments: &[JSValue],
+        watch_inputs: Option<JSValue>,
     ) -> JsResult<JSValue> {
         if arguments.is_empty() || !arguments[0].is_object() {
             return Err(global_this.throw_invalid_arguments(format_args!(
@@ -1511,8 +1520,20 @@ pub(crate) mod js_bundler {
                  const result = Bun.spawnSync([\"bun\", \"build\", entrypoint, \"--format=esm\"]);")));
         }
 
+        // With `watch: true` the builds are the watcher's, so its plugins are not set up here.
+        if watch_inputs.is_none()
+            && arguments[0].get_boolean_strict(global_this, "watch")? == Some(true)
+        {
+            return bun_jsc::from_js_host_call(global_this, || {
+                Bun__watchBuild(global_this, arguments[0])
+            });
+        }
+
         let mut plugins: Option<*mut Plugin> = None;
-        let config = Config::from_js(global_this, arguments[0], &mut plugins)?;
+        let mut config = Config::from_js(global_this, arguments[0], &mut plugins)?;
+        if watch_inputs.is_some() {
+            config.throw_on_error = false;
+        }
 
         // `BundleV2.generateFromJavaScript` — the completion-task struct lives in
         // `crate::api::js_bundle_completion_task` (bun_runtime owns it because its
@@ -1524,6 +1545,8 @@ pub(crate) mod js_bundler {
             global_this,
             context,
         );
+        completion.watch_inputs =
+            watch_inputs.map(|inputs| jsc::Strong::create(inputs, global_this));
         completion.promise = jsc::JSPromiseStrong::init(global_this);
         let promise = completion.promise.value();
         completion.schedule();
@@ -1540,6 +1563,7 @@ pub(crate) mod js_bundler {
             global_this,
             global_this.bun_vm().context_of_caller(callframe).id(),
             callframe.arguments(),
+            None,
         )
     }
 
@@ -2048,6 +2072,23 @@ pub(crate) fn js_worker_live_count(
     Ok(JSValue::js_number(
         bun_bundler::thread_pool::WORKER_LIVE_COUNT.load(Ordering::SeqCst) as f64,
     ))
+}
+
+/// `internal/build_watcher`: `(config, inputs)`, one build of a `Bun.build({ watch: true })`.
+/// See [`js_bundler::build`].
+#[bun_jsc::host_fn]
+pub(crate) fn js_build_for_watch(
+    global: &JSGlobalObject,
+    callframe: &CallFrame,
+) -> JsResult<JSValue> {
+    let inputs = callframe.argument(1);
+    debug_assert!(inputs.is_array());
+    js_bundler::build(
+        global,
+        global.bun_vm().context_of_caller(callframe).id(),
+        callframe.arguments(),
+        Some(inputs),
+    )
 }
 
 pub(crate) use js_bundler::BunPluginTarget;

@@ -4345,6 +4345,33 @@ declare module "bun" {
     throw?: boolean;
 
     /**
+     * Build again every time a file that went into the bundle changes.
+     *
+     * With `watch: true`, `Bun.build()` returns a {@link BuildWatcher} in place
+     * of a promise: an async iterator of the result of the first build and then
+     * of every rebuild. A build that fails is a result with `success: false`,
+     * whatever `throw` says, and the watcher goes on.
+     *
+     * Equivalent to `--watch` in the CLI.
+     *
+     * @default false
+     *
+     * @example
+     * ```ts
+     * const watcher = Bun.build({
+     *   entrypoints: ['./src/index.ts'],
+     *   outdir: './dist',
+     *   watch: true,
+     * });
+     * for await (const result of watcher) {
+     *   if (result.success) console.log(`Built ${result.outputs.length} files`);
+     *   else console.error(...result.logs);
+     * }
+     * ```
+     */
+    watch?: boolean;
+
+    /**
      * Custom tsconfig.json file path. This build reads it in place of every
      * `tsconfig.json` it would otherwise find, for `paths`, JSX and decorator
      * settings, and for `check`. A directory means the `tsconfig.json` in it.
@@ -5224,6 +5251,70 @@ declare module "bun" {
   }
 
   /**
+   * A build that is made again every time one of its input files changes.
+   * {@link Bun.build} returns one when `watch` is `true`.
+   *
+   * It is an async iterator of {@link BuildOutput}: the first build, then every
+   * rebuild. A build that fails is a result with `success: false`, and the
+   * watcher goes on. An error that is not a build message, such as what a
+   * plugin's `setup()` or `onEnd` threw, is in `logs` as it was thrown. The
+   * process stays alive until the watcher is stopped.
+   *
+   * What is watched is every file on disk that the last build read, apart from
+   * those in `node_modules`. A watcher whose build read no such file has nothing
+   * to wait for, and ends after that build. A rebuild is a complete build of the
+   * same options, which are read when the watcher is made: the `setup()` of
+   * every plugin runs again, with a copy of them in `build.config`.
+   *
+   * @example
+   * ```ts
+   * const watcher = Bun.build({
+   *   entrypoints: ['./src/index.tsx'],
+   *   outdir: './dist',
+   *   watch: true,
+   * });
+   *
+   * for await (const result of watcher) {
+   *   if (result.success) console.log(`Built ${result.outputs.length} files`);
+   *   else console.error(...result.logs);
+   * }
+   * ```
+   *
+   * @category Bundler
+   */
+  interface BuildWatcher extends AsyncIterableIterator<BuildOutput>, AsyncDisposable {
+    /**
+     * The newest build that no call of `next()` has returned yet, or the next
+     * one when there is none. Builds that finished in between are skipped.
+     *
+     * Each build is returned once: of several calls that are waiting, the
+     * first gets the next build.
+     *
+     * `done` is `true` once the watcher is stopped. The promise rejects, once,
+     * when the watcher cannot go on because a directory cannot be watched.
+     */
+    next(): Promise<IteratorResult<BuildOutput, undefined>>;
+
+    /**
+     * The same as {@link BuildWatcher.stop}. A `for await` loop calls it when
+     * it is left with `break`, `return` or an error.
+     */
+    return(): Promise<IteratorResult<BuildOutput, undefined>>;
+
+    /**
+     * Stop watching.
+     *
+     * A build cannot be cancelled: one that is running still writes its files,
+     * and its result is dropped. The promise resolves when that build has
+     * ended, and a `next()` that is waiting then resolves with `done: true`.
+     *
+     * The build waits for the callbacks of its plugins. Inside one of them,
+     * call `stop()` without `await`.
+     */
+    stop(): Promise<void>;
+  }
+
+  /**
    * Build metadata: every input and output file, its size, and the imports
    * between them.
    *
@@ -5291,6 +5382,60 @@ declare module "bun" {
       };
     };
   }
+
+  /**
+   * Bundles JavaScript, TypeScript, CSS, HTML and other supported files into optimized outputs,
+   * and bundles them again every time one of the files that went into the bundle changes.
+   *
+   * For TypeScript to pick this signature, `watch` has to be the literal `true`. A `watch`
+   * of type `boolean` gives `Promise<BuildOutput> | BuildWatcher`. A config that is typed as
+   * {@link BuildConfig} is taken for a build without watch, whatever its `watch` is.
+   *
+   * @param config Build configuration options, with `watch: true`
+   * @returns An async iterator of the result of the first build and of every rebuild
+   *
+   * @category Bundler
+   *
+   * @example
+   * Rebuild on change until the process is stopped
+   *```ts
+   * const watcher = Bun.build({
+   *   entrypoints: ['./src/index.tsx'],
+   *   outdir: './dist',
+   *   watch: true,
+   * });
+   *
+   * for await (const result of watcher) {
+   *   if (result.success) console.log(`Built ${result.outputs.length} files`);
+   *   else console.error(...result.logs);
+   * }
+   *```
+   *
+   * @example
+   * Stop watching
+   *```ts
+   * const watcher = Bun.build({ entrypoints: ['./src/index.tsx'], outdir: './dist', watch: true });
+   * process.on('SIGINT', () => watcher.stop());
+   *```
+   */
+  function build(config: BuildConfig & { watch: true }): BuildWatcher;
+
+  /**
+   * Bundles JavaScript, TypeScript, CSS, HTML and other supported files into optimized outputs.
+   * With `watch: false` this is a build without watch.
+   *
+   * @category Bundler
+   */
+  function build(config: BuildConfig & { watch: false }): Promise<BuildOutput>;
+
+  /**
+   * Bundles JavaScript, TypeScript, CSS, HTML and other supported files into optimized outputs.
+   * With a `watch` that is only known when the program runs, so is what this returns: a
+   * {@link BuildWatcher} for `true`, and a promise for `false`.
+   *
+   * @category Bundler
+   */
+  function build(config: BuildConfig & { watch: boolean }): Promise<BuildOutput> | BuildWatcher;
 
   /**
    * Bundles JavaScript, TypeScript, CSS, HTML and other supported files into optimized outputs.
