@@ -16,7 +16,7 @@ use bun_core::String as BunString;
 use bun_jsc::ConcurrentTask::ConcurrentTask;
 use bun_jsc::bindgen::{JsHeap, JsLocal, JsScope, JsWrapper};
 use bun_jsc::bun_string_jsc;
-use bun_jsc::{self as jsc, JSGlobalObject, JSValue, JsError, JsResult, StringJsc as _};
+use bun_jsc::{self as jsc, JSArray, JSGlobalObject, JSValue, JsError, JsResult, StringJsc as _};
 use bun_options_types::aot_options::AotOptions;
 use bun_options_types::compile_target::CompileTarget;
 use bun_options_types::schema::api; // bun.schema.api
@@ -1865,10 +1865,33 @@ pub(crate) mod js_bundler {
         pub(crate) keep_names: bool,
     }
 
+    bun_jsc::jsc_abi_extern! {
+        /// `BundlerWatch.cpp`: the `BuildWatcher` that `internal/build_watcher` makes for `config`.
+        safe fn Bun__watchBuild(global_this: &JSGlobalObject, config: JSValue) -> JSValue;
+    }
+
     /// `Bun.build(config)`
     pub(crate) fn build(cx: &mut JsScope<'_>, config: JsLocal<'_>) -> JsResult<JSValue> {
-        let global_this = cx.global();
-        let config = config.to_js();
+        build_impl(cx.global(), config.to_js(), None)
+    }
+
+    /// `internal/build_watcher`: `(config, inputs)`, one build of a `Bun.build({ watch: true })`.
+    pub(crate) fn build_for_watch<'a>(
+        cx: &mut JsScope<'a>,
+        config: JsLocal<'a>,
+        inputs: JsLocal<'a, JSArray>,
+    ) -> JsResult<JSValue> {
+        build_impl(cx.global(), config.to_js(), Some(inputs.to_js()))
+    }
+
+    /// `Bun.build(config)`, or with `watch_inputs` one build of a `Bun.build({ watch: true })`
+    /// for `internal/build_watcher`: `watch_inputs` is the array that gets the files the build
+    /// read, and a failed build resolves with `success: false` whatever `throw` says.
+    fn build_impl(
+        global_this: &JSGlobalObject,
+        config: JSValue,
+        watch_inputs: Option<JSValue>,
+    ) -> JsResult<JSValue> {
         if !config.is_object() {
             return Err(global_this.throw_invalid_arguments(format_args!(
                 "Expected a config object to be passed to Bun.build"
@@ -1892,8 +1915,27 @@ pub(crate) mod js_bundler {
                  const result = Bun.spawnSync([\"bun\", \"build\", entrypoint, \"--format=esm\"]);")));
         }
 
+        // With `watch: true` the builds are the watcher's, so its plugins are not set up here.
+        if watch_inputs.is_none() && config.get_boolean_strict(global_this, "watch")? == Some(true)
+        {
+            return bun_jsc::from_js_host_call(global_this, || {
+                Bun__watchBuild(global_this, config)
+            });
+        }
+
         let mut plugins: Option<*mut Plugin> = None;
-        let config = Config::from_js(global_this, config, &mut plugins)?;
+        let mut config = Config::from_js(global_this, config, &mut plugins)?;
+        if watch_inputs.is_some() {
+            // Such a build does not say which files it read, and the watcher would have nothing to watch.
+            let is_compiled_ahead_of_time =
+                (config.compile.as_ref()).is_some_and(|compile| compile.aot.is_some());
+            if is_compiled_ahead_of_time {
+                return Err(global_this.throw_invalid_arguments(format_args!(
+                    "watch cannot be used with compile.aot"
+                )));
+            }
+            config.throw_on_error = false;
+        }
 
         // `BundleV2.generateFromJavaScript` — the completion-task struct lives in
         // `crate::api::js_bundle_completion_task` (bun_runtime owns it because its
@@ -1905,6 +1947,8 @@ pub(crate) mod js_bundler {
             global_this,
             context,
         );
+        completion.watch_inputs =
+            watch_inputs.map(|inputs| jsc::Strong::create(inputs, global_this));
         completion.promise = jsc::JSPromiseStrong::init(global_this);
         let promise = completion.promise.value();
         completion.schedule();
