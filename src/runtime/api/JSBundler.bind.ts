@@ -32,4 +32,11 @@ export const build = b.fn({
   rustPath: "crate::api::js_bundler::js_bundler::build",
 });
 
+/** `internal/build_watcher`: one build of a `Bun.build({ watch: true })`. `inputs` gets the files the build read. */
+export const buildForWatch = b.fn({
+  ...method,
+  args: { config: b.any, inputs: b.jsArray },
+  rustPath: "crate::api::js_bundler::js_bundler::build_for_watch",
+});
+
 export const workerLiveCount = b.fn({ returns: b.usize });
