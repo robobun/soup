@@ -6,6 +6,7 @@ use core::ptr::NonNull;
 use std::io::Write as _;
 
 use bun_alloc::Arena;
+use bun_bundler::Graph::{InputFileColumns as _, InputFileFlags};
 use bun_bundler::aot::PluginSetup;
 use bun_bundler::bundle_v2::{BuildResult, BundleV2, dispatch};
 use bun_bundler::options::{self, OutputFile, OutputKind, Side};
@@ -59,6 +60,10 @@ pub(crate) struct JSBundleCompletionTask {
     result: bun_bundler::Result<BuildResult>,
     plugins: Option<JsPtr<Plugin>>,
     declarations: Option<DeclarationOutputs>,
+    /// For a build of `Bun.build({ watch: true })`: the files on disk that the build read,
+    /// apart from those in `node_modules`, whether the build succeeded or not. `None` for
+    /// every other build.
+    watch_inputs: Option<Vec<Box<[u8]>>>,
     /// Owned. Not a `Box`: the JS thread uses it while this task is on the bundle thread.
     js: JsPtr<BundleJs>,
 }
@@ -79,6 +84,9 @@ pub(crate) enum BuildOwner {
     Promise {
         promise: jsc::JSPromiseStrong,
         plugins: Option<OwnedPlugin>,
+        /// For a build of `Bun.build({ watch: true })`: the array of `internal/build_watcher`
+        /// that gets the files the build read before the promise settles.
+        watch_inputs: Option<jsc::Strong>,
     },
     Route {
         route: html_bundle::PendingBuild,
@@ -158,6 +166,10 @@ impl JSBundleCompletionTask {
         if let Some(plugins) = plugins {
             Plugin::opaque_ref(plugins.as_ptr()).freeze_filters();
         }
+        let watch_inputs = match &owner {
+            BuildOwner::Promise { watch_inputs, .. } => watch_inputs.as_ref().map(|_| Vec::new()),
+            BuildOwner::Route { .. } => None,
+        };
         let js = bun_core::heap::alloc_nn(BundleJs {
             global_this: BackRef::new(global_this),
             owner,
@@ -190,6 +202,7 @@ impl JSBundleCompletionTask {
             result: Err(bun_bundler::Error::BuildFailed),
             plugins,
             declarations: None,
+            watch_inputs,
             js,
         });
         bundle_thread::enqueue(task, vm.ticket());
@@ -677,8 +690,23 @@ impl JSBundleCompletionTask {
                 }
                 Ok(())
             }
-            BuildOwner::Promise { promise, .. } if deliver => {
-                self.settle(promise.swap(), &global_this)
+            BuildOwner::Promise {
+                promise,
+                watch_inputs,
+                ..
+            } if deliver => {
+                let promise = promise.swap();
+                if let Some(array) = watch_inputs.take() {
+                    let array = array.get();
+                    for path in self.watch_inputs.take().unwrap_or_default() {
+                        let pushed = bun_string_jsc::create_utf8_for_js(&global_this, &path)
+                            .and_then(|path| array.push(&global_this, path));
+                        if let Err(e) = pushed {
+                            return promise.reject(&global_this, Err(e));
+                        }
+                    }
+                }
+                self.settle(promise, &global_this)
             }
             BuildOwner::Promise { .. } => Ok(()),
         }
@@ -1217,11 +1245,35 @@ impl JSBundleCompletionTask {
 
         let mut bv2 = BundleV2::init(transpiler, None, heap, event_loop, worker_pool, heap);
         bv2.plugins = plugins;
+        bv2.recheck_unresolved_imports = self.watch_inputs.is_some();
         bv2.plugin_context = self.context;
         bv2.completion = Some(completion);
         bv2.file_map = file_map;
 
-        bv2.run_from_js_in_new_thread(&entry_points)
+        let result = bv2.run_from_js_in_new_thread(&entry_points);
+
+        if let Some(inputs) = &mut self.watch_inputs {
+            let sources = bv2.graph.input_files.items_source();
+            let flags = bv2.graph.input_files.items_flags();
+            *inputs = sources
+                .iter()
+                .zip(flags)
+                .filter(|(source, flags)| {
+                    let path = &source.path;
+                    path.is_file()
+                        && !path.is_disabled
+                        && bun_paths::is_absolute(path.text)
+                        && !bun_core::strings::contains(path.text, bun_paths::NODE_MODULES_NEEDLE)
+                        && !config.files.contains(path.text)
+                        // What a plugin made up under a path of its own has no file to watch.
+                        && (!flags.contains(InputFileFlags::IS_LOADED_BY_PLUGIN)
+                            || bun_sys::exists(path.text))
+                })
+                .map(|(source, _)| Box::from(source.path.text))
+                .collect();
+        }
+
+        result
     }
 }
 
