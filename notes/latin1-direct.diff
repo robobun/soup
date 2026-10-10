@@ -1,0 +1,40 @@
+--- /tmp/wk/src-c3/Source/WTF/wtf/text/StringImpl.cpp	2026-10-10 03:23:14.000000000 +0000
++++ /tmp/wk/src-c4/Source/WTF/wtf/text/StringImpl.cpp	2026-10-10 07:14:49.032268458 +0000
+@@ -1653,12 +1653,31 @@
+     if (source.empty())
+         return emptyUTF8CString();
+ 
+-    auto result = tryGetUTF8ForCharacters([] (std::span<const char8_t> converted) {
+-        return tryCopyToUTF8CString(converted);
+-    }, source);
+-    if (!result) [[unlikely]]
+-        return makeUnexpected(result.error());
+-    return WTF::move(*result);
++    if (source.size() <= UTF8ConversionBuffer::inlineCapacity / 2) {
++        auto result = tryGetUTF8ForCharacters([] (std::span<const char8_t> converted) {
++            return tryCopyToUTF8CString(converted);
++        }, source);
++        if (!result) [[unlikely]]
++            return makeUnexpected(result.error());
++        return WTF::move(*result);
++    }
++
++    // The scratch memory of tryGetUTF8ForCharacters() would be an allocation of 2 bytes for each character.
++    // The characters are measured, and converted straight into the UTF8CString.
++    if (productOverflows<size_t>(source.size(), 2) || !isValidCapacityForVector<char8_t>(source.size() * 2)) [[unlikely]]
++        return makeUnexpected(UTF8ConversionError::OutOfMemory);
++
++#if CPU(ARM64)
++    if (!find8NonASCII(source))
++        return tryCopyToUTF8CString(byteCast<char8_t>(source));
++#endif
++    std::span<char8_t> destination;
++    auto result = UTF8CString::tryNewUninitialized(simdutf::utf8_length_from_latin1(source), destination);
++    if (result.isNull()) [[unlikely]]
++        return makeUnexpected(UTF8ConversionError::OutOfMemory);
++    size_t convertedSize = simdutf::convert_latin1_to_utf8(source, destination);
++    ASSERT_UNUSED(convertedSize, convertedSize == destination.size());
++    return result;
+ }
+ 
+ // The steps of tryGetUTF8ForCharacters(), with one difference: a result that does not fit the inline scratch buffer
