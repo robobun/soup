@@ -253,6 +253,8 @@ impl<'a> Parser<'a, '_> {
             self.ctx.test_options.coverage.reporters.text = true;
         } else if item_str == b"lcov" {
             self.ctx.test_options.coverage.reporters.lcov = true;
+        } else if item_str == b"html" {
+            self.ctx.test_options.coverage.reporters.html = true;
         } else {
             self.add_error_format(
                 item.loc,
@@ -641,6 +643,7 @@ impl<'a> Parser<'a, '_> {
                         self.ctx.test_options.coverage.reporters = CoverageReporters {
                             text: false,
                             lcov: false,
+                            html: false,
                         };
                         if let ExprData::EString(_) = &expr.data {
                             self.apply_coverage_reporter_item(&expr)?;
