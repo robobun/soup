@@ -102,6 +102,10 @@ pub(crate) mod test {
     #[path = "CoverageInclude.rs"]
     pub(crate) mod coverage_include;
 
+    /// `--coverage-reporter=html`: writes the HTML report.
+    #[path = "CoverageHtml.rs"]
+    pub(crate) mod coverage_html;
+
     /// `bun test --parallel`: a coordinator hands test files to worker processes. `runner` has the entry points.
     pub(crate) mod parallel {
         #[path = "aggregate.rs"]
