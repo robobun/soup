@@ -194,7 +194,7 @@ Coverage reports exclude test files by default. To include them:
 coverageSkipTestFiles = false  # default true
 ```
 
-When `coverageSkipTestFiles` is `true` (the default), the coverage report excludes files matching test patterns (for example `*.test.ts`, `*.spec.js`).
+When `coverageSkipTestFiles` is `true` (the default), the coverage report excludes files matching test patterns (for example `*.test.ts`, `*.spec.js`). With [`testMatch`](/test/configuration#testmatch) set, it excludes the files that those patterns name instead.
 
 ### Ignore Specific Paths and Patterns
 

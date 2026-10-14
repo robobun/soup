@@ -109,6 +109,8 @@ pub(crate) struct TestRunner {
     pub(crate) concurrent: bool,
     /// `concurrentTestGlob` in bunfig: files that match one of these run their tests concurrently.
     pub(crate) concurrent_test_glob: Option<Vec<bun_glob::Prepared<Box<[u8]>>>>,
+    /// `--test-match` and `testMatch`, for `coverageSkipTestFiles`. The scanner asks the same.
+    pub(crate) test_files: Cell<Option<&'static crate::cli::test::scanner::TestFiles>>,
     pub(crate) bail: u32,
     pub(crate) max_concurrency: u32,
     pub(crate) randomize: bool,
