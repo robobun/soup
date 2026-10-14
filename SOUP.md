@@ -4368,6 +4368,189 @@ Files: `src/js/internal/build_watcher.ts` (new), `src/jsc/bindings/BundlerWatch.
 `docs/bundler/index.mdx`, `docs/bundler/esbuild.mdx`, `test/bundler/bun-build-watch.test.ts` (new),
 `test/integration/bun-types/fixture/build.ts`.
 
+### 2026-10-13: `testMatch`, custom test file patterns for `bun test`
+
+`bun test` runs the files whose name ends in `.test`, `_test`, `.spec` or `_spec` before the
+extension, and nothing could change that. A project that names its tests `*.unit.ts` and
+`*.int.ts`, or keeps them in `tests/` without a suffix, had to rename them or hand `bun test` a
+list from `find`. oven-sh/bun#3440 asks for patterns: open since June 2023, 40 thumbs up, "Jest and
+Vitest both allow us to specify a custom glob", and a maintainer's answer in the thread that "we
+can do this now" that bun has globs. oven-sh/bun#26714 did it in Zig as `[test] include` in
+February 2026. The sweep after the Rust rewrite closed it as stale, and nobody had reviewed it.
+This is that feature on the Rust tree, under Jest's name:
+
+```toml
+# bunfig.toml
+[test]
+testMatch = ["**/*.unit.ts", "**/*.int.ts"]
+```
+
+```sh
+# for one run: the flag replaces the list in bunfig.toml
+bun test --test-match '**/*.unit.ts'
+bun test --test-match 'tests/**' --test-match '!tests/fixtures/**'
+```
+
+The name is Jest's because its neighbours are: `pathIgnorePatterns` is `testPathIgnorePatterns`,
+the flags of `bun test` are Jest's in kebab case, and the rule for `!` below is Jest's. The
+`include` of a Vitest config works as a `testMatch` too.
+
+What it does:
+
+- A pattern is a `Bun.Glob` pattern, matched against the path of a file relative to the project
+  root (the directory `bun test` runs in), like `pathIgnorePatterns`. `tests/**` is the `tests`
+  directory of the project. A `./` in front is dropped.
+- A pattern with a `!` in front takes files away, by the rule of Jest's `globsToMatcher`: the
+  patterns are asked in order and the last one that has a say decides, a pattern on the paths it
+  matches and a negated one on the paths it rejects.
+  `["tests/**", "!tests/helpers/**", "tests/helpers/e2e.ts"]` means what it says. A `!(a|b)` group
+  in front counts as a negation, as in Jest.
+- A list of only negated patterns takes files away from the default names. This is not Jest's
+  rule, where such a list makes every file a test. A file without tests fails a Jest run. In bun it
+  runs and passes, so `testMatch = ["!e2e/**"]` would have executed every script in the project.
+- A group with alternatives needs no prefix: `**/*.(spec|test).ts` is read as
+  `**/*.@(spec|test).ts`. Jest's matcher (picomatch) reads a bare group that way and `Bun.Glob`
+  reads it as text, and Jest lists are full of them: old versions of Jest had
+  `**/?(*.)(spec|test).js?(x)` for a default. Parentheses without a `|` stay text, so
+  `app/(marketing)/**` is the directory it looks like.
+- `<rootDir>` in front of a pattern is the directory in `[test] root`, or the project root
+  without one, with or without the slash behind it.
+- Nothing else about discovery changes. A test file still needs an extension that bun loads as
+  JavaScript or TypeScript (`tests/**` does not run `tests/data.json`, and a `[loader]` mapping
+  counts), `node_modules` and dot directories are not scanned, `pathIgnorePatterns` and the
+  positional filters still apply, and a file path on the command line runs whether or not a
+  pattern matches it.
+- `--test-match` replaces `testMatch` for the scan. A wrong `testMatch` in bunfig.toml is an error
+  with or without the flag.
+- `coverageSkipTestFiles` leaves out the files the patterns name in place of the files with a
+  default name. A run with `--test-match` also leaves out the tests it did not ask for: what
+  `testMatch` in bunfig.toml names, or without one the default names. So
+  `bun test --coverage --test-match '**/*.unit.ts'` does not report `cart.int.ts` as source.
+- When nothing matches, the message names the patterns in place of the four suffixes, and adds a
+  note when a pattern ends in an extension that bun does not run (`features/**/*.feature`
+  without a loader).
+
+The cucumber case from the issue thread works and is in the docs and the tests: `testMatch =
+["features/**/*.feature"]`, `[loader] ".feature" = "ts"`, and a preload plugin whose `onLoad`
+turns a feature file into `test()` calls.
+
+How it is made. `Scanner.rs` has two new types. `TestMatch` is one list: the patterns prepared
+once with upstream's `bun_glob::Prepared`, and the project root as it was when the run started.
+`TestFiles` is the two lists, the flag's and bunfig's. The scanner asks `TestFiles::scanned()` at
+the one place where it took a file name for a test. `coverageSkipTestFiles` asks
+`TestFiles::names()` through the runner, where upstream asked for the suffix, so a `--parallel`
+worker answers the same (it gets `--test-match` on its command line when coverage is on, and
+reads bunfig.toml itself). A pattern is rewritten once, when the list is made: the prefix goes,
+a bare group gets its `@`, and what stood behind a dropped prefix is escaped where it would
+otherwise join the `!` in front (`!./(old)/**` is not the group `!(old)/**`). The other places
+this could have lived were weighed and left: globs as positional arguments (what `node --test`
+has) would change what `bun test [id]` means today and give plain `bun test` no configuration,
+and more than one `root` does nothing for suffixes.
+
+What a project that does not use it pays. A scan: an `Option` that is `None`, asked twice for a
+file. A module load under `--coverage`: the same `Option` on the runner. `TestOptions` is 48
+bytes larger (two empty `Vec`s), the runner and the scanner 8 each, and `bun test` has one more
+flag in its table. No release build was made, so there is no number for the binary.
+
+Against Jest. A reviewer wrote Jest's `globsToMatcher` over the picomatch 2.3.1 and 4.0.4 that are
+in `test/node_modules`, and compared real `bun test` runs with it on a tree of 77 files. Of 63
+pattern lists of the kind Jest configs have, 60 now run the same files (48 before bare groups were
+read Jest's way). The three that differ: `**.test.ts` and `**.spec.js`, which picomatch matches at
+any depth and `Bun.Glob` only in the root, and a group without a `|`, `(*.)`. Of 200 random lists
+of one to five patterns, 177 run the same files, and the 23 that differ are the lists of only
+negated patterns, on purpose. The docs name what else differs: patterns are relative (Jest matches
+absolute paths), `[id]` is a character class, and there is no `testRegex`.
+
+A review pass before the push: four readers with the debug build, one each for the matcher
+against picomatch, the scanner, the other `bun test` features, and the docs and tests, about 470
+probes in an hour. No crash and no sanitizer report. What they found is fixed above and has a
+test: a dropped `./` or `<rootDir>/` changed what the rest of a pattern meant. A `!(a|b)` group in
+front added files where Jest removes them. A bare group matched nothing and said nothing. A list
+of only negated patterns ran every file. `<rootDir>` ignored `root`. With `--coverage
+--rerun-each` the header of the second run named a file that does not exist, because the first
+version asked `resolve_path::relative()`, which answers in a buffer of the thread that
+`TestCommand::run` is still reading the file name from: `TestMatch` now computes the relative
+path itself. Coverage read the patterns against the directory a test had changed to. A run
+narrowed with `--test-match` reported the other tests as uncovered source. An invalid bunfig
+value passed with the flag and killed every `--parallel` worker without it. The hint blamed the
+patterns when the extension was the reason. Two tests passed without the feature. There was no
+second review after the rework. The first reviewer's harness was run again, with the numbers
+above.
+
+A bug in an older patch, found by the same readers: since `--last-failed` (2026-09-05), a test
+file behind a symlink was printed under a garbled name, `linked.test.tsntation.ts:` for
+`shared/implementation.ts:`, in every run. `LastFailed::begin_file` asked `relative()` after
+`TestCommand::run` had taken the file name from the same buffer. It is fixed in that patch, by
+asking first, with a test in `test-last-failed.test.ts`.
+
+Tests: 31 in `describe("testMatch")` at the end of `test/cli/test/bun-test.test.ts`. All 31 fail
+on the released bun (1.4.3) and pass on the debug build. The whole file in the debug build: 141
+pass, 8 fail, none of the 8 in the new block. Six import `node:test` and take 5 to 7 seconds
+against the local limit of 5 (they pass with `--timeout 60000`). Two make a value 100,000 levels
+deep, which takes the debug build 14 seconds. They were not compared with a build without this
+commit. Also run in the debug build, with `--timeout 60000` where a test does several runs:
+`test-last-failed.test.ts` (8), `coverage.test.ts` (50), `test-shard.test.ts` (29),
+`test-changed.test.ts` (20), `path-ignore-patterns.test.ts` (10), `concurrent-test-glob.test.ts`
+(6) and `pass-with-no-tests.test.ts` (5) pass. `parallel.test.ts`: 44 pass, 3 fail. Two of the
+three count worker processes by how long a file takes and fail alone as well: a file takes the
+debug build longer than the 250 ms the test allows. They pass on the released bun, and were not
+compared with a debug build without this stack. `test/internal/source-lints/`: 178 pass with the
+released bun, which is how CI runs it. In the debug build it takes 22 minutes and three of its
+tests hit the limit of 5 seconds.
+
+Not done, and not checked:
+
+- `coverageSkipTestFiles` asks about the path a module was loaded under. A test file behind a
+  symlink is loaded under its real path, which the patterns may not name, and then it is in the
+  report. The default names do not have this problem, because a suffix goes with the file.
+- For a file path on the command line that bun cannot run, the note still says what `testMatch`
+  needs, and a file path needs no match. Upstream's note for the default names has the same flaw.
+- A `--parallel` worker reads `./bunfig.toml` and is not told of `--config`, on the released bun
+  too. With `--config`, `--parallel` and `--coverage` together, a worker takes `testMatch` from the
+  wrong file. Handed to an upstream session with a reproduction, and not taken up.
+- `bun test --coverage` panics on the released bun when a test imports a `data:` URL of more than
+  4096 bytes ("range end index 5042 out of range for slice of length 4096" when the table is
+  made). `TestMatch` returns early for what is not a path, so this commit adds no second place.
+  Handed to an upstream session as well, and not taken up.
+- A scan still walks the whole tree. It does not start at `tests/` because the only pattern is
+  `tests/**`.
+- Built and run on Linux x64 only. On Windows the relative path is compared without regard to
+  case and with both separators, and nobody ran it. The zsh completion was not tried in zsh.
+- The design check that the harness asks for was not run. It traces a bug to its root cause, and a
+  feature has none. The choices above are this commit's own.
+
+Rebase notes: 48 patches onto oven-sh/bun c69a636b9d (37 commits since e655c58032, among them
+`bun lint`, `bun fmt`, a new glob matcher and the merge of the open TLS fixes), nothing dropped.
+Nine patches had conflicts. In seven, both sides are kept: three import lines
+(`bunshell.test.ts`, `proxy.test.ts`, `pack_command.rs`), the module list in `cli/mod.rs`, a
+section of `docs/runtime/bunfig.mdx`, the `Loader` type in three docs pages (upstream's formatter
+had put it on one line, and with `"bytes"` it no longer fits), and `glob.rs` of the `ignore`
+patch. Two took more. `is_ignored` in `test_command.rs` now gets prepared patterns from upstream,
+so `collectCoverageFrom` prepares its list once. And upstream added `lint` and `fmt` to the chain
+of compares that the "did you mean" patch had turned into the `ROOT_COMMANDS` table: they are two
+rows of it now, and the check for a script of the same name is upstream's
+`script_or_command::is_of_the_project`. Three patches built no longer and were changed without a
+conflict. Upstream's `bun lint` brought a `strings::edit_distance` of its own (plain Levenshtein),
+so the one of "did you mean" is `typo_distance`. The parser type lost a const parameter
+(`import.meta.glob`). Upstream's new migration of Yarn Berry lockfiles builds a `LoadResultOk`,
+which needed the `merged_conflict` field of the lockfile merge. After that the stack builds. The
+tests of the patches that were touched pass in the debug build: `scan.test.ts` (215, and 6 that
+compare with fast-glob time out, because fast-glob takes the debug build 142 seconds where
+`Bun.Glob` takes 2.5 for the same 10,793 paths), `run_command.test.ts` and the `bun pm` test of
+"did you mean", upstream's `test/cli/lint/help.test.ts` (56, it goes through the rewritten
+`which()`), the SOCKS5 tests (44, five of them only when run alone), the `collectCoverageFrom`
+tests (15, three only alone), both `import.meta.glob` files, the 70 lockfile merge tests, the
+shell's `[[ ]]` tests, the source lints and the types test.
+
+Files: `src/runtime/cli/test/Scanner.rs` (`TestFiles`, `TestMatch`),
+`src/runtime/cli/test_command.rs`, `src/runtime/test_runner/jest.rs`,
+`src/runtime/cli/test/parallel/runner.rs`,
+`src/runtime/cli/Arguments.rs`, `src/bunfig/bunfig.rs`, `src/options_types/context.rs`,
+`completions/bun.zsh`, `completions/bun-cli.json`, `docs/test/configuration.mdx`,
+`docs/test/discovery.mdx`, `docs/test/code-coverage.mdx`, `docs/runtime/bunfig.mdx`,
+`docs/guides/test/migrate-from-jest.mdx`, `docs/snippets/cli/test.mdx`,
+`test/cli/test/bun-test.test.ts`.
+
 ## Dropped
 
 Nothing yet.

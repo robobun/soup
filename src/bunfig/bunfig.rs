@@ -805,6 +805,48 @@ impl<'a> Parser<'a, '_> {
                         }
                     }
                 }
+
+                // Kept next to `--test-match`, which replaces it for a scan only.
+                if let Some(expr) = test.get(b"testMatch") {
+                    match &expr.data {
+                        ExprData::EString(s) => {
+                            if s.len() == 0 {
+                                self.add_error(expr.loc, b"testMatch cannot be an empty string")?;
+                                return Ok(());
+                            }
+                            self.ctx.test_options.test_match = vec![estring_to_owned(s, self.bump)];
+                        }
+                        ExprData::EArray(arr) => {
+                            let items = arr.items.slice();
+                            let mut patterns: Vec<Box<[u8]>> = Vec::with_capacity(items.len());
+                            for item in items {
+                                let ExprData::EString(s) = &item.data else {
+                                    self.add_error(
+                                        item.loc,
+                                        b"testMatch array must contain only strings",
+                                    )?;
+                                    return Ok(());
+                                };
+                                if s.len() == 0 {
+                                    self.add_error(
+                                        item.loc,
+                                        b"testMatch patterns cannot be empty strings",
+                                    )?;
+                                    return Ok(());
+                                }
+                                patterns.push(estring_to_owned(s, self.bump));
+                            }
+                            self.ctx.test_options.test_match = patterns;
+                        }
+                        _ => {
+                            self.add_error(
+                                expr.loc,
+                                b"testMatch must be a string or array of strings",
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
 

@@ -1079,6 +1079,7 @@ _bun_test_completion() {
         '--dry-run[Load the test files and list the tests that would run, without running any test or hook]' \
         '--reporter[Test output reporter format: junit (requires --reporter-outfile), json, dots]:reporter:(junit json dots)' \
         '--reporter-outfile[Output file path for the reporter format]:outfile:_files' \
+        '--test-match[Glob patterns for the files to run as tests, in place of the default .test, _test, .spec and _spec names]:pattern' \
         '--test-name-pattern[Run only tests with a name that matches the given regex]:pattern' \
         '-t[Run only tests with a name that matches the given regex]:pattern' &&
         ret=0

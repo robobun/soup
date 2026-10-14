@@ -194,6 +194,17 @@ Same as the top-level `preload` field, but only applies to `bun test`.
 preload = ["./setup.ts"]
 ```
 
+### `test.testMatch`
+
+Glob patterns for the files that `bun test` runs as tests, in place of the default `*.test.*`, `*_test.*`, `*.spec.*` and `*_spec.*` names. Bun matches them against the path of a file relative to the project root, so a name at any depth is `**/*.unit.ts`. A pattern that starts with `!` takes files away.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+testMatch = ["**/*.unit.ts", "**/*.int.ts"]
+```
+
+Equivalent CLI flag: `--test-match`. CLI flags replace the `bunfig.toml` value for the run. See [Test configuration](/test/configuration#testmatch) for the rules, and for what differs from Jest's `testMatch`.
+
 ### `test.pathIgnorePatterns`
 
 Exclude files and directories from test discovery using glob patterns. The test runner prunes matched directories during scanning, so it never traverses their contents. Use this when your project contains submodules or vendored code with `*.test.ts` files that you don't want `bun test` to pick up.

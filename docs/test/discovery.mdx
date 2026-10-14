@@ -100,6 +100,29 @@ By default, Bun looks for test files starting from the current working directory
 root = "src"  # Only scan for tests in the src directory
 ```
 
+### Changing Which Files Are Tests
+
+To run files with other names as tests, list glob patterns in `testMatch`. They replace the default patterns:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+# Unit tests and integration tests, named by their suffix
+testMatch = ["**/*.unit.ts", "**/*.int.ts"]
+```
+
+`--test-match` does the same for one run, which lets one project keep several kinds of tests apart:
+
+```json title="package.json" icon="file-json"
+{
+  "scripts": {
+    "test:unit": "bun test --test-match '**/*.unit.ts'",
+    "test:int": "bun test --test-match '**/*.int.ts'"
+  }
+}
+```
+
+Bun matches the patterns against the path of a file relative to the project root, so a name at any depth starts with `**/`. [`testMatch`](/test/configuration#testmatch) has the rules, and says what to expect of a list that comes from Jest or Vitest.
+
 ## Listing tests without running them
 
 To see what a given `bun test` command line would run, add `--dry-run`. Every other flag keeps its meaning, so this is the quickest way to check a `-t` pattern, a `--changed` or `--shard` selection, or which tests a stray `.only` leaves behind:

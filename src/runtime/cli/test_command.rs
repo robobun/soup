@@ -1849,21 +1849,55 @@ extern "C" fn BunTest__shouldGenerateCodeCoverage(test_name_str: &bun_core::Stri
         return false;
     }
 
-    if let Some(runner) = jest::Jest::runner() {
-        if runner.test_options.coverage.skip_test_files && has_test_file_name(slice) {
-            return false;
-        }
-    }
-
-    true
+    let skip_test_files =
+        jest::Jest::runner().is_some_and(|runner| runner.test_options.coverage.skip_test_files);
+    !(skip_test_files && has_test_file_name(slice))
 }
 
-/// Whether `coverageSkipTestFiles` leaves the file out.
+/// Whether `coverageSkipTestFiles` leaves the file out: it has a test suffix,
+/// or with `--test-match` or `testMatch` the patterns name it.
 pub(crate) fn has_test_file_name(path: &[u8]) -> bool {
-    let name_without_extension = &path[0..path.len() - bun_path::extension(path).len()];
-    scanner::TEST_NAME_SUFFIXES
-        .iter()
-        .any(|suffix| strings::ends_with(name_without_extension, suffix))
+    match jest::Jest::runner().and_then(|runner| runner.test_files) {
+        Some(test_files) => test_files.names(path),
+        None => scanner::has_test_suffix(path),
+    }
+}
+
+/// The `testMatch` patterns as the user wrote them, for a message: `"a", "b"`.
+struct QuotedPatterns<'a>(&'a [Box<[u8]>]);
+
+impl QuotedPatterns<'_> {
+    /// A pattern can name files that Bun does not run: `features/**/*.feature`. Says so for the
+    /// first pattern that ends in such an extension.
+    fn print_loader_note(&self, options: &bun_bundler::options::BundleOptions<'_>) {
+        for pattern in self.0 {
+            let extension = bun_path::extension(pattern);
+            let is_plain = extension.len() > 1
+                && extension[1..]
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric());
+            if is_plain && !options.loader(extension).is_javascript_like() {
+                pretty_errorln!(
+                    "<blue>note<r><d>:<r> Bun does not run \"{}\" files as code. Map the extension in bunfig.toml: <b>[loader]<r> \"{}\" = \"ts\"",
+                    bstr::BStr::new(extension),
+                    bstr::BStr::new(extension),
+                );
+                return;
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for QuotedPatterns<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (i, pattern) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", bun_fmt::quote(pattern))?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct TestCommand;
@@ -2002,6 +2036,8 @@ impl TestCommand {
                 concurrent_test_glob: concurrent_test_glob_view
                     .as_deref()
                     .map(|s| unsafe { bun_ptr::detach_lifetime(s) }),
+                // Set once the VM is there: the patterns are relative to `top_level_dir`.
+                test_files: None,
                 run_todo: ctx.test_options.run_todo,
                 only: ctx.test_options.only,
                 bail: ctx.test_options.bail,
@@ -2096,6 +2132,17 @@ impl TestCommand {
                 ..Default::default()
             })?
         };
+        // `top_level_dir` is the project root from here on, and no module has loaded yet.
+        let test_files = scanner::TestFiles::new(
+            &ctx.test_options.test_match_flag,
+            &ctx.test_options.test_match,
+            FileSystem::instance().top_level_dir,
+            &ctx.debug.test_directory,
+        );
+        // SAFETY: `test_files` is held in this never-returning frame.
+        reporter.jest.test_files = test_files
+            .as_ref()
+            .map(|files| unsafe { bun_ptr::detach_lifetime_ref(files) });
         vm.argv = core::mem::take(&mut ctx.passthrough);
         // Clone (not take): build_worker_argv reads ctx.preloads to forward --preload.
         vm.preload = ctx.preloads.clone();
@@ -2181,6 +2228,7 @@ impl TestCommand {
         // frame, underlying bytes live in `ctx` (process-lifetime).
         scanner.path_ignore_patterns =
             unsafe { bun_ptr::detach_lifetime(&path_ignore_patterns_view[..]) };
+        scanner.test_match = test_files.as_ref().and_then(scanner::TestFiles::scanned);
         let has_relative_path = 'hr: {
             for arg in &ctx.positionals {
                 if bun_paths::is_absolute(arg)
@@ -2659,20 +2707,42 @@ impl TestCommand {
         if test_files.is_empty() && !pass_with_no_tests_from_filter {
             failed_to_find_any_tests = true;
 
+            // The list that the scan asked.
+            let patterns = QuotedPatterns(if ctx.test_options.test_match_flag.is_empty() {
+                &ctx.test_options.test_match
+            } else {
+                &ctx.test_options.test_match_flag
+            });
             // "bun test" - positionals[0] == "test"
             // Therefore positionals starts at [1].
             if ctx.positionals.len() < 2 {
                 if Output::is_ai_agent() {
                     // Be very clear to ai.
-                    Output::err_generic(
-                        "0 test files matching **{{.test,.spec,_test_,_spec_}}.{{js,ts,jsx,tsx}} in --cwd={}",
-                        (bun_fmt::quote(FileSystem::instance().top_level_dir),),
-                    );
-                } else {
+                    if patterns.0.is_empty() {
+                        Output::err_generic(
+                            "0 test files matching **{{.test,.spec,_test_,_spec_}}.{{js,ts,jsx,tsx}} in --cwd={}",
+                            (bun_fmt::quote(FileSystem::instance().top_level_dir),),
+                        );
+                    } else {
+                        Output::err_generic(
+                            "0 test files matching testMatch {} in --cwd={}",
+                            (
+                                &patterns,
+                                bun_fmt::quote(FileSystem::instance().top_level_dir),
+                            ),
+                        );
+                    }
+                } else if patterns.0.is_empty() {
                     // Be friendlier to humans.
                     pretty_errorln!(
                         "<yellow>No tests found!<r>\n\nTests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename <d>(ex: \"MyApp.test.ts\")<r>\n"
                     );
+                } else {
+                    pretty_errorln!(
+                        "<yellow>No tests found!<r>\n\nTests need a path that matches testMatch: {}",
+                        patterns
+                    );
+                    patterns.print_loader_note(&vm.transpiler.options);
                 }
             } else {
                 if Output::is_ai_agent() {
@@ -2707,9 +2777,17 @@ impl TestCommand {
                     Output::print_start_end(ctx.start_time, bun::time::nano_timestamp());
                 }
 
-                pretty_errorln!(
-                    "\n\n<blue>note<r><d>:<r> Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename <d>(ex: \"MyApp.test.ts\")<r>"
-                );
+                if patterns.0.is_empty() {
+                    pretty_errorln!(
+                        "\n\n<blue>note<r><d>:<r> Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename <d>(ex: \"MyApp.test.ts\")<r>"
+                    );
+                } else {
+                    pretty_errorln!(
+                        "\n\n<blue>note<r><d>:<r> Tests need a path that matches testMatch: {}",
+                        patterns
+                    );
+                    patterns.print_loader_note(&vm.transpiler.options);
+                }
 
                 // print a helpful note
                 if let Some(i) = has_file_like {
