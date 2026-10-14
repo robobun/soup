@@ -89,7 +89,7 @@
         },
         {
           "name": "coverage-reporter",
-          "description": "Report coverage in 'text' and/or 'lcov'. Defaults to 'text'.",
+          "description": "Report coverage in 'text', 'lcov' and/or 'html'. Defaults to 'text'.",
           "hasValue": true,
           "valueType": "val",
           "defaultValue": "'text'",
