@@ -3,7 +3,6 @@
 
 use core::sync::atomic::Ordering;
 
-use bun_core::Output;
 use bun_jsc::virtual_machine::VirtualMachine;
 use bun_options_types::code_coverage_options::CodeCoverageOptions;
 use bun_sourcemap_jsc::code_coverage::Report;
@@ -111,7 +110,7 @@ pub(crate) fn write_coverage_report(
                 .get_or_insert_with(|| u32::from(bun_sys::SignalCode(signal as u8).to_exit_code()));
         }
         Err(err) => {
-            Output::err(err, "Failed to write lcov.info", ());
+            err.print();
             coord.aborted.get_or_insert(1);
         }
     }

@@ -49,6 +49,7 @@ impl Default for CodeCoverageOptions {
             reporters: Reporters {
                 text: true,
                 lcov: false,
+                html: false,
             },
             reports_directory: Box::from(b"coverage" as &[u8]),
             fractions: Fraction::default(),
@@ -65,4 +66,5 @@ impl Default for CodeCoverageOptions {
 pub struct Reporters {
     pub text: bool,
     pub lcov: bool,
+    pub html: bool,
 }

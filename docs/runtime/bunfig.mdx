@@ -301,7 +301,7 @@ coveragePathIgnorePatterns = [
 
 ### `test.coverageReporter`
 
-By default, the test runner prints coverage reports to the console. For persistent reports that CI and other tools can read, use `lcov`.
+By default, the test runner prints coverage reports to the console. For persistent reports that CI and other tools can read, use `lcov`. To browse coverage file by file, use `html`.
 
 ```toml title="bunfig.toml" icon="settings"
 [test]
@@ -310,7 +310,7 @@ coverageReporter  = ["text", "lcov"]  # default ["text"]
 
 ### `test.coverageDir`
 
-Set the path where coverage reports are saved. This only applies to persistent reporters like `lcov`.
+Set the path where coverage reports are saved. This only applies to persistent reporters like `lcov` and `html`.
 
 ```toml title="bunfig.toml" icon="settings"
 [test]

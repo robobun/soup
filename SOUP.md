@@ -4479,6 +4479,209 @@ Files: `src/runtime/cli/test/Scanner.rs` (`TestFiles`, `TestMatch`),
 `docs/guides/test/migrate-from-jest.mdx`, `docs/snippets/cli/test.mdx`,
 `test/cli/test/bun-test.test.ts`.
 
+### 2026-10-14: `bun test --coverage-reporter=html`, a coverage report to browse
+
+`bun test --coverage` prints a table and can write `lcov.info`. The table says which lines of a file
+did not run, and nothing shows them: for that one needs `genhtml` from the lcov package, an editor
+extension or a coverage service. oven-sh/bun#4099 asks for the `html` reporter that Jest, Vitest, c8
+and nyc have. It has been open since August 2023 and has 31 upvotes, and the last comment in it
+says that `genhtml` on Bun's `lcov.info` is "not as good as" the Istanbul report. One attempt
+exists, oven-sh/bun#21015 of July 2025 from the `jarred-sumner-bot` account. It was closed with CI
+red and without a review. By its description it wrote one page per file under a flat name
+(`src-utils.ts.html`) with the percentages and the uncovered line ranges, and not the source. A
+search found no open pull request for an html reporter (oven-sh/bun#40218 adds a cobertura one).
+Now:
+
+```sh
+bun test --coverage-reporter=text --coverage-reporter=html
+```
+
+```toml
+[test]
+coverageReporter = ["text", "html"]   # then: bun test --coverage
+```
+
+```txt
+coverage/
+├── index.html
+└── src/
+    ├── math.ts.html
+    └── utils/
+        └── string.ts.html
+```
+
+What it writes, point by point:
+
+- `index.html` lists every file with the `% Funcs` and `% Lines` of the text table, the number of
+  functions and lines that ran, and a bar. The "All files" row is the one of the table, made by the
+  same function (`average_fraction`, which the table now calls too), so the two cannot differ. A
+  number is red when it is below the threshold, by the rule the table colours with. The rows can be
+  sorted by name and by either percentage, and filtered by a search box. That is the one script of
+  the report, 1.2 KB, in the index alone. Without it the table is the files in the order of their
+  names.
+- The page of a file shows its source, one row for each line. A line that ran has a green mark, a
+  line that is executable and did not run has a red mark and a red background, and a line the report
+  does not count has none. The ranges of the "Uncovered Line #s" column are at the top, each a link
+  to its first line, and every line has an anchor (`#L12`).
+- The pages mirror the directories of the project. When a test loads a file from outside the project
+  directory (the sibling package of a monorepo), the paths start at the deepest directory that holds
+  the project directory and every file, so no page leaves the coverage directory. A module that is
+  not a file (a `data:` or `blob:` URL, a module a plugin makes up) has one page next to the index.
+- Every page carries its style (2.9 KB) and loads nothing, so a page opens alone and the directory
+  can be an artifact of a CI run. It follows `prefers-color-scheme`, and on a narrow screen the index
+  hides the counts and the bars.
+- A page is written to a temporary file next to it and renamed, so a reader never sees half a page.
+  When a file cannot be written the run ends with `Failed to write coverage/src/math.ts.html` and
+  exit code 1, in a serial run and under `--parallel`.
+
+It is one more consumer of the reports that the other two reporters print, so it follows
+`--parallel` (the coordinator writes it from the merged reports), `collectCoverageFrom`,
+`coveragePathIgnorePatterns`, the ignore hints and `coverageThreshold` without a line of its own for
+any of them. The tests hold it to that: the marks of every row are compared with the `DA` records of
+`lcov.info` of the same run, the numbers with the table.
+
+What the pages do not show, and why. There are no hit counts. The number after the comma in Bun's
+`DA:<line>,<n>` is not how often a line ran: it counts the bytes of the executed blocks that map to
+the line (`DA:2,13` for a `return a + b;` that ran once), so only zero and not zero mean something,
+and that is what a mark is. The marks also make visible what the table only hints at: for a function that
+never ran, the report has the lines around its start and not its body, so the body has no mark, and
+the line above the function can be red (upstream has oven-sh/bun#41528 open for line attribution).
+The docs say so instead of promising that red means "did not run".
+
+A page has a note in place of the source when the source on disk is not what the line numbers
+count: the file cannot be read, the module is not a file, the file has fewer lines than the last
+line the report marks (a test rewrote it), `coverageIgnoreSourcemaps` is set, or the file is a
+`// @bun` bundle that names a source map of its own (Bun then numbers the lines of the sources the
+bundle was made from). The ranges at the top are plain text then, as there is no line to link to.
+
+The names of the pages. A segment of a path keeps its bytes except the ones Windows forbids
+(`< > : " | ? *`, `\`, control characters), which become `_`. `.`, `..` and the device names of
+Win32 (`aux`, `nul.js`) get a `_` in front, a directory that ends in a dot or a space gets one
+behind, a segment is cut at 200 bytes, and two pages that end up with one name (also when they only
+differ in case) are numbered: `a_b.ts.html`, `a_b.ts-2.html`. Every file of the report ends in
+`.html`, so a directory that does (and one named `lcov.info`) gets a `_` too, and a page can never
+be where the index or a directory has to be. A path that does not fit a path buffer with the
+coverage directory in front of it loses its directories instead of failing the run.
+
+How it is made. The renderer is `src/sourcemap_jsc/CodeCoverageHtml.rs` (417 lines with the style
+sheet and the script), next to the `text` and `lcov` modules, because the fields of a `Report` are
+private to that crate. The rows of a page are not split by a rule of its own: they come from
+`LineOffsetTable::generate`, the table that numbers the lines of the report, so a row is a line of
+the report by construction. `src/runtime/cli/test/CoverageHtml.rs` (336 lines) lays the pages out,
+reads each source the way the module loader does (a UTF-16 file with a byte order mark is
+converted), and writes the files. The hook is three lines in `print_coverage_reports_`, which the
+serial runner and the `--parallel` coordinator both go through. The error of that path was a bare
+`bun_sys::Error` printed as "Failed to write lcov.info" at two places, and is now a `ReportError`
+that names the file.
+
+What a run without the reporter pays: one more `bool` in `Reporters` and one branch after the lcov
+branch. What a run with it pays: one read of every source file and one page, 78 bytes of markup for
+a line on top of its text. For 2000 files (240,000 lines, 9.4 MB) the debug build needs 38 to 42
+seconds with `--coverage-reporter=lcov` and 45 seconds with `html` (27 without coverage), and writes
+42 MB. No release build was made, so there is no number for a release binary: not for the time and
+not for what the two modules add to its size.
+
+A review pass (four readers with the debug build, each with an area: the Rust code, the contents of
+the pages, the file system, and the tests and docs; 87 minutes, 474 commands, 39 findings) found
+these, all fixed in this commit and with a test unless it says otherwise:
+
+- The run never ended when the coverage directory was a dangling symlink. `File::make_open` makes
+  the directories with `bun_paths::make_path_with`, which goes back and forth between the link
+  (`EEXIST`) and its child (`ENOENT`) for ever. The pages are now opened and their directories made
+  the way the lcov reporter does it, which ends with `ENOENT`.
+- The first version split lines by its own rule. The line table reads a `\n` after a byte such as a
+  Latin-1 `é` as a part of that character, so in such a file every mark was one row off.
+- A UTF-16 source, which Bun loads, was shown byte by byte.
+- For a module that is not a file, a file of that name in the working directory was shown as its
+  source. A `data:` URL became a directory for each `/` in it (470 for a URL of 3.9 KB).
+- The temporary files were named by the process id, as the `--timings` file is. Two runs in two
+  containers that share a directory have the same id. They have a random name now, as the one of
+  `lcov.info`.
+- The bar was a `<meter>`, whose colour could contradict the number beside it (yellow at a
+  threshold of 1.0). It is a `<progress>` in the colour of the number.
+- The index said it was sorted by name and was sorted by path, which differs for a file outside the
+  project. After "filter, open a page, Back" Chrome restores the text of the filter after the script
+  has run, and the list was whole again (checked by hand, as the script has no test: see below).
+- The links of the uncovered ranges led nowhere on a page without source. A bundle with its own
+  source map was shown with the line numbers of other files painted on it.
+- A source path of 4061 bytes, which is fine for the other reporters, failed the run.
+- The docs said that red means "executable and did not run", which the fixture of the tests
+  disproves, linked to an anchor that does not exist, and had a `bunfig.toml` snippet that writes
+  nothing as written (`coverageReporter` does not turn coverage on).
+- Tests that could not fail: the marks of the line-ending test came from `lcov.info` of the same
+  run alone, the regular expression of the index took either colour, and nothing looked at the
+  totals of a page, at `--coverage-dir`, or at a failure under `--parallel`.
+
+Found on the way, in upstream and not in this stack. All four are reproduced on the released
+1.4.3-canary.1+367d939d9. They were handed to the hand-off of this session, which took none, so
+they are written down here:
+
+- `bun test --coverage-reporter=lcov` leaves a `.lcov.info.<hex>.tmp` in the coverage directory on
+  every run after the first. `write_lcov_report` moves its temporary file with `move_file_z`, which
+  swaps the two names when `lcov.info` exists, and the old file stays under the temporary name.
+- The loop above is in a helper that upstream uses too. When `link` is a dangling symlink,
+  `bun test --timings=link/sub/t.json --update-timings` and
+  `bun build --metafile=link/sub/meta.json` never return.
+- `bun test --coverage` panics (`range end index 6748 out of range for slice of length 4096`) when
+  a test imports a module from a `data:` URL that is longer than a path buffer. The table and
+  `lcov.info` pass the URL to `resolve_path::relative`. The html reporter does not, and gets through.
+- A map that comes from a file's `sourceMappingURL` is parsed with `i32::MAX` for the number of
+  lines, and the report of that file is sized by it: two bit sets of 2^31 bits and 8 GB of zero
+  pages for the hits. For a bundle of 9 lines that is 1.5 seconds in a serial run and 45 seconds
+  under `--parallel=2`, where every worker sends all of it to the coordinator. This is why the test
+  for such a bundle is skipped in debug and ASAN builds, where the walk takes 16 seconds.
+
+Not done, and not checked.
+
+- The script of the index has no test. A DOM to run it in costs the debug build 17 seconds to
+  import (happy-dom). It was run in Chrome 153 through `Bun.WebView`: sort by each column in both
+  directions, filter, filter and Back, the links in both directions, the anchor of a line, dark
+  mode, a width of 400 pixels.
+- No syntax highlighting, no execution counts (see above), no branches, no page for a directory.
+- A file that the `onLoad` of a plugin rewrites is shown as it is on disk, with the marks of what
+  the plugin returned, unless that is longer than the file. The report has no way to tell.
+- The pages of an earlier run are not deleted, and a run with nothing to report writes nothing, so
+  the directory can hold an index that is older than the run. The docs say to delete it first.
+- When a page cannot be written, a serial run exits before the JUnit or JSON report, the timings
+  and the record of `--last-failed` are written. That is what a failure to write `lcov.info` does
+  today. `--parallel` writes them first.
+- `--coverage-reporter` and `--coverage-dir` on the command line lose to `coverageReporter` and
+  `coverageDir` in `bunfig.toml`. That is upstream's order, and oven-sh/bun#44682 changes it.
+- A threshold that fails ends the run with exit code 1 and no message when the text reporter is
+  off, as with `lcov` alone.
+- Built and run on Linux x64 only. The Windows rules for names are code that was read, not run:
+  the tests for them run on POSIX, and the one test for a dangling symlink is skipped on Windows.
+  `completions/bun-cli.json` was edited by hand, not generated.
+- No design check was run before the code: the reporter has one place to live, next to the other
+  two. The shape of the report (an index and a page for each file, under the coverage directory, as
+  Istanbul's `html` reporter has it) is this commit's own choice.
+
+Tests are in `test/cli/test/coverage.test.ts`: 15 in a block of their own and one with the
+`collectCoverageFrom` tests. All 16 fail on the released binary. The debug build passes 15 and
+skips the one for the bundle (it passed there once, in 16.8 seconds, before it was skipped). The
+whole file passes there (65, 1 skipped) with a timeout above the default: eight of its older tests
+need more than the 5 seconds of a local run in a debug build. `test/internal/source-lints/` passes
+with the released binary (178). With the debug build four of its tests time out and the rest pass.
+
+Rebase notes: 49 patches onto oven-sh/bun 408c9374b2, no conflict, nothing dropped. The run of
+2026-10-13 was still under way when this one started. Three and a half hours into this run it
+pushed `testMatch` and a change to the `--last-failed` patch, on the base of the day before. This
+run had rebased the 48 patches it found in the morning, and found out when its push was refused.
+It rebased the 49 of that push, which was clean, and put this commit on top, where `SOUP.md` was
+the one conflict (two entries at the same place). Two sentences of the `testMatch` entry are
+reflowed in its commit: prettier does not take a code span that runs over the end of a line. The
+stack of 50 builds. On it the tests of this commit, the `testMatch` tests (31), the `--last-failed`
+tests (8) and the source lints pass. The three workflows of the fork were green on the push before
+this one.
+
+Files: `src/sourcemap_jsc/CodeCoverageHtml.rs` (new), `src/runtime/cli/test/CoverageHtml.rs` (new),
+`src/sourcemap_jsc/CodeCoverage.rs`, `src/runtime/cli/test_command.rs` (`ReportError`,
+`average_fraction`, the hook), `src/runtime/cli/test/parallel/aggregate.rs`,
+`src/runtime/cli/Arguments.rs`, `src/runtime/cli/mod.rs`, `src/bunfig/bunfig.rs`,
+`src/options_types/code_coverage_options.rs`, `docs/test/code-coverage.mdx`,
+`docs/test/configuration.mdx`, `docs/runtime/bunfig.mdx`, `docs/snippets/cli/test.mdx`,
+`completions/bun-cli.json`, `test/cli/test/coverage.test.ts`.
+
 ## Dropped
 
 Nothing yet.

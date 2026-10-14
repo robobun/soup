@@ -834,6 +834,9 @@ pub mod lcov {
     }
 }
 
+#[path = "CodeCoverageHtml.rs"]
+pub mod html;
+
 /// Comments in a source file that leave code out of its coverage report:
 ///
 /// ```js
