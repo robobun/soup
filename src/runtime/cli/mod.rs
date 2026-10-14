@@ -98,6 +98,10 @@ pub(crate) mod test {
     #[path = "CoverageInclude.rs"]
     pub(crate) mod coverage_include;
 
+    /// `--coverage-reporter=html`: writes the HTML report.
+    #[path = "CoverageHtml.rs"]
+    pub(crate) mod coverage_html;
+
     /// `bun test --parallel`: process-pool coordinator/worker entry points.
     /// Thin façade re-exporting from `parallel::runner`.
     #[path = "ParallelRunner.rs"]

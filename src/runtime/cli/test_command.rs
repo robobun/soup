@@ -2,6 +2,7 @@ use bun_io::Write as _;
 
 use crate::cli::Command;
 use crate::cli::test::changed_files_filter as ChangedFilesFilter;
+use crate::cli::test::coverage_html;
 use crate::cli::test::coverage_include;
 use crate::cli::test::json_reporter::JsonReporter;
 use crate::cli::test::last_failed::LastFailed;
@@ -1627,10 +1628,26 @@ impl CommandLineReporter {
         let mut reports: Vec<CodeCoverageReport<'static>> = Vec::new();
         Self::for_each_coverage_report(vm, opts, |report| reports.push(report.into_owned()));
         if let Err(err) = finish_coverage_reports(vm, opts, include, reports, &|| false) {
-            Output::err(err, "Failed to write lcov.info", ());
+            err.print();
             return false;
         }
         true
+    }
+}
+
+/// A file of a coverage report that could not be written.
+pub(crate) struct ReportError {
+    pub(crate) err: bun_sys::Error,
+    pub(crate) file: Vec<u8>,
+}
+
+impl ReportError {
+    pub(crate) fn print(self) {
+        Output::err(
+            self.err,
+            "Failed to write {}",
+            (bstr::BStr::new(&self.file),),
+        );
     }
 }
 
@@ -1639,14 +1656,14 @@ impl CommandLineReporter {
 /// every worker. With `collectCoverageFrom` (`include`) they become the
 /// reports of the files the list names before they are printed.
 /// `interrupted` is asked between two files that nothing loaded.
-/// Errors only from writing `lcov.info`.
+/// Errors only from writing `lcov.info` or the HTML report.
 pub(crate) fn finish_coverage_reports(
     vm: &mut VirtualMachine,
     opts: &mut CodeCoverageOptions,
     include: Option<&coverage_include::Run>,
     mut reports: Vec<CodeCoverageReport<'static>>,
     interrupted: &dyn Fn() -> bool,
-) -> bun_sys::Result<coverage_include::Completed> {
+) -> Result<coverage_include::Completed, ReportError> {
     let relative_dir = match include {
         Some(run) => {
             let completed = coverage_include::complete(run, vm, opts, &mut reports, interrupted);
@@ -1661,13 +1678,13 @@ pub(crate) fn finish_coverage_reports(
     Ok(coverage_include::Completed::Yes)
 }
 
-/// Write the `--coverage` text table to stderr and/or `lcov.info` for
+/// Write the `--coverage` text table to stderr, `lcov.info` and/or the HTML report for
 /// `reports` (sorted by path), and set `opts.fractions.failing`.
 fn print_coverage_reports(
     opts: &mut CodeCoverageOptions,
     relative_dir: &[u8],
     reports: &[CodeCoverageReport<'_>],
-) -> bun_sys::Result<()> {
+) -> Result<(), ReportError> {
     if Output::enable_ansi_colors_stderr() {
         print_coverage_reports_::<true>(opts, relative_dir, reports)
     } else {
@@ -1679,7 +1696,7 @@ fn print_coverage_reports_<const COLORS: bool>(
     opts: &mut CodeCoverageOptions,
     relative_dir: &[u8],
     reports: &[CodeCoverageReport<'_>],
-) -> bun_sys::Result<()> {
+) -> Result<(), ReportError> {
     let thresholds = opts.fractions;
 
     let fractions: Vec<Fraction> = reports.iter().map(|r| r.fraction(&thresholds)).collect();
@@ -1690,9 +1707,37 @@ fn print_coverage_reports_<const COLORS: bool>(
         print_coverage_table::<COLORS>(relative_dir, &thresholds, reports, &fractions, failing);
     }
     if opts.reporters.lcov {
-        write_lcov_report(opts, relative_dir, reports)?;
+        write_lcov_report(opts, relative_dir, reports).map_err(|err| ReportError {
+            err,
+            file: b"lcov.info".to_vec(),
+        })?;
+    }
+    if opts.reporters.html {
+        coverage_html::write(opts, relative_dir, reports, &fractions)?;
     }
     Ok(())
+}
+
+/// The "All files" row: the mean of what each file has.
+pub(crate) fn average_fraction(fractions: &[Fraction]) -> Fraction {
+    let mut avg = Fraction {
+        functions: 0.0,
+        lines: 0.0,
+        stmts: 0.0,
+        failing: false,
+    };
+    for f in fractions {
+        avg.functions += f.functions;
+        avg.lines += f.lines;
+        avg.stmts += f.stmts;
+    }
+    if !fractions.is_empty() {
+        let n = fractions.len() as f64;
+        avg.functions /= n;
+        avg.lines /= n;
+        avg.stmts /= n;
+    }
+    avg
 }
 
 fn print_coverage_table<const COLORS: bool>(
@@ -1709,25 +1754,10 @@ fn print_coverage_table<const COLORS: bool>(
         .map(|r| resolve_path::relative(relative_dir, &r.source_url).len())
         .fold(b"All files".len(), usize::max);
 
-    let zero = Fraction {
-        functions: 0.0,
-        lines: 0.0,
-        stmts: 0.0,
-        failing: false,
-    };
-    let mut avg = zero;
-    for f in fractions {
-        avg.functions += f.functions;
-        avg.lines += f.lines;
-        avg.stmts += f.stmts;
-    }
+    let avg = average_fraction(fractions);
     let avg_thresholds = if fractions.is_empty() {
-        zero
+        avg
     } else {
-        let n = fractions.len() as f64;
-        avg.functions /= n;
-        avg.lines /= n;
-        avg.stmts /= n;
         thresholds
     };
 
