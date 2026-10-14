@@ -129,6 +129,8 @@ pub(crate) struct TestRunner<'a> {
     /// `Vec<Box<[u8]>>` with process lifetime); see the detach in
     /// `test_command.rs` where this is populated.
     pub(crate) concurrent_test_glob: Option<&'a [bun_glob::Prepared<&'a [u8]>]>,
+    /// `--test-match` and `testMatch`, for `coverageSkipTestFiles`. The scanner asks the same.
+    pub(crate) test_files: Option<&'a crate::cli::test::scanner::TestFiles>,
     pub(crate) bail: u32,
     pub(crate) max_concurrency: u32,
 

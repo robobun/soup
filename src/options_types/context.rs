@@ -447,6 +447,11 @@ pub struct TestOptions {
     pub concurrent_test_glob: Option<Vec<Box<[u8]>>>,
     pub bail: u32,
     pub coverage: CodeCoverageOptions,
+    /// `testMatch` in bunfig.toml, in the order given: globs of the files that
+    /// are tests, in place of the `.test`/`.spec` names. Empty: those names.
+    pub test_match: Vec<Box<[u8]>>,
+    /// `--test-match`. Not empty: a scan asks this list and not `test_match`.
+    pub test_match_flag: Vec<Box<[u8]>>,
     pub path_ignore_patterns: Vec<Box<[u8]>>,
     pub path_ignore_patterns_from_cli: bool,
     /// `--collect-coverage-from` was passed, so bunfig's `collectCoverageFrom`
@@ -542,6 +547,8 @@ impl Default for TestOptions {
             concurrent_test_glob: None,
             bail: 0,
             coverage: CodeCoverageOptions::default(),
+            test_match: Vec::new(),
+            test_match_flag: Vec::new(),
             path_ignore_patterns: Vec::new(),
             path_ignore_patterns_from_cli: false,
             collect_coverage_from_cli: false,

@@ -39,6 +39,116 @@ root = "tests"
 # root = ["src", "lib"]  # This syntax is not supported
 ```
 
+### testMatch
+
+`testMatch` sets which files `bun test` runs as tests, using glob patterns. The patterns replace the default names, so a project can name its tests `*.unit.ts`, or keep them in a `tests/` directory without a suffix.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+# Single pattern
+testMatch = "tests/**"
+
+# Multiple patterns
+testMatch = ["**/*.unit.ts", "**/*.int.ts"]
+```
+
+This is equivalent to using `--test-match` on the command line:
+
+```bash terminal icon="terminal"
+bun test --test-match '**/*.unit.ts' --test-match '**/*.int.ts'
+```
+
+Patterns use the same syntax as [`Bun.Glob`](/runtime/glob). Bun matches them against the path of a file relative to the project root, which is the directory you run `bun test` in. `tests/**` is the `tests` directory of the project, and `**/tests/**` is one at any depth. A `./` at the start of a pattern is dropped.
+
+To keep the default names next to your own, add them as a pattern:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+testMatch = ["**/*{.,_}{test,spec}.{js,jsx,ts,tsx,mjs,cjs,mts,cts}", "**/*.unit.ts"]
+```
+
+#### Negated patterns
+
+A pattern that starts with `!` takes files away. As in Jest, Bun asks the patterns in order and the last one that has a say decides. A pattern has a say on the paths it matches, and a negated pattern on the paths it rejects:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+testMatch = [
+  "tests/**",             # every file under tests/
+  "!tests/helpers/**",    # but nothing under tests/helpers/
+  "tests/helpers/e2e.ts"  # except this file
+]
+```
+
+A list of only negated patterns takes files away from the default names: `testMatch = ["!e2e/**"]` runs the `*.test.*` and `*.spec.*` files that are not under `e2e/`.
+
+#### What else decides
+
+`testMatch` changes which names are tests, and nothing else about discovery:
+
+- A test file still needs an extension that Bun loads as JavaScript or TypeScript, so `tests/**` doesn't run `tests/data.json` or a snapshot. To run files with another extension, map it in [`[loader]`](/runtime/bunfig#loader).
+- Bun doesn't scan `node_modules` or directories whose name starts with a period.
+- [`pathIgnorePatterns`](#path-ignore-patterns) excludes files that `testMatch` names.
+- Filters narrow the list further. `bun test cart` runs the files that `testMatch` names and that have `cart` in their path.
+- A file path on the command line, such as `bun test ./scratch.ts`, runs whether or not a pattern matches it.
+
+<Note>Command-line `--test-match` flags replace the `bunfig.toml` value for the run. Bun does not merge the two.</Note>
+
+With `testMatch` set, [`coverageSkipTestFiles`](#skip-test-files-from-coverage) leaves out the files that the patterns name instead of the files with a default test name. A run with `--test-match` leaves out both: the files that the flag names and the files that `testMatch` in `bunfig.toml` names, or without one the default names. The tests you didn't ask for this time don't turn up as uncovered source.
+
+#### Lists from Jest and Vitest
+
+The `testMatch` of a Jest config and the `include` of a Vitest config work as they are written:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+# Jest's default
+testMatch = ["**/__tests__/**/*.[jt]s?(x)", "**/?(*.)+(spec|test).[jt]s?(x)"]
+
+# Vitest's default
+testMatch = ["**/*.{test,spec}.?(c|m)[jt]s?(x)"]
+```
+
+Bun reads two things the way Jest does, because Jest lists rely on them:
+
+- A group with alternatives needs no prefix: `**/*.(spec|test).ts` is `**/*.@(spec|test).ts`. Parentheses without a `|` are text, as in `Bun.Glob`, so `app/(marketing)/**` is a directory.
+- `<rootDir>/` at the start of a pattern is the directory in [`root`](#root), or the project root without one.
+
+Three things differ from Jest:
+
+- Patterns are relative to the project root. Jest matches absolute paths, so a pattern that starts with an absolute path finds nothing here.
+- `**.test.ts` only matches files in the project root. Write `**/*.test.ts`.
+- Square brackets are a character class. For a directory such as `[id]`, write `\\[id\\]` in `bunfig.toml`.
+
+`testRegex` has no equivalent.
+
+#### Other file types
+
+To run files that aren't JavaScript as tests, pair `testMatch` with a [plugin](/runtime/plugins) that turns them into test code. This runs every `.feature` file:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+testMatch = ["features/**/*.feature"]
+preload = ["./feature-plugin.ts"]
+
+[loader]
+".feature" = "ts"
+```
+
+```ts title="feature-plugin.ts" icon="/icons/typescript.svg"
+import { plugin } from "bun";
+
+plugin({
+  name: "feature",
+  setup(build) {
+    build.onLoad({ filter: /\.feature$/ }, async args => {
+      const source = await Bun.file(args.path).text();
+      return { contents: toTests(source), loader: "ts" }; // your code that writes test() calls
+    });
+  },
+});
+```
+
 ### Preload Scripts
 
 The `preload` option loads scripts before the tests run:
@@ -457,6 +567,7 @@ exact = true
 # Test discovery
 root = "src"
 preload = ["./test-setup.ts", "./global-mocks.ts"]
+testMatch = ["**/*.test.ts", "**/*.unit.ts"]
 pathIgnorePatterns = ["vendor/**", "submodules/**"]
 
 # Execution settings

@@ -110,6 +110,7 @@ Many other Jest settings are irrelevant in `bun test`.
 Many other settings have an equivalent in the `[test]` section of `bunfig.toml`. For example:
 
 - `setupFiles`/`setupFilesAfterEnv` → `preload`
+- `testMatch` → `testMatch` (relative to the project root, see [what differs](/test/configuration#lists-from-jest-and-vitest))
 - `testPathIgnorePatterns` → `pathIgnorePatterns`
 - `rootDir` → `root`
 - `collectCoverageFrom` → `collectCoverageFrom`

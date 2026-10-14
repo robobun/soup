@@ -44,6 +44,11 @@ bun test <patterns>
 
 ### Test Filtering
 
+<ParamField path="--test-match" type="string">
+  Glob patterns for the files to run as tests, in place of the default <code>.test</code> and <code>.spec</code> names.
+  Repeatable. Replaces <code>testMatch</code> in <code>bunfig.toml</code>
+</ParamField>
+
 <ParamField path="--todo" type="boolean">
   Include tests that are marked with <code>test.todo()</code>
 </ParamField>
