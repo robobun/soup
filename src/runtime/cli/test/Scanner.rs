@@ -23,6 +23,9 @@ pub(crate) struct Scanner<'a> {
     /// When this list is empty, no filters are applied.
     /// "test" suffixes (e.g. .spec.*) are always applied when traversing directories.
     pub(crate) filter_names: &'a [Box<[u8]>],
+    /// `--test-match` or `testMatch`. `None`: a test file has one of [`TEST_NAME_SUFFIXES`]
+    /// before its extension.
+    pub(crate) test_match: Option<&'a TestMatch>,
     /// Glob patterns for paths to ignore. Matched against the path relative to the
     /// project root (top_level_dir). When a file matches any pattern, it is excluded.
     pub(crate) path_ignore_patterns: &'a [bun_glob::Prepared<&'a [u8]>],
@@ -75,6 +78,7 @@ impl<'a> Scanner<'a> {
         Ok(Scanner {
             exclusion_names: &[],
             filter_names: &[],
+            test_match: None,
             path_ignore_patterns: &[],
             dirs_to_scan: Fifo::new(),
             options: &transpiler.options,
@@ -371,7 +375,14 @@ impl<'a> Scanner<'a> {
                 }
 
                 self.search_count += 1;
-                if !self.could_be_test_file::<true>(name) {
+                let has_test_name = match self.test_match {
+                    // The patterns are about the path, which is joined below.
+                    Some(test_match) if !test_match.keeps_default_names() => {
+                        self.could_be_test_file::<false>(name)
+                    }
+                    _ => self.could_be_test_file::<true>(name),
+                };
+                if !has_test_name {
                     return;
                 }
 
@@ -386,6 +397,12 @@ impl<'a> Scanner<'a> {
                     return;
                 };
                 let path = &self.open_dir_buf[..path_len];
+
+                if let Some(test_match) = self.test_match {
+                    if !test_match.matches(path) {
+                        return;
+                    }
+                }
 
                 if !self.does_absolute_path_match_filter(path) {
                     let rel_path = bun_paths::resolve_path::relative(self.top_level_dir(), path);
@@ -411,3 +428,345 @@ impl<'a> Scanner<'a> {
 }
 
 pub(crate) const TEST_NAME_SUFFIXES: [&[u8]; 4] = [b".test", b"_test", b".spec", b"_spec"];
+
+/// Whether the name of the file at `path` ends in one of [`TEST_NAME_SUFFIXES`] before its
+/// extension.
+pub(crate) fn has_test_suffix(path: &[u8]) -> bool {
+    let name_without_extension = &path[..path.len() - bun_paths::extension(path).len()];
+    TEST_NAME_SUFFIXES
+        .iter()
+        .any(|suffix| strings::ends_with(name_without_extension, suffix))
+}
+
+/// Which files are tests, when `--test-match` or `testMatch` says so: for a scan, and for
+/// `coverageSkipTestFiles`.
+pub(crate) struct TestFiles {
+    /// `--test-match`.
+    flag: Option<TestMatch>,
+    /// `testMatch` in bunfig.toml.
+    config: Option<TestMatch>,
+}
+
+impl TestFiles {
+    /// `None` without either list: the default names apply everywhere. `root` is `[test] root`.
+    pub(crate) fn new(
+        flag: &[Box<[u8]>],
+        config: &[Box<[u8]>],
+        top_level_dir: &[u8],
+        root: &[u8],
+    ) -> Option<TestFiles> {
+        if flag.is_empty() && config.is_empty() {
+            return None;
+        }
+        Some(TestFiles {
+            flag: TestMatch::new(flag, top_level_dir, root),
+            config: TestMatch::new(config, top_level_dir, root),
+        })
+    }
+
+    /// The list a scan asks. `--test-match` replaces `testMatch`.
+    pub(crate) fn scanned(&self) -> Option<&TestMatch> {
+        self.flag.as_ref().or(self.config.as_ref())
+    }
+
+    /// Whether `coverageSkipTestFiles` leaves the file at `path` out. It is a test of this run,
+    /// or one of the tests that `--test-match` did not ask for this time: what `testMatch`
+    /// names, or without it the default names.
+    pub(crate) fn names(&self, path: &[u8]) -> bool {
+        let named_by = |list: &TestMatch| {
+            list.matches(path) && (!list.keeps_default_names() || has_test_suffix(path))
+        };
+        match (&self.flag, &self.config) {
+            (Some(flag), None) => named_by(flag) || has_test_suffix(path),
+            (Some(flag), Some(config)) => named_by(flag) || named_by(config),
+            (None, Some(config)) => named_by(config),
+            (None, None) => has_test_suffix(path),
+        }
+    }
+}
+
+/// One list of `testMatch` globs.
+pub(crate) struct TestMatch {
+    patterns: Vec<Pattern>,
+    /// Every pattern takes paths away, so the list starts from the default names.
+    only_excludes: bool,
+    /// The project root when the run started, without a separator at its end. A test can
+    /// `process.chdir()`, and the patterns must keep their meaning.
+    root: Box<[u8]>,
+}
+
+struct Pattern {
+    glob: bun_glob::Prepared<Box<[u8]>>,
+    /// Takes paths away: an odd number of `!` in front, or a `!(...)` group in front, which
+    /// Jest counts as a negation too.
+    negated: bool,
+}
+
+impl TestMatch {
+    fn new(patterns: &[Box<[u8]>], top_level_dir: &[u8], root: &[u8]) -> Option<TestMatch> {
+        if patterns.is_empty() {
+            return None;
+        }
+        let is_separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
+        let without_end_separators = |path: &[u8]| -> usize {
+            path.iter()
+                .rposition(|byte| !is_separator(byte))
+                .map_or(0, |last| last + 1)
+        };
+        let project = &top_level_dir[..without_end_separators(top_level_dir)];
+
+        // What `<rootDir>` stands for: nothing, or `[test] root` from the project root.
+        let mut root_dir: Vec<u8> = Vec::new();
+        if !root.is_empty() {
+            use bun_paths::resolve_path::{join_abs, platform};
+            let absolute = join_abs::<platform::Auto>(top_level_dir, root);
+            let absolute = &absolute[..without_end_separators(absolute)];
+            let mut buf = bun_paths::path_buffer_pool::get();
+            if let Some(relative) = relative_to(project, absolute, &mut buf[..]) {
+                if !relative.is_empty() {
+                    root_dir = escaped(relative);
+                    root_dir.push(b'/');
+                }
+            }
+        }
+
+        let patterns: Vec<Pattern> = patterns
+            .iter()
+            .map(|pattern| Pattern::new(pattern, &root_dir))
+            .collect();
+        Some(TestMatch {
+            only_excludes: patterns.iter().all(|pattern| pattern.negated),
+            patterns,
+            root: Box::from(project),
+        })
+    }
+
+    /// With only `!` patterns, a test also needs one of [`TEST_NAME_SUFFIXES`]. A scan and
+    /// `coverageSkipTestFiles` each have their own way to ask for that.
+    pub(crate) fn keeps_default_names(&self) -> bool {
+        self.only_excludes
+    }
+
+    /// Whether the patterns take the file at `path`, which is absolute, for a test.
+    ///
+    /// Jest's rule for `testMatch`: the patterns are asked in order and the last one that has a
+    /// say decides. A pattern has a say on the paths it matches, a negated one on the paths it
+    /// rejects.
+    pub(crate) fn matches(&self, path: &[u8]) -> bool {
+        // A module that is no file has no place in the project: a `data:` URL, for one.
+        if !bun_paths::is_absolute(path) {
+            return false;
+        }
+        let mut buf = bun_paths::path_buffer_pool::get();
+        let Some(relative_path) = relative_to(&self.root, path, &mut buf[..]) else {
+            return false;
+        };
+        let mut kept: Option<bool> = None;
+        for pattern in &self.patterns {
+            let matched = pattern.glob.r#match(relative_path).matches();
+            if pattern.negated {
+                if !matched {
+                    kept = Some(false);
+                }
+            } else if matched {
+                kept = Some(true);
+            }
+        }
+        if self.only_excludes {
+            kept != Some(false)
+        } else {
+            kept == Some(true)
+        }
+    }
+}
+
+impl Pattern {
+    /// `root_dir` is what `<rootDir>` stands for, as a glob.
+    fn new(pattern: &[u8], root_dir: &[u8]) -> Pattern {
+        let bangs = pattern.iter().take_while(|byte| **byte == b'!').count();
+        let (bangs, rest) = pattern.split_at(bangs);
+        let mut glob = bangs.to_vec();
+
+        // A path relative to the project starts with neither prefix. Jest configs have `<rootDir>`.
+        let (rest, has_prefix) = if let Some(rest) = rest.strip_prefix(b"<rootDir>") {
+            glob.extend_from_slice(root_dir);
+            (rest.strip_prefix(b"/").unwrap_or(rest), true)
+        } else if let Some(rest) = rest.strip_prefix(b"./") {
+            (rest, true)
+        } else {
+            (rest, false)
+        };
+
+        let is_after_bang = !has_prefix && !bangs.is_empty();
+        let rest = with_bare_groups(rest, is_after_bang);
+        // What stood behind the prefix is not part of the `!`s in front of it: `!./(old)/**` is
+        // not the group `!(old)`, and `./!important/**` is not a negation.
+        let joins_the_bangs = match rest.first() {
+            Some(b'!') => true,
+            Some(b'(') => !bangs.is_empty(),
+            _ => false,
+        };
+        if has_prefix && glob.len() == bangs.len() && joins_the_bangs {
+            glob.push(b'\\');
+        }
+        glob.extend_from_slice(&rest);
+
+        // The same count as the matcher's, where the `!` of a `!(...)` group is not a negation.
+        let bangs = glob.iter().take_while(|byte| **byte == b'!').count();
+        let group = usize::from(bangs > 0 && glob.get(bangs) == Some(&b'('));
+        Pattern {
+            negated: (bangs - group) % 2 == 1 || group == 1,
+            glob: bun_glob::Prepared::new(glob.into_boxed_slice()),
+        }
+    }
+}
+
+/// Jest's matcher reads `(spec|test)` as the group `@(spec|test)`, and `Bun.Glob` as text. Jest
+/// lists are full of them, so a group that has alternatives and no prefix gets the `@`.
+/// Parentheses without a `|` stay text: `app/(marketing)/**` is a directory.
+fn with_bare_groups(glob: &[u8], is_after_bang: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(glob.len() + 2);
+    // The byte before, unless it was escaped.
+    let mut before = is_after_bang.then_some(b'!');
+    let mut at = 0;
+    while at < glob.len() {
+        let byte = glob[at];
+        if byte == b'\\' {
+            out.extend_from_slice(&glob[at..(at + 2).min(glob.len())]);
+            before = None;
+            at += 2;
+            continue;
+        }
+        if byte == b'[' {
+            // A class is copied as it is: `[(|]` has no group in it. The first byte of a class
+            // can be a `]`.
+            let class_start = at + 2;
+            if let Some(close) = (class_start..glob.len()).find(|i| glob[*i] == b']') {
+                out.extend_from_slice(&glob[at..=close]);
+                before = Some(b']');
+                at = close + 1;
+                continue;
+            }
+        }
+        let has_prefix = matches!(before, Some(b'?' | b'*' | b'+' | b'@' | b'!'));
+        if byte == b'(' && !has_prefix && has_alternatives(&glob[at..]) {
+            out.push(b'@');
+        }
+        out.push(byte);
+        before = Some(byte);
+        at += 1;
+    }
+    out
+}
+
+/// Whether the group that `glob` starts with has a `|` in it, at any depth.
+fn has_alternatives(glob: &[u8]) -> bool {
+    let mut depth = 0usize;
+    let mut found = false;
+    let mut at = 0;
+    while at < glob.len() {
+        match glob[at] {
+            b'\\' => at += 1,
+            b'[' => {
+                if let Some(close) = (at + 2..glob.len()).find(|i| glob[*i] == b']') {
+                    at = close;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return found;
+                }
+            }
+            b'|' => found = true,
+            _ => {}
+        }
+        at += 1;
+    }
+    // Never closed: text.
+    false
+}
+
+/// `path` as a glob that matches only it, with `/` between its parts.
+fn escaped(path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(path.len());
+    for &byte in path {
+        let byte = if cfg!(windows) && byte == b'\\' {
+            b'/'
+        } else {
+            byte
+        };
+        if matches!(
+            byte,
+            b'\\' | b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b'(' | b')' | b'!'
+        ) {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    out
+}
+
+/// `path` from the directory `root`. Both are absolute and normalized, and `root` has no
+/// separator at its end. `None` when the answer does not fit `buf`.
+///
+/// Not `resolve_path::relative`, which answers in a buffer of the thread. This is asked for
+/// every module that a test loads, and `TestCommand::run` reads the name of the test file from
+/// that buffer for as long as the file runs.
+fn relative_to<'a>(root: &[u8], path: &'a [u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    let is_separator = |byte: u8| byte == b'/' || (cfg!(windows) && byte == b'\\');
+    let is_same = |a: u8, b: u8| {
+        a == b
+            || (is_separator(a) && is_separator(b))
+            || (cfg!(windows) && a.eq_ignore_ascii_case(&b))
+    };
+
+    // How much of `root` the two have in common, ending where a directory ends.
+    let mut shared = 0;
+    let mut at = 0;
+    loop {
+        if at == root.len() {
+            if at == path.len() || is_separator(path[at]) {
+                shared = at;
+            }
+            break;
+        }
+        if at == path.len() {
+            if is_separator(root[at]) {
+                shared = at;
+            }
+            break;
+        }
+        if !is_same(root[at], path[at]) {
+            break;
+        }
+        if is_separator(root[at]) {
+            shared = at;
+        }
+        at += 1;
+    }
+
+    let below = &path[shared..];
+    let below = match below.iter().position(|byte| !is_separator(*byte)) {
+        Some(start) => &below[start..],
+        None => b"",
+    };
+    // Inside the root, which is nearly every path: the rest of it.
+    if shared == root.len() {
+        return Some(below);
+    }
+    let above = root[shared..]
+        .split(|byte| is_separator(*byte))
+        .filter(|part| !part.is_empty())
+        .count();
+    let len = above * 3 + below.len();
+    if len > buf.len() {
+        return None;
+    }
+    for up in buf[..above * 3].as_chunks_mut::<3>().0 {
+        *up = *b"../";
+    }
+    buf[above * 3..len].copy_from_slice(below);
+    Some(&buf[..len])
+}

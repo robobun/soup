@@ -419,6 +419,14 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Box<[bun_spawn
     }
     if opts.coverage.enabled {
         argv.push(lit(b"--coverage\0"));
+        // `coverageSkipTestFiles` asks a worker which of the files it loads are tests.
+        // It reads `testMatch` from bunfig.toml itself.
+        for pattern in &opts.test_match_flag {
+            argv.push(print_z(format_args!(
+                "--test-match={}",
+                bstr::BStr::new(pattern)
+            ))?);
+        }
     }
 
     argv.push(core::ptr::null());

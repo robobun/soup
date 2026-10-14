@@ -951,6 +951,9 @@ pub(crate) const TEST_ONLY_PARAMS: &[ParamType] = &[
     parse_param!(
         "--max-concurrency <NUMBER>        Maximum number of concurrent tests to execute at once. Default is 20."
     ),
+    parse_param!(
+        "--test-match <STR>...            Glob patterns for the files to run as tests, in place of the default .test, _test, .spec and _spec names."
+    ),
     parse_param!("--path-ignore-patterns <STR>...   Glob patterns for test file paths to ignore."),
     parse_param!(
         "--changed <STR>?                 Only run test files affected by changed files according to git. Optionally pass a commit or branch to compare against."
@@ -2226,6 +2229,17 @@ fn parse_test_command_options(args: &clap::Args<clap::Help>, ctx: Context<'_>) {
         ctx.test_options.path_ignore_patterns =
             slice_to_owned(args.options(b"--path-ignore-patterns"));
         ctx.test_options.path_ignore_patterns_from_cli = true;
+    }
+
+    let test_match = args.options(b"--test-match");
+    if !test_match.is_empty() {
+        if test_match.iter().any(|pattern| pattern.is_empty()) {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r>: --test-match expects a glob pattern, e.g. --test-match='**/*.unit.ts'"
+            );
+            Global::exit(1);
+        }
+        ctx.test_options.test_match_flag = slice_to_owned(test_match);
     }
 
     if let Some(bail) = args.option(b"--bail") {

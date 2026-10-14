@@ -2720,3 +2720,645 @@ test("hooks throw in a Worker", async () => {
   expect(stderr).toContain(" 1 pass");
   expect(exitCode).toBe(0);
 });
+
+describe.concurrent("testMatch", () => {
+  const passing = (name: string) =>
+    `import { test, expect } from "bun:test";\ntest(${JSON.stringify(name)}, () => {\n  expect(1).toBe(1);\n});\n`;
+  // Not a test, and says so when a run loads it.
+  const script = `console.log("NOT A TEST");\n`;
+
+  /** Runs `bun test` in `cwd`. `files` is the test files that ran, sorted. */
+  async function run(cwd: string, args: string[] = [], env: Record<string, string> = {}) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", ...args],
+      cwd,
+      env: { ...bunEnv, ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // Every file that runs gets a line of its own: its path and a colon.
+    const files = Array.from(stderr.matchAll(/^(\S+):$/gm), match => match[1].replaceAll("\\", "/")).sort();
+    return { files, stdout, stderr, exitCode };
+  }
+
+  /** The file column of the `--coverage` table, without its two header rows. */
+  function coveredFiles(stderr: string) {
+    return stderr
+      .split("\n")
+      .filter(line => line.includes("|"))
+      .map(line => line.split("|")[0].trim().replaceAll("\\", "/"))
+      .filter(file => file !== "File" && file !== "All files" && !/^-+$/.test(file))
+      .sort();
+  }
+
+  test("bunfig: the patterns replace the default names", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts", "**/*.int.ts"]\n`,
+      "src/cart.unit.ts": passing("cart unit"),
+      "src/db.int.ts": passing("db int"),
+      "src/legacy.test.ts": passing("default name"),
+      "src/cart.ts": `export const cart = [];\n`,
+    });
+
+    const { files, stderr, exitCode } = await run(String(dir));
+    expect(files).toEqual(["src/cart.unit.ts", "src/db.int.ts"]);
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("bunfig: a single string, and a pattern that starts at the project root", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = "checks/**"\n`,
+      "checks/one.ts": passing("one"),
+      "checks/deep/two.js": passing("two"),
+      "src/checks/three.ts": passing("not at the root"),
+      "other.test.ts": passing("default name"),
+    });
+
+    const { files, stderr, exitCode } = await run(String(dir));
+    expect(files).toEqual(["checks/deep/two.js", "checks/one.ts"]);
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("bunfig: an empty array leaves the default names in place", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = []\n`,
+      "a.test.ts": passing("default name"),
+      "b.unit.ts": passing("unit"),
+    });
+
+    const [plain, flag] = await Promise.all([run(String(dir)), run(String(dir), ["--test-match", "*.unit.ts"])]);
+    expect(plain.files).toEqual(["a.test.ts"]);
+    expect(plain.exitCode).toBe(0);
+    expect(flag.files).toEqual(["b.unit.ts"]);
+    expect(flag.exitCode).toBe(0);
+  });
+
+  test("a pattern for a directory runs the files in it that Bun loads as code", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["tests/**"]\n`,
+      "tests/api.ts": passing("api"),
+      "tests/ui/button.tsx": passing("button"),
+      "tests/data.json": `{"a": 1}\n`,
+      "tests/README.md": `# tests\n`,
+      "tests/styles.css": `body { color: red }\n`,
+      "tests/__snapshots__/api.ts.snap": `// Bun Snapshot v1\n`,
+      "src/api.test.ts": passing("default name"),
+    });
+
+    const { files, stderr, exitCode } = await run(String(dir));
+    expect(files).toEqual(["tests/api.ts", "tests/ui/button.tsx"]);
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("the defaults of Jest and of Vitest work as they are written", async () => {
+    const files = {
+      "src/__tests__/a.js": passing("a"),
+      "src/__tests__/util.tsx": passing("util"),
+      "src/b.test.ts": passing("b"),
+      "src/c.spec.jsx": passing("c"),
+      "src/d.test.mts": passing("d"),
+      "src/test.ts": passing("test"),
+      "lib/e_test.ts": passing("a test for Bun only"),
+      "lib/f.tests.ts": passing("not a test"),
+    };
+    using jest = tempDir("test-match", {
+      ...files,
+      "bunfig.toml": `[test]\ntestMatch = ["**/__tests__/**/*.[jt]s?(x)", "**/?(*.)+(spec|test).[jt]s?(x)"]\n`,
+    });
+    using vitest = tempDir("test-match", {
+      ...files,
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.{test,spec}.?(c|m)[jt]s?(x)"]\n`,
+    });
+
+    const [asJest, asVitest] = await Promise.all([run(String(jest)), run(String(vitest))]);
+    expect(asJest.files).toEqual([
+      "src/__tests__/a.js",
+      "src/__tests__/util.tsx",
+      "src/b.test.ts",
+      "src/c.spec.jsx",
+      "src/test.ts",
+    ]);
+    expect(asJest.exitCode).toBe(0);
+    expect(asVitest.files).toEqual(["src/b.test.ts", "src/c.spec.jsx", "src/d.test.mts"]);
+    expect(asVitest.exitCode).toBe(0);
+  });
+
+  test("the default names of Bun, written as a pattern next to another", async () => {
+    const files = {
+      "top.test.ts": passing("top"),
+      "src/a.test.tsx": passing("a"),
+      "src/b_test.js": passing("b"),
+      "src/c.spec.mjs": passing("c"),
+      "src/deep/d_spec.cts": passing("d"),
+      "src/e.test.d.ts": script,
+      "src/f.test.helper.ts": script,
+      "src/g.tests.ts": script,
+      "src/test.ts": script,
+      "src/h.unit.ts": passing("h"),
+    };
+    using defaults = tempDir("test-match", files);
+    using pattern = tempDir("test-match", {
+      ...files,
+      "bunfig.toml": `[test]\ntestMatch = ["**/*{.,_}{test,spec}.{js,jsx,ts,tsx,mjs,cjs,mts,cts}", "**/*.unit.ts"]\n`,
+    });
+
+    const [byDefault, byPattern] = await Promise.all([run(String(defaults)), run(String(pattern))]);
+    expect(byDefault.files).toEqual([
+      "src/a.test.tsx",
+      "src/b_test.js",
+      "src/c.spec.mjs",
+      "src/deep/d_spec.cts",
+      "top.test.ts",
+    ]);
+    expect(byPattern.files).toEqual([...byDefault.files, "src/h.unit.ts"].sort());
+    expect(byPattern.stdout).not.toContain("NOT A TEST");
+    expect(byPattern.exitCode).toBe(0);
+  });
+
+  test("a group with alternatives needs no prefix, as in Jest", async () => {
+    using dir = tempDir("test-match", {
+      "src/__tests__/api.js": passing("api"),
+      "src/cart.test.js": passing("cart"),
+      "src/user.spec.jsx": passing("user"),
+      "src/a.unit.ts": passing("unit"),
+      "src/b.int.ts": passing("int"),
+      "src/cart.js": script,
+      "app/(marketing)/page.check.ts": passing("in a directory with parentheses"),
+      "app/marketing/page.check.ts": passing("in a directory without"),
+    });
+
+    const [oldJest, suffixes, directory, both] = await Promise.all([
+      // The default of old Jest versions.
+      run(String(dir), ["--test-match", "**/__tests__/**/*.js?(x)", "--test-match", "**/?(*.)(spec|test).js?(x)"]),
+      run(String(dir), ["--test-match", "**/*.(unit|int).ts"]),
+      // Parentheses without a `|` are text.
+      run(String(dir), ["--test-match", "app/(marketing)/**"]),
+      run(String(dir), ["--test-match", "(src|app)/**/*.(unit|check).ts", "--test-match", "!app/(marketing)/**"]),
+    ]);
+    expect(oldJest.files).toEqual(["src/__tests__/api.js", "src/cart.test.js", "src/user.spec.jsx"]);
+    expect(oldJest.stdout).not.toContain("NOT A TEST");
+    expect(suffixes.files).toEqual(["src/a.unit.ts", "src/b.int.ts"]);
+    expect(directory.files).toEqual(["app/(marketing)/page.check.ts"]);
+    expect(both.files).toEqual(["app/marketing/page.check.ts", "src/a.unit.ts"]);
+  });
+
+  test("--test-match, more than once", async () => {
+    using dir = tempDir("test-match", {
+      "src/cart.unit.ts": passing("unit"),
+      "src/cart.e2e.ts": passing("e2e"),
+      "src/cart.int.ts": passing("int"),
+      "src/cart.test.ts": passing("default name"),
+    });
+
+    const { files, stderr, exitCode } = await run(String(dir), [
+      "--test-match",
+      "**/*.unit.ts",
+      "--test-match=**/*.e2e.ts",
+    ]);
+    expect(files).toEqual(["src/cart.e2e.ts", "src/cart.unit.ts"]);
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("--test-match replaces testMatch from bunfig.toml", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts"]\n`,
+      "src/cart.unit.ts": passing("unit"),
+      "src/cart.int.ts": passing("int"),
+    });
+
+    const { files, exitCode } = await run(String(dir), ["--test-match", "**/*.int.ts"]);
+    expect(files).toEqual(["src/cart.int.ts"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("negated patterns: the last pattern that has a say decides", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["tests/**", "!**/helpers/**", "tests/helpers/kept.ts"]\n`,
+      "tests/a.ts": passing("a"),
+      "tests/helpers/util.ts": script,
+      "tests/helpers/kept.ts": passing("kept"),
+    });
+
+    const { files, stdout, exitCode } = await run(String(dir));
+    expect(files).toEqual(["tests/a.ts", "tests/helpers/kept.ts"]);
+    expect(stdout).not.toContain("NOT A TEST");
+    expect(exitCode).toBe(0);
+  });
+
+  test("only negated patterns take files away from the default names", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["!**/fixtures/**", "!e2e/**"]\n`,
+      "src/a.test.ts": passing("a"),
+      "lib/b_spec.js": passing("b"),
+      "fixtures/c.test.ts": passing("fixture"),
+      "e2e/d.test.ts": passing("e2e"),
+      "scripts/deploy.ts": script,
+    });
+
+    const { files, stdout, stderr, exitCode } = await run(String(dir));
+    expect(files).toEqual(["lib/b_spec.js", "src/a.test.ts"]);
+    expect(stdout).not.toContain("NOT A TEST");
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("a !(a|b) group in front takes files away, as in Jest", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.test.ts", "!(fixtures|e2e)/**"]\n`,
+      "src/a.test.ts": passing("a"),
+      "src/a.ts": script,
+      "fixtures/f.test.ts": passing("fixture"),
+      "e2e/x.test.ts": passing("e2e"),
+    });
+
+    const { files, stdout, exitCode } = await run(String(dir));
+    expect(files).toEqual(["src/a.test.ts"]);
+    expect(stdout).not.toContain("NOT A TEST");
+    expect(exitCode).toBe(0);
+  });
+
+  test("a leading ./ or <rootDir>/ is dropped from a pattern", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["./unit/**/*.ts", "<rootDir>/e2e/**/*.ts", "<rootDir>smoke/*.ts", "!./unit/skip/**"]\n`,
+      "unit/a.ts": passing("a"),
+      "unit/skip/c.ts": passing("skipped"),
+      "e2e/b.ts": passing("b"),
+      "smoke/e.ts": passing("e"),
+      "other/d.ts": passing("other"),
+    });
+
+    const { files, exitCode } = await run(String(dir));
+    expect(files).toEqual(["e2e/b.ts", "smoke/e.ts", "unit/a.ts"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("what stands behind a dropped prefix keeps its meaning", async () => {
+    using dir = tempDir("test-match", {
+      "(group)/page.unit.ts": passing("in the group"),
+      "(group)/plain.ts": script,
+      "group/y.unit.ts": passing("y"),
+      "other/x.unit.ts": passing("x"),
+      "other/plain.ts": script,
+      "!important/a.ts": passing("important"),
+    });
+
+    const [negated, rootDir, bang] = await Promise.all([
+      // Not the group `!(group)/**`, which is every other directory.
+      run(String(dir), ["--test-match", "**/*.unit.ts", "--test-match", "!./(group)/**"]),
+      run(String(dir), ["--test-match", "**/*.unit.ts", "--test-match", "!<rootDir>/(group)/**"]),
+      // Not a negation.
+      run(String(dir), ["--test-match", "./!important/**"]),
+    ]);
+    expect(negated.files).toEqual(["group/y.unit.ts", "other/x.unit.ts"]);
+    expect(negated.stdout).not.toContain("NOT A TEST");
+    expect(rootDir.files).toEqual(["group/y.unit.ts", "other/x.unit.ts"]);
+    expect(bang.files).toEqual(["!important/a.ts"]);
+  });
+
+  test("positional filters narrow what testMatch names", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts"]\n`,
+      "src/cart.unit.ts": passing("cart unit"),
+      "src/user.unit.ts": passing("user unit"),
+      "src/cart.test.ts": passing("default name"),
+    });
+
+    const { files, exitCode } = await run(String(dir), ["cart"]);
+    expect(files).toEqual(["src/cart.unit.ts"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("pathIgnorePatterns, node_modules and hidden directories still exclude", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts"]\npathIgnorePatterns = ["vendor/**"]\n`,
+      "src/a.unit.ts": passing("a"),
+      "vendor/b.unit.ts": passing("vendored"),
+      "node_modules/pkg/c.unit.ts": passing("dependency"),
+      ".cache/d.unit.ts": passing("hidden"),
+    });
+
+    const { files, exitCode } = await run(String(dir));
+    expect(files).toEqual(["src/a.unit.ts"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a file path on the command line runs whether or not it matches", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts"]\n`,
+      "a.unit.ts": passing("unit"),
+      "scratch.ts": passing("scratch"),
+    });
+
+    const [scanned, named] = await Promise.all([run(String(dir)), run(String(dir), ["./scratch.ts"])]);
+    expect(scanned.files).toEqual(["a.unit.ts"]);
+    expect(named.files).toEqual(["scratch.ts"]);
+    expect(named.exitCode).toBe(0);
+  });
+
+  test("a directory on the command line is scanned with patterns relative to the project", async () => {
+    using dir = tempDir("test-match", {
+      "project/bunfig.toml": `[test]\ntestMatch = ["pkg/*.unit.ts", "../sibling/*.unit.ts"]\n`,
+      "project/pkg/a.unit.ts": passing("a"),
+      "project/pkg/b.test.ts": passing("default name"),
+      "project/pkg/nested/c.unit.ts": passing("nested"),
+      "project/other/d.unit.ts": passing("other"),
+      "sibling/e.unit.ts": passing("outside the project"),
+      "sibling/nested/f.unit.ts": passing("nested outside"),
+    });
+    const project = join(String(dir), "project");
+
+    const [inside, outside] = await Promise.all([run(project, ["./pkg"]), run(project, ["../sibling"])]);
+    expect(inside.files).toEqual(["pkg/a.unit.ts"]);
+    expect(inside.exitCode).toBe(0);
+    expect(outside.files).toEqual(["../sibling/e.unit.ts"]);
+    expect(outside.exitCode).toBe(0);
+  });
+
+  test("root: patterns stay relative to the project, and <rootDir> is root", async () => {
+    const files = {
+      "packages/a/checks/x.ts": passing("x"),
+      "packages/a/src/y.ts": `export const y = 1;\n`,
+      "packages/a/src/y.test.ts": passing("default name"),
+      "packages/b/checks/z.ts": passing("z"),
+      "a/checks/outside.ts": passing("outside root"),
+    };
+    using relative = tempDir("test-match", {
+      ...files,
+      "bunfig.toml": `[test]\nroot = "packages"\ntestMatch = ["packages/*/checks/*.ts"]\n`,
+    });
+    using rootDir = tempDir("test-match", {
+      ...files,
+      "bunfig.toml": `[test]\nroot = "./packages/"\ntestMatch = ["<rootDir>/a/checks/*.ts"]\n`,
+    });
+
+    const [byProject, byRootDir] = await Promise.all([run(String(relative)), run(String(rootDir))]);
+    expect(byProject.files).toEqual(["packages/a/checks/x.ts", "packages/b/checks/z.ts"]);
+    expect(byProject.exitCode).toBe(0);
+    expect(byRootDir.files).toEqual(["packages/a/checks/x.ts"]);
+    expect(byRootDir.exitCode).toBe(0);
+  });
+
+  test("an extension needs a loader for code", async () => {
+    const files = {
+      "a.check": passing("check"),
+      "b.test.ts": passing("default name"),
+    };
+    using without = tempDir("test-match", {
+      ...files,
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.check"]\n`,
+    });
+    using withLoader = tempDir("test-match", {
+      ...files,
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.check"]\n\n[loader]\n".check" = "ts"\n`,
+    });
+
+    const [none, loaded] = await Promise.all([run(String(without)), run(String(withLoader))]);
+    expect(none.files).toEqual([]);
+    expect(none.stderr).toContain("No tests found!");
+    expect(none.stderr).toContain(
+      `note: Bun does not run ".check" files as code. Map the extension in bunfig.toml: [loader] ".check" = "ts"`,
+    );
+    expect(none.exitCode).toBe(1);
+    expect(loaded.files).toEqual(["a.check"]);
+    expect(loaded.stderr).toContain(" 1 pass");
+    expect(loaded.exitCode).toBe(0);
+  });
+
+  test("a plugin can load what testMatch names", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]
+testMatch = ["features/**/*.feature"]
+preload = ["./feature-plugin.ts"]
+
+[loader]
+".feature" = "ts"
+`,
+      "feature-plugin.ts": `import { plugin } from "bun";
+
+plugin({
+  name: "feature",
+  setup(build) {
+    build.onLoad({ filter: /\\.feature$/ }, async args => {
+      const text = await Bun.file(args.path).text();
+      const scenarios = Array.from(text.matchAll(/^\\s*Scenario: (.+)$/gm), match => match[1]);
+      return {
+        contents:
+          'import { test, expect } from "bun:test";\\n' +
+          scenarios.map(name => "test(" + JSON.stringify(name) + ", () => { expect(true).toBe(true); });").join("\\n"),
+        loader: "ts",
+      };
+    });
+  },
+});
+`,
+      "features/login.feature": `Feature: Login
+  Scenario: a user logs in
+    Given a user
+  Scenario: a wrong password is rejected
+    Given a user
+`,
+      "features/login.test.ts": passing("default name"),
+    });
+
+    const { files, stderr, exitCode } = await run(String(dir));
+    expect(files).toEqual(["features/login.feature"]);
+    expect(stderr).toContain("(pass) a user logs in");
+    expect(stderr).toContain("(pass) a wrong password is rejected");
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("no file matches: the message names the patterns", async () => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts", "checks/**"]\n`,
+      "a.test.ts": passing("default name"),
+    });
+
+    const [plain, filtered, allowed, agent, flag] = await Promise.all([
+      run(String(dir)),
+      run(String(dir), ["cart"]),
+      run(String(dir), ["--pass-with-no-tests"]),
+      run(String(dir), [], { AGENT: "1" }),
+      run(String(dir), ["--test-match", "nothing/**"]),
+    ]);
+
+    expect(plain.files).toEqual([]);
+    expect(plain.stderr).toContain("No tests found!");
+    expect(plain.stderr).toContain(`Tests need a path that matches testMatch: "**/*.unit.ts", "checks/**"`);
+    expect(plain.stderr).not.toContain(`".test"`);
+    expect(plain.stderr).not.toContain("note:");
+    expect(plain.exitCode).toBe(1);
+
+    expect(filtered.stderr).toContain("The following filters did not match any test files:");
+    expect(filtered.stderr).toContain(`note: Tests need a path that matches testMatch: "**/*.unit.ts", "checks/**"`);
+    expect(filtered.stderr).not.toContain(`".test"`);
+    expect(filtered.exitCode).toBe(1);
+
+    expect(allowed.exitCode).toBe(0);
+
+    expect(agent.stderr).toContain(`error: 0 test files matching testMatch "**/*.unit.ts", "checks/**" in --cwd=`);
+    expect(agent.exitCode).toBe(1);
+
+    // The list that the scan asked.
+    expect(flag.stderr).toContain(`Tests need a path that matches testMatch: "nothing/**"`);
+    expect(flag.exitCode).toBe(1);
+  });
+
+  test.each([
+    [`testMatch = 123`, "testMatch must be a string or array of strings"],
+    [`testMatch = ["**/*.unit.ts", 123]`, "testMatch array must contain only strings"],
+    [`testMatch = ""`, "testMatch cannot be an empty string"],
+    [`testMatch = ["**/*.unit.ts", ""]`, "testMatch patterns cannot be empty strings"],
+  ])("bunfig: %s is an error", async (line, message) => {
+    using dir = tempDir("test-match", {
+      "bunfig.toml": `[test]\n${line}\n`,
+      "a.test.ts": passing("default name"),
+    });
+
+    // `--test-match` replaces a list. It does not make a wrong one right.
+    const [plain, flag] = await Promise.all([run(String(dir)), run(String(dir), ["--test-match", "*.test.ts"])]);
+    for (const { files, stderr, exitCode } of [plain, flag]) {
+      expect(stderr).toContain(message);
+      expect(files).toEqual([]);
+      expect(exitCode).toBe(1);
+    }
+  });
+
+  test("--test-match with an empty pattern is an error", async () => {
+    using dir = tempDir("test-match", {
+      "a.test.ts": passing("default name"),
+    });
+
+    const { files, stderr, exitCode } = await run(String(dir), ["--test-match", ""]);
+    expect(stderr).toContain("error: --test-match expects a glob pattern");
+    expect(files).toEqual([]);
+    expect(exitCode).toBe(1);
+  });
+
+  describe("coverageSkipTestFiles", () => {
+    const project = {
+      "src/math.ts": `export function add(a: number, b: number) {\n  return a + b;\n}\n`,
+      // Has a default test name, and is no test where bunfig.toml has a testMatch.
+      "src/shared.test.ts": `export function twice(n: number) {\n  return n * 2;\n}\n`,
+      "src/math.unit.ts": `import { test, expect } from "bun:test";
+import { add } from "./math";
+import { twice } from "./shared.test";
+test("add", () => {
+  expect(twice(add(1, 2))).toBe(6);
+});
+`,
+      "src/more.unit.ts": `import { test, expect } from "bun:test";
+import { add } from "./math";
+test("add again", () => {
+  expect(add(2, 2)).toBe(4);
+});
+`,
+    };
+
+    test("leaves out the files that testMatch names", async () => {
+      using skipped = tempDir("test-match", {
+        ...project,
+        "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts"]\ncoverageSkipTestFiles = true\n`,
+      });
+      using kept = tempDir("test-match", {
+        ...project,
+        "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts"]\ncoverageSkipTestFiles = false\n`,
+      });
+
+      const [skip, keep] = await Promise.all([run(String(skipped), ["--coverage"]), run(String(kept), ["--coverage"])]);
+
+      expect(skip.files).toEqual(["src/math.unit.ts", "src/more.unit.ts"]);
+      expect(coveredFiles(skip.stderr)).toEqual(["src/math.ts", "src/shared.test.ts"]);
+      expect(skip.exitCode).toBe(0);
+
+      expect(coveredFiles(keep.stderr)).toEqual([
+        "src/math.ts",
+        "src/math.unit.ts",
+        "src/more.unit.ts",
+        "src/shared.test.ts",
+      ]);
+      expect(keep.exitCode).toBe(0);
+    });
+
+    test("--test-match leaves out the tests it did not ask for too", async () => {
+      // Without a testMatch in bunfig.toml those are the default names.
+      using defaults = tempDir("test-match", {
+        ...project,
+        "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      });
+      // With one, they are what it names.
+      using listed = tempDir("test-match", {
+        ...project,
+        "src/math.int.ts": `import { add } from "./math";\nexport const three = add(1, 2);\n`,
+        "src/helper.ts": `import "./math.int";\nexport const helper = true;\n`,
+        "src/more.unit.ts": `import { test, expect } from "bun:test";
+import { add } from "./math";
+import "./helper";
+test("add again", () => {
+  expect(add(2, 2)).toBe(4);
+});
+`,
+        "bunfig.toml": `[test]\ntestMatch = ["**/*.unit.ts", "**/*.int.ts"]\ncoverageSkipTestFiles = true\n`,
+      });
+
+      const args = ["--coverage", "--test-match", "**/*.unit.ts"];
+      const [serial, parallel, other] = await Promise.all([
+        run(String(defaults), args),
+        run(String(defaults), [...args, "--parallel=2"]),
+        run(String(listed), args),
+      ]);
+      expect(serial.files).toEqual(["src/math.unit.ts", "src/more.unit.ts"]);
+      expect(coveredFiles(serial.stderr)).toEqual(["src/math.ts"]);
+      expect(serial.exitCode).toBe(0);
+
+      expect(parallel.stderr).toContain("Ran 2 tests across 2 files.");
+      expect(coveredFiles(parallel.stderr)).toEqual(["src/math.ts"]);
+      expect(parallel.exitCode).toBe(0);
+
+      expect(other.files).toEqual(["src/math.unit.ts", "src/more.unit.ts"]);
+      expect(coveredFiles(other.stderr)).toEqual(["src/helper.ts", "src/math.ts", "src/shared.test.ts"]);
+      expect(other.exitCode).toBe(0);
+    });
+
+    test("a test that changes directory changes nothing", async () => {
+      using dir = tempDir("test-match", {
+        "bunfig.toml": `[test]\ntestMatch = ["tests/**"]\ncoverageSkipTestFiles = true\npreload = ["./setup.ts"]\n`,
+        "setup.ts": `process.chdir(import.meta.dir + "/sandbox");\n`,
+        "sandbox/.keep": "",
+        "src/math.ts": project["src/math.ts"],
+        "tests/a.ts": `import { test, expect } from "bun:test";
+import { add } from "../src/math";
+test("a", () => {
+  expect(add(1, 2)).toBe(3);
+});
+`,
+      });
+
+      const { files, stderr, exitCode } = await run(String(dir), ["--coverage"]);
+      expect(files).toEqual(["tests/a.ts"]);
+      // The table is relative to where the run is by then.
+      expect(coveredFiles(stderr)).toEqual(["../setup.ts", "../src/math.ts"]);
+      expect(exitCode).toBe(0);
+    });
+
+    test("--rerun-each prints the name of the test file for every run", async () => {
+      using dir = tempDir("test-match", {
+        ...project,
+        "bunfig.toml": `[test]\ntestMatch = ["**/math.unit.ts"]\ncoverageSkipTestFiles = true\n`,
+      });
+
+      const { stderr, exitCode } = await run(String(dir), ["--coverage", "--rerun-each=3"]);
+      expect(Array.from(stderr.matchAll(/^(.+): \(run #(\d)\)$/gm), match => [match[1], match[2]])).toEqual([
+        ["src/math.unit.ts", "1"],
+        ["src/math.unit.ts", "2"],
+        ["src/math.unit.ts", "3"],
+      ]);
+      expect(exitCode).toBe(0);
+    });
+  });
+});
