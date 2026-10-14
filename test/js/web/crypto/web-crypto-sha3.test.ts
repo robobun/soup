@@ -1,5 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import { createHash, createHmac, getHashes, pbkdf2Sync } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  createPrivateKey,
+  createPublicKey,
+  getHashes,
+  KeyObject,
+  pbkdf2Sync,
+  verify,
+} from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const hex = (buf: ArrayBuffer) => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 
@@ -96,6 +107,63 @@ describe("RSA with SHA-3 hash", () => {
       "verify",
     ]);
     expect(await crypto.subtle.verify({ name: "RSA-PSS", saltLength: 32 }, reimported, sig, data)).toBe(true);
+  });
+
+  // RSA PKCS#1 v1.5 is deterministic, so the signature bytes are pinned: Node.js v26.3.0 (OpenSSL 3.5.6) made
+  // them over `signedMessage` with test/js/node/crypto/fixtures/rsa_private_2048.pem.
+  const signedMessage = Buffer.from("sign and verify with every digest");
+  const rsaPrivatePem = readFileSync(join(import.meta.dir, "../../node/crypto/fixtures/rsa_private_2048.pem"), "utf8");
+  const rsaPrivateJwk = createPrivateKey(rsaPrivatePem).export({ format: "jwk" });
+  const rsaPublicJwk = createPublicKey(rsaPrivatePem).export({ format: "jwk" });
+
+  describe.each([
+    [
+      "SHA3-256",
+      "sha3-256",
+      "Y2awi0Oj/3MD2dWw787topJc8F4FcooXiMWot/PSTbq+g9zB6sVxh7Rq8HaMFHezz3F90MpR/McaVaTWV2HwzukExf/Okz+pWWHETreFV/SvEeK48efh2CGtFwxzeWt6j1u8qTg63VYm//YLtqNt09sKA8Lhmt2mZX4Kw8tMlsCznDjkQq+P+jT09mrvFCjURoTLdjPGiETVSkp1EIR2rAyQhLOvuOAUWQ9o01wD7C9iTUDdLNpCKKS32Mvj77ksvz+f/qAX01RGh7Ht4W+3wOJdFLSK9KpCe6sNN7QM2wI1XGEwcuYJe09UvmX41wNKQ/Rsckhdotov6AeM4IkyaA==",
+    ],
+    [
+      "SHA3-384",
+      "sha3-384",
+      "ZS5mdHKrLT6s3gAURS1wWo0v45zR0S8AAMFbVNAKXrgzcdroJEk83YzkhxnetnJMRjAk/c6dkiWcmSxc2r2nMSt8chmrBcITWuotjqQc2LgR0HW4PzHICXm2OE42guRo5CSO9ARdmw4xekbQI78LhNZ3owMCYgVO7DoY1bVuyx7b/AwpCIFrCDV6FFj1Uz0X2vHsU5nYJF/GzcN7TRPW+xn5dJb/SLUeGNxuZzwBp0c0ZjvK3A5/kJL50ewOq2+sU4W4RORXL5b3ILGeRiobw0bUReTPA7OOPiX4TrWn9Tf7Vt4NBjyVix3/FZ81/eENYGed8KdH31w+hyUCVk2bcg==",
+    ],
+    [
+      "SHA3-512",
+      "sha3-512",
+      "SsjYznTh9Xq6hSpgF2dZ0i8PHGGr3I+LaXhgJ0S8K98PziUK6y2CvlrbO+qVSPH3iMtFhuOG5+OKS9VxfX8y0T50dn7ArHPMbmif+i4NvXQqsNjPBWsxDQUR3uxfU1bJGDxsXbFMq2HzQEg7gr9CKbRLBUojKamtDiVoGM9o7pDBvwMSrF/ea/3+9e9UjyFxxfSgWFjYpZ8Bk6SZwcMc2yFxGX3Xs6/79TU1jp06YMaLASs/R9X7A/1TOW2o31Muby3ywDVDVZy54D+9Ly1PnxAGzg/LAnp1v340WK8V9Z0pSaY90e6fTGR06IGgVwvfS5aCNjb43o2mGfc1bXVevA==",
+    ],
+  ] as const)("RSASSA-PKCS1-v1_5 with %s", (hash, nodeDigest, nodeSignature) => {
+    const algorithm = { name: "RSASSA-PKCS1-v1_5", hash };
+
+    it("signs the bytes Node signs and verifies Node's signature", async () => {
+      const privateKey = await crypto.subtle.importKey("jwk", rsaPrivateJwk, algorithm, false, ["sign"]);
+      const publicKey = await crypto.subtle.importKey("jwk", rsaPublicJwk, algorithm, true, ["verify"]);
+      const tampered = Buffer.from(nodeSignature, "base64");
+      tampered[20] ^= 1;
+      expect({
+        signature: Buffer.from(await crypto.subtle.sign(algorithm.name, privateKey, signedMessage)).toString("base64"),
+        nodeSignature: await crypto.subtle.verify(
+          algorithm.name,
+          publicKey,
+          Buffer.from(nodeSignature, "base64"),
+          signedMessage,
+        ),
+        tampered: await crypto.subtle.verify(algorithm.name, publicKey, tampered, signedMessage),
+      }).toEqual({ signature: nodeSignature, nodeSignature: true, tampered: false });
+    });
+
+    it("keys that crossed toCryptoKey, structuredClone and KeyObject.from still sign and verify", async () => {
+      const privateKey = createPrivateKey(rsaPrivatePem).toCryptoKey(algorithm, false, ["sign"]);
+      const publicKey = structuredClone(
+        await crypto.subtle.importKey("jwk", rsaPublicJwk, algorithm, true, ["verify"]),
+      );
+      const signature = Buffer.from(await crypto.subtle.sign(algorithm.name, privateKey, signedMessage));
+      expect({
+        signature: signature.toString("base64"),
+        cloneVerifies: await crypto.subtle.verify(algorithm.name, publicKey, signature, signedMessage),
+        keyObjectVerifies: verify(nodeDigest, signedMessage, KeyObject.from(publicKey), signature),
+      }).toEqual({ signature: nodeSignature, cloneVerifies: true, keyObjectVerifies: true });
+    });
   });
 });
 

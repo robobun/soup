@@ -1,8 +1,10 @@
 import { CryptoHasher, MD4, MD5, SHA1, SHA224, SHA256, SHA384, SHA512, SHA512_256, gc } from "bun";
 import { describe, expect, it } from "bun:test";
 import crypto from "crypto";
+import { readFileSync } from "fs";
 import { bunEnv, bunExe, isWindows, tmpdirSync } from "harness";
 import path from "path";
+import { promisify } from "util";
 import { hashesFixture } from "./fixtures/sign.fixture.ts";
 const HashClasses = [MD5, MD4, SHA1, SHA224, SHA256, SHA384, SHA512, SHA512_256];
 
@@ -314,6 +316,166 @@ describe("crypto.createSign()/.verifySign()", () => {
       expect(verify).toBeTrue();
     },
   );
+});
+
+// Signatures that Node.js v26.3.0 (OpenSSL 3.5.6) made over `signedMessage` with the rsa_private_2048.pem and
+// ec_p256_private.pem fixtures. RSA PKCS#1 v1.5 is deterministic, so `rsa` pins the DigestInfo bytes of each digest.
+const signedMessage = Buffer.from("sign and verify with every digest");
+const nodeSignatures = {
+  "sha512-224": {
+    rsa: "g4T4Mxk7ru9bo/bgl/P41ylpzho7OzBzLO2jlRKYJRCSs2d+v7QdvIXlT0YJVfCLtFCNV/VfSr4QB0symT7b6sWxbq0PrzAQBada2uTvQ+GUeptZOyyqxtnFBi6S9QHx33qlmedsocRVaL4wjR7zJQiKMiKhXQrlg4jLpgoz94PtACrg1iM3Il7UuCeiO4dRzgWtYAU7DQ+HRN0hEgf3xaP1BNKsNe11QZMxmTSgR61Ep3XTPquTqr5BL+1OLsskaqgzzNSYBm2YrEETYD9CoOaPA/7IpfxtQ0ZsYjfC6LQ1rcrr45UxTI4qnfgEuACxg3P+Hcxkjw3qazFlvUA4Cg==",
+    ecDer: "MEUCIAS5YzSAmC6ppYp5lHuBKoba+MQTuInSh98103Q/8RVoAiEArU3Li6OMkIp1AYNPFxOkDARnO/Yda9u3wOwW6z8ruOI=",
+    ecP1363: "phLdcbXBHypfGj+s/bLkGNaMWJKO3+2pRH4oCOFXapU3sEiteptmL5zPbxroi73GNjRpQk8lQBNtmbqc6BU10w==",
+  },
+  "sha512-256": {
+    rsa: "D2simp/KorcmlVk1YJ6+ppSdNnD+G9AWg6tbKLkSPCSv2FGL1nXUU7FdiC44Ts8MyRgKETOB7tP96K1DrXCS38OFPA9HL14XaNTEWePFLDB/rocRbF6RDIImdK19hWrxN2AXAwA2FrIivhuQT+VNUmmE+T/XSmU53hkyI/Gk6iUzGqGiYqLarwMNre4L0Y1z/EUpFyBrdr7/xLK2DFD9n1JksEs9VI6VGySGXks9i/V9l0+URCZxTrP8obYqEUIPBqLruS8HKHSMlG+OCRJiuHXsyuUaOeZCfKOF3Wckdy+UL857uzPK++q9Ewm2KPUbnibjwsF3xUndp46527NZZQ==",
+    ecDer: "MEQCIFI6tWl2PZC6IZ8IRanw3IgustEfviD9zqYwbRojlzptAiADtZciiL9EccYAfjmaoj5pKPTJYbombFkzSmRIs2NqoQ==",
+    ecP1363: "aMQDPgm7TNTPrPQPWvpRf1V69U0zP1kvK00+Lc1hm1oma3R6ReQjdVVklXs/wqw6bNWdBbzR5drsKH0Dv/YaCw==",
+  },
+  "sha3-224": {
+    rsa: "JkoZFs5wd5IU6bj4PajVdXPB7S8/juHnfdMwtm5pdvGhlJ1sUlvgqcy9KOQLmZshoHaalWJ80CJCrWWXz4/Ic7o4++SxfeT6NWYTAXufgrfLu7uxc0DE8Jq7yy48DwIZmbMzK5aThUFOc/iobrC0yTwyGBIKClXIzB1tWYmx9nlGAEJRSqVZuFLp4NvltwW3oRqT+1TO7lk30xDRows1Vk110qd5xcwFPEPWF/jibOwe6Ua8DAvG4H3BiHFIDRkC1EGt6oM5YVaFNfSL6ZsXP04/O8ED6X0zpxp4aC3FmpQDahDXDK/kK9GYt+PRSSbhNYb6+SUDTsBZy52Z2ffP6Q==",
+    ecDer: "MEUCIQCU04mHxgWWljAD9KHo/IaiM6VEyKXAVYNKCzZXLs3gDAIgHAkKIHClGsFN/XrmHcPFtJlCjX6+VGAT2drYs1mBaCk=",
+    ecP1363: "kRz1O8iqAtB68fw9ltFGGQmIQKWiB59/8JFEAS6zXxIIMylGUYBySoxmLlDcn754RcN5ayVaxpQTQdUdmH28tw==",
+  },
+  "sha3-256": {
+    rsa: "Y2awi0Oj/3MD2dWw787topJc8F4FcooXiMWot/PSTbq+g9zB6sVxh7Rq8HaMFHezz3F90MpR/McaVaTWV2HwzukExf/Okz+pWWHETreFV/SvEeK48efh2CGtFwxzeWt6j1u8qTg63VYm//YLtqNt09sKA8Lhmt2mZX4Kw8tMlsCznDjkQq+P+jT09mrvFCjURoTLdjPGiETVSkp1EIR2rAyQhLOvuOAUWQ9o01wD7C9iTUDdLNpCKKS32Mvj77ksvz+f/qAX01RGh7Ht4W+3wOJdFLSK9KpCe6sNN7QM2wI1XGEwcuYJe09UvmX41wNKQ/Rsckhdotov6AeM4IkyaA==",
+    ecDer: "MEQCIFec1M22SyY6cjECK6QkvGBpxC119NWaY4004uL23JgmAiBUWrutEQ5KdZqibWi8CPTlKF/ypdT78WglcAHofBYE1Q==",
+    ecP1363: "/XH95Ij8eRDZSQSUzC32ECjLK+JcDioD9mFI/kxhsssFClGjczeqRVojdDaFzSgOy8aqmfbX4pAfCg4x+NaNWg==",
+  },
+  "sha3-384": {
+    rsa: "ZS5mdHKrLT6s3gAURS1wWo0v45zR0S8AAMFbVNAKXrgzcdroJEk83YzkhxnetnJMRjAk/c6dkiWcmSxc2r2nMSt8chmrBcITWuotjqQc2LgR0HW4PzHICXm2OE42guRo5CSO9ARdmw4xekbQI78LhNZ3owMCYgVO7DoY1bVuyx7b/AwpCIFrCDV6FFj1Uz0X2vHsU5nYJF/GzcN7TRPW+xn5dJb/SLUeGNxuZzwBp0c0ZjvK3A5/kJL50ewOq2+sU4W4RORXL5b3ILGeRiobw0bUReTPA7OOPiX4TrWn9Tf7Vt4NBjyVix3/FZ81/eENYGed8KdH31w+hyUCVk2bcg==",
+    ecDer: "MEQCICFJRbJugE243pwgh7/mUdA4h6q7WRL711RNTz6JpnYgAiB3CMkNZKuNiJx2fcs/3aUY0lMFyb1plDWRpUGOhKt1Og==",
+    ecP1363: "lnsB9+gqbOdox6bZMY2jLhNoMKL13Qf3I5qtuxefwtBhkYB7p2qfe+1uhu94/jaa4vsaOCpWRIWcJX7JIf2C1A==",
+  },
+  "sha3-512": {
+    rsa: "SsjYznTh9Xq6hSpgF2dZ0i8PHGGr3I+LaXhgJ0S8K98PziUK6y2CvlrbO+qVSPH3iMtFhuOG5+OKS9VxfX8y0T50dn7ArHPMbmif+i4NvXQqsNjPBWsxDQUR3uxfU1bJGDxsXbFMq2HzQEg7gr9CKbRLBUojKamtDiVoGM9o7pDBvwMSrF/ea/3+9e9UjyFxxfSgWFjYpZ8Bk6SZwcMc2yFxGX3Xs6/79TU1jp06YMaLASs/R9X7A/1TOW2o31Muby3ywDVDVZy54D+9Ly1PnxAGzg/LAnp1v340WK8V9Z0pSaY90e6fTGR06IGgVwvfS5aCNjb43o2mGfc1bXVevA==",
+    ecDer: "MEYCIQCt4mwDLPTN1Rm3vlHLdoAYH6XUGkDGQvKrMjdW5belYgIhANJqhKc30U7QonWi8AEd5zAI/70Jpfw0FlvRhl4k4kPM",
+    ecP1363: "aQBQgwA1fj2JxDRUoIChM4nYh9nHCfYNeANxOGVqfUjb/dRTzS0G8JI1jH9RuVyTHgpkRh/F4eNuT+DCgz3rNA==",
+  },
+  "ripemd160": {
+    rsa: "bTtNC0XQzK8+yzrlEmx/rUjrSq8+55yp/mdJ7t6Plgz9CR6ier6D7cNfZZQDP3j6331DCUuU73XZ8BSWcYIoy7n3EelLCuK44eCelA3g6Q+Y8v6mePDveFxH4d3YL1McUQuVyWFOSmBHc4lrqiNASok9lNdOLi7jnT88HZ9LiANfDHZxlQqQ6SpdhZ2JWYV5BktNLExARe1+R4jNLH4Jng5ORr7W3gMbwF+tYRu0+7+VsKnp5hRBYHBxEMx2xHI3nWe8trZAH/dB3zvXfYIVtjvlf8iqDriVHwlaoZ1JQIqUzBRiROxD5hKko7j7Q37R9AhLf4+EZ2wHDwLm5dZajQ==",
+    ecDer: "MEUCIAkMdgm6wQpTcSPjVzp6DccjqR69h8a7S6GqQGQSip/gAiEA+Ir2pyihNE9mQ9BAz6yWB5Xnt/byYhCKir7ogikfqns=",
+    ecP1363: "OciCOqWZky2B8jaGgJ8yQzKHnuqYQ4I8JxM7hLGqA7zTZkKBz3+Y1rIHVyzeuhGsXp8fxTA+cTY29xSeI8uUZg==",
+  },
+  "md5": {
+    rsa: "i0j2wsanudVUqZh96i3kQmP2uPH9lAlYxVY/1ZNrJuFlSVSh/O/wqFIjCRXQtlm2Ppio/DUYBayAHZjoR6ploMDEk77DmmwkC+jQTbTi2VW0V53aaId3KYfoE1hJFcvlgLJzRZA7aonr3vpk8wI5op/XbF+V0PlUNwT5E1gUOJX/j4P/0DvaAKcI5rgOJgOmZ6QXCCr/bno1kSfqoYhW6QJuezuKQxal/xGLnf5JlH3towJzcuhxBSpWeggeCARwl7jyUAScJFRvPFJNyeGxeDOVM3k8G4rgFoHjbEFjkYudFvsZJY0Cc6B/5cGKpRLEyBXuv5OGCHd7mzKPE8gv/A==",
+    ecDer: "MEUCIQDAklOV3g4kQhqnUcRWyO2/z9no1HiygVuKK2Sjiq5GCgIgZRzIb889QazXHUECx1r8EFOMNOeJGKXG7IFRRC9ZK0A=",
+    ecP1363: "rfiTtOTIOmSKHdAnajl3COc2hlJgHneuYm1HOzT4RaoAzpxNpu80u4tbcKQms0m5lV9O9vZVi00FfI/Z9wGi0Q==",
+  },
+  "md5-sha1": {
+    rsa: "QayodJthWhDei7V6u5MkLlXsFdytIr4sBz22xozxqZKUdn4+Psgtyrv7xtxSmBiT+9EO9/SS3sKqwmldVXczzWwMbl57ZEluQHU4DA5ewNfBYYNJ1BVvVGe5dVkc7f/GG9ZcxK20WMQi0sxaTyxnNg0REuuv5tOdXx7AEWoHEADzrLC49G6wQZ6Wideiews7q1X9yRlOfd0vrBr9iyiYturtQ7zoUTDmFo1l7mXq59hCpmgLJLweEB/XcQDw3HHeJ9a+AQqk+kyd6kuOn6Rh2k5pbO7b/Zk8Ii1Lk3AV/cXw+SrVjvhemBDsMoqP85y1f2qNSFFtdfMq4h8l0YI0CQ==",
+    ecDer: "MEUCIQCAzY2skBJl58AvhO1top5VgV7m01ZCcw1/OJIf18mgkwIgQ+ekt4X91dUb+XeuBiW6rQCLV2F7vkCnPVUJqvl3Et4=",
+    ecP1363: "i0uWGUECyKaq+J1OqJ/JiZ7plhVkCFzEAyaeI2SIaBoLl8f51Nt0aVWrRR+8o+pxvUXlDjYaCfMZ/nfKZ/u06A==",
+  },
+};
+
+describe("sign and verify with the digests beyond SHA-1 and SHA-2", () => {
+  const fixture = (name: string) => readFileSync(path.join(import.meta.dir, "fixtures", name), "utf8");
+  const rsaPrivate = fixture("rsa_private_2048.pem");
+  const rsaPublic = fixture("rsa_public_2048.pem");
+  const ecPrivate = fixture("ec_p256_private.pem");
+  const ecPublic = fixture("ec_p256_public.pem");
+  const p1363 = (key: string) => ({ key, dsaEncoding: "ieee-p1363" as const });
+  const signAsync = promisify(crypto.sign);
+  const verifyAsync = promisify(crypto.verify);
+
+  describe.each(Object.entries(nodeSignatures))("%s", (digest, node) => {
+    const nodeRsa = Buffer.from(node.rsa, "base64");
+    const nodeEcDer = Buffer.from(node.ecDer, "base64");
+    const nodeEcP1363 = Buffer.from(node.ecP1363, "base64");
+
+    it("RSA PKCS#1 v1.5 signs the bytes Node signs", async () => {
+      expect({
+        sync: crypto.sign(digest, signedMessage, rsaPrivate).toString("base64"),
+        callback: (await signAsync(digest, signedMessage, rsaPrivate)).toString("base64"),
+        streaming: crypto.createSign(digest).update(signedMessage).sign(rsaPrivate, "base64"),
+      }).toEqual({ sync: node.rsa, callback: node.rsa, streaming: node.rsa });
+    });
+
+    it("verifies Node's RSA signature", async () => {
+      expect({
+        sync: crypto.verify(digest, signedMessage, rsaPublic, nodeRsa),
+        callback: await verifyAsync(digest, signedMessage, rsaPublic, nodeRsa),
+        streaming: crypto.createVerify(digest).update(signedMessage).verify(rsaPublic, nodeRsa),
+      }).toEqual({ sync: true, callback: true, streaming: true });
+    });
+
+    it("verifies Node's ECDSA signatures, DER and ieee-p1363", async () => {
+      expect({
+        sync: crypto.verify(digest, signedMessage, ecPublic, nodeEcDer),
+        callback: await verifyAsync(digest, signedMessage, ecPublic, nodeEcDer),
+        streaming: crypto.createVerify(digest).update(signedMessage).verify(ecPublic, nodeEcDer),
+        syncP1363: crypto.verify(digest, signedMessage, p1363(ecPublic), nodeEcP1363),
+        streamingP1363: crypto.createVerify(digest).update(signedMessage).verify(p1363(ecPublic), nodeEcP1363),
+      }).toEqual({ sync: true, callback: true, streaming: true, syncP1363: true, streamingP1363: true });
+    });
+
+    it("ECDSA signatures made here verify", async () => {
+      const sync = crypto.sign(digest, signedMessage, ecPrivate);
+      const callback = await signAsync(digest, signedMessage, ecPrivate);
+      const streaming = crypto.createSign(digest).update(signedMessage).sign(ecPrivate);
+      const syncP1363 = crypto.sign(digest, signedMessage, p1363(ecPrivate));
+      expect({
+        sync: crypto.verify(digest, signedMessage, ecPublic, sync),
+        callback: crypto.verify(digest, signedMessage, ecPublic, callback),
+        streaming: crypto.verify(digest, signedMessage, ecPublic, streaming),
+        syncP1363: crypto.verify(digest, signedMessage, p1363(ecPublic), syncP1363),
+        p1363Length: syncP1363.length,
+      }).toEqual({ sync: true, callback: true, streaming: true, syncP1363: true, p1363Length: 64 });
+    });
+
+    it("a tampered or junk signature answers false", async () => {
+      const tamper = (signature: Buffer) => {
+        const copy = Buffer.from(signature);
+        copy[copy.length - 1] ^= 1;
+        return copy;
+      };
+      const junk = Buffer.alloc(8, 0x5a);
+      expect({
+        rsaTampered: crypto.verify(digest, signedMessage, rsaPublic, tamper(nodeRsa)),
+        rsaJunk: crypto.verify(digest, signedMessage, rsaPublic, junk),
+        rsaOtherMessage: crypto.verify(digest, Buffer.from("other"), rsaPublic, nodeRsa),
+        rsaStreamingTampered: crypto.createVerify(digest).update(signedMessage).verify(rsaPublic, tamper(nodeRsa)),
+        ecTampered: crypto.verify(digest, signedMessage, ecPublic, tamper(nodeEcDer)),
+        ecJunk: crypto.verify(digest, signedMessage, ecPublic, junk),
+        ecCallbackJunk: await verifyAsync(digest, signedMessage, ecPublic, junk),
+        ecStreamingJunk: crypto.createVerify(digest).update(signedMessage).verify(ecPublic, junk),
+        ecP1363Tampered: crypto.verify(digest, signedMessage, p1363(ecPublic), tamper(nodeEcP1363)),
+      }).toEqual({
+        rsaTampered: false,
+        rsaJunk: false,
+        rsaOtherMessage: false,
+        rsaStreamingTampered: false,
+        ecTampered: false,
+        ecJunk: false,
+        ecCallbackJunk: false,
+        ecStreamingJunk: false,
+        ecP1363Tampered: false,
+      });
+    });
+  });
+
+  it("every digest getHashes() lists signs and verifies with RSA and EC keys, except md4", () => {
+    const roundTrip = (digest: string, privateKey: string, publicKey: string) => {
+      try {
+        return crypto.verify(digest, signedMessage, publicKey, crypto.sign(digest, signedMessage, privateKey));
+      } catch {
+        return "refused";
+      }
+    };
+    const listed = crypto.getHashes();
+    const results = Object.fromEntries(
+      listed.map(digest => [
+        digest,
+        { rsa: roundTrip(digest, rsaPrivate, rsaPublic), ec: roundTrip(digest, ecPrivate, ecPublic) },
+      ]),
+    );
+    // Node refuses MD4 for signatures, and BoringSSL has no entry for it on purpose.
+    const expected = Object.fromEntries(
+      listed.map(digest => [digest, digest === "md4" ? { rsa: "refused", ec: "refused" } : { rsa: true, ec: true }]),
+    );
+    expect(results).toEqual(expected);
+  });
 });
 
 it("should send cipher events in the right order", async () => {

@@ -87,6 +87,7 @@ Then `bun run ci:watch` and fix anything that turns up.
 - **HMAC-SHA3** — `crypto/hmac/hmac_test*.{cc,txt}`
 - **BLAKE2b-512** — `crypto/blake2/blake2.cc`, `include/openssl/blake2.h`
 - **RIPEMD160 in `crypto/` (not `decrepit/`) + `EVP_ripemd160` lookup** — `crypto/ripemd/ripemd.cc` (moved), `crypto/digest/digest_extra.cc`, `include/openssl/digest.h`, `gen/sources.*`, `build.json`
+- **RSA PKCS#1 v1.5 and ECDSA signatures with the digests above** — `crypto/fipsmodule/rsa/rsa.cc.inc` (`kPKCS1SigPrefixes` rows for SHA-512/224, SHA-512/256, SHA-3 and RIPEMD-160; `RSA_add_pkcs1_prefix` walks the table once), `crypto/evp/p_ec.cc` (`pkey_ec_is_extra_md`). MD4 stays out of both. A digest that `crypto.getHashes()` lists needs an entry in both: the `getHashes()` loop in `test/js/node/crypto/crypto.test.ts` fails without one.
 - **`EVP_PBE_validate_scrypt_params`** — `crypto/evp/scrypt.cc`, `include/openssl/evp.h`
 - **Electron `SSL_want` / `EVP_CIPHER_do_all_sorted`** — `ssl/ssl_lib.cc` (return `rwstate` directly), `ssl/ssl_test.cc` (drops the corresponding test block), `decrepit/evp/evp_do_all.cc`, `crypto/cipher/get_cipher.cc`, `include/openssl/cipher.h`
 - **MLDSA stack-frame pragma** — `crypto/fipsmodule/mldsa/mldsa.cc.inc`
