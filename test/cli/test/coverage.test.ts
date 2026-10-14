@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isWindows, normalizeBunSnapshot, tempDir } from "harness";
-import { readFileSync, symlinkSync } from "node:fs";
+import { bunEnv, bunExe, isASAN, isDebug, isWindows, normalizeBunSnapshot, tempDir } from "harness";
+import { readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "path";
 
 test("coverage crash", () => {
@@ -108,6 +108,597 @@ test("sub", () => {
       }).toEqual({ lcov, table, exitCode: 0 });
     },
   );
+});
+
+// https://github.com/oven-sh/bun/issues/4099
+describe("html coverage reporter", () => {
+  const unescapeHTML = (text: string) =>
+    text
+      .replaceAll("&lt;", "<")
+      .replaceAll("&gt;", ">")
+      .replaceAll("&quot;", '"')
+      .replaceAll("&#x27;", "'")
+      .replaceAll("&amp;", "&");
+
+  // The index: the name of every file, the path of its page, its numbers and which of them are red ("low").
+  function indexRows(index: string) {
+    const row =
+      /<tr><td><a href="([^"]*)">(.*?)<\/a><\/td><td class="num (ok|low)">([\d.]+)<\/td><td class="num count">(\d+\/\d+)<\/td><td class="num (ok|low)">([\d.]+)<\/td><td class="num count">(\d+\/\d+)<\/td><td class="bar"><progress class="(ok|low)" max="1" value="([\d.]+)">/g;
+    return [...index.matchAll(row)].map(
+      ([
+        ,
+        href,
+        name,
+        functionsClass,
+        percentFunctions,
+        functions,
+        linesClass,
+        percentLines,
+        lines,
+        barClass,
+        bar,
+      ]) => ({
+        name: unescapeHTML(name).replaceAll("\\", "/"),
+        page: decodeURIComponent(unescapeHTML(href)),
+        percent: `${percentFunctions} | ${percentLines}`,
+        functions,
+        lines,
+        classes: `${functionsClass} ${linesClass} ${barClass}`,
+        bar: (Number(bar) * 100).toFixed(2),
+      }),
+    );
+  }
+
+  // The page of a file: "hit", "miss" or "" for every line of its source, and the text of the line.
+  function sourceRows(page: string) {
+    const row =
+      /<tr id="L(\d+)"(?: class="(hit|miss)")?><td class="n"><a href="#L\1">\1<\/a><\/td><td class="c">(.*?)<\/td><\/tr>/gs;
+    return [...page.matchAll(row)].map(([, , state = "", text]) => ({ state, text: unescapeHTML(text) }));
+  }
+
+  // The page of a file: what follows "Uncovered lines:", as the text reporter writes it, and where its links go.
+  function uncoveredRanges(page: string) {
+    const list = /<p class="uncovered">Uncovered lines: (.*?)<\/p>/.exec(page)?.[1] ?? "";
+    return {
+      ranges: list.replaceAll(/<[^>]*>/g, "").replaceAll(", ", ","),
+      links: [...list.matchAll(/<a href="([^"]*)">(\d+)/g)].map(([, href, first]) => href === `#L${first}`),
+    };
+  }
+
+  // The text table by file: "% Funcs | % Lines" and the uncovered lines.
+  function tableRows(stderr: string) {
+    const rows: Record<string, { percent: string; uncovered: string }> = {};
+    for (const line of stderr.split("\n")) {
+      const cells = line.split("|").map(cell => cell.trim());
+      if (cells.length !== 4 || !/^[\d.]+$/.test(cells[1])) continue;
+      rows[cells[0].replaceAll("\\", "/")] = { percent: `${cells[1]} | ${cells[2]}`, uncovered: cells[3] };
+    }
+    return rows;
+  }
+
+  // lcov.info by file: functions and lines hit/found, and "hit" or "miss" for every line it lists.
+  function lcovRecords(dir: string) {
+    const records: Record<string, { functions: string; lines: string; states: Record<string, string> }> = {};
+    const lcov = readFileSync(path.join(dir, "coverage", "lcov.info"), "utf-8");
+    for (const record of lcov.split("end_of_record")) {
+      const file = /^SF:(.*)$/m.exec(record)?.[1];
+      if (!file) continue;
+      const count = (key: string) => new RegExp(`^${key}:(\\d+)$`, "m").exec(record)![1];
+      records[file.replaceAll("\\", "/")] = {
+        functions: `${count("FNH")}/${count("FNF")}`,
+        lines: `${count("LH")}/${count("LF")}`,
+        states: Object.fromEntries(
+          [...record.matchAll(/^DA:(\d+),(\d+)$/gm)].map(([, line, hits]) => [line, hits === "0" ? "miss" : "hit"]),
+        ),
+      };
+    }
+    return records;
+  }
+
+  async function run(cwd: string, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", ...args],
+      // Start both workers at once instead of when the first one is busy.
+      env: { ...bunEnv, BUN_TEST_PARALLEL_SCALE_MS: "0" },
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  const project = {
+    "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+    "src/math.ts": `export function add(a: number, b: number) {
+  return a + b;
+}
+
+// A comment is not executable.
+export function subtract(a: number, b: number) {
+  return a - b;
+}
+`,
+    "src/text/escape.ts": `export const tag = "<script>alert('&')</script>";
+
+export function never(list: string[]) {
+  return list.length > 0 && list[0] < tag;
+}
+`,
+    "add.test.ts": `import { expect, test } from "bun:test";
+import { add } from "./src/math";
+
+test("add", () => {
+  expect(add(1, 2)).toBe(3);
+});
+`,
+    "tag.test.ts": `import { expect, test } from "bun:test";
+import { tag } from "./src/text/escape";
+
+test("tag", () => {
+  expect(tag).toStartWith("<script>");
+});
+`,
+  };
+
+  test.concurrent.each([
+    ["in one process", []],
+    ["with --parallel", ["--parallel=2"]],
+  ])("writes an index and a page for every file %s", async (_, flags) => {
+    using dir = tempDir("cov-html", project);
+    const { stderr, exitCode } = await run(
+      String(dir),
+      "--coverage-reporter=html",
+      "--coverage-reporter=lcov",
+      "--coverage-reporter=text",
+      ...flags,
+    );
+    const read = (file: string) => readFileSync(path.join(String(dir), "coverage", file), "utf-8");
+    const index = read("index.html");
+    const table = tableRows(stderr);
+    const lcov = lcovRecords(String(dir));
+
+    // The numbers are the ones the other two reporters give, and below the default threshold of 90% they are red.
+    const files = ["src/math.ts", "src/text/escape.ts"] as const;
+    expect(indexRows(index)).toEqual(
+      files.map(name => ({
+        name,
+        page: `${name}.html`,
+        percent: table[name].percent,
+        functions: lcov[name].functions,
+        lines: lcov[name].lines,
+        classes: "low low low",
+        bar: table[name].percent.split(" | ")[1],
+      })),
+    );
+    const allFiles =
+      /<tr><td>All files<\/td><td class="num low">([\d.]+)<\/td><td class="count"><\/td><td class="num low">([\d.]+)<\/td>/;
+    expect(index.match(allFiles)?.slice(1).join(" | ")).toBe(table["All files"].percent);
+
+    // Every line of a source is a row, marked as lcov.info lists it.
+    for (const name of files) {
+      const page = read(`${name}.html`);
+      const lines = project[name].split("\n").slice(0, -1);
+      expect(sourceRows(page)).toEqual(lines.map((text, i) => ({ state: lcov[name].states[i + 1] ?? "", text })));
+      expect(uncoveredRanges(page)).toEqual({ ranges: table[name].uncovered, links: [true] });
+    }
+    const math = read("src/math.ts.html");
+    expect(sourceRows(math).map(row => row.state)).toEqual(["hit", "hit", "", "", "", "miss", "", ""]);
+    expect(math).toContain(`<p class="uncovered">Uncovered lines: <a href="#L6">6</a></p>`);
+    expect(math).toContain(`<dd class="low">50.00% <small>1/2</small></dd>`);
+    expect(math).toContain(`<dd class="low">66.67% <small>2/3</small></dd>`);
+
+    // The source is text: a page has no script, and the index has its own alone.
+    const escapePage = read("src/text/escape.ts.html");
+    expect(escapePage).toContain(
+      `<td class="c">export const tag = &quot;&lt;script&gt;alert(&#x27;&amp;&#x27;)&lt;/script&gt;&quot;;</td>`,
+    );
+    expect(escapePage).not.toContain("<script");
+    expect(escapePage).toContain(
+      `<nav><a href="../../index.html">All files</a></nav>\n<h1>${path.join("src", "text", "escape.ts")}</h1>`,
+    );
+    expect(index.match(/<script/g)).toHaveLength(1);
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("coverageThreshold decides which numbers are red, and fails the run", async () => {
+    using dir = tempDir("cov-html", {
+      ...project,
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncoverageThreshold = { lines = 0.6, functions = 0.5 }\n`,
+    });
+    const { exitCode } = await run(String(dir), "--coverage-reporter=html", "--coverage-dir=reports");
+    const read = (file: string) => readFileSync(path.join(String(dir), "reports", file), "utf-8");
+    const index = read("index.html");
+
+    expect(indexRows(index).map(({ name, percent, classes }) => ({ name, percent, classes }))).toEqual([
+      { name: "src/math.ts", percent: "50.00 | 66.67", classes: "ok ok ok" },
+      { name: "src/text/escape.ts", percent: "0.00 | 0.00", classes: "low low low" },
+    ]);
+    expect(index).toContain(`<tr><td>All files</td><td class="num low">25.00</td>`);
+    expect(read("src/math.ts.html")).toContain(
+      `<div><dt>Functions</dt><dd class="ok">50.00% <small>1/2</small></dd></div>\n` +
+        `<div><dt>Lines</dt><dd class="ok">66.67% <small>2/3</small></dd></div>`,
+    );
+    expect(exitCode).toBe(1);
+  });
+
+  test.concurrent("a second run overwrites its pages and leaves no temporary file", async () => {
+    using dir = tempDir("cov-html", project);
+    const coverage = path.join(String(dir), "coverage");
+    const written = () =>
+      readdirSync(coverage, { recursive: true })
+        .map(file => String(file).replaceAll("\\", "/"))
+        .sort();
+
+    const first = await run(String(dir), "--coverage-reporter=html", "add.test.ts");
+    expect(written()).toEqual(["index.html", "src", "src/math.ts.html"]);
+
+    writeFileSync(path.join(String(dir), "src", "math.ts"), `${project["src/math.ts"]}export const more = 1;\n`);
+    const second = await run(String(dir), "--coverage-reporter=html");
+    expect(written()).toEqual(["index.html", "src", "src/math.ts.html", "src/text", "src/text/escape.ts.html"]);
+    expect(sourceRows(readFileSync(path.join(coverage, "src", "math.ts.html"), "utf-8")).at(-1)?.text).toBe(
+      "export const more = 1;",
+    );
+    expect([first.exitCode, second.exitCode]).toEqual([0, 0]);
+  });
+
+  test.concurrent("names that HTML, a URL or a file system cannot take as they are", async () => {
+    // Windows takes no "<", ">" or ":" in a file name, no name of a device, and no name of 230 bytes in a temporary directory.
+    const markup = isWindows ? "it's 100% &amp; ünï.ts" : "it's 100% <b>&amp; ünï.ts";
+    const long = Buffer.alloc(230, "n").toString();
+    const posix = {
+      "src/a:b.ts": `export const colon = 2;\n`,
+      "src/a_b.ts": `export const underscore = 3;\n`,
+      "src/aux/con.ts": `export const device = 4;\n`,
+      "src/x.html/inside.ts": `export const inside = 5;\n`,
+      [`src/${long}1.ts`]: `export const first = 6;\n`,
+      [`src/${long}2.ts`]: `export const second = 7;\n`,
+    };
+    using dir = tempDir("cov-html", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      [`src/${markup}`]: `export const markup = 1;\n`,
+      ...(isWindows ? {} : posix),
+      "names.test.ts": `import { expect, test } from "bun:test";
+import { markup } from ${JSON.stringify(`./src/${markup}`)};
+${Object.keys(isWindows ? {} : posix)
+  .map(file => `import ${JSON.stringify(`./${file}`)};`)
+  .join("\n")}
+
+test("names", () => {
+  expect(markup).toBe(1);
+});
+`,
+    });
+    const { stderr, exitCode } = await run(String(dir), "--coverage-reporter=html");
+    const coverage = path.join(String(dir), "coverage");
+    const index = readFileSync(path.join(coverage, "index.html"), "utf-8");
+    const rows = indexRows(index);
+
+    const short = Buffer.alloc(200, "n").toString();
+    expect({ stderr, rows: rows.map(({ name, page }) => ({ name, page })) }).toEqual({
+      stderr: expect.stringContaining("1 pass"),
+      rows: [
+        ...(isWindows
+          ? []
+          : [
+              // Two names that become one: the second one is numbered.
+              { name: "src/a:b.ts", page: "src/a_b.ts.html" },
+              { name: "src/a_b.ts", page: "src/a_b.ts-2.html" },
+              { name: "src/aux/con.ts", page: "src/_aux/_con.ts.html" },
+            ]),
+        { name: `src/${markup}`, page: isWindows ? `src/${markup}.html` : "src/it's 100% _b_&amp; ünï.ts.html" },
+        ...(isWindows
+          ? []
+          : [
+              { name: `src/${long}1.ts`, page: `src/${short}.html` },
+              { name: `src/${long}2.ts`, page: `src/${short}-2.html` },
+              // A page is a file that ends in .html, so a directory of pages does not.
+              { name: "src/x.html/inside.ts", page: "src/x.html_/inside.ts.html" },
+            ]),
+      ],
+    });
+    // Every link of the index leads to a page that is about the file the link names.
+    for (const { name, page } of rows) {
+      const title = /<title>(.*?)<\/title>/.exec(readFileSync(path.join(coverage, page), "utf-8"))?.[1];
+      expect(title).not.toMatch(/[<>'"]/);
+      expect(unescapeHTML(title!).replaceAll("\\", "/")).toBe(name);
+    }
+    const encoded = isWindows ? "it&#x27;s%20100%25%20%26amp%3B" : "it&#x27;s%20100%25%20_b_%26amp%3B";
+    expect(index).toContain(`<a href="src/${encoded}%20%C3%BCn%C3%AF.ts.html">`);
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("a file outside the project directory has a page inside the coverage directory", async () => {
+    using dir = tempDir("cov-html", {
+      "packages/app/bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      "packages/app/src/app.ts": `import { shared } from "../../shared/shared";
+export const app = () => shared() + 1;
+`,
+      "packages/app/app.test.ts": `import { expect, test } from "bun:test";
+import { app } from "./src/app";
+
+test("app", () => {
+  expect(app()).toBe(2);
+});
+`,
+      "packages/shared/shared.ts": `export const shared = () => 1;\n`,
+    });
+    const cwd = path.join(String(dir), "packages", "app");
+    const { exitCode } = await run(cwd, "--coverage-reporter=html");
+    const read = (file: string) => readFileSync(path.join(cwd, "coverage", file), "utf-8");
+
+    // In the order of the names, as the header of the column says.
+    expect(indexRows(read("index.html")).map(({ name, page }) => ({ name, page }))).toEqual([
+      { name: "../shared/shared.ts", page: "shared/shared.ts.html" },
+      { name: "src/app.ts", page: "app/src/app.ts.html" },
+    ]);
+    expect(read("app/src/app.ts.html")).toContain(`<a href="../../index.html">All files</a>`);
+    expect(read("shared/shared.ts.html")).toContain(`<a href="../index.html">All files</a>`);
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("coverageReporter and coverageDir in bunfig.toml", async () => {
+    const bunfig = `[test]\ncoverageSkipTestFiles = true\ncoverageReporter = ["html"]\ncoverageDir = "reports/coverage"\n`;
+    using dir = tempDir("cov-html", { ...project, "bunfig.toml": bunfig });
+    using nothingToReport = tempDir("cov-html", {
+      ...project,
+      "bunfig.toml": `${bunfig}coveragePathIgnorePatterns = ["**"]\n`,
+    });
+    const [all, none] = await Promise.all([String(dir), String(nothingToReport)].map(cwd => run(cwd, "--coverage")));
+    const index = (cwd: string) => readFileSync(path.join(cwd, "reports", "coverage", "index.html"), "utf-8");
+
+    expect(indexRows(index(String(dir))).map(row => row.page)).toEqual(["src/math.ts.html", "src/text/escape.ts.html"]);
+    expect(all.stderr).not.toContain("% Funcs");
+    // Without a file the text reporter prints 0.00 for "All files" in green.
+    expect(indexRows(index(String(nothingToReport)))).toEqual([]);
+    expect(index(String(nothingToReport))).toContain(
+      `<tr><td>All files</td><td class="num ok">0.00</td><td class="count"></td><td class="num ok">0.00</td>`,
+    );
+    expect([all.exitCode, none.exitCode]).toEqual([0, 0]);
+  });
+
+  test.concurrent("a page says why it does not show a source, and has no links to lines then", async () => {
+    const files = (bunfig: string, during: string) => ({
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncoverageReporter = "html"\n${bunfig}`,
+      "src/changes.ts": `export function one() {
+  return 1;
+}
+
+export function two() {
+  return 2;
+}
+`,
+      "changes.test.ts": `import { expect, test } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
+import { one } from "./src/changes";
+
+test("changes", () => {
+  expect(one()).toBe(1);
+  const file = import.meta.dir + "/src/changes.ts";
+  ${during}
+});
+`,
+    });
+    using shown = tempDir("cov-html", files("", ""));
+    using removed = tempDir("cov-html", files("", "rmSync(file);"));
+    using shortened = tempDir("cov-html", files("", `writeFileSync(file, "// one line\\n");`));
+    using transpiled = tempDir("cov-html", files("coverageIgnoreSourcemaps = true\n", ""));
+    const dirs = [shown, removed, shortened, transpiled].map(String);
+    const runs = await Promise.all(dirs.map(dir => run(dir, "--coverage")));
+
+    expect(
+      dirs.map((dir, i) => {
+        const page = readFileSync(path.join(dir, "coverage", "src", "changes.ts.html"), "utf-8");
+        return {
+          note: /<p class="note">(.*?)<\/p>/.exec(page)?.[1],
+          rows: sourceRows(page).length,
+          uncovered: uncoveredRanges(page),
+          exitCode: runs[i].exitCode,
+        };
+      }),
+    ).toEqual([
+      { note: undefined, rows: 7, uncovered: { ranges: "5", links: [true] }, exitCode: 0 },
+      {
+        note: "The file could not be read, so its source is not shown.",
+        rows: 0,
+        uncovered: { ranges: "5", links: [] },
+        exitCode: 0,
+      },
+      {
+        note: "The file has fewer lines than the code that ran, so its source is not shown.",
+        rows: 0,
+        uncovered: { ranges: "5", links: [] },
+        exitCode: 0,
+      },
+      {
+        note: "coverageIgnoreSourcemaps is set: the line numbers are those of the transpiled code, so the source is not shown.",
+        rows: 0,
+        uncovered: { ranges: expect.stringMatching(/^\d/), links: [] },
+        exitCode: 0,
+      },
+    ]);
+  });
+
+  test.concurrent("a module that is not a file has a page next to the index, and no file is read for it", async () => {
+    using dir = tempDir("cov-html", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\npreload = ["./preload.ts"]\n`,
+      "preload.ts": `import { plugin } from "bun";
+
+plugin({
+  name: "virtual",
+  setup(build) {
+    build.module("virtual-math", () => ({
+      contents: "export function add(a, b) {\\n  return a + b;\\n}\\n",
+      loader: "js",
+    }));
+  },
+});
+`,
+      // A file where the name of the module would be a path.
+      "virtual-math": `not the module\n// line 2\n// line 3\n`,
+      "virtual.test.ts": `import { expect, test } from "bun:test";
+import { add } from "virtual-math";
+
+test("virtual", async () => {
+  const data = await import("data:text/javascript,export const one = () => 1; //../../outside");
+  expect(add(1, 2) + data.one()).toBe(4);
+});
+`,
+    });
+    const { stderr, exitCode } = await run(String(dir), "--coverage-reporter=html");
+    const coverage = path.join(String(dir), "coverage");
+    const rows = indexRows(readFileSync(path.join(coverage, "index.html"), "utf-8"));
+
+    expect({ stderr, rows: rows.map(({ name, page }) => ({ name, page })) }).toEqual({
+      stderr: expect.stringContaining("1 pass"),
+      rows: expect.arrayContaining([
+        { name: "virtual-math", page: "virtual-math.html" },
+        {
+          name: "data:text/javascript,export const one = () => 1; //../../outside",
+          page: "data_text_javascript,export const one = () =_ 1; __.._.._outside.html",
+        },
+      ]),
+    });
+    for (const { page } of rows.filter(row => !row.name.endsWith("preload.ts"))) {
+      const text = readFileSync(path.join(coverage, page), "utf-8");
+      expect(text).toContain(`<p class="note">This module is not a file, so there is no source to show.</p>`);
+      expect(text).not.toContain("not the module");
+    }
+    expect(exitCode).toBe(0);
+  });
+
+  // Bun sizes the report of such a file for 2^31 lines, which takes a debug build 15 seconds to walk.
+  test.skipIf(isDebug || isASAN).concurrent("a bundle that names a source map of its own is not shown", async () => {
+    using dir = tempDir("cov-html", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      // What `bun build --target=bun --sourcemap=inline` makes of a src/two.ts that has `two` on its second line.
+      "dist/two.js": `// @bun
+// src/two.ts
+function two() {
+  return 2;
+}
+export {
+  two
+};
+
+//# debugId=DCE865C90336C71D64756E2164756E21
+//# sourceMappingURL=data:application/json;base64,ewogICJ2ZXJzaW9uIjogMywKICAic291cmNlcyI6IFsiLi4vc3JjL3R3by50cyJdLAogICJzb3VyY2VzQ29udGVudCI6IFsKICAgICIvLyBUaGUgYnVuZGxlIGhhcyB0aGlzIGZ1bmN0aW9uIG9uIGFub3RoZXIgbGluZSB0aGFuIHRoaXMgZmlsZS5cbmV4cG9ydCBmdW5jdGlvbiB0d28oKSB7XG4gIHJldHVybiAyO1xufVxuIgogIF0sCiAgIm1hcHBpbmdzIjogIjs7QUFDTyxTQUFTLEdBQUcsR0FBRztBQUFBLEVBQ3BCLE9BQU87QUFBQTsiLAogICJkZWJ1Z0lkIjogIkRDRTg2NUM5MDMzNkM3MUQ2NDc1NkUyMTY0NzU2RTIxIiwKICAibmFtZXMiOiBbXQp9
+`,
+      "bundle.test.ts": `import { expect, test } from "bun:test";
+import { two } from "./dist/two.js";
+
+test("bundle", () => {
+  expect(two()).toBe(2);
+});
+`,
+    });
+    const { stderr, exitCode } = await run(String(dir), "--coverage-reporter=html");
+    const page = readFileSync(path.join(String(dir), "coverage", "dist", "two.js.html"), "utf-8");
+
+    expect(stderr).toContain("1 pass");
+    expect(/<p class="note">(.*?)<\/p>/.exec(page)?.[1]).toBe(
+      "This file names a source map of its own: the line numbers are those of the sources it was made from, so the file is not shown.",
+    );
+    expect(sourceRows(page)).toEqual([]);
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("a row is a line as the report numbers it, whatever the bytes of the file", async () => {
+    const lines = ["export function crlf() {", "  return 1;", "}", "export function cr() {", "  return 2;", "}"];
+    const bytes = (...parts: (string | number[])[]) => Buffer.concat(parts.map(part => Buffer.from(part)));
+    using dir = tempDir("cov-html", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\n`,
+      // A byte order mark, \r\n, \r, U+2028 and U+2029.
+      "src/endings.ts": `\uFEFF${lines.slice(0, 3).join("\r\n")}\r\n${lines.slice(3, 6).join("\r")}\r// \u2028// \u2029`,
+      // UTF-16, which the module loader converts.
+      "src/utf16.js": bytes(
+        [0xff, 0xfe],
+        Buffer.from(`export function wide() {\n  return "\u00e9\u0a0a";\n}\n`, "utf16le"),
+      ),
+      // Latin-1: the line table reads the \n after the 0xE9 as a part of its character.
+      "src/latin1.js": bytes("// caf", [0xe9], "\nexport function latin() {\n\treturn 1;\n}\n"),
+      // A NUL, a byte that is no UTF-8, and a last line without a terminator.
+      "src/zero.js": bytes(`export const zero = () => "a\0b"; // `, [0xff], "\nexport const last = () => 2;"),
+      "bytes.test.ts": `import { expect, test } from "bun:test";
+import { cr, crlf } from "./src/endings";
+import { latin } from "./src/latin1.js";
+import { wide } from "./src/utf16.js";
+import { last, zero } from "./src/zero.js";
+
+test("bytes", () => {
+  expect(crlf() + cr() + latin() + last()).toBe(6);
+  expect(zero() + wide()).toBe("a\\0b\u00e9\u0a0a");
+});
+`,
+    });
+    const { stderr, exitCode } = await run(String(dir), "--coverage-reporter=html", "--coverage-reporter=lcov");
+    const lcov = lcovRecords(String(dir));
+    const rows = (name: string) =>
+      sourceRows(readFileSync(path.join(String(dir), "coverage", "src", `${name}.html`), "utf-8"));
+    const marked = (name: string, texts: string[]) =>
+      texts.map((text, i) => ({ state: lcov[`src/${name}`].states[i + 1] ?? "", text }));
+
+    expect(stderr).toContain("1 pass");
+    expect(rows("endings.ts")).toEqual(marked("endings.ts", [...lines, "// ", "// "]));
+    expect(rows("utf16.js")).toEqual(marked("utf16.js", ["export function wide() {", `  return "\u00e9\u0a0a";`, "}"]));
+    expect(rows("latin1.js")).toEqual(
+      marked("latin1.js", ["// caf\uFFFD\nexport function latin() {", "\treturn 1;", "}"]),
+    );
+    expect(rows("zero.js")).toEqual(
+      marked("zero.js", [`export const zero = () => "a\uFFFDb"; // \uFFFD`, "export const last = () => 2;"]),
+    );
+    // The marks are not lcov.info's alone: the first two lines of these functions ran.
+    expect(rows("endings.ts").slice(0, 2)).toEqual([
+      { state: "hit", text: lines[0] },
+      { state: "hit", text: lines[1] },
+    ]);
+    expect(rows("utf16.js").map(row => row.state)).toEqual(["hit", "hit", ""]);
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent.each([
+    ["in one process", []],
+    ["with --parallel", ["--parallel=2"]],
+  ])("fails when a page cannot be written %s", async (_, flags) => {
+    using dir = tempDir("cov-html", {
+      ...project,
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncoverageDir = "blocked/coverage"\n`,
+      "blocked": "a file where the coverage directory would go",
+    });
+    const { stderr, exitCode } = await run(String(dir), "--coverage-reporter=html", ...flags);
+
+    expect(stderr).toContain("Failed to write blocked/coverage/src/math.ts.html");
+    expect(exitCode).toBe(1);
+  });
+
+  test
+    .skipIf(isWindows)
+    .concurrent("ends with an error when the coverage directory is a dangling symlink", async () => {
+      using dir = tempDir("cov-html", project);
+      symlinkSync("missing", path.join(String(dir), "coverage"));
+      const { stderr, exitCode } = await run(String(dir), "--coverage-reporter=html");
+
+      expect(stderr).toContain("Failed to write coverage/src/math.ts.html");
+      expect(exitCode).toBe(1);
+    });
+
+  test.concurrent("a reporter that is not text, lcov or html is an error", async () => {
+    using onTheCommandLine = tempDir("cov-html", project);
+    using inBunfig = tempDir("cov-html", {
+      ...project,
+      "bunfig.toml": `[test]\ncoverageReporter = ["html", "HTML"]\n`,
+    });
+    const [flag, bunfig] = await Promise.all([
+      run(String(onTheCommandLine), "--coverage-reporter=html", "--coverage-reporter=htm"),
+      run(String(inBunfig)),
+    ]);
+
+    expect(flag.stderr).toContain(
+      "error: invalid coverage reporter 'htm'. Available options: 'text' (console output), 'lcov' (code coverage file), 'html' (browsable report)",
+    );
+    expect(bunfig.stderr).toContain(`Invalid coverage reporter "HTML"`);
+    expect([flag.exitCode, bunfig.exitCode]).toEqual([1, 1]);
+  });
 });
 
 test("coverage excludes node_modules directory", () => {
@@ -1679,6 +2270,35 @@ test("a", () => {
     expect(stderr).toContain("1 pass");
     expect(rows).toEqual([unusedRow, "src/used.ts | 100.00 | 100.00 |"]);
     expect(exitCode).toBe(1);
+  });
+
+  test.concurrent("a file that nothing loaded has a page in the html report", async () => {
+    using dir = tempDir("cov-collect-from", {
+      "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncollectCoverageFrom = ["src/**"]\n`,
+      "src/used.ts": project["src/used.ts"],
+      "src/unused.ts": unused,
+      "a.test.ts": `import { expect, test } from "bun:test";
+import { used } from "./src/used";
+
+test("a", () => {
+  expect(used()).toBe(1);
+});
+`,
+    });
+    const { rows, exitCode } = await run(String(dir), ...lcovFlags, "--coverage-reporter=html");
+    const read = (file: string) => readFileSync(path.join(String(dir), "coverage", file), "utf-8");
+    const page = read("src/unused.ts.html");
+
+    expect(rows[0]).toBe(unusedRow);
+    expect(read("index.html")).toContain(
+      `<a href="src/unused.ts.html">src/unused.ts</a></td><td class="num low">0.00</td>`,
+    );
+    // The lines that lcov.info lists are the lines that are marked, and none of them ran.
+    expect([...page.matchAll(/<tr id="L(\d+)" class="miss">/g)].map(match => Number(match[1]))).toEqual(
+      lcovRecords(String(dir))["src/unused.ts"].listed,
+    );
+    expect(page).not.toContain(`class="hit"`);
+    expect(exitCode).toBe(0);
   });
 
   test.concurrent("a run has to run a test file to report the files that nothing loaded", async () => {

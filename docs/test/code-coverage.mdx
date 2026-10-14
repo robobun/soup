@@ -74,7 +74,7 @@ Setting either key makes `bun test --coverage` exit with a non-zero exit code wh
 
 By default, Bun prints coverage reports to the console.
 
-To save a report for CI or other tools, pass `--coverage-reporter=lcov` on the command line or set `coverageReporter` in `bunfig.toml`.
+To save a report for CI or other tools, pass `--coverage-reporter=lcov` on the command line or set `coverageReporter` in `bunfig.toml`. To browse the coverage of each file, use the `html` reporter.
 
 ```toml title="bunfig.toml" icon="settings"
 [test]
@@ -84,10 +84,11 @@ coverageDir = "path/to/somewhere"    # default "coverage"
 
 ### Available Reporters
 
-| Reporter | Description                                          |
-| -------- | ---------------------------------------------------- |
-| `text`   | Prints a text summary of the coverage to the console |
-| `lcov`   | Save coverage in lcov format                         |
+| Reporter | Description                                            |
+| -------- | ------------------------------------------------------ |
+| `text`   | Prints a text summary of the coverage to the console   |
+| `lcov`   | Save coverage in lcov format                           |
+| `html`   | Save an HTML report that shows the source of each file |
 
 ### LCOV Coverage Reporter
 
@@ -129,6 +130,66 @@ jobs:
         with:
           file: ./coverage/lcov.info
 ```
+
+### HTML Coverage Reporter
+
+The html reporter writes a report that you open in a browser. It writes `index.html` to the coverage directory, and one page for each source file.
+
+```bash terminal icon="terminal"
+bun test --coverage-reporter=text --coverage-reporter=html
+```
+
+To write the report on every coverage run, set the reporters in `bunfig.toml`. `bun test --coverage` then prints the table and writes the report.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+coverageReporter = ["text", "html"]
+```
+
+```txt
+coverage/
+├── index.html
+└── src/
+    ├── math.ts.html
+    └── utils/
+        └── string.ts.html
+```
+
+`index.html` lists every file with the `% Funcs` and `% Lines` that the text reporter prints, and with the number of functions and lines that ran. Select `File`, `% Funcs` or `% Lines` to sort by that column. Type in the filter box to narrow the list.
+
+The page of a file shows its source. The marks follow the lines that `lcov.info` lists:
+
+- A green mark next to the line number: the line ran.
+- A red mark and a red background: the line is one of the `Uncovered Line #s` of the console. The ranges at the top of the page link to these lines.
+- No mark: the line is not in the report. Most such lines have nothing to execute, for example a comment or a type.
+
+For a function that never ran, the report has the lines around the start of the function and not its body. The body has no mark then.
+
+A percentage is red when it is below the [coverage threshold](#coverage-thresholds), the same as in the console.
+
+The paths of the pages follow the directories of your project. When a test loads a file from outside the project directory, the paths start at the deepest directory that contains the project directory and every file in the report. A module that is not a file, such as a `data:` URL or a module that a plugin makes up, has a page next to `index.html`.
+
+Each page carries its own styles and loads nothing from the network. To keep the report of a CI run, upload the coverage directory as an artifact:
+
+```yaml title=".github/workflows/test.yml" icon="file-code"
+- run: bun test --coverage-reporter=html
+- uses: actions/upload-artifact@v4
+  if: ${{ !cancelled() }}
+  with:
+    name: coverage
+    path: coverage
+```
+
+Bun reads each source file from disk when it writes the report. A page has a note in place of the source in these cases:
+
+- Bun cannot read the file, or the module is not a file.
+- The file has fewer lines than the code that ran, for example because a test changed the file.
+- The file is a `// @bun` bundle that names a source map of its own. The line numbers are then those of the original sources.
+- [`coverageIgnoreSourcemaps`](#sourcemaps) is set.
+
+The report marks lines. It does not show how many times a line ran, and it does not show branches.
+
+Bun does not delete the pages of an earlier run, and a run with no file to report writes nothing. To start clean, delete the coverage directory before the run.
 
 ## Choosing the Files to Cover
 
@@ -214,7 +275,7 @@ coveragePathIgnorePatterns = [
 ]
 ```
 
-The option accepts glob patterns. Bun excludes files matching any of the patterns from coverage calculation and reporting in both text and LCOV output, including the files [`collectCoverageFrom`](#choosing-the-files-to-cover) names.
+The option accepts glob patterns. Bun excludes files matching any of the patterns from coverage calculation and from every reporter, including the files [`collectCoverageFrom`](#choosing-the-files-to-cover) names.
 
 #### Common Use Cases
 
