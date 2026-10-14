@@ -403,6 +403,13 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Argv> {
         argv.flag("--jsx-side-effects", jsx.side_effects);
     }
     argv.flag("--coverage", opts.coverage.enabled);
+    if opts.coverage.enabled {
+        // `coverageSkipTestFiles` asks a worker which of the files it loads are tests.
+        // It reads `testMatch` from bunfig.toml itself.
+        for pattern in &opts.test_match_flag {
+            argv.option("--test-match", Some(BStr::new(pattern)));
+        }
+    }
     argv.option("--environment", opts.environment.map(|it| it.name()));
     argv.option("--globals", opts.globals.map(|it| it.name()));
     // Each worker reads `include` and `exclude` from bunfig.toml itself.
