@@ -259,6 +259,7 @@ _bun_pm_completion() {
             'bin\:"print the path to bin folder" '
             'ls\:"list the tree of installed dependencies" '
             'licenses\:"list installed packages grouped by license" '
+            'sbom\:"print a software bill of materials of the dependencies" '
             'hash\:"generate & print the hash of the current lockfile" '
             'hash-string\:"print the string used to hash the lockfile" '
             'hash-print\:"print the hash stored in the current lockfile" '
@@ -321,6 +322,21 @@ _bun_pm_completion() {
                 "--long[also print author, description and homepage]"
                 "*--filter[list only the matching workspaces' dependencies]:workspace pattern"
                 "*-F[list only the matching workspaces' dependencies]:workspace pattern"
+            )
+
+            _arguments -s -C \
+                '1: :->cmd' \
+                '2: :->cmd2' \
+                $pmargs &&
+                ret=0
+
+            ;;
+        sbom)
+            pmargs=(
+                "--sbom-format[the format of the document]:format:(cyclonedx spdx)"
+                "--sbom-type[what the project is]:type:(library application framework)"
+                "--prod[omit devDependencies]"
+                "--production[omit devDependencies]"
             )
 
             _arguments -s -C \
