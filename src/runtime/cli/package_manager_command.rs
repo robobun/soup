@@ -22,6 +22,7 @@ use crate::cli::pm_cache_prune_command::{DEFAULT_MAX_AGE_DAYS, PmCachePruneComma
 use crate::cli::pm_diff_command as PmDiffCommand;
 use crate::cli::pm_licenses_command::{BunStore, LicensesFlags, PmLicensesCommand};
 use crate::cli::pm_pkg_command::PmPkgCommand;
+use crate::cli::pm_sbom_command::{PmSbomCommand, SbomFlags};
 use crate::cli::pm_trusted_command::{
     DefaultTrustedCommand, TrustCommand, UntrustedCommand, read_trusted_dependencies,
 };
@@ -45,6 +46,7 @@ const SUBCOMMANDS: &[(&[u8], &[u8])] = &[
     (b"why", b"why"),
     (b"diff", b"diff"),
     (b"licenses", b"licenses"),
+    (b"sbom", b"sbom"),
     (b"whoami", b"whoami"),
     (b"view", b"view"),
     (b"version", b"version"),
@@ -281,6 +283,10 @@ impl PackageManagerCommand {
         let licenses_flags = LicensesFlags {
             dev_only: cli.dev_only,
             long: cli.long,
+        };
+        let sbom_flags = SbomFlags {
+            format: cli.sbom_format,
+            project_type: cli.sbom_type,
         };
         let diff_flags = PmDiffCommand::DiffFlags {
             raw: cli.diff_raw,
@@ -856,6 +862,9 @@ impl PackageManagerCommand {
             Global::exit(0);
         } else if strings::eql_comptime(subcommand, b"licenses") {
             PmLicensesCommand::exec(pm, positionals, &cwd, licenses_flags)?;
+            Global::exit(0);
+        } else if strings::eql_comptime(subcommand, b"sbom") {
+            PmSbomCommand::exec(pm, positionals, sbom_flags)?;
             Global::exit(0);
         } else if strings::eql_comptime(subcommand, b"pkg") {
             PmPkgCommand::exec(&&mut *ctx, pm, positionals, &cwd)?;
