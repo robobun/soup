@@ -3959,6 +3959,12 @@
           "flags": [],
           "positionalArgs": []
         },
+        "sbom": {
+          "name": "sbom",
+          "description": "print a software bill of materials of the dependencies",
+          "flags": [],
+          "positionalArgs": []
+        },
         "whoami": {
           "name": "whoami",
           "description": "print the current npm username",

@@ -1006,15 +1006,15 @@ impl Tag {
 
     pub(crate) const LocalTarball: Tag = Tag(8);
 
-    pub(crate) const Github: Tag = Tag(16);
+    pub const Github: Tag = Tag(16);
 
-    pub(crate) const Git: Tag = Tag(32);
+    pub const Git: Tag = Tag(32);
 
     pub const Symlink: Tag = Tag(64);
 
     pub const Workspace: Tag = Tag(72);
 
-    pub(crate) const RemoteTarball: Tag = Tag(80);
+    pub const RemoteTarball: Tag = Tag(80);
 
     // This is a placeholder for now.
     // But the intent is to eventually support URL imports at the package manager level.
