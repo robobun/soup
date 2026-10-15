@@ -269,6 +269,82 @@ From a workspace root, Bun lists every workspace's dependencies. From inside a w
 
 Requires both `bun.lock` and `node_modules`. Bun skips packages that are in the lockfile but missing from `node_modules` (e.g. after `bun install --production`) and prints a warning.
 
+## sbom
+
+Print a software bill of materials (SBOM) of the project: every package that `bun install` links into it, with its version, package URL, integrity hash, license and the packages it depends on. Vulnerability scanners and compliance tools read this document instead of the project. Bun writes it to stdout as JSON, in [CycloneDX](https://cyclonedx.org) 1.6 or in [SPDX](https://spdx.dev) 2.3.
+
+```bash terminal icon="terminal"
+bun pm sbom > bom.json
+bun pm sbom --sbom-format spdx > bom.spdx.json
+```
+
+```json bom.json icon="file-json"
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:75a892d5-1962-47e1-adea-b64f53dbc721",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-10-15T18:06:37Z",
+    "lifecycles": [{ "phase": "build" }],
+    "tools": { "components": [{ "type": "application", "name": "bun", "version": "1.3.0" }] },
+    "component": {
+      "bom-ref": "my-app@1.0.0",
+      "type": "library",
+      "name": "my-app",
+      "version": "1.0.0",
+      "scope": "required",
+      "purl": "pkg:npm/my-app@1.0.0",
+      "properties": [{ "name": "cdx:npm:package:path", "value": "" }]
+    }
+  },
+  "components": [
+    {
+      "bom-ref": "path-parse@1.0.6",
+      "type": "library",
+      "name": "path-parse",
+      "version": "1.0.6",
+      "scope": "required",
+      "description": "Node.js path.parse() ponyfill",
+      "authors": [{ "name": "Javier Blanco" }],
+      "licenses": [{ "license": { "id": "MIT" } }],
+      "purl": "pkg:npm/path-parse@1.0.6",
+      "hashes": [{ "alg": "SHA-512", "content": "19298e4f611b1eb20d05ff5247b08310…" }],
+      "externalReferences": [
+        { "type": "distribution", "url": "https://registry.npmjs.org/path-parse/-/path-parse-1.0.6.tgz" },
+        { "type": "vcs", "url": "https://github.com/jbgutierrez/path-parse.git" }
+      ],
+      "properties": [{ "name": "cdx:npm:package:path", "value": "node_modules/path-parse" }]
+    }
+  ],
+  "dependencies": [
+    { "ref": "my-app@1.0.0", "dependsOn": ["path-parse@1.0.6"] },
+    { "ref": "path-parse@1.0.6", "dependsOn": [] }
+  ]
+}
+```
+
+| Flag                                            | Description                                                   |
+| ----------------------------------------------- | ------------------------------------------------------------- |
+| `--sbom-format <cyclonedx\|spdx>`               | The format of the document. `cyclonedx` is the default        |
+| `--sbom-type <library\|application\|framework>` | What the project is. `library` is the default                 |
+| `--prod`, `-p`                                  | Leave out `devDependencies` (same as `--omit=dev`)            |
+| `--omit=<dev\|optional\|peer>`                  | Leave out a dependency type, as with `bun install`            |
+| `--cpu`, `--os`                                 | List the optional dependencies of another platform than yours |
+
+The two `--sbom` flags have the names and the values they have in `npm sbom`.
+
+The document lists what `bun install` with the same flags links on this machine: `bun pm sbom --production` describes what `bun install --production` installs, and an optional dependency that is made for another operating system is not in it. From a workspace root, the document covers every workspace. From inside a workspace package, it covers that package and what it depends on. `--filter` is not supported.
+
+A package that only `devDependencies` lead to has the property `cdx:npm:package:development`. A package has the scope `optional` when only `optionalDependencies` and optional peers lead to it. As in `npm sbom`, a package that `devDependencies` lead to one way and `optionalDependencies` another way is `optional` too, because a production install has it only as an optional package. In SPDX, each dependency is a relationship: `DEPENDS_ON`, `DEV_DEPENDENCY_OF`, `OPTIONAL_DEPENDENCY_OF` (also for an optional peer), or `HAS_PREREQUISITE` for a peer dependency.
+
+The packages, their versions, their hashes and the dependency graph come from `bun.lock`. Without a `bun.lock`, Bun reads `package-lock.json`, `yarn.lock` or `pnpm-lock.yaml`, as `bun install` does, and writes nothing. The license, the author, the description and the links of a package come from its `package.json` in `node_modules`. Without `node_modules`, Bun prints the document without them, with a warning on stderr, and marks it as made before the build (`"phase": "pre-build"`).
+
+A `license` that is an identifier of the [SPDX license list](https://spdx.org/licenses/) is written as that identifier, a valid SPDX expression such as `(MIT OR Apache-2.0)` as an expression, and any other text (`SEE LICENSE IN LICENSE.md`) as the name of a license.
+
+A dependency on a git repository or on a tarball URL has the place it comes from in its package URL (`pkg:npm/pkg@1.0.0?vcs_url=git%2Bhttps://github.com/owner/repo.git%40<commit>`). A user name or a password in such a URL is not written to the document. A private workspace has no package URL.
+
 ## diff
 
 Show what changed between two versions of a package: a summary of the files and lines touched, the `package.json` changes worth a second look (new install scripts, dependencies, entry points, binaries), then a unified diff of every file. Each side can be a registry spec, a local folder, or a `.tgz`.
