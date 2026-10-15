@@ -129,7 +129,7 @@ We update this page regularly. It reflects the latest version of Bun's compatibi
 
 ### [`node:perf_hooks`](https://nodejs.org/api/perf_hooks.html)
 
-🟡 `monitorEventLoopDelay()`, `createHistogram()`, `timerify()` and `PerformanceObserver` (`mark`, `measure`, `function`, `net`, `http` and `http2` entries) are implemented. Bun never emits `gc`, `dns` or `resource` entries. `eventLoopUtilization()` always returns zeros, and `performance.nodeTiming` holds placeholder values. The Node-specific additions to the global `performance` object only appear once `node:perf_hooks` has been imported.
+🟡 `eventLoopUtilization()`, `monitorEventLoopDelay()`, `createHistogram()`, `timerify()` and `PerformanceObserver` (`mark`, `measure`, `function`, `net`, `http` and `http2` entries) are implemented. Bun never emits `gc`, `dns` or `resource` entries. The event loop starts to count its idle time at its first poll for events after `eventLoopUtilization()` or `performance.nodeTiming.idleTime` is first used. Until then both return zeros and `performance.nodeTiming.loopStart` is `-1`, as in Node.js before its loop has started. The other values of `performance.nodeTiming` are placeholders. The Node-specific additions to the global `performance` object only appear once `node:perf_hooks` has been imported.
 
 ### [`node:process`](https://nodejs.org/api/process.html)
 
@@ -373,7 +373,7 @@ The following list covers the globals implemented by Node.js and Bun's compatibi
 
 ### [`performance`](https://developer.mozilla.org/en-US/docs/Web/API/performance)
 
-🟡 `now()`, `timeOrigin`, `mark()`, `measure()` and `getEntries()` are implemented. The Node.js additions (`eventLoopUtilization()`, `nodeTiming`, `timerify()`) only exist once `node:perf_hooks` has been loaded. `eventLoopUtilization()` always returns zeros and `nodeTiming` holds placeholder values.
+🟡 `now()`, `timeOrigin`, `mark()`, `measure()` and `getEntries()` are implemented. The Node.js additions (`eventLoopUtilization()`, `nodeTiming`, `timerify()`) only exist once `node:perf_hooks` has been loaded. `eventLoopUtilization()`, `nodeTiming.idleTime` and `nodeTiming.loopStart` count from their first use. The other values of `nodeTiming` are placeholders.
 
 ### [`process`](https://nodejs.org/api/process.html)
 

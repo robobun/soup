@@ -71,6 +71,11 @@ pub struct InternalLoopData {
     num_unresumable_sockets: Cell<c_int>,
     /// `us_internal_unresumable_socket_t *`. Only `loop.c` reads or frees this list.
     unresumable_sockets: Cell<*mut c_void>,
+    /// These belong to `us_loop_idle_time` and the loop's tick.
+    idle_time_state: Cell<c_char>,
+    idle_time_origin_ns: Cell<u64>,
+    #[cfg(not(windows))]
+    idle_time_ns: Cell<u64>,
 }
 
 impl InternalLoopData {
