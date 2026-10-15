@@ -286,6 +286,27 @@ rewriter.on("p", {
 });
 ```
 
+`text.text` is the text as it is written in the document, so `&amp;` stays `&amp;`. The same goes for the value `el.getAttribute()` returns. [`Bun.unescapeHTML()`](/runtime/utils#bun-unescapehtml) decodes both. A text node can arrive in several chunks, so collect them first:
+
+```ts
+let title = "";
+
+rewriter.on("title", {
+  text(text) {
+    title += text.text;
+    if (text.lastInTextNode) {
+      console.log(Bun.unescapeHTML(title)); // "Tom & Jerry"
+    }
+  },
+});
+
+rewriter.on("a[href]", {
+  element(el) {
+    const href = Bun.unescapeHTML(el.getAttribute("href")!, { attribute: true });
+  },
+});
+```
+
 ### Comment Operations
 
 Comments support similar methods to text nodes:

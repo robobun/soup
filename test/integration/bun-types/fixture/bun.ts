@@ -121,3 +121,8 @@ new Bun.Glob("**/*.ts").scan({ ignore: "node_modules/**" }) satisfies AsyncItera
 new Bun.Glob("**/*.ts").scanSync({ ignore: ["node_modules/**", "dist/**"] }) satisfies IterableIterator<string>;
 // @ts-expect-error ignore takes glob pattern strings
 new Bun.Glob("**/*.ts").scanSync({ ignore: /node_modules/ });
+
+tsd.expectType(Bun.unescapeHTML("&lt;b&gt;")).is<string>();
+tsd.expectType(Bun.unescapeHTML("/search?q=1&copy=2", { attribute: true })).is<string>();
+// @ts-expect-error options is an object
+Bun.unescapeHTML("&amp;", true);
