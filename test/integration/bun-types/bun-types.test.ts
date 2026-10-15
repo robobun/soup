@@ -462,6 +462,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "test_context.bind.ts": null,
   "trim_testing.bind.ts": null,
   "udp_socket.bind.ts": null,
+  "unescape_html.bind.ts": "typeof Bun",
   "upgrade_command.bind.ts": null,
   "valkey.bind.ts": "typeof Bun",
   "vi_utils.bind.ts": null,

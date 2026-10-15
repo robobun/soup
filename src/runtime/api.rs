@@ -72,6 +72,8 @@ pub(crate) mod standalone_graph_jsc;
 pub(crate) mod toml_object;
 #[path = "api/trim_testing.rs"]
 pub(crate) mod trim_testing;
+#[path = "api/unescape_html.rs"]
+pub(crate) mod unescape_html;
 #[path = "api/UnsafeObject.rs"]
 pub(crate) mod unsafe_object;
 #[path = "api/XMLObject.rs"]

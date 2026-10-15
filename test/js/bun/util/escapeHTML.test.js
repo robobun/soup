@@ -1,4 +1,4 @@
-import { escapeHTML } from "bun";
+import { escapeHTML, unescapeHTML } from "bun";
 import { describe, expect, it } from "bun:test";
 
 describe("escapeHTML", () => {
@@ -190,5 +190,185 @@ describe("escapeHTML", () => {
     expect(escapeHTML("<".repeat(100))).toBe("&lt;".repeat(100));
     expect(escapeHTML("<>".repeat(100))).toBe("&lt;&gt;".repeat(100));
     expect(escapeHTML(`&<>"'`.repeat(50))).toBe("&amp;&lt;&gt;&quot;&#x27;".repeat(50));
+  });
+});
+
+describe("unescapeHTML", () => {
+  it("decodes named, decimal and hexadecimal references", () => {
+    expect(unescapeHTML("&lt;p&gt;Tom &amp; Jerry&lt;/p&gt;")).toBe("<p>Tom & Jerry</p>");
+    expect(unescapeHTML("&quot;&apos;&#39;&#x27;&#X27;")).toBe(`"''''`);
+    expect(unescapeHTML("caf&eacute; &#9749; &#x2615; &copy; 2026")).toBe("café ☕ ☕ © 2026");
+    expect(unescapeHTML("&hearts;&nbsp;&euro;&mdash;&hellip;")).toBe("♥\u00A0€—…");
+    // the longest name there is
+    expect(unescapeHTML("&CounterClockwiseContourIntegral;")).toBe("∳");
+    // names are case-sensitive
+    expect(unescapeHTML("&Eacute;&eacute;&AMP;&Amp;&LT;&Lt;")).toBe("Éé&&Amp;<≪");
+    // one name, two code points
+    expect(unescapeHTML("&NotEqualTilde;&fjlig;")).toBe("\u2242\u0338fj");
+    // outside the BMP
+    expect(unescapeHTML("&Afr;&#x1F600;&#128512;")).toBe("\u{1D504}😀😀");
+  });
+
+  it("leaves what is not a reference alone", () => {
+    const texts = [
+      "",
+      "plain text",
+      "a & b",
+      "AT&T",
+      "&",
+      "&&",
+      "&;",
+      "& amp;",
+      "&am;",
+      "&bogus;",
+      "&Amp;",
+      "&#;",
+      "&#x;",
+      "&#xg;",
+      "&#-1;",
+      "&# 38;",
+      "&\u00e9;",
+      "&😊;",
+      "trailing &",
+    ];
+    for (const text of texts) expect(unescapeHTML(text)).toBe(text);
+  });
+
+  it("takes the names of HTML 4 without their semicolon", () => {
+    expect(unescapeHTML("&amp")).toBe("&");
+    expect(unescapeHTML("&lt&gt&quot&amp")).toBe(`<>"&`);
+    expect(unescapeHTML("&copy 2026 &reg&trade")).toBe("© 2026 ®&trade");
+    expect(unescapeHTML("&frac12cup &sup2")).toBe("½cup ²");
+    // the longest name wins, and what follows it is text
+    expect(unescapeHTML("&notin; &notit; &not;")).toBe("∉ ¬it; ¬");
+    expect(unescapeHTML("&ampere; &ltimes; &ltfoo")).toBe("&ere; ⋉ <foo");
+    // the other names need it
+    expect(unescapeHTML("&hearts &euro &apos &trade")).toBe("&hearts &euro &apos &trade");
+
+    const html4 = (
+      "AElig AMP Aacute Acirc Agrave Aring Atilde Auml COPY Ccedil ETH Eacute Ecirc Egrave Euml GT Iacute " +
+      "Icirc Igrave Iuml LT Ntilde Oacute Ocirc Ograve Oslash Otilde Ouml QUOT REG THORN Uacute Ucirc " +
+      "Ugrave Uuml Yacute aacute acirc acute aelig agrave amp aring atilde auml brvbar ccedil cedil cent " +
+      "copy curren deg divide eacute ecirc egrave eth euml frac12 frac14 frac34 gt iacute icirc iexcl " +
+      "igrave iquest iuml laquo lt macr micro middot nbsp not ntilde oacute ocirc ograve ordf ordm oslash " +
+      "otilde ouml para plusmn pound quot raquo reg sect shy sup1 sup2 sup3 szlig thorn times uacute ucirc " +
+      "ugrave uml uuml yacute yen yuml"
+    ).split(" ");
+    expect(html4).toHaveLength(106);
+    for (const name of html4) {
+      const decoded = unescapeHTML(`&${name};`);
+      expect(decoded).not.toBe(`&${name};`);
+      expect(unescapeHTML(`&${name}`)).toBe(decoded);
+      expect(unescapeHTML(`&${name} &${name}x`)).toBe(`${decoded} ${decoded}x`);
+    }
+  });
+
+  it("reads numeric references the way HTML does", () => {
+    expect(unescapeHTML("&#65;&#x41;&#X41;&#x4a;&#x4A;&#0065;")).toBe("AAAJJA");
+    // not a code point
+    expect(unescapeHTML("&#0;&#x0;")).toBe("\uFFFD\uFFFD");
+    expect(unescapeHTML("&#xD800;&#xDFFF;&#x110000;&#99999999999999999999;&#xFFFFFFFFFFFFFFFFF;")).toBe(
+      "\uFFFD".repeat(5),
+    );
+    expect(unescapeHTML("&#x10FFFF;&#xD7FF;&#xE000;")).toBe("\u{10FFFF}\uD7FF\uE000");
+    // the C1 controls are Windows-1252
+    expect(unescapeHTML("&#128;&#x85;&#145;&#146;&#147;&#148;&#150;&#151;&#153;&#159;")).toBe("€…‘’“”–—™Ÿ");
+    expect(unescapeHTML("&#129;&#x8D;&#143;&#144;&#157;")).toBe("\x81\x8D\x8F\x90\x9D");
+    // the semicolon can be left out
+    expect(unescapeHTML("&#38&#x26&#38x&#x26g&#38")).toBe("&&&x&g&");
+  });
+
+  it("attribute: true leaves the `&name=` of a query string alone", () => {
+    const href = "/search?q=1&copy=2&amp;lang=en&lt=3&reg2&not";
+    expect(unescapeHTML(href)).toBe("/search?q=1©=2&lang=en<=3®2¬");
+    expect(unescapeHTML(href, { attribute: true })).toBe("/search?q=1&copy=2&lang=en&lt=3&reg2¬");
+    expect(unescapeHTML(href, { attribute: false })).toBe(unescapeHTML(href));
+    expect(unescapeHTML(href, {})).toBe(unescapeHTML(href));
+    // a name with its semicolon and a numeric reference are references everywhere
+    expect(unescapeHTML("&copy;=&#38=&#38a&notin;", { attribute: true })).toBe("©=&=&a∉");
+    expect(unescapeHTML("&notit; &amp &amp", { attribute: true })).toBe("&notit; & &");
+  });
+
+  it("validates options", () => {
+    expect(unescapeHTML("&amp;", undefined)).toBe("&");
+    expect(unescapeHTML("&amp;", null)).toBe("&");
+    expect(() => unescapeHTML("&amp;", true)).toThrow('The "options" argument must be of type object');
+    expect(() => unescapeHTML("&amp;", "attribute")).toThrow(TypeError);
+  });
+
+  it("works with latin1 and utf16 strings", () => {
+    // latin1 in, latin1 out
+    expect(unescapeHTML("caf\xE9 &amp; cr&egrave;me")).toBe("café & crème");
+    // latin1 in, and a reference to a character that latin1 does not have
+    expect(unescapeHTML("caf\xE9 &amp; &hearts; cr\xE8me &#x1F600; \xFF&yuml;")).toBe("café & ♥ crème 😀 ÿÿ");
+    // utf16 in
+    expect(unescapeHTML("😊 &lt;☕&gt; &eacute;&hearts;")).toBe("😊 <☕> é♥");
+    // lone surrogates pass through
+    expect(unescapeHTML("\uD800&amp;\uDC00")).toBe("\uD800&\uDC00");
+
+    for (let i = 0; i < 70; i++) {
+      const pad = "a".repeat(i);
+      expect(unescapeHTML("&lt;" + pad)).toBe("<" + pad);
+      expect(unescapeHTML(pad + "&lt;" + pad)).toBe(pad + "<" + pad);
+      expect(unescapeHTML(pad + "&lt;")).toBe(pad + "<");
+      expect(unescapeHTML(pad + "&hearts;" + pad)).toBe(pad + "♥" + pad);
+      expect(unescapeHTML("☕" + pad + "&lt;" + pad + "&#x1F600;")).toBe("☕" + pad + "<" + pad + "😀");
+    }
+  });
+
+  it("undoes escapeHTML", () => {
+    const texts = [
+      `&<>"'`,
+      `<script>alert('x' + "y" & 1)</script>`,
+      "&amp;",
+      "&lt;b&gt;",
+      "a & b &amp c &#38; d &copy",
+      "café ☕ <😊>",
+      "&".repeat(100),
+      `"'`.repeat(1000) + "☕",
+    ];
+    for (const text of texts) expect(unescapeHTML(escapeHTML(text))).toBe(text);
+  });
+
+  it("decodes what HTMLRewriter hands back", async () => {
+    let text = "";
+    let href;
+    await new HTMLRewriter()
+      .on("p", {
+        text(chunk) {
+          text += chunk.text;
+        },
+      })
+      .on("a", {
+        element(element) {
+          href = element.getAttribute("href");
+        },
+      })
+      .transform(new Response('<p>Tom &amp; Jerry &lt;3 caf&eacute;</p><a href="/search?q=1&copy=2&amp;lang=en">x</a>'))
+      .text();
+    expect(text).toBe("Tom &amp; Jerry &lt;3 caf&eacute;");
+    expect(unescapeHTML(text)).toBe("Tom & Jerry <3 café");
+    expect(href).toBe("/search?q=1&copy=2&amp;lang=en");
+    expect(unescapeHTML(href, { attribute: true })).toBe("/search?q=1&copy=2&lang=en");
+  });
+
+  it("coerces non-string arguments", () => {
+    expect(unescapeHTML(123)).toBe("123");
+    expect(unescapeHTML(true)).toBe("true");
+    expect(unescapeHTML(null)).toBe("null");
+    expect(unescapeHTML(undefined)).toBe("undefined");
+    expect(unescapeHTML()).toBe("undefined");
+    expect(unescapeHTML({ toString: () => "&lt;b&gt;" })).toBe("<b>");
+    expect(unescapeHTML(["&amp;", "&lt;"])).toBe("&,<");
+    expect(() => unescapeHTML(Symbol.iterator)).toThrow("Cannot convert a symbol to a string");
+  });
+
+  it("handles densely packed and long input", () => {
+    expect(unescapeHTML("&amp;".repeat(100_000))).toBe("&".repeat(100_000));
+    expect(unescapeHTML("&".repeat(10_000))).toBe("&".repeat(10_000));
+    expect(unescapeHTML(("x".repeat(1000) + "&hearts;").repeat(200))).toBe(("x".repeat(1000) + "♥").repeat(200));
+    // a run of letters that is longer than any name
+    expect(unescapeHTML("&" + "a".repeat(5000) + ";")).toBe("&" + "a".repeat(5000) + ";");
+    expect(unescapeHTML("&amp" + "a".repeat(5000) + ";")).toBe("&" + "a".repeat(5000) + ";");
   });
 });
