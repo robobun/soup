@@ -566,3 +566,127 @@ describe("monitorEventLoopDelay with a resolution above the int32 range", () => 
     });
   });
 });
+
+// Runs `script` in a process of its own, where nothing else keeps the event loop busy, and returns what it reports.
+async function reportOf(script: string) {
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "-e", `const report = value => console.log(JSON.stringify(value));\n${script}`],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  if (exitCode !== 0) expect(stderr).toBe("");
+  return JSON.parse(stdout);
+}
+
+test.concurrent("eventLoopUtilization() takes the wait for events as idle and the rest as active", async () => {
+  const { first, again, loopStartBefore, idleTimeBefore, waited, loopStart, spun, end, delta, beforeSpin, idleTime } =
+    await reportOf(`
+      const { performance } = require("node:perf_hooks");
+      const { nodeTiming } = performance;
+      // Nothing is counted until the loop polls for events again: Node.js answers the same until its loop has started.
+      const first = performance.eventLoopUtilization();
+      const again = performance.eventLoopUtilization(first);
+      const loopStartBefore = nodeTiming.loopStart;
+      const idleTimeBefore = nodeTiming.idleTime;
+      setTimeout(() => {
+        const waited = performance.eventLoopUtilization();
+        const loopStart = nodeTiming.loopStart;
+
+        const beforeSpin = performance.eventLoopUtilization();
+        const until = performance.now() + 250;
+        while (performance.now() < until);
+        // An immediate runs without a wait in between.
+        setImmediate(() => {
+          const spun = performance.eventLoopUtilization(beforeSpin);
+          const end = performance.eventLoopUtilization();
+          const idleTime = nodeTiming.idleTime;
+          const delta = performance.eventLoopUtilization(end, beforeSpin);
+          report({ first, again, loopStartBefore, idleTimeBefore, waited, loopStart, spun, end, delta, beforeSpin, idleTime });
+        });
+      }, 500);
+    `);
+
+  const zeros = { idle: 0, active: 0, utilization: 0 };
+  expect({ first, again, loopStartBefore, idleTimeBefore }).toEqual({
+    first: zeros,
+    again: zeros,
+    loopStartBefore: -1,
+    idleTimeBefore: 0,
+  });
+
+  // The loop sat in epoll/kqueue/IOCP until the timer was due, but for what it took to get there.
+  expect(waited.idle).toBeGreaterThan(250);
+  expect(waited.active).toBeGreaterThan(0);
+  expect(waited.utilization).toBe(waited.active / (waited.idle + waited.active));
+  expect(loopStart).toBeGreaterThan(0);
+
+  // A loop that JavaScript keeps busy does not wait.
+  expect(spun.active).toBeGreaterThan(240);
+  expect({ idle: spun.idle, utilization: spun.utilization }).toEqual({ idle: 0, utilization: 1 });
+
+  // Without an argument: everything since the loop began to count.
+  expect(end.idle).toBe(waited.idle);
+  expect(end.active).toBeGreaterThan(waited.active + spun.active);
+  // With two: the difference, and no reading of the loop.
+  expect(delta).toEqual({
+    idle: end.idle - beforeSpin.idle,
+    active: end.active - beforeSpin.active,
+    utilization: (end.active - beforeSpin.active) / (end.idle - beforeSpin.idle + end.active - beforeSpin.active),
+  });
+
+  // nodeTiming.idleTime is the same count.
+  expect(idleTime).toBe(end.idle);
+});
+
+// A debug build takes seconds to start a worker on a busy machine.
+test.concurrent(
+  "eventLoopUtilization() is the utilization of the thread that asks",
+  async () => {
+    const { main, worker } = await reportOf(`
+      const { performance } = require("node:perf_hooks");
+      const { Worker } = require("node:worker_threads");
+      performance.eventLoopUtilization();
+      const worker = new Worker(
+        \`
+          const { performance } = require("node:perf_hooks");
+          const { parentPort } = require("node:worker_threads");
+          performance.eventLoopUtilization();
+          // A timer runs after the loop has polled for events, which is where it begins to count.
+          setTimeout(() => {
+            const before = performance.eventLoopUtilization();
+            const until = performance.now() + 250;
+            while (performance.now() < until);
+            setImmediate(() => parentPort.postMessage(performance.eventLoopUtilization(before)));
+          }, 1);
+        \`,
+        { eval: true },
+      );
+      // The main thread has nothing to do but to wait for the worker, which never waits.
+      worker.once("message", busy => {
+        report({ main: performance.eventLoopUtilization(), worker: busy });
+        worker.terminate();
+      });
+    `);
+
+    expect(worker.active).toBeGreaterThan(240);
+    expect({ idle: worker.idle, utilization: worker.utilization }).toEqual({ idle: 0, utilization: 1 });
+    expect(main.idle).toBeGreaterThan(200);
+  },
+  30_000,
+);
+
+test("eventLoopUtilization(a, b) with two equal readings has no utilization to report", async () => {
+  // The loop counts from its next poll for events after the first call, and before that every answer is zeros.
+  perf.performance.eventLoopUtilization();
+  while (perf.performance.nodeTiming.loopStart < 0) await new Promise(resolve => setImmediate(resolve));
+
+  const reading = { idle: 12.5, active: 7.5, utilization: 0.375 };
+  expect(perf.performance.eventLoopUtilization(reading, reading)).toEqual({ idle: 0, active: 0, utilization: NaN });
+  expect(perf.performance.eventLoopUtilization(reading, { idle: 2.5, active: 2.5, utilization: 0.5 })).toEqual({
+    idle: 10,
+    active: 5,
+    utilization: 1 / 3,
+  });
+});

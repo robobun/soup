@@ -430,6 +430,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "node_net_binding.bind.ts": null,
   "node_os.bind.ts": null,
   "node_path.bind.ts": null,
+  "node_perf_hooks_binding.bind.ts": null,
   "node_quic_binding.bind.ts": null,
   "node_tls_binding.bind.ts": null,
   "node_util_binding.bind.ts": null,

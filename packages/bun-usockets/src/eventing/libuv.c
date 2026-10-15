@@ -328,7 +328,30 @@ void us_internal_poll_set_type(struct us_poll_t *p, int poll_type) {
 
 LIBUS_SOCKET_DESCRIPTOR us_poll_fd(struct us_poll_t *p) { return p->fd; }
 
+/* The counterpart of the first lines of us_loop_run_bun_tick: the iteration
+ * after us_loop_idle_time() was first asked begins the count. */
+static void begin_idle_time_if_requested(struct us_loop_t *loop) {
+  if (loop->data.idle_time_state == US_IDLE_TIME_REQUESTED) {
+    loop->data.idle_time_origin_ns = uv_hrtime();
+    loop->data.idle_time_state = US_IDLE_TIME_COUNTING;
+  }
+}
+
+int us_loop_idle_time(struct us_loop_t *loop, uint64_t *counted_ns, uint64_t *idle_ns) {
+  if (loop->data.idle_time_state != US_IDLE_TIME_COUNTING) {
+    /* libuv accumulates the wait of its poll phase from here on. Nothing
+     * waits before the next iteration takes the origin. */
+    uv_loop_configure(loop->uv_loop, UV_METRICS_IDLE_TIME);
+    loop->data.idle_time_state = US_IDLE_TIME_REQUESTED;
+    return 0;
+  }
+  *counted_ns = uv_hrtime() - loop->data.idle_time_origin_ns;
+  *idle_ns = uv_metrics_idle_time(loop->uv_loop);
+  return 1;
+}
+
 void us_loop_pump(struct us_loop_t *loop) {
+  begin_idle_time_if_requested(loop);
   /* POSIX parity: us_loop_run_bun_tick polls epoll/kqueue and dispatches
    * regardless of ref state (it only early-outs on num_polls == 0). libuv's
    * uv_run() skips its body when uv__loop_alive() is 0, so IOCP completions
@@ -447,6 +470,7 @@ extern unsigned int Bun__JSC_onBeforeWait(void *jsc_vm, uint64_t now_ns, int *re
 static void idle_sweep_again_cb(struct us_timer_t *t) {}
 
 void us_loop_run(struct us_loop_t *loop) {
+  begin_idle_time_if_requested(loop);
   us_loop_integrate(loop);
   uv_update_time(loop->uv_loop);
 

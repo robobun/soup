@@ -601,6 +601,11 @@ void *us_loop_ext(us_loop_r loop) nonnull_fn_decl;
 /* Blocks the calling thread and drives the event loop until no more non-fallthrough polls are scheduled */
 void us_loop_run(us_loop_r loop) nonnull_fn_decl;
 
+/* For node:perf_hooks, from the thread that runs the loop. The first call asks the loop to count, which it does from
+ * its next iteration on. Returns 0 until then. After that it returns 1 with how long the loop has counted and how much
+ * of that it was parked in its event provider (epoll_pwait2, kevent64, the poll phase of libuv), in nanoseconds. */
+int us_loop_idle_time(us_loop_r loop, uint64_t *counted_ns, uint64_t *idle_ns) nonnull_fn_decl;
+
 
 /* Signals the loop from any thread to wake up and execute its wakeup handler from the loop's own running thread.
  * This is the only fully thread-safe function and serves as the basis for thread safety */

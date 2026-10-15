@@ -276,6 +276,15 @@ impl PosixLoop {
         c::us_loop_run_bun_tick(self, timespec, now_ns);
     }
 
+    /// For `node:perf_hooks`. `(counted, idle)` in nanoseconds: how long the loop has counted and how
+    /// much of that it was parked in its event provider. The first call asks the loop to count,
+    /// which it does from its next iteration on. `None` until then.
+    pub fn idle_time(&self) -> Option<(u64, u64)> {
+        let (mut counted_ns, mut idle_ns) = (0, 0);
+        let counting = c::us_loop_idle_time(self, &mut counted_ns, &mut idle_ns) != 0;
+        counting.then_some((counted_ns, idle_ns))
+    }
+
     /// Free everything queued on `loop->data.closed_head` /
     /// `closed_connecting_head`. Normally `loop_post()` does this once per
     /// tick; at process/Worker teardown the loop has stopped, so
@@ -400,6 +409,15 @@ impl WindowsLoop {
         c::us_loop_pump(self);
     }
 
+    /// For `node:perf_hooks`. `(counted, idle)` in nanoseconds: how long the loop has counted and how
+    /// much of that it was parked in its event provider. The first call asks the loop to count,
+    /// which it does from its next iteration on. `None` until then.
+    pub fn idle_time(&self) -> Option<(u64, u64)> {
+        let (mut counted_ns, mut idle_ns) = (0, 0);
+        let counting = c::us_loop_idle_time(self, &mut counted_ns, &mut idle_ns) != 0;
+        counting.then_some((counted_ns, idle_ns))
+    }
+
     pub fn drain_quic_if_necessary(&self) {
         if !self.internal_loop_data.nq_head.get().is_null() {
             // Full pass with close dispatch deferred to the next loop point.
@@ -515,6 +533,11 @@ mod c {
         #[cfg(windows)]
         pub(super) safe fn us_loop_pump(loop_: &Loop);
         pub fn us_wakeup_loop(loop_: *const Loop);
+        pub(super) safe fn us_loop_idle_time(
+            loop_: &Loop,
+            counted_ns: &mut u64,
+            idle_ns: &mut u64,
+        ) -> c_int;
         #[cfg(not(windows))]
         pub(super) safe fn us_loop_run_bun_tick(
             loop_: &Loop,
