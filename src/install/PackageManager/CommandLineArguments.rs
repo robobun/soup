@@ -317,6 +317,12 @@ pub(crate) static PM_PARAMS: ParamTable = &[
             "--long                                 Also print author, description and homepage (bun pm licenses)"
         ),
         clap::param!(
+            "--sbom-format <STR>                    The format of the bill of materials: cyclonedx (default) or spdx (bun pm sbom)"
+        ),
+        clap::param!(
+            "--sbom-type <STR>                      What the project is: library (default), application or framework (bun pm sbom)"
+        ),
+        clap::param!(
             "--destination <STR>                    The directory the tarball will be saved in"
         ),
         clap::param!("--filename <STR>                       The filename of the tarball"),
@@ -895,6 +901,10 @@ pub struct CommandLineArguments {
     // `bun pm licenses` options
     pub dev_only: bool,
     pub long: bool,
+
+    // `bun pm sbom` options
+    pub sbom_format: Option<&'static [u8]>,
+    pub sbom_type: Option<&'static [u8]>,
 
     // `bun pm diff` options
     pub diff_args: Vec<&'static [u8]>,
@@ -2026,6 +2036,8 @@ Full documentation is available at <magenta>https://bun.com/docs/pm/cli/prune<r>
             cli.trusted_only = args.flag(b"--trusted");
             cli.dev_only = args.flag(b"--dev");
             cli.long = args.flag(b"--long");
+            cli.sbom_format = args.option(b"--sbom-format");
+            cli.sbom_type = args.option(b"--sbom-type");
             cli.diff_args = args.options(b"--diff").to_vec();
             cli.diff_name_only = args.flag(b"--name-only");
             cli.diff_raw = args.flag(b"--raw") || args.flag(b"--unformatted");

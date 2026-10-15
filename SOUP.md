@@ -5268,6 +5268,147 @@ Files: `packages/bun-usockets/src/eventing/epoll_kqueue.c`,
 `docs/runtime/nodejs-compat.mdx`, `test/js/node/perf_hooks/perf_hooks.test.ts`,
 `test/js/node/test/parallel/test-perf-hooks-eventlooputilization.js` (new, from Node.js).
 
+### 2026-10-15: `bun pm sbom`, a software bill of materials from `bun.lock`
+
+A software bill of materials (SBOM) lists what a project ships: every package with its version,
+its hash, its license and the packages it depends on. Vulnerability scanners such as Grype, Trivy
+and Dependency-Track read one instead of the project, and more and more customers ask a vendor for
+one. npm has `npm sbom`. A Bun project had no `package-lock.json` to run it on, so it needed a
+third-party generator that can read `bun.lock`. oven-sh/bun#8483 asks for the command. Now:
+
+```sh
+bun pm sbom > bom.json                            # CycloneDX 1.6
+bun pm sbom --sbom-format spdx > bom.spdx.json    # SPDX 2.3
+bun pm sbom --production --sbom-type application  # what the deployed application has
+```
+
+```json
+{
+  "bom-ref": "path-parse@1.0.6",
+  "type": "library",
+  "name": "path-parse",
+  "version": "1.0.6",
+  "scope": "required",
+  "description": "Node.js path.parse() ponyfill",
+  "authors": [{ "name": "Javier Blanco" }],
+  "licenses": [{ "license": { "id": "MIT" } }],
+  "purl": "pkg:npm/path-parse@1.0.6",
+  "hashes": [
+    { "alg": "SHA-512", "content": "19298e4f611b1eb20d05ff5247b08310…" }
+  ],
+  "externalReferences": [
+    {
+      "type": "distribution",
+      "url": "https://registry.npmjs.org/path-parse/-/path-parse-1.0.6.tgz"
+    },
+    { "type": "vcs", "url": "https://github.com/jbgutierrez/path-parse.git" }
+  ],
+  "properties": [
+    { "name": "cdx:npm:package:path", "value": "node_modules/path-parse" }
+  ]
+}
+```
+
+What is in the document, and where it comes from:
+
+- The packages are the ones that `bun install` with the same flags links on this machine. The
+  command uses the walk of `bun install --production` and `bun pm licenses`
+  (`lockfile::reachable`), so `--production`, `--omit`, `--cpu` and `--os` mean what they mean
+  there. In a workspace package, the document is about that package and what it depends on.
+- Name, version, hash, tarball URL and the dependency graph come from `bun.lock`. The command works
+  without `node_modules`. Without a `bun.lock` it reads the lockfile of npm, yarn or pnpm, as
+  `bun install` does, and writes nothing.
+- License, author, description, homepage, repository and issue tracker come from the `package.json`
+  of each installed package, through the lookup of `bun pm licenses` (hoisted tree, isolated store).
+  Without `node_modules` the document has none of these, a warning on stderr says so, and the
+  document carries `"phase": "pre-build"`.
+- A license is classified with the SPDX license list 3.29.0, which is the list of the CycloneDX 1.6
+  schema: an identifier in the spelling of the list (`mit` becomes `MIT`), a valid SPDX expression
+  (`(MIT OR Apache-2.0)`), or a name for any other text (`SEE LICENSE IN LICENSE.md`). The list is
+  a text file in the binary (740 licenses and 86 exceptions, 11,107 bytes).
+- The package URL is `pkg:npm/...`. A git dependency has `?vcs_url=`, a tarball URL has
+  `?download_url=`, a private workspace has none. The repository of a git dependency is the https
+  form that `bun install` clones from first (`Repository::try_https`).
+- The user name and the password of a URL in `bun.lock` are not written to the document. A
+  tarball dependency on `https://user:token@host/pkg.tgz` would put the token into a file that is
+  made to be handed to other people.
+- Scope and relationships follow `npm sbom`: a package that only `devDependencies` lead to has the
+  property `cdx:npm:package:development`, a package that only `optionalDependencies` or optional
+  peers lead to has the scope `optional`, and so has one that `devDependencies` lead to one way and
+  `optionalDependencies` another way. SPDX has `DEPENDS_ON`, `DEV_DEPENDENCY_OF`,
+  `OPTIONAL_DEPENDENCY_OF` and `HAS_PREREQUISITE` (a peer). When two dependencies of one package
+  lead to the same package, the stronger one stands.
+- `--sbom-format` and `--sbom-type` have the names and values of `npm sbom`, so a script written
+  for npm works.
+
+How it was checked:
+
+- The documents of eleven projects, one of them with 799 components from the public registry,
+  validate against the official JSON schemas of CycloneDX 1.6 and SPDX 2.3. The validator was ajv.
+  Its `iri-reference` format takes registered schemes only, so `git+https:` fails it. The check
+  used the RFC 3986 pattern of ajv-formats in its place.
+- The embedded list was compared with the `license.id` enum of the CycloneDX schema: 826
+  identifiers, no difference.
+- For four projects whose dev, optional and peer dependencies overlap, the components, their
+  scopes, the development property and the dependency edges are the same as in `npm sbom` 11.16.0.
+- With `--omit`, the two differ on those projects. npm filters with a query selector and leaves
+  out a direct devDependency that an installed package depends on too, although
+  `npm install --omit=dev` installs it. `bun pm sbom` with a flag lists what `bun install` with
+  that flag links. That was compared with `node_modules` for both linkers and five sets of flags:
+  40 runs, no difference.
+- The 22 tests in the repository do not depend on the schemas or on npm. They compare whole
+  documents by value.
+
+An open upstream pull request, oven-sh/bun#29512, adds a command of the same name. It was opened
+on 2026-04-20 by the account that maintains this fork, has no review from a maintainer and
+conflicts with `main`. It was found after this commit was written, and the two share no code. That
+one reads `bun.lock` only, so its documents have no license, author or description. It lists every
+package of the lockfile, has the flags `--format` and `-o`, writes CycloneDX 1.7 and gives
+devDependencies the scope `excluded`. Its 67 review threads were read as a checklist for this
+commit. What they found there is handled and tested here: the scope of a package that a dev path
+and an optional path lead to, optional peers, two edges to one package, unique identifiers after
+the SPDX character rules, the percent-encoding of versions, and a run from a workspace directory.
+
+Costs for the commands that do not use it: two entries in the flag table of `bun pm`, and the
+license list and the code in the binary. The size of the code was not measured, no release build
+was made. `bun pm licenses` shares its `package.json` lookup now (`InstalledPackages`); its 82
+tests pass unchanged.
+
+Not done: no `--filter` (the command refuses it, as every `bun pm` command but `licenses` does),
+no `-o` (the document goes to stdout), no CycloneDX XML, no SPDX 3. Licenses come from
+`package.json` only, not from `LICENSE` files. A `file:` dependency that is not private gets a
+`pkg:npm` package URL, as in `npm sbom`, although it may not be that npm package. A failed write to
+stdout is not reported, as in every `bun pm` command. Not run on Windows or macOS. No design or
+self-review workflow ran for this commit, because the shared GitHub token was at its rate limit
+during the run. Three local review passes read the diff instead, and their findings are in the
+commit: credentials in URLs, a depth limit for the license parser, stricter URL checks, the https
+form of git URLs, and the line endings of the embedded list.
+
+Notes on the day: three runs worked on this day, and the two entries above have the notes of the
+other two. This run was started by hand, rebased the stack on its own, and found their pushes when
+it fetched. It took their stack as it is, rebased it onto the one commit that upstream `main` has
+gained since (a407eae88a, no conflicts), and put this commit on top. Its own port of the patch of
+2026-09-25 is not used. The two ports differ in one piece of code, which this push adds to the
+pushed one: when the sides of a conflicted lockfile cannot be merged, `load_conflicted` takes back
+the `npm:` aliases that the package manager recorded while it read the sides. No test covers that
+path. `cargo clippy --workspace` showed nine errors of upstream's lint level in seven patches:
+`--watch-path`, `testMatch`, `collectCoverageFrom`, `globalName`, `kill()` for `$`, the HTML
+coverage reporter and the patch of 2026-09-25. The lint job of upstream runs on pull requests only,
+so this fork had never run it. Each one is fixed in the commit it belongs to, and the workspace is
+clean now. One test of the `kill()` patch failed in two of five runs: it counted one file descriptor
+fewer after its rounds than before them. Its first count is taken after a collection now, as its
+second one is, and 20 runs passed.
+
+Files: `src/runtime/cli/pm_sbom_command.rs` (new), `src/runtime/cli/spdx-license-ids.txt` (new),
+`src/runtime/cli/pm_licenses_command.rs` (`InstalledPackages`, `PackageInfo` with `repository`,
+`bugs`, `private`), `src/runtime/cli/package_manager_command.rs`, `src/runtime/cli/mod.rs`,
+`src/install/PackageManager/CommandLineArguments.rs` (`--sbom-format`, `--sbom-type`),
+`src/install/PackageManager.rs` (help), `src/install/lockfile/reachable.rs` (`edges_from`),
+`src/install/lockfile/Package/Meta.rs` (`integrity()`), `src/install/integrity.rs` and
+`src/install/resolution.rs` (visibility), `src/runtime/shell/builtin/ls.rs` (`civil_from_days` is
+`pub(crate)`), `.gitattributes`, `docs/pm/cli/pm.mdx`, `completions/bun.{zsh,bash,fish}`,
+`completions/bun-cli.json`, `test/cli/install/bun-pm-sbom.test.ts` (new).
+
 ## Dropped
 
 Nothing yet.

@@ -17,17 +17,22 @@ use bun_sys::{self, Dir, Fd, File};
 
 use crate::cli::package_manager_command::PackageManagerCommand;
 
-const UNKNOWN_LICENSE: &[u8] = b"Unknown";
+pub(crate) const UNKNOWN_LICENSE: &[u8] = b"Unknown";
 const MAX_SCAN_DEPTH: usize = 64;
 
-struct PackageInfo {
-    name: Option<Box<[u8]>>,
-    version: Option<Box<[u8]>>,
-    license: Box<[u8]>,
-    homepage: Option<Box<[u8]>>,
-    author: Option<Box<[u8]>>,
-    description: Option<Box<[u8]>>,
-    path: Box<[u8]>,
+/// What the package.json of an installed package says about it.
+pub(crate) struct PackageInfo {
+    pub(crate) name: Option<Box<[u8]>>,
+    pub(crate) version: Option<Box<[u8]>>,
+    pub(crate) license: Box<[u8]>,
+    pub(crate) homepage: Option<Box<[u8]>>,
+    pub(crate) repository: Option<Box<[u8]>>,
+    pub(crate) bugs: Option<Box<[u8]>>,
+    pub(crate) author: Option<Box<[u8]>>,
+    pub(crate) description: Option<Box<[u8]>>,
+    pub(crate) private: bool,
+    /// The directory of the package.json.
+    pub(crate) path: Box<[u8]>,
 }
 
 struct Entry {
@@ -49,6 +54,108 @@ pub(crate) struct BunStore {
 
 struct DiskIndex {
     entries: Option<StringHashMap<PackageInfo>>,
+}
+
+/// Finds the package.json of a package of the lockfile where `bun install` put the package.
+pub(crate) struct InstalledPackages {
+    isolated: bool,
+    path: AutoAbsPath,
+    top_len: usize,
+    /// Where the hoisted tree has each package. Built for the first package that is read.
+    locations: Option<Vec<Option<Box<[u8]>>>>,
+    store: BunStore,
+    disk: DiskIndex,
+    log: Log,
+}
+
+impl InstalledPackages {
+    pub(crate) fn init(isolated: bool) -> Self {
+        let path = AutoAbsPath::init_top_level_dir();
+        Self {
+            isolated,
+            top_len: path.len(),
+            path,
+            locations: None,
+            store: BunStore::init(),
+            disk: DiskIndex { entries: None },
+            log: Log::init(),
+        }
+    }
+
+    pub(crate) fn has_node_modules(&mut self) -> bool {
+        let _ = self.path.append(b"node_modules");
+        let exists = bun_sys::exists(self.path.slice());
+        self.path.set_length(self.top_len);
+        exists
+    }
+
+    /// `version`: the resolution as bun.lock prints it. An npm package.json has to have that version.
+    pub(crate) fn read(
+        &mut self,
+        lockfile: &Lockfile,
+        pkg_id: usize,
+        version: &[u8],
+    ) -> Option<PackageInfo> {
+        self.read_or_other_version(lockfile, pkg_id, version).0
+    }
+
+    /// What `read` finds, then the copy in the hoisted tree when it is an npm package of another
+    /// version than bun.lock has.
+    pub(crate) fn read_or_other_version(
+        &mut self,
+        lockfile: &Lockfile,
+        pkg_id: usize,
+        version: &[u8],
+    ) -> (Option<PackageInfo>, Option<PackageInfo>) {
+        let packages = lockfile.packages.slice();
+        let name = packages.items_name()[pkg_id];
+        let resolution = &packages.items_resolution()[pkg_id];
+        let buf = lockfile.buffers.string_bytes.as_slice();
+        let is_npm = resolution.tag == ResolutionTag::Npm;
+        let (path, top_len, log) = (&mut self.path, self.top_len, &mut self.log);
+
+        let mut info = if self.isolated {
+            (self.store).read_info(path, top_len, name, resolution, buf, log)
+        } else {
+            None
+        };
+
+        let mut other_version: Option<PackageInfo> = None;
+        if info.is_none() {
+            let locations = (self.locations).get_or_insert_with(|| tree_locations(lockfile));
+            if let Some(location) = &locations[pkg_id] {
+                let segments: [&[u8]; 1] = [location];
+                info = read_package_info_at(path, top_len, &segments, log);
+            }
+            if is_npm {
+                other_version = info.take_if(|info| match &info.version {
+                    Some(installed) => installed[..] != version[..],
+                    None => false,
+                });
+            }
+        }
+
+        if info.is_none() && !self.isolated {
+            info = (self.store).read_info(path, top_len, name, resolution, buf, log);
+        }
+
+        if info.is_none() && is_npm {
+            info = (self.disk).take(path, top_len, log, name.slice(buf), version);
+        }
+
+        (info, other_version)
+    }
+
+    /// The package.json in `dir`, a path below the top-level directory: a workspace, or `""`.
+    pub(crate) fn read_at(&mut self, dir: &[u8]) -> Option<PackageInfo> {
+        // `dir` is as bun.lock has it, and `append` checks neither.
+        let room = bun_paths::MAX_PATH_BYTES.saturating_sub(self.top_len + "/package.json/".len());
+        if dir.len() >= room || bun_paths::is_absolute(dir) {
+            return None;
+        }
+        let segments: &[&[u8]] = if dir.is_empty() { &[] } else { &[dir] };
+        read_package_info_at(&mut self.path, self.top_len, segments, &mut self.log)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -110,17 +217,14 @@ impl PmLicensesCommand {
             Global::exit(1);
         }
 
-        let mut path = AutoAbsPath::init_top_level_dir();
-        let top_len = path.len();
-        let _ = path.append(b"node_modules");
-        if !bun_sys::exists(path.slice()) {
+        let mut installed = InstalledPackages::init(isolated);
+        if !installed.has_node_modules() {
             if not_silent {
                 Output::err_generic("node_modules not found, nothing to list", ());
                 bun_core::note!("run 'bun install' first");
             }
             Global::exit(1);
         }
-        path.set_length(top_len);
 
         let filter_patterns = pm.options.filter_patterns;
         let (roots, follow_workspace_edges): (Vec<PackageID>, bool) = if filter_patterns.is_empty()
@@ -197,16 +301,11 @@ impl PmLicensesCommand {
                     },
                 )
             });
-        let locations = tree_locations(lockfile);
-
         let packages = lockfile.packages.slice();
         let pkg_names = packages.items_name();
         let pkg_resolution = packages.items_resolution();
         let buf = lockfile.buffers.string_bytes.as_slice();
 
-        let mut log = Log::init();
-        let mut store = BunStore::init();
-        let mut disk = DiskIndex { entries: None };
         let mut entries: Vec<Entry> = Vec::new();
         // Packages whose installed copy is not the version in bun.lock. They are listed under the
         // version in the installed package.json.
@@ -231,59 +330,11 @@ impl PmLicensesCommand {
             let _ = write!(&mut version, "{}", resolution.fmt(buf, PathSep::Posix));
             let is_npm = resolution.tag == ResolutionTag::Npm;
 
-            let mut info = if isolated {
-                store.read_info(
-                    &mut path,
-                    top_len,
-                    pkg_names[pkg_id],
-                    resolution,
-                    buf,
-                    &mut log,
-                )
-            } else {
-                None
-            };
-
-            let mut other_version: Option<PackageInfo> = None;
-            if info.is_none() {
-                if let Some(location) = &locations[pkg_id] {
-                    let segments: [&[u8]; 1] = [location];
-                    info = read_package_info_at(&mut path, top_len, &segments, &mut log);
-                }
-                if is_npm {
-                    other_version = info.take_if(|info| match &info.version {
-                        Some(installed) => installed[..] != version[..],
-                        None => false,
-                    });
-                }
-            }
-
-            if info.is_none() && !isolated {
-                info = store.read_info(
-                    &mut path,
-                    top_len,
-                    pkg_names[pkg_id],
-                    resolution,
-                    buf,
-                    &mut log,
-                );
-            }
-
-            if info.is_none() && is_npm {
-                info = disk.take(
-                    &mut path,
-                    top_len,
-                    &mut log,
-                    pkg_names[pkg_id].slice(buf),
-                    &version,
-                );
-            }
-
-            let (info, list) = match (info, other_version) {
+            let (info, list) = match installed.read_or_other_version(lockfile, pkg_id, &version) {
                 (Some(info), _) => (info, &mut entries),
                 (None, Some(info)) => {
-                    if let Some(installed) = &info.version {
-                        version = installed.to_vec();
+                    if let Some(installed_version) = &info.version {
+                        version = installed_version.to_vec();
                     }
                     (info, &mut other_versions)
                 }
@@ -299,7 +350,7 @@ impl PmLicensesCommand {
                 version: version.into_boxed_slice(),
                 path: info.path,
                 semver: is_npm.then(|| resolution.npm().version),
-                homepage: info.homepage,
+                homepage: info.homepage.or(info.repository),
                 author: info.author,
                 description: info.description,
                 dev_only: production.as_ref().is_some_and(|prod| !prod.is_set(pkg_id)),
@@ -423,9 +474,12 @@ fn read_package_info(path: &[u8], dir: &[u8], log: &mut Log) -> Option<PackageIn
                 name: string_field(&json, b"name"),
                 version: string_field(&json, b"version"),
                 license: license_of(&json),
-                homepage: string_field(&json, b"homepage").or_else(|| repository_of(&json)),
+                homepage: string_field(&json, b"homepage"),
+                repository: repository_of(&json),
+                bugs: bugs_of(&json),
                 author: author_of(&json),
                 description: string_field(&json, b"description"),
+                private: crate::cli::pack_command::is_private_package(&json),
                 path: platform_dir(dir),
             },
             Err(_) => PackageInfo {
@@ -433,8 +487,11 @@ fn read_package_info(path: &[u8], dir: &[u8], log: &mut Log) -> Option<PackageIn
                 version: None,
                 license: UNKNOWN_LICENSE.into(),
                 homepage: None,
+                repository: None,
+                bugs: None,
                 author: None,
                 description: None,
+                private: false,
                 path: platform_dir(dir),
             },
         },
@@ -501,6 +558,13 @@ fn repository_of(json: &Expr) -> Option<Box<[u8]>> {
     str_of(&repository)
         .map(Into::into)
         .or_else(|| string_field(&repository, b"url"))
+}
+
+fn bugs_of(json: &Expr) -> Option<Box<[u8]>> {
+    let bugs = json.get(b"bugs")?;
+    str_of(&bugs)
+        .map(Into::into)
+        .or_else(|| string_field(&bugs, b"url"))
 }
 
 fn author_of(json: &Expr) -> Option<Box<[u8]>> {
