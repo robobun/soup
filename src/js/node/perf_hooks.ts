@@ -15,6 +15,27 @@ const cppCreateHistogram = $newCppFunction("JSNodePerformanceHooksHistogram.cpp"
   figures: number,
 ) => import("node:perf_hooks").RecordableHistogram;
 
+// `[counted, idle]` in milliseconds: how long the event loop of this thread has counted, and how much of that it was
+// parked in its event provider (epoll, kqueue, the poll phase of libuv).
+//
+// Node.js has libuv time the wait of every loop from its start (UV_METRICS_IDLE_TIME is always set). Here a loop
+// reads the clock around its wait only after something has asked: the first call asks, the loop counts from its next
+// iteration on, and the answer is `undefined` until then. That is also what the code that asks first sees in Node.js
+// most of the time, because the loop of the main thread does not start until the main script has run.
+const eventLoopIdleTime = $bindgen("node_perf_hooks_binding.bind.ts", "eventLoopIdleTime") as () =>
+  [counted: number, idle: number] | undefined;
+
+// `performance.nodeTiming.loopStart`: when the loop began to count, or -1.
+let loopStart = -1;
+let askedLoopToCount = false;
+
+function eventLoopTimes() {
+  askedLoopToCount = true;
+  const times = eventLoopIdleTime();
+  if (times && loopStart < 0) loopStart = performance.now() - times[0];
+  return times;
+}
+
 var {
   Performance,
   PerformanceEntry,
@@ -63,9 +84,9 @@ var constants = {
 class PerformanceNodeTiming {
   bootstrapComplete: number = 0;
   environment: number = 0;
-  idleTime: number = 0;
+  declare readonly idleTime: number;
   loopExit: number = 0;
-  loopStart: number = 0;
+  declare readonly loopStart: number;
   nodeStart: number = 0;
   v8Start: number = 0;
 
@@ -111,17 +132,57 @@ function createPerformanceNodeTiming() {
   const object = Object.create(PerformanceNodeTiming.prototype);
 
   object.bootstrapComplete = object.environment = object.nodeStart = object.v8Start = performance.timeOrigin;
-  object.loopStart = object.idleTime = 1;
+  Object.defineProperty(object, "loopStart", {
+    __proto__: null,
+    configurable: true,
+    enumerable: true,
+    get() {
+      // Reading the milestone does not make the loop count.
+      if (loopStart < 0 && askedLoopToCount) eventLoopTimes();
+      return loopStart;
+    },
+  });
   object.loopExit = -1;
+  Object.defineProperty(object, "idleTime", {
+    __proto__: null,
+    configurable: true,
+    enumerable: true,
+    get() {
+      const times = eventLoopTimes();
+      return times ? times[1] : 0;
+    },
+  });
   return object;
 }
 
-function eventLoopUtilization(_utilization1, _utilization2) {
-  return {
-    idle: 0,
-    active: 0,
-    utilization: 0,
-  };
+// https://github.com/nodejs/node/blob/v24.0.0/lib/internal/perf/event_loop_utilization.js
+function eventLoopUtilization(
+  utilization1?: import("node:perf_hooks").EventLoopUtilization,
+  utilization2?: import("node:perf_hooks").EventLoopUtilization,
+): import("node:perf_hooks").EventLoopUtilization {
+  const times = eventLoopTimes();
+  // `loopStart <= 0` in Node.js.
+  if (!times) {
+    return { idle: 0, active: 0, utilization: 0 };
+  }
+
+  if (utilization2) {
+    const idle = utilization1!.idle - utilization2.idle;
+    const active = utilization1!.active - utilization2.active;
+    return { idle, active, utilization: active / (idle + active) };
+  }
+
+  const idle = times[1];
+  const active = times[0] - idle;
+
+  if (!utilization1) {
+    return { idle, active, utilization: active / (idle + active) };
+  }
+
+  const idleDelta = idle - utilization1.idle;
+  const activeDelta = active - utilization1.active;
+  const utilization = activeDelta / (idleDelta + activeDelta);
+  return { idle: idleDelta, active: activeDelta, utilization };
 }
 
 const { PerformanceResourceTiming } = globalThis;

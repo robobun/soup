@@ -5142,6 +5142,132 @@ Files: `src/runtime/api/unescape_html.rs` (new), `src/runtime/api.rs`,
 `docs/runtime/html-rewriter.mdx`, `docs/runtime/bun-apis.mdx`,
 `test/js/bun/util/escapeHTML.test.js`, `test/integration/bun-types/fixture/bun.ts`.
 
+### 2026-10-15: a real `performance.eventLoopUtilization()`
+
+`performance.eventLoopUtilization()` of `node:perf_hooks` says which share of its time the event
+loop spent working and which share it spent waiting for events. It is what a server reads to shed
+load before it falls behind. In Bun it was a stub that returned `{ idle: 0, active: 0, utilization:
+0 }` for every call, and the compatibility page said so. A program that reads it does not fail: it
+sees a loop that is never busy. oven-sh/bun#34068 reports it for `@fastify/under-pressure`, whose
+load shedding never triggers on Bun. Now the numbers are real:
+
+```js
+import { performance } from "node:perf_hooks";
+
+let last = performance.eventLoopUtilization();
+setInterval(() => {
+  const now = performance.eventLoopUtilization();
+  const { utilization } = performance.eventLoopUtilization(now, last);
+  last = now;
+  console.log(`event loop ${(utilization * 100).toFixed(0)}% busy`);
+}, 1000).unref();
+// event loop 1% busy
+// event loop 72% busy      <- a second with a 1.2 s synchronous loop in it
+// event loop 2% busy
+```
+
+What it counts:
+
+- `idle` is the time the loop of the calling thread was parked in its event provider: the
+  `epoll_pwait2` or `kevent64` call of `us_loop_run_bun_tick` on Linux and macOS, timed only when
+  the call can block (not for a zero timeout, which is libuv's rule too), and libuv's own
+  `UV_METRICS_IDLE_TIME` on Windows. `active` is the rest of the time, `utilization` is
+  `active / (idle + active)`. Time in `Bun.sleepSync`, in a synchronous file read or in
+  `spawnSync` is active, as in Node.js: the loop is blocked, not waiting.
+- The three ways to call it are Node's, ported from `lib/internal/perf/event_loop_utilization.js`
+  with its order of checks: no argument for the totals, one earlier reading for the difference
+  since then, two readings for their difference without a reading of the loop.
+- Every thread has its own loop, so a `Worker` that calls it gets its own numbers.
+- `performance.nodeTiming.idleTime` is the same count. `performance.nodeTiming.loopStart` is the
+  time at which the loop began to count, and `-1` before. Both were the constant `1`.
+
+What it costs, and the one place where it is not Node. Node.js lets libuv time the wait of every
+loop from its start. Here a loop reads the clock for this only after something has asked. The
+first call of `eventLoopUtilization()` (or the first read of `nodeTiming.idleTime`) asks, the loop
+takes its origin the next time it polls for events, and until then the answers are zeros and
+`loopStart` is `-1`. That is what Node.js answers until its loop has started, so the usual first
+call, in the main script, reads the same in both. Two things differ. The time before the first
+call is in no total, so a first call that comes late in the life of a process returns zeros once
+where Node.js returns the totals since its loop started. And the immediates that the turn of the
+first call queues run before the count begins, where Node's loop start comes before them. What a
+loop that is never asked pays: two compares of one byte in each tick, on the cache line that the
+tick writes `tick_depth` to. What a loop pays after it was asked: two clock readings for each tick
+that can wait. `us_internal_loop_data_t` grows by 16 bytes on Linux and macOS (208 to 224) and by 8
+on Windows (216 to 224), one per loop, measured with `size_of` for three targets. These are counts
+from the code. There is no release build of this commit and no benchmark.
+
+Upstream has this three times already, which I found after the code was written: the search before
+the pick was of the source, where the stub is, and not of the pull requests. oven-sh/bun#32618 is
+this account's own, from June, and was closed by the stale sweep on the day of this entry.
+oven-sh/bun#44627 (open) does it for the main thread on Linux and macOS. oven-sh/bun#34424 (open,
+from the bun team) has it inside a larger `worker_threads` change, which I have not read. By their
+descriptions the first two time every tick that waits, for every loop, from its start, and #32618
+stores the count with atomics so that a parent thread can read the loop of a worker. Several of its
+automated reviews asked for a maintainer to look at the cost in the hot path. So this is a fourth
+take, written without their code. What is new in it is the cost model: nobody pays who does not ask.
+What it lacks that #32618 and #34424 have: `worker.performance.eventLoopUtilization()`, the parent's
+view of a worker, is still the stub.
+
+Tests. Node's own `test/parallel/test-perf-hooks-eventlooputilization.js` is vendored unchanged
+(from `main` of nodejs/node on 2026-10-15). On the released 1.4.3-canary.1 it never ends: it waits
+for idle time to appear. On the debug build of this commit it passed 25 of 25 runs, 6 of them with
+the machine oversubscribed twice over. `test/js/node/perf_hooks/perf_hooks.test.ts` has three new
+tests: the wait for a timer is idle and a synchronous loop is active, with the exact relations
+between the three call forms and `nodeTiming`; a worker that never waits and a main thread that only
+waits for it each see their own loop; two equal readings give `NaN`. All three fail on the released
+binary and pass on the debug build, also under that load. The file passes (16), and so do
+`bun-server.test.ts` (82), `worker_threads.test.ts` (153), the `setImmediate` and `performance`
+timer tests and six vendored Node tests of `perf_hooks`, all on the debug build. The source lints
+pass with the released binary (182), as the fork's workflow runs them. With the debug build two of
+them time out. `setTimeout.test.js` and `setInterval.test.js` fail four leak tests on the debug
+build. Their fixtures take the ASAN threshold only for a binary named `bun-asan`, and the debug
+build is an ASAN build under another name: its RSS grew by 102 MB, which is between the two
+thresholds (10 MB and 192 MB).
+
+Not done, and not checked.
+
+- `worker.performance.eventLoopUtilization()` (above). The other values of `nodeTiming` are still
+  placeholders, and the Node additions to the global `performance` still appear only after
+  `node:perf_hooks` was loaded.
+- Built and run on Linux x64 only. `libuv.c` was not compiled: it calls `uv_loop_configure`,
+  `uv_hrtime` and `uv_metrics_idle_time`, which libuv has had since 1.39. The Rust side was checked
+  with `cargo check -p bun_uws_sys` for `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`.
+- No design check was run before the code. The measurement has one place to live (the wait itself).
+  When the count starts was decided twice: the first version counted from the first call, and
+  Node's test showed that `nodeTiming.loopStart` has to agree with the totals.
+
+Rebase notes: two runs did the work of this day. This one and the run that pushed
+`Bun.unescapeHTML()` started from the same stack and the same upstream commit (oven-sh/bun
+5f5799ed16, 18 commits after the last base), and each rebased the 50 patches without knowing of the
+other. This one found out when it fetched before its push. It took that push as its base and put two
+commits on it: the patch of 2026-09-25, which the other run had dropped (see the note in its entry),
+and this one. The rest of the stack is as the other run pushed it, and nothing is dropped any more.
+A `git range-diff` of the two rebases shows 42 of the 49 patches they share as identical. Two more
+differ only in the lines of this file around their entries. The other five were ported again onto
+upstream's rewritten package manager (oven-sh/bun#44968) by both runs, and four of them to the same
+design: a table of the subcommand words for the "did you mean" note of `bun pm`, the `publishConfig`
+call in the new `edit_root_package_json`, `Scope::with_issued_token` and no early check for
+credentials when an id token is on offer for trusted publishing, and the `#semver:` lookup inside
+upstream's merged arm for GitHub and tarball dependencies. The fifth is `bun outdated --json`: the
+version that is pushed keeps the version strings of the first pass, and this run's printed them from
+the rows of the table. Upstream `main` has one commit more since (a407eae88a). The stack is not on
+it.
+
+On the stack as it is pushed, these pass on the debug build: `bun-lock` (317, with `--timeout
+120000`), `bun-audit` (241), `bun-dedupe` (82), `bun-prune` (158), the `outdated` tests (38),
+`bun-publish` (213), `bun-pm` (122), `bun-pack` (292), `bun-install-git-deps` (113),
+`bun-install-offline` (11), `run_command` (22), `escapeHTML` (21), `worker_threads` (153),
+`bun-server` (82) and `perf_hooks` (16). The bun-types test (22) and the source lints (182) pass
+with the released binary. The three workflows of the fork were green on the push of the other run.
+
+Files: `packages/bun-usockets/src/eventing/epoll_kqueue.c`,
+`packages/bun-usockets/src/eventing/libuv.c`, `packages/bun-usockets/src/internal/loop_data.h`,
+`packages/bun-usockets/src/libusockets.h` (`us_loop_idle_time`), `src/uws_sys/InternalLoopData.rs`,
+`src/uws_sys/Loop.rs` (`idle_time`), `src/runtime/node/node_perf_hooks_binding.rs` (new),
+`src/runtime/node.rs`, `src/codegen/generate-js2native.ts`, `src/js/node/perf_hooks.ts`,
+`docs/runtime/nodejs-compat.mdx`, `test/js/node/perf_hooks/perf_hooks.test.ts`,
+`test/js/node/test/parallel/test-perf-hooks-eventlooputilization.js` (new, from Node.js).
+
 ## Dropped
 
 Nothing yet.
