@@ -476,6 +476,13 @@ extern unsigned int Bun__JSC_onBeforeWait(void * _Nonnull jsc_vm, uint64_t now_n
 extern void Bun__JSC_acquireHeapAccessAfterWait(void * _Nonnull jsc_vm);
 
 void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout, uint64_t now_ns) {
+    /* us_loop_idle_time() was asked since the last tick. The count begins here and not in the middle of the turn
+     * that asked: Node.js counts from the start of its loop, which comes after the script that usually asks first. */
+    if (UNLIKELY(loop->data.idle_time_state == US_IDLE_TIME_REQUESTED)) {
+        loop->data.idle_time_origin_ns = us_internal_monotonic_ns();
+        loop->data.idle_time_state = US_IDLE_TIME_COUNTING;
+    }
+
     if (loop->num_polls == 0)
         return;
 
@@ -528,6 +535,10 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
         }
     }
 
+    /* Only the wait in the kernel is idle, as for libuv's UV_METRICS_IDLE_TIME (uv__io_poll skips it for a zero timeout). */
+    const uint64_t idle_start_ns = UNLIKELY(loop->data.idle_time_state == US_IDLE_TIME_COUNTING) && will_idle_inside_event_loop
+        ? us_internal_monotonic_ns() : 0;
+
     /* Fetch ready polls */
 #ifdef LIBUS_USE_EPOLL
     /* A zero timespec already has a fast path in ep_poll (fs/eventpoll.c):
@@ -546,6 +557,9 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
         timeout);
 #endif
 
+    if (idle_start_ns)
+        loop->data.idle_time_ns += us_internal_monotonic_ns() - idle_start_ns;
+
     /* Anything that stops a poll from here on scrubs this batch (us_internal_loop_update_pending_ready_polls). */
     loop->current_ready_poll = 0;
     /* Before anything can allocate again. */
@@ -562,6 +576,16 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
     /* Emit post callback */
     us_internal_loop_post(loop);
     loop->data.tick_depth--;
+}
+
+int us_loop_idle_time(struct us_loop_t *loop, uint64_t *counted_ns, uint64_t *idle_ns) {
+    if (loop->data.idle_time_state != US_IDLE_TIME_COUNTING) {
+        loop->data.idle_time_state = US_IDLE_TIME_REQUESTED;
+        return 0;
+    }
+    *counted_ns = us_internal_monotonic_ns() - loop->data.idle_time_origin_ns;
+    *idle_ns = loop->data.idle_time_ns;
+    return 1;
 }
 
 void us_internal_loop_update_pending_ready_polls(struct us_loop_t *loop, struct us_poll_t *old_poll, struct us_poll_t *new_poll, int old_events, int new_events) {
