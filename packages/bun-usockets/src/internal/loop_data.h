@@ -94,6 +94,22 @@ struct us_internal_loop_data_t {
      * sockets must be deferred to the outermost tick so the outer dispatch
      * doesn't read a freed poll. */
     int tick_depth;
+    /* For node:perf_hooks, see us_loop_idle_time(). A loop that is never asked
+     * stays at US_IDLE_TIME_OFF and reads no clock for this. */
+    char idle_time_state;
+    /* The clock at the iteration that began to count. */
+    uint64_t idle_time_origin_ns;
+#ifndef LIBUS_USE_LIBUV
+    /* Time parked in epoll/kqueue since then. libuv keeps its own count. */
+    uint64_t idle_time_ns;
+#endif
+};
+
+enum {
+    US_IDLE_TIME_OFF = 0,
+    /* Asked. The next iteration of the loop takes the origin. */
+    US_IDLE_TIME_REQUESTED = 1,
+    US_IDLE_TIME_COUNTING = 2,
 };
 
 #endif // LOOP_DATA_H

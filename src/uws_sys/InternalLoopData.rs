@@ -64,6 +64,11 @@ pub struct InternalLoopData {
     // Higher tier (`bun_runtime`) casts this back when reading.
     pub jsc_vm: *const c_void,
     pub tick_depth: c_int,
+    /// These belong to `us_loop_idle_time` and the loop's tick.
+    idle_time_state: c_char,
+    idle_time_origin_ns: u64,
+    #[cfg(not(windows))]
+    idle_time_ns: u64,
 }
 
 impl InternalLoopData {
