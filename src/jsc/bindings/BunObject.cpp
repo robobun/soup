@@ -71,6 +71,7 @@
 #include "GeneratedTerminal.h"
 #include "GeneratedTranspiler.h"
 #include "GeneratedUdpSocket.h"
+#include "GeneratedUnescapeHtml.h"
 #include "GeneratedUnsafeObject.h"
 #include "GeneratedValkey.h"
 #include "GeneratedXMLObject.h"
@@ -1064,6 +1065,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     stripANSI                                      jsFunctionBunStripANSI                                              DontDelete|Function 1
     wrapAnsi                                       jsFunctionBunWrapAnsi                                               DontDelete|Function 3
     Terminal                                       Bun::Bindgen::Generated::Terminal::getTerminalConstructor           DontDelete|PropertyCallback
+    unescapeHTML                                   Bun::Bindgen::Generated::UnescapeHtml::jsUnescapeHTML               DontDelete|Function 1
     unsafe                                         Bun::Bindgen::Generated::UnsafeObject::createUnsafe                 DontDelete|PropertyCallback
     version                                        constructBunVersion                                                 ReadOnly|DontDelete|PropertyCallback
     WebView                                        constructWebViewObject                                              ReadOnly|DontDelete|PropertyCallback

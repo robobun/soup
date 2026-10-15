@@ -2806,6 +2806,45 @@ declare module "bun" {
    */
   function escapeHTML(input: string | object | number | boolean): string;
 
+  interface UnescapeHTMLOptions {
+    /**
+     * The text is the value of an attribute.
+     *
+     * In an attribute, a name without its `;` is not a character reference when `=`, a letter or
+     * a digit follows it, so that `&copy=2` in `href="/search?q=1&copy=2"` stays as it is.
+     *
+     * @default false
+     */
+    attribute?: boolean;
+  }
+
+  /**
+   * Replace the HTML character references in a string with the characters they stand for.
+   * The inverse of {@link escapeHTML}.
+   *
+   * References are read the way a browser reads them:
+   *
+   * - named references: `&amp;`, `&lt;`, `&eacute;`, `&hearts;` and the rest of the HTML list
+   * - decimal and hexadecimal references: `&#38;`, `&#x26;`
+   * - the names of HTML 4 without their `;`: `&amp`, `&copy`, `&nbsp`
+   *
+   * Text that is not a character reference stays as it is, so malformed input never throws.
+   *
+   * Non-string types are converted to a string first.
+   *
+   * @example
+   * ```ts
+   * Bun.unescapeHTML("&lt;p&gt;Tom &amp; Jerry&lt;/p&gt;"); // "<p>Tom & Jerry</p>"
+   * Bun.unescapeHTML("caf&eacute; &#9749; &copy 2026"); // "café ☕ © 2026"
+   *
+   * // The value of an attribute, for example from `HTMLRewriter`'s `getAttribute()`
+   * Bun.unescapeHTML("/search?q=1&copy=2&amp;lang=en", { attribute: true }); // "/search?q=1&copy=2&lang=en"
+   * ```
+   *
+   * @category Utilities
+   */
+  function unescapeHTML(input: string | object | number | boolean, options?: UnescapeHTMLOptions): string;
+
   /**
    * Convert a filesystem path to a file:// URL.
    *

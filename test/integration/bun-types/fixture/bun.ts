@@ -130,3 +130,8 @@ tsd.expectType(Bun.Archive.write("out.zip", { "a.txt": "a" }, { format: "zip" })
 new Bun.Archive({ "a.txt": "a" }, { format: "rar" });
 // @ts-expect-error compress names an algorithm or is false
 new Bun.Archive({ "a.txt": "a" }, { format: "zip", compress: true });
+
+tsd.expectType(Bun.unescapeHTML("&lt;b&gt;")).is<string>();
+tsd.expectType(Bun.unescapeHTML("/search?q=1&copy=2", { attribute: true })).is<string>();
+// @ts-expect-error options is an object
+Bun.unescapeHTML("&amp;", true);
