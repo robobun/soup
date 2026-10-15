@@ -309,6 +309,35 @@ This function is optimized for large input. On an M1 Max, it processes 480 MB/s 
 20 GB/s, depending on how much data is being escaped and whether there is non-ASCII
 text. Bun converts non-string types to a string before escaping.
 
+## `Bun.unescapeHTML()`
+
+`Bun.unescapeHTML(value: string | object | number | boolean, options?: { attribute?: boolean }): string`
+
+The inverse of `Bun.escapeHTML()`. Replaces the character references in a string with the characters they stand for, the way a browser reads them:
+
+- named references: `&amp;`, `&lt;`, `&eacute;`, `&hearts;` and the rest of the [HTML list](https://html.spec.whatwg.org/multipage/named-characters.html)
+- decimal and hexadecimal references: `&#38;`, `&#x26;`
+- the names of HTML 4 without their `;`: `&amp`, `&copy`, `&nbsp`
+
+```ts
+Bun.unescapeHTML("&lt;p&gt;Tom &amp; Jerry&lt;/p&gt;"); // => "<p>Tom & Jerry</p>"
+Bun.unescapeHTML("caf&eacute; &#9749; &copy 2026"); // => "café ☕ © 2026"
+Bun.unescapeHTML("5 &lt 6, &bogus; & co"); // => "5 < 6, &bogus; & co"
+```
+
+Text that is not a character reference stays as it is, so malformed input never throws. Numeric references follow the rules of HTML too: `&#0;` and numbers that are not a code point become U+FFFD, and `&#128;` to `&#159;` are read as Windows-1252, so `&#150;` is `–`.
+
+The value of an attribute has one more rule. A name without its `;` is not a reference there when `=`, a letter or a digit follows it, so that the `&copy=` of a query string is not read as `©`. Pass `attribute: true` for text that comes from an attribute:
+
+```ts
+const href = "/search?q=1&copy=2&amp;lang=en";
+
+Bun.unescapeHTML(href); // => "/search?q=1©=2&lang=en"
+Bun.unescapeHTML(href, { attribute: true }); // => "/search?q=1&copy=2&lang=en"
+```
+
+[`HTMLRewriter`](/runtime/html-rewriter) hands back text and attribute values as they are written in the document, and this is the function that decodes them. Bun converts non-string types to a string first. A string without a character reference is returned as it is.
+
 ## `Bun.stringWidth()`
 
 <Note>~6,756x faster `string-width` alternative</Note>

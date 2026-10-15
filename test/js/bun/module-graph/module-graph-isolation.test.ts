@@ -3985,6 +3985,7 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
         "spawnSync",
         "stringWidth",
         "stripANSI",
+        "unescapeHTML",
         "version",
         "version_with_sha",
         "which",

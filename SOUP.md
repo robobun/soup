@@ -4754,6 +4754,88 @@ Files: `src/sourcemap_jsc/CodeCoverageHtml.rs` (new), `src/runtime/cli/test/Cove
 `docs/test/configuration.mdx`, `docs/runtime/bunfig.mdx`, `docs/snippets/cli/test.mdx`,
 `completions/bun-cli.json`, `test/cli/test/coverage.test.ts`.
 
+### 2026-10-15: `Bun.unescapeHTML()`
+
+`Bun.escapeHTML()` has been in Bun since the early releases, and nothing went the other way.
+`HTMLRewriter` hands back the text of a page as it is written in the document, so `text.text` is
+`Tom &amp; Jerry` and `el.getAttribute("href")` is `/search?q=1&amp;lang=en`. Feeds, scraped pages
+and the HTML bodies of mail are the same. To get the text a person reads, a script installs `he`,
+`html-entities` or `entities`, although the table of the 2,125 named references of HTML has been in
+the binary since `Bun.markdown`. Now:
+
+```ts
+Bun.unescapeHTML("&lt;p&gt;Tom &amp; Jerry&lt;/p&gt;"); // "<p>Tom & Jerry</p>"
+Bun.unescapeHTML("caf&eacute; &#9749; &copy 2026"); // "café ☕ © 2026"
+Bun.unescapeHTML("5 &lt 6, &bogus; & co"); // "5 < 6, &bogus; & co"
+
+// the value of an attribute
+const href = el.getAttribute("href"); // "/search?q=1&copy=2&amp;lang=en"
+Bun.unescapeHTML(href); // "/search?q=1©=2&lang=en"
+Bun.unescapeHTML(href, { attribute: true }); // "/search?q=1&copy=2&lang=en"
+```
+
+It reads a character reference the way the HTML tokenizer does, which is what `he.decode()` and
+`entities.decodeHTML()` implement too:
+
+- A name with its `;`: all 2,125 of them, case-sensitive, one or two code points each
+  (`&NotEqualTilde;` is two, `&Afr;` is outside the BMP).
+- The 106 names of HTML 4 also without their `;` (`&amp`, `&copy`, `&nbsp`). The longest name that
+  matches wins and what follows it is text: `&notin;` is `∉`, `&notit;` is `¬it;`.
+- `&#38;` and `&#x26;`, with or without the `;`. `&#0;`, a surrogate and a number above U+10FFFF
+  are U+FFFD, and 128 to 159 are read as Windows-1252 (`&#150;` is `–`), as pages written on Windows
+  meant them.
+- Everything else stays as it is, `&` included, so no input throws.
+- `attribute: true` adds the rule of the tokenizer for attribute values: a name without its `;` is
+  not a reference when `=`, a letter or a digit follows it. That rule exists for query strings, and
+  it is why the option is there: `HTMLRewriter` returns attribute values raw, and decoding an `href`
+  as text turns `&copy=2` into `©=2`.
+
+Non-string arguments are converted to a string first, as in `Bun.escapeHTML()`. A string without a
+reference is returned as it is and nothing is allocated for it. Otherwise the output is allocated
+once at the length of the input, because no reference is shorter than what it stands for, and the
+string is handed to JavaScriptCore without a copy. The decoder is generic over the two kinds of
+JavaScript string. A Latin-1 string stays Latin-1 until a reference names a character Latin-1 does
+not have, so `caf&eacute;` costs one byte per character and `&hearts;` still works, and a UTF-16
+string is read as UTF-16, so a lone surrogate next to a reference passes through untouched.
+
+The named references come from `bun_md::entity::lookup`, which is now public; the new code adds the
+list of the 106 HTML 4 names and the 32 code points of the Windows-1252 block. While it was written,
+the function was compared with `entities` 4.5.0 (`decodeHTML` and `decodeHTMLAttribute`) on every
+name with and without its `;` in front of twelve different characters, on the numeric edge cases, and
+on 300,000 random strings of fragments: 703,958 comparisons, no difference. The test in the
+repository does not depend on that package. It has the cases by hand, the 106 names, a round trip
+through `Bun.escapeHTML()`, both string kinds with a reference at every offset of the first 70, and
+`HTMLRewriter` output for text and for an attribute.
+
+Not done: the function takes a whole string, so a caller has to join the chunks of an
+`HTMLRewriter` text node first (the docs say so and show how). There is no strict mode that
+reports a malformed reference.
+
+Rebase notes: oven-sh/bun#44968 landed upstream the evening before. It consolidates 597 package
+manager pull requests in one commit that touches 699 files, and twelve patches of this stack needed
+a hand merge because of it and of a few smaller upstream changes of the same day. Six were ported
+again onto rewritten upstream code: `bun outdated --json` (the table is built from
+`DeclaredDependencies` now, and the JSON rows are kept beside it), the "did you mean" note of
+`bun pm` (upstream's dispatch is kept and the candidates come from a list, see that entry),
+`publishConfig` overrides (`edit_root_package_json` was rewritten), `#semver:` for git dependencies
+(the enqueue code was reshaped; the refresh of a cached clone is upstream's now), trusted
+publishing (`publish()` was rewritten, the exchange now also runs once per package under
+`--recursive`) and zip in `Bun.Archive` (the extraction writes through upstream's new sparse-aware
+writer). The patch of 2026-09-25 is dropped, see below. After the rebase the tests of every merged
+patch pass. The other test files of the stack were run as well. What does not pass in them is the
+debug build being slow (timeouts, and one test that needs a worker process to start within 200 ms),
+one inline snapshot that expects colours, and a MySQL login that this machine does not have.
+
+Files: `src/runtime/api/unescape_html.rs` (new), `src/runtime/api.rs`,
+`src/runtime/api/BunObject.rs`, `src/jsc/bindings/BunObject.cpp`,
+`src/jsc/bindings/BunObject+exports.h`, `src/md/lib.rs`, `src/md/entity.rs` (`lookup` is public),
+`packages/bun-types/bun.d.ts` (`unescapeHTML`, `UnescapeHTMLOptions`), `docs/runtime/utils.mdx`,
+`docs/runtime/html-rewriter.mdx`, `docs/runtime/bun-apis.mdx`,
+`test/js/bun/util/escapeHTML.test.js`, `test/integration/bun-types/fixture/bun.ts`.
+
 ## Dropped
 
-Nothing yet.
+- 2026-09-25, "`bun install` merges a `bun.lock` with git conflict markers" (commit
+  `fc4afb1c6eb9b5d258642cb5c68b5df14fadbc48` of this repository): dropped on 2026-10-15. oven-sh/bun#44968
+  rewrote the lockfile loader and the resolver rules that the merge checks every dependency against,
+  so porting it is a rewrite of the merge, not a conflict resolution.

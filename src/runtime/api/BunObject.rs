@@ -260,6 +260,7 @@ pub(crate) mod bun_object {
         BunObject_callback_spawn => super::static_adapters::subprocess_spawn,
         BunObject_callback_spawnSync => super::static_adapters::subprocess_spawn_sync,
         BunObject_callback_udpSocket => super::static_adapters::udp_socket,
+        BunObject_callback_unescapeHTML => crate::api::unescape_html::unescape_html,
         BunObject_callback_write => crate::webcore::blob::write_file,
     }
     // `createParsedShellScript` / `createShellInterpreter` go through the same

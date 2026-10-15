@@ -52,6 +52,7 @@
     macro(spawn) \
     macro(spawnSync) \
     macro(udpSocket) \
+    macro(unescapeHTML) \
     macro(write) \
 
 #define DECLARE_ZIG_BUN_OBJECT_CALLBACK(name) BUN_DECLARE_HOST_FUNCTION(BunObject_callback_##name);
