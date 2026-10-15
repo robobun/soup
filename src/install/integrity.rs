@@ -163,7 +163,8 @@ impl Integrity {
         Integrity { value: out, tag }
     }
 
-    pub(crate) fn slice(&self) -> &[u8] {
+    /// The digest. Empty when the tag is unknown.
+    pub fn slice(&self) -> &[u8] {
         &self.value[0..self.tag.digest_len()]
     }
 
@@ -293,7 +294,7 @@ impl Tag {
     }
 
     /// The algorithm part of the SRI string (`sha512` in `sha512-...`); `None` for `UNKNOWN`.
-    pub(crate) fn name(self) -> Option<&'static str> {
+    pub fn name(self) -> Option<&'static str> {
         Some(match self {
             Tag::SHA1 => "sha1",
             Tag::SHA256 => "sha256",

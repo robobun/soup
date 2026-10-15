@@ -202,6 +202,19 @@ pub(crate) fn required_without(
     required
 }
 
+// The edges of `parent` that a walk with `options` follows, before `admit` filters their targets.
+pub fn edges_from(
+    lockfile: &Lockfile,
+    resolutions: &[PackageID],
+    parent: PackageID,
+    follow_workspace_edges: bool,
+    options: Options,
+) -> Vec<(PackageID, Behavior)> {
+    Walk::new(lockfile, resolutions, follow_workspace_edges, options)
+        .edges(parent)
+        .collect()
+}
+
 // Out-of-range ids (invalid_package_id) are treated as already seen.
 fn mark(seen: &mut DynamicBitSet, id: PackageID) -> bool {
     let index = id as usize;

@@ -72,6 +72,10 @@ impl Meta {
         !self.arch.is_match(cpu) || !self.os.is_match(os) || !self.libc.is_match(libc)
     }
 
+    pub fn integrity(&self) -> &Integrity {
+        &self.integrity
+    }
+
     pub(crate) fn has_install_script(&self) -> bool {
         self.has_install_script == HasInstallScript::True
     }
