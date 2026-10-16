@@ -78,7 +78,12 @@ impl For {
 
     pub(crate) fn next(interp: &Interpreter, this: NodeId) -> Yield {
         // The script may have been stopped while the loop was off the thread.
-        if interp.interrupted(this) && matches!(interp.as_for(this).state, ForState::Body { .. }) {
+        let stop = {
+            let me = interp.as_for(this);
+            matches!(me.state, ForState::Body { .. })
+                && (interp.interrupted(this) || me.io.has_broken_pipe())
+        };
+        if stop {
             let exit_code = interp.as_for(this).last_exit_code;
             return Self::finish(interp, this, exit_code);
         }

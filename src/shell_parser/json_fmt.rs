@@ -17,7 +17,7 @@ use core::fmt::{self, Write};
 use super::parse::SmolList;
 use super::parse::ast::{
     Assign, Atom, Binary, BinaryOp, Cmd, CmdSubst, CompoundAtom, CondExpr, Expr, For, If, JSBuf,
-    Pipeline, PipelineItem, Redirect, RedirectFlags, Script, SimpleAtom, Stmt, Subshell,
+    Pipeline, PipelineItem, Redirect, RedirectFlags, Script, SimpleAtom, Stmt, Subshell, While,
 };
 
 // ───────────────────────────── primitives ─────────────────────────────
@@ -115,6 +115,7 @@ fn write_expr(w: &mut impl Write, e: &Expr<'_>) -> fmt::Result {
             w.write_str("{\"for\":")?;
             write_for(w, f)?;
         }
+        Expr::While(l) => write_while(w, l)?,
         Expr::CondExpr(c) => {
             w.write_str("{\"condexpr\":")?;
             write_condexpr(w, c)?;
@@ -171,6 +172,7 @@ fn write_pipeline_item(w: &mut impl Write, p: &PipelineItem<'_>) -> fmt::Result 
             w.write_str("{\"for\":")?;
             write_for(w, f)?;
         }
+        PipelineItem::While(l) => write_while(w, l)?,
         PipelineItem::CondExpr(c) => {
             w.write_str("{\"condexpr\":")?;
             write_condexpr(w, c)?;
@@ -209,6 +211,20 @@ fn write_for(w: &mut impl Write, f: &For<'_>) -> fmt::Result {
     write_array(w, f.words, write_atom)?;
     w.write_str(",\"body\":")?;
     write_stmt_smol(w, &f.body)?;
+    w.write_char('}')
+}
+
+/// Without the closing brace of the expression, like the arms around its callers.
+fn write_while(w: &mut impl Write, l: &While<'_>) -> fmt::Result {
+    w.write_str(if l.until {
+        "{\"until\":"
+    } else {
+        "{\"while\":"
+    })?;
+    w.write_str("{\"cond\":")?;
+    write_stmt_smol(w, &l.cond)?;
+    w.write_str(",\"body\":")?;
+    write_stmt_smol(w, &l.body)?;
     w.write_char('}')
 }
 
