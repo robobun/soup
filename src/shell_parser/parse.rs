@@ -79,6 +79,7 @@ pub mod ast {
         Subshell(&'arena Subshell<'arena>),
         If(&'arena If<'arena>),
         For(&'arena For<'arena>),
+        While(&'arena While<'arena>),
         CondExpr(&'arena CondExpr<'arena>),
         /// Valid async (`&`) expressions: pipeline, cmd, subshell, if, condexpr.
         /// Note that commands in a pipeline cannot be async.
@@ -99,6 +100,7 @@ pub mod ast {
         Subshell,
         If,
         For,
+        While,
         #[strum(serialize = "condexpr")]
         CondExpr,
         Async,
@@ -112,6 +114,7 @@ pub mod ast {
                 Expr::Subshell(s) => Some(PipelineItem::Subshell(*s)),
                 Expr::If(i) => Some(PipelineItem::If(*i)),
                 Expr::For(f) => Some(PipelineItem::For(*f)),
+                Expr::While(w) => Some(PipelineItem::While(*w)),
                 Expr::CondExpr(c) => Some(PipelineItem::CondExpr(*c)),
                 _ => None,
             }
@@ -389,6 +392,24 @@ pub mod ast {
         }
     }
 
+    /// `while cond; do body; done` and `until cond; do body; done`
+    pub struct While<'arena> {
+        pub cond: SmolList<Stmt<'arena>, 1>,
+        pub body: SmolList<Stmt<'arena>, 1>,
+        /// `until`: the body runs for as long as the condition fails.
+        pub until: bool,
+    }
+
+    impl<'arena> While<'arena> {
+        pub(crate) fn to_expr(
+            self,
+            bump: &'arena Bump,
+        ) -> Result<Expr<'arena>, bun_alloc::AllocError> {
+            let w = bump.alloc(self);
+            Ok(Expr::While(w))
+        }
+    }
+
     pub struct Binary<'arena> {
         pub op: BinaryOp,
         pub left: Expr<'arena>,
@@ -412,6 +433,7 @@ pub mod ast {
         Subshell(&'arena Subshell<'arena>),
         If(&'arena If<'arena>),
         For(&'arena For<'arena>),
+        While(&'arena While<'arena>),
         CondExpr(&'arena CondExpr<'arena>),
     }
 
@@ -757,6 +779,8 @@ pub struct Parser<'bump> {
     pub(crate) current: u32,
     pub errors: bun_alloc::ArenaVec<'bump, ParserError<'bump>>,
     pub(crate) inside_subshell: Option<SubshellKind>,
+    /// Loops around the clause that is being parsed, see `enter_loop`.
+    pub(crate) loop_depth: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -796,6 +820,7 @@ impl<'bump> Parser<'bump> {
             current: 0,
             errors: bun_alloc::ArenaVec::new_in(bump),
             inside_subshell: None,
+            loop_depth: 0,
         })
     }
 
@@ -816,6 +841,7 @@ impl<'bump> Parser<'bump> {
             current: self.current,
             errors: core::mem::replace(&mut self.errors, bun_alloc::ArenaVec::new_in(self.alloc)),
             inside_subshell: Some(kind),
+            loop_depth: self.loop_depth,
         }
     }
 
@@ -974,6 +1000,8 @@ impl<'bump> Parser<'bump> {
             IfClauseTok::In => b"in",
             IfClauseTok::Do => b"do",
             IfClauseTok::Done => b"done",
+            IfClauseTok::While => b"while",
+            IfClauseTok::Until => b"until",
         }
     }
 
@@ -1034,6 +1062,15 @@ impl<'bump> Parser<'bump> {
                 .parse_for_clause()?
                 .to_expr(self.alloc)
                 .map_err(Into::into);
+        }
+
+        for keyword in [IfClauseTok::While, IfClauseTok::Until] {
+            if self.is_if_clause_text_token(keyword) {
+                return self
+                    .parse_while_clause(keyword)?
+                    .to_expr(self.alloc)
+                    .map_err(Into::into);
+            }
         }
 
         match self.peek().tag() {
@@ -1272,7 +1309,9 @@ impl<'bump> Parser<'bump> {
             | IfClauseTok::For
             | IfClauseTok::In
             | IfClauseTok::Do
-            | IfClauseTok::Done => {
+            | IfClauseTok::Done
+            | IfClauseTok::While
+            | IfClauseTok::Until => {
                 self.add_error(format_args!(
                     "Expected \"else\", \"elif\", or \"fi\" but got: {}",
                     <&'static str>::from(self.peek().tag())
@@ -1357,6 +1396,7 @@ impl<'bump> Parser<'bump> {
     /// which Bun Shell does not have as a list, so `in` is required.
     fn parse_for_clause(&mut self) -> ParseResult<ast::For<'bump>> {
         let _ = self.expect_if_clause_text_token(IfClauseTok::For);
+        self.enter_loop()?;
 
         let var = match self.peek() {
             Token::Text(range)
@@ -1440,10 +1480,86 @@ impl<'bump> Parser<'bump> {
             return Err(ParseError::Unsupported.into());
         }
 
+        self.loop_depth -= 1;
         Ok(ast::For {
             var,
             words: words.into_bump_slice(),
             body,
+        })
+    }
+
+    /// The parser recurses once for every loop inside a loop. A script with more of them than
+    /// this is refused, so that none can use up the stack.
+    fn enter_loop(&mut self) -> ParseResult<()> {
+        const MAX_LOOP_DEPTH: u32 = 128;
+        if self.loop_depth >= MAX_LOOP_DEPTH {
+            self.add_error(format_args!(
+                "Loops are nested more than {MAX_LOOP_DEPTH} deep"
+            ))?;
+            return Err(ParseError::Unsupported.into());
+        }
+        self.loop_depth += 1;
+        Ok(())
+    }
+
+    /// while_clause : While compound_list do_group
+    /// until_clause : Until compound_list do_group
+    fn parse_while_clause(&mut self, keyword: IfClauseTok) -> ParseResult<ast::While<'bump>> {
+        let name = bstr::BStr::new(Self::extract_if_clause_text_token(keyword));
+        let _ = self.expect_if_clause_text_token(keyword);
+        self.enter_loop()?;
+        self.skip_newlines();
+
+        let cond = self.parse_if_body(&[IfClauseTok::Do])?;
+        if cond.slice().iter().all(|stmt| stmt.exprs.is_empty()) {
+            self.add_error(format_args!(
+                "Expected a command between \"{name}\" and \"do\""
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+
+        if !self.match_if_clausetok(IfClauseTok::Do) {
+            self.add_error(format_args!(
+                "Expected \"do\" but got: {}",
+                bstr::BStr::new(self.peek().as_human_readable(self.strpool))
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+        self.skip_newlines();
+
+        let body = self.parse_if_body(&[IfClauseTok::Done])?;
+        if body.slice().iter().all(|stmt| stmt.exprs.is_empty()) {
+            self.add_error(format_args!(
+                "Expected a command between \"do\" and \"done\""
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+
+        if !self.match_if_clausetok(IfClauseTok::Done) {
+            self.add_error(format_args!(
+                "Expected \"done\" but got: {}",
+                bstr::BStr::new(self.peek().as_human_readable(self.strpool))
+            ))?;
+            return Err(ParseError::Expected.into());
+        }
+
+        if self.peek().tag() == TokenTag::Redirect {
+            let article = if keyword == IfClauseTok::Until {
+                "an"
+            } else {
+                "a"
+            };
+            self.add_error(format_args!(
+                "Redirecting {article} \"{name}\" loop is not supported yet. Redirect the commands in its body instead."
+            ))?;
+            return Err(ParseError::Unsupported.into());
+        }
+
+        self.loop_depth -= 1;
+        Ok(ast::While {
+            cond,
+            body,
+            until: keyword == IfClauseTok::Until,
         })
     }
 
@@ -2055,9 +2171,9 @@ struct ParsedRedirect<'bump> {
     redirect: Option<ast::Redirect<'bump>>,
 }
 
-/// We make it so that `if`/`else`/`elif`/`then`/`fi` and `for`/`in`/`do`/`done`
-/// need to be single, simple .Text tokens (so the whitespace logic remains the
-/// same). This is used to convert them
+/// We make it so that `if`/`else`/`elif`/`then`/`fi`, `for`/`in`/`do`/`done` and
+/// `while`/`until` need to be single, simple .Text tokens (so the whitespace
+/// logic remains the same). This is used to convert them
 #[derive(Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum IfClauseTok {
@@ -2079,6 +2195,10 @@ pub enum IfClauseTok {
     Do,
     #[strum(serialize = "done")]
     Done,
+    #[strum(serialize = "while")]
+    While,
+    #[strum(serialize = "until")]
+    Until,
 }
 
 impl IfClauseTok {
@@ -2123,6 +2243,12 @@ impl IfClauseTok {
         }
         if txt == b"done" {
             return Some(IfClauseTok::Done);
+        }
+        if txt == b"while" {
+            return Some(IfClauseTok::While);
+        }
+        if txt == b"until" {
+            return Some(IfClauseTok::Until);
         }
         None
     }
@@ -4254,8 +4380,8 @@ pub fn needs_escape_utf8_ascii_latin1(str: &[u8]) -> bool {
 }
 
 pub fn is_if_clause_keyword_bunstr(bunstr: &BunString) -> bool {
-    use IfClauseTok::{Do, Done, Elif, Else, Fi, For, If, In, Then};
-    [If, Else, Elif, Then, Fi, For, In, Do, Done]
+    use IfClauseTok::{Do, Done, Elif, Else, Fi, For, If, In, Then, Until, While};
+    [If, Else, Elif, Then, Fi, For, In, Do, Done, While, Until]
         .iter()
         .any(|&kw| bunstr.eq_ascii(<&'static str>::from(kw).as_bytes()))
 }

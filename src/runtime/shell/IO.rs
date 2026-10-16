@@ -18,6 +18,14 @@ pub(crate) struct IO {
 }
 
 impl IO {
+    /// A command wrote to a stdout or stderr that nothing reads any more. bash is killed by
+    /// SIGPIPE at that write. A loop ends on this, because its commands go on failing.
+    pub(crate) fn has_broken_pipe(&self) -> bool {
+        [&self.stdout, &self.stderr]
+            .into_iter()
+            .any(|out| matches!(out, OutKind::Fd(fd) if fd.writer.is_broken_pipe()))
+    }
+
     /// Sum of stdin/stdout/stderr.
     pub(crate) fn memory_cost(&self) -> usize {
         let mut size = core::mem::size_of::<IO>();

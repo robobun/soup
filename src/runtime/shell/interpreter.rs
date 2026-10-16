@@ -48,6 +48,7 @@ use crate::shell::states::pipeline::Pipeline;
 use crate::shell::states::script::Script;
 use crate::shell::states::stmt::Stmt;
 use crate::shell::states::subshell::Subshell;
+use crate::shell::states::r#while::While;
 use crate::shell::yield_::Yield;
 use crate::shell::{ShellErr, ast};
 
@@ -114,6 +115,7 @@ pub(crate) enum Node {
     Expansion(Expansion),
     If(If),
     For(For),
+    While(While),
     CondExpr(CondExpr),
     Async(Async),
     Subshell(Subshell),
@@ -132,6 +134,7 @@ impl Node {
             Node::Expansion(_) => StateKind::Expansion,
             Node::If(_) => StateKind::IfClause,
             Node::For(_) => StateKind::ForClause,
+            Node::While(_) => StateKind::WhileClause,
             Node::CondExpr(_) => StateKind::Condexpr,
             Node::Async(_) => StateKind::Async,
             Node::Subshell(_) => StateKind::Subshell,
@@ -152,6 +155,7 @@ impl Node {
             Node::Expansion(s) => Some(&s.base),
             Node::If(s) => Some(&s.base),
             Node::For(s) => Some(&s.base),
+            Node::While(s) => Some(&s.base),
             Node::CondExpr(s) => Some(&s.base),
             Node::Async(s) => Some(&s.base),
             Node::Subshell(s) => Some(&s.base),
@@ -170,6 +174,7 @@ impl Node {
             Node::Expansion(s) => Some(&mut s.base),
             Node::If(s) => Some(&mut s.base),
             Node::For(s) => Some(&mut s.base),
+            Node::While(s) => Some(&mut s.base),
             Node::CondExpr(s) => Some(&mut s.base),
             Node::Async(s) => Some(&mut s.base),
             Node::Subshell(s) => Some(&mut s.base),
@@ -222,6 +227,7 @@ node_accessors! {
     Expansion => Expansion, as_expansion, as_expansion_mut;
     If        => If,        as_if,        as_if_mut;
     For       => For,       as_for,       as_for_mut;
+    While     => While,     as_while,     as_while_mut;
     CondExpr  => CondExpr,  as_condexpr,  as_condexpr_mut;
     Async     => Async,     as_async,     as_async_mut;
     Subshell  => Subshell,  as_subshell,  as_subshell_mut;
@@ -247,6 +253,7 @@ pub enum StateKind {
     Expansion,
     IfClause,
     ForClause,
+    WhileClause,
     Condexpr,
     Async,
     Subshell,
@@ -1057,6 +1064,7 @@ impl Interpreter {
         Expansion,
         IfClause => If,
         ForClause => For,
+        WhileClause => While,
         Condexpr => CondExpr,
         Async,
         Subshell,
@@ -1081,6 +1089,7 @@ impl Interpreter {
             ast::Expr::Assign(a) => Assigns::init(self, shell, *a, parent, AssignCtx::Shell),
             ast::Expr::If(i) => If::init(self, shell, *i, parent, io),
             ast::Expr::For(f) => For::init(self, shell, *f, parent, io),
+            ast::Expr::While(w) => While::init(self, shell, *w, parent, io),
             ast::Expr::CondExpr(c) => CondExpr::init(self, shell, *c, parent, io),
             ast::Expr::Subshell(s) => {
                 // Stmt/Binary callers dupe
@@ -1126,6 +1135,7 @@ impl Interpreter {
             StateKind::Expansion => Expansion::deinit(self, id),
             StateKind::IfClause => If::deinit(self, id),
             StateKind::ForClause => For::deinit(self, id),
+            StateKind::WhileClause => While::deinit(self, id),
             StateKind::Condexpr => CondExpr::deinit(self, id),
             StateKind::Async => return, // Async deinit is purposefully empty; freed later by async_cmd_done → actually_deinit.
             StateKind::Subshell => Subshell::deinit(self, id),
@@ -1962,8 +1972,9 @@ pub(crate) struct ShellExecEnv {
     pub(crate) __prev_cwd: Vec<u8>,
     pub(crate) __cwd: Vec<u8>,
     pub(crate) cwd_fd: Fd,
-    /// Loops whose body is running in this env. `break` and `continue` mean
-    /// something only when it is not zero.
+    /// Loops that are running in this env: a `for` from its body on, a `while` or
+    /// `until` from its condition on. `break` and `continue` mean something only
+    /// when it is not zero.
     pub(crate) loop_depth: u32,
     /// A `break` or `continue` ran and the loop it names has not seen it yet.
     /// The sequencing states between the two finish early on it (see

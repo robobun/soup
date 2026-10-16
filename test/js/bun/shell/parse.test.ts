@@ -1046,6 +1046,104 @@ describe("parse shell", () => {
     });
   });
 
+  describe("while_clause", () => {
+    const cmd = (...words: string[]) => ({
+      cmd: {
+        assigns: [],
+        name_and_args: words.map(Text => ({ simple: { Text } })),
+        redirect: redirect({}),
+        redirect_file: null,
+      },
+    });
+
+    test("while", () => {
+      const expected = {
+        stmts: [
+          {
+            exprs: [
+              {
+                while: {
+                  cond: [{ exprs: [cmd("true")] }],
+                  body: [{ exprs: [cmd("echo", "hi")] }, { exprs: [cmd("break")] }],
+                },
+              },
+            ],
+          },
+        ],
+      };
+
+      expect(JSON.parse(parse`while true; do echo hi; break; done`)).toEqual(expected);
+      expect(
+        JSON.parse(parse`
+          while true
+          do
+            echo hi
+            break
+          done
+        `),
+      ).toEqual(expected);
+    });
+
+    test("until", () => {
+      expect(JSON.parse(parse`until false; do echo hi; done`)).toEqual({
+        stmts: [{ exprs: [{ until: { cond: [{ exprs: [cmd("false")] }], body: [{ exprs: [cmd("echo", "hi")] }] } }] }],
+      });
+    });
+
+    test("the condition is a list", () => {
+      expect(JSON.parse(parse`while echo a; false; do echo b; done`)).toEqual({
+        stmts: [
+          {
+            exprs: [
+              {
+                while: {
+                  cond: [{ exprs: [cmd("echo", "a")] }, { exprs: [cmd("false")] }],
+                  body: [{ exprs: [cmd("echo", "b")] }],
+                },
+              },
+            ],
+          },
+        ],
+      });
+    });
+
+    test("reserved words are plain words in arguments", () => {
+      expect(JSON.parse(parse`until echo while until do done; do echo done; done`)).toEqual({
+        stmts: [
+          {
+            exprs: [
+              {
+                until: {
+                  cond: [{ exprs: [cmd("echo", "while", "until", "do", "done")] }],
+                  body: [{ exprs: [cmd("echo", "done")] }],
+                },
+              },
+            ],
+          },
+        ],
+      });
+    });
+
+    test("in a pipeline and a binary expression", () => {
+      const loop = { while: { cond: [{ exprs: [cmd("true")] }], body: [{ exprs: [cmd("break")] }] } };
+      expect(JSON.parse(parse`while true; do break; done | cat`)).toEqual({
+        stmts: [{ exprs: [{ pipeline: { items: [loop, cmd("cat")] } }] }],
+      });
+      expect(JSON.parse(parse`while true; do break; done && cat`)).toEqual({
+        stmts: [{ exprs: [{ binary: { op: "And", left: loop, right: cmd("cat") } }] }],
+      });
+    });
+
+    test("nested", () => {
+      const parsed = JSON.parse(parse`if true; then while true; do until false; do echo hi; done; done; fi`);
+      const loop = parsed.stmts[0].exprs[0].if.then[0].exprs[0].while;
+      expect(loop.cond).toEqual([{ exprs: [cmd("true")] }]);
+      expect(loop.body).toEqual([
+        { exprs: [{ until: { cond: [{ exprs: [cmd("false")] }], body: [{ exprs: [cmd("echo", "hi")] }] } }] },
+      ]);
+    });
+  });
+
   describe("bad syntax", () => {
     test("cmd subst edgecase", () => {
       const expected = {
@@ -1189,5 +1287,38 @@ done`
     await TestBuilder.command`for x in a b; do echo $x; done > out.txt`
       .error(`Redirecting a "for" loop is not supported yet. Redirect the commands in its body instead.`)
       .run();
+  });
+
+  test("while and until loops", async () => {
+    await TestBuilder.command`while`.error(`Expected a command between "while" and "do"`).run();
+    await TestBuilder.command`while; do echo hi; done`.error(`Expected a command between "while" and "do"`).run();
+    await TestBuilder.command`until do echo hi; done`.error(`Expected a command between "until" and "do"`).run();
+    await TestBuilder.command`while true`.error(`Expected "do" but got: EOF`).run();
+    await TestBuilder.command`while true; echo hi; done`.error(`Expected "do" but got: EOF`).run();
+    await TestBuilder.command`until false; do echo hi`.error(`Expected "done" but got: EOF`).run();
+    await TestBuilder.command`while true; do done`.error(`Expected a command between "do" and "done"`).run();
+    await TestBuilder.command`while true; do
+done`
+      .error(`Expected a command between "do" and "done"`)
+      .run();
+    await TestBuilder.command`until
+do echo hi; done`
+      .error(`Expected a command between "until" and "do"`)
+      .run();
+    await TestBuilder.command`while false; do echo hi; done > out.txt`
+      .error(`Redirecting a "while" loop is not supported yet. Redirect the commands in its body instead.`)
+      .run();
+    await TestBuilder.command`until true; do echo hi; done > out.txt`
+      .error(`Redirecting an "until" loop is not supported yet. Redirect the commands in its body instead.`)
+      .run();
+  });
+
+  test("loops nested too deeply", async () => {
+    const nested = (depth: number) => ({
+      raw:
+        "until false; do for i in 1; do ".repeat(depth / 2) + "echo deep; " + "done; break; done; ".repeat(depth / 2),
+    });
+    await TestBuilder.command`${nested(128)}`.stdout("deep\n").run();
+    await TestBuilder.command`${nested(130)}`.error("Loops are nested more than 128 deep").run();
   });
 });

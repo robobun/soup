@@ -363,7 +363,67 @@ await $`
 
 The exit code of a loop is the exit code of the last command its body ran, or `0` when the body never ran. `break` and `continue` are commands that succeed, so a loop that ends with one of them exits with `0`. The variable is a shell variable: it is not exported to the commands in the body, and it keeps its last value after the loop. A loop can be a member of a pipeline and an operand of `&&` and `||`.
 
-`while` and `until` loops, `for name; do` without a word list, and redirecting a whole loop (`done > file`) are not supported yet. Redirect the commands in the body instead.
+`for name; do` without a word list, and redirecting a whole loop (`done > file`) are not supported yet. Redirect the commands in the body instead.
+
+## Loops (`while` and `until`)
+
+`while` runs a list of commands for as long as a condition succeeds. `until` runs it for as long as the condition fails. The condition is a command and its exit code is the answer, so anything that can be a command can be a condition: a program, a `[[ ... ]]` test, a pipeline, or several commands, of which the last one decides.
+
+```js
+import { $ } from "bun";
+
+// Wait for a server to come up
+await $`
+  until curl -sf http://localhost:3000/health; do
+    echo waiting for the server
+    sleep 1
+  done
+`;
+
+// Run a flaky command again until it passes
+await $`until bun test integration.test.ts; do echo "failed, trying again"; done`;
+
+// Wait for a file that another process writes
+await $`until [[ -f dist/manifest.json ]]; do sleep 0.1; done`;
+```
+
+On Windows, `bun run` runs `package.json` scripts in Bun Shell, so a script with such a loop works there too:
+
+```json package.json icon="file-json"
+{
+  "scripts": {
+    "test:retry": "until bun test; do echo retrying; done"
+  }
+}
+```
+
+`break` and `continue` work as they do in a `for` loop, counts included. `continue` runs the condition again.
+
+```js
+import { $ } from "bun";
+
+await $`
+  while true; do
+    bun run sync.ts && break
+    echo "sync failed, next attempt in 5 seconds"
+    sleep 5
+  done
+`;
+```
+
+Both also work in the condition itself, where `break` ends the loop before the body runs: `while bun run sync.ts || break; do echo synced; done`.
+
+The exit code of the loop is the exit code of the last command its body ran, or `0` when the body never ran. The exit code of the condition is not the exit code of the loop, so `while false; do ...; done` exits with `0`.
+
+A loop ends when a builtin in it prints to an output that nothing reads any more, so `while true; do echo y; done | head -n 3` prints three lines and is done, like `yes | head -n 3`. A loop of builtins also gives the event loop a turn every so often: timers, I/O and the other members of a pipeline keep running next to `while true; do true; done`.
+
+Things to know:
+
+- `exit` does not end a loop. In Bun Shell it ends only the command it is, so `while true; do ...; exit 1; done` never ends. Use `break`.
+- `sleep` is not a builtin. It is the program of that name on the system, and Windows does not ship one. A script that has to wait there can run `bun -e "await Bun.sleep(1000)"` instead.
+- Bun Shell has no arithmetic expansion (`$((i + 1))`) yet. For a loop over a range of numbers, use `for i in $(seq 1 10)`.
+- Redirecting a whole loop (`done < file`) and `read` are not supported yet.
+- Loops can be nested 128 deep.
 
 ## Command substitution (`$(...)`)
 
@@ -637,7 +697,7 @@ For cross-platform compatibility, Bun Shell implements a set of builtin commands
 - `which`
 - `mv`
 - `exit`
-- `break`, `continue`: leave a [`for` loop](#loops-for), or skip to its next word
+- `break`, `continue`: leave a [`for`](#loops-for), [`while` or `until`](#loops-while-and-until) loop, or skip to its next round
 - `true`
 - `false`
 - `yes`

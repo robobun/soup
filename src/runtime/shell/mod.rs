@@ -73,6 +73,8 @@ pub(crate) mod states {
     pub(crate) mod stmt;
     #[path = "Subshell.rs"]
     pub(crate) mod subshell;
+    #[path = "While.rs"]
+    pub(crate) mod r#while;
 }
 
 #[path = "builtin"]
@@ -168,6 +170,7 @@ pub(crate) mod ast {
     pub(crate) type Redirect = p::Redirect<'static>;
     pub(crate) type If = p::If<'static>;
     pub(crate) type For = p::For<'static>;
+    pub(crate) type While = p::While<'static>;
     pub(crate) type Subshell = p::Subshell<'static>;
     pub(crate) type CondExpr = p::CondExpr<'static>;
     pub(crate) type Assign = p::Assign<'static>;
