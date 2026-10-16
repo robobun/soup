@@ -7,6 +7,7 @@ use bun_core::{Global, Output, UnwrapOrOom as _, strings};
 use bun_glob::Prepared;
 use bun_paths::{MAX_PATH_BYTES, Path, from_portable, to_portable};
 
+use super::changed_since;
 use crate::bun_fs::FileSystem;
 use crate::dependency::Behavior;
 use crate::lockfile::Lockfile;
@@ -28,7 +29,30 @@ pub enum RootSelection {
 
 pub struct Selection {
     pub selected: DynamicBitSet,
+    /// A `[<rev>]` pattern is never listed: that nothing changed is an answer, not a typo.
     pub unmatched_patterns: Vec<usize>,
+    /// A `[<rev>]` pattern had workspaces to select from, so an empty selection can mean that
+    /// nothing changed.
+    pub since: bool,
+}
+
+/// What a `[<rev>]` pattern is evaluated against.
+#[derive(Clone, Copy)]
+pub struct Since<'a> {
+    /// The directory of the root `package.json`. git runs there, so the directory a command was
+    /// started in does not decide which repository answers.
+    pub root: &'a [u8],
+    pub root_lockfile: RootLockfile,
+}
+
+/// What a changed `bun.lock` in the root means to a `[<rev>]` pattern.
+#[derive(Clone, Copy)]
+pub enum RootLockfile {
+    /// `bun run`: every workspace changed, since any of them may resolve to other versions now.
+    ChangesAll,
+    /// The commands that read and write `bun.lock`: it is a change of no workspace. Otherwise the
+    /// second `bun add --filter '[main]'` of a branch would reach the root, or every workspace.
+    Ignored,
 }
 
 pub struct LockfileSelection {
@@ -62,6 +86,15 @@ struct Selector {
     dependents: bool,
     exclude_self: bool,
     base: Base,
+    /// `[<rev>]`: of what `base` matches, only the workspaces changed since this git revision.
+    since: Option<Box<[u8]>>,
+}
+
+/// `[<rev>]` is a revision only as the whole pattern. A class inside a longer glob (`pkg-[ab]`,
+/// `[ab]*`, `[ab][cd]`) keeps matching package names.
+fn since_rev(remain: &[u8]) -> Option<&[u8]> {
+    let rev = remain.strip_prefix(b"[")?.strip_suffix(b"]")?;
+    strings::index_of_any(rev, b"[]").is_none().then_some(rev)
 }
 
 fn strip_negations(raw: &[u8]) -> (&[u8], bool) {
@@ -159,7 +192,7 @@ fn only_escapes(mut glob: &[u8]) -> bool {
     true
 }
 
-/// Accepted shapes: `!`* then `...`/`...^` prefix and/or `...`/`^...` suffix around `*`, `{dir}`, `./path` or a name glob.
+/// Accepted shapes: `!`* then `...`/`...^` prefix and/or `...`/`^...` suffix around `*`, `[rev]`, `{dir}`, `./path` or a name glob.
 fn parse(raw: &[u8], original_cwd: &[u8]) -> Selector {
     let (mut remain, negated) = strip_negations(raw);
     let mut dependencies = false;
@@ -207,7 +240,8 @@ fn parse(raw: &[u8], original_cwd: &[u8]) -> Selector {
         })
     };
 
-    let base = if remain == b"*" || remain == b"**" {
+    let since = since_rev(remain);
+    let base = if remain == b"*" || remain == b"**" || since.is_some() {
         Base::All
     } else if remain.len() >= 2 && remain[0] == b'{' && remain[remain.len() - 1] == b'}' {
         Base::Subtree(resolve(&remain[1..remain.len() - 1]))
@@ -223,6 +257,7 @@ fn parse(raw: &[u8], original_cwd: &[u8]) -> Selector {
         dependents,
         exclude_self,
         base,
+        since: since.map(Box::from),
     }
 }
 
@@ -319,6 +354,7 @@ pub fn select(
     candidates: &[Candidate<'_>],
     graph: Option<&WorkspaceGraph>,
     root: RootSelection,
+    since: Since<'_>,
 ) -> Selection {
     let n = candidates.len();
     let explicit_root_only = root == RootSelection::ExplicitOnly && n > 1;
@@ -328,6 +364,7 @@ pub fn select(
     let mut include = bitset(n);
     let mut exclude = bitset(n);
     let mut any_positive = false;
+    let mut any_since = false;
     let mut unmatched_patterns: Vec<usize> = Vec::new();
 
     for (index, raw) in patterns.iter().enumerate() {
@@ -343,6 +380,12 @@ pub fn select(
                 break;
             }
         }
+        if let Some(rev) = &sel.since {
+            any_since |= set.count() > 0;
+            let mut changed = bitset(n);
+            changed_since::mark(raw, rev, since, candidates, &set, &mut changed);
+            set = changed;
+        }
         if sel.dependencies || sel.dependents {
             debug_assert!(graph.is_some());
             if let Some(graph) = graph {
@@ -353,7 +396,7 @@ pub fn select(
             exclude.set_union(&set);
         } else {
             any_positive = true;
-            if set.count() == 0 {
+            if set.count() == 0 && sel.since.is_none() {
                 unmatched_patterns.push(index);
             }
             include.set_union(&set);
@@ -372,6 +415,7 @@ pub fn select(
     Selection {
         selected: include,
         unmatched_patterns,
+        since: any_since,
     }
 }
 
@@ -596,7 +640,18 @@ pub fn select_lockfile_workspaces(
     let Selection {
         selected,
         unmatched_patterns,
-    } = select(patterns, original_cwd, &candidates, graph.as_ref(), root);
+        since: _,
+    } = select(
+        patterns,
+        original_cwd,
+        &candidates,
+        graph.as_ref(),
+        root,
+        Since {
+            root: top_level_dir,
+            root_lockfile: RootLockfile::Ignored,
+        },
+    );
     let ids: Vec<PackageID> = ids
         .into_iter()
         .enumerate()

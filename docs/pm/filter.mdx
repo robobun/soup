@@ -3,7 +3,7 @@ title: "bun --filter"
 description: "Select packages by pattern in a monorepo using the --filter flag"
 ---
 
-The `--filter` (or `-F`) flag selects packages in a monorepo by pattern. A pattern is a package name glob, a `./path` glob, a `{dir}` directory selector, or a `...` dependency relation.
+The `--filter` (or `-F`) flag selects packages in a monorepo by pattern. A pattern is a package name glob, a `./path` glob, a `{dir}` directory selector, a `[rev]` git revision, or a `...` dependency relation.
 
 The flag works with `bun run`, `bun install`, `bun add`, `bun remove`, `bun update`, `bun outdated`, `bun prune`, and `bun pm licenses`. For package-manager commands, put the flag after the subcommand (`bun install --filter api`), since `bun --filter <pattern> <word>` runs `<word>` as a script.
 
@@ -36,7 +36,7 @@ Adding `...` to a pattern also selects workspaces related through workspace depe
 | `...foo`  | `foo` and the workspaces that depend on it, directly or transitively |
 | `...^foo` | only the workspaces that depend on `foo`, not `foo` itself           |
 
-`foo` can be a name glob or a directory selector (`...{./packages/api}`). To exclude, `!` goes first: `--filter '!...foo'`.
+`foo` can be a name glob, a directory selector (`...{./packages/api}`) or a git revision (`...[origin/main]`). To exclude, `!` goes first: `--filter '!...foo'`.
 
 ```bash terminal icon="terminal"
 bun install --filter 'web...'
@@ -44,13 +44,70 @@ bun add zod --filter '...^ui'
 bun outdated --filter '{./packages/apps}'
 ```
 
+### Changed since a git revision `--filter '[<rev>]'`
+
+A git revision in brackets selects the workspaces that changed since that revision. `<rev>` is anything that git resolves to a commit: a branch, a tag, a commit hash, `HEAD~3`.
+
+```bash terminal icon="terminal"
+# test the workspaces that this branch changed, and the workspaces that depend on them
+bun --filter '...[origin/main]' test
+
+# build what has a change in the working tree and what it depends on, in dependency order
+bun --filter '[HEAD]...' build
+
+# the outdated dependencies of the workspaces changed since the last release
+bun outdated --filter '[v1.2.0]'
+```
+
+| Pattern     | Selects                                                       |
+| ----------- | ------------------------------------------------------------- |
+| `[main]`    | the workspaces changed since `main`                           |
+| `...[main]` | the changed workspaces and the workspaces that depend on them |
+| `[main]...` | the changed workspaces and the workspaces that they depend on |
+| `![main]`   | every workspace that did not change                           |
+
+A workspace changed when one of these is true for a file in its directory:
+
+- The file in the working tree is not the file of the merge base of `<rev>` and `HEAD`. Commits of the branch, staged changes and edits that are not staged all count. A deleted file counts. A file that moved counts for the workspace it left and for the workspace it went to.
+- The file is untracked, and git does not ignore it.
+
+A commit that only `<rev>` has does not count. When `main` gets new commits, `[main]` still selects what your branch changed. A file belongs to the deepest workspace that contains it. A `package.json` without a name is not selected, as it is not by `*`, and its files belong to the workspace around it. A submodule that changed counts for the workspace it is and for every workspace inside it. git runs in the workspace root, so the directory where you start the command does not change the selection.
+
+The brackets must be the whole pattern, after `!`, `...` and `^`, and the pattern needs quotes in a shell. Brackets inside a longer glob are a character class as before: `'pkg-[ab]'` and `'[ab]*'` match package names.
+
+The root `bun.lock` is a special case. For `bun run`, a changed `bun.lock` selects every workspace, because each workspace can resolve to other versions now. For the other commands, which write `bun.lock` themselves, it is a change of no workspace. Thus the second `bun add --filter '[main]'` of a branch edits the same `package.json` files as the first one.
+
+When nothing changed, `bun --filter '[main]' <script>` prints that no workspace matched and exits with code 0. `bun install` and `bun outdated` have nothing to do. The commands for which an empty selection is an error (`bun add`, `bun remove`, `bun update`, `bun prune`, `bun publish`, `bun pm licenses`) still exit with code 1. If no selected workspace has the script, that is an error as with every filter, unless you pass `--if-present`.
+
+Bun asks git only when a pattern has this form. It is an error when git is not installed, when the directory is not in a repository, when git does not know the revision, and when the revision and `HEAD` have no common ancestor.
+
+In a shallow clone, git can find a merge base that is not the real one, because the real one is behind a commit that the clone cut off. Bun accepts the merge base when it is `<rev>` or `HEAD` itself, or when no history is missing between it and the two commits. Otherwise it is an error. A depth that reaches the commit where the branch left is not always enough: a side branch that was merged later can end in a commit that was cut off. The full history always works. In a GitHub Actions workflow for pull requests:
+
+```yaml .github/workflows/test.yml icon="file-code"
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run --if-present --filter "...[origin/$BASE]" test
+        env:
+          BASE: ${{ github.base_ref }}
+```
+
+`--frozen-lockfile` is part of it: an install that writes `bun.lock` changes the lockfile, and then the step after it runs every workspace. The checkout of a pull request is a merge commit whose first parent is the base branch, so `fetch-depth: 2` with `--filter '...[HEAD^1]'` selects the same workspaces without the full history.
+
 ---
 
 ## `bun install` and `bun outdated`
 
 By default, `bun install` installs dependencies for every package in the monorepo. To install dependencies for specific packages, use `--filter`.
 
-Multiple `--filter` flags combine: everything matched by a positive pattern, minus everything matched by a `!` pattern. A pattern that matches nothing prints a warning. For `bun add`, `bun remove`, `bun update`, `bun prune`, and `bun pm licenses`, selecting no workspaces at all is an error.
+Multiple `--filter` flags combine: everything matched by a positive pattern, minus everything matched by a `!` pattern. A pattern that matches nothing prints a warning, except a `[rev]` pattern: that nothing changed is not a mistake. For `bun add`, `bun remove`, `bun update`, `bun prune`, `bun publish`, and `bun pm licenses`, selecting no workspaces at all is an error.
 
 Given a monorepo with workspaces `pkg-a`, `pkg-b`, and `pkg-c` under `./packages`:
 

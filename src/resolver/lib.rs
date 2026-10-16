@@ -1511,7 +1511,7 @@ pub mod fs {
 // owns this impl. See PORTING.md §Dispatch.
 // ──────────────────────────────────────────────────────────────────────────
 pub mod dir_entry_accessor {
-    use crate::fs::{DirEntry, EntriesOption, Entry, EntryKind, FileSystem as FS};
+    use crate::fs::{DirEntry, EntriesOption, Entry, EntryKind, EntryLookup, FileSystem as FS};
     use bun_core::ZStr;
     use bun_glob::walk::{self, Accessor, AccessorDirIter};
     use bun_paths::Path;
@@ -1541,18 +1541,16 @@ pub mod dir_entry_accessor {
         #[inline]
         fn next(&mut self) -> Maybe<Option<walk::AccessorDirEntry<'_>>> {
             if let Some(value) = &mut self.value {
-                let Some((key, val)) = value.next() else {
+                let Some((_, val)) = value.next() else {
                     return Ok(None);
                 };
-                // BACKREF: ARENA — `*mut Entry` points into the EntryStore
+                // ARENA — `*mut Entry` points into the EntryStore
                 // BSSList singleton ('static lifetime). This iterator holds a
                 // live `.data` iterator across calls, which `entries_mutex`
                 // cannot cover; it is only sound on the single-threaded CLI
                 // glob walk (`bun run --filter`), before any concurrent
                 // resolver exists to rewrite the map.
-                let entry = bun_ptr::BackRef::<Entry>::from(
-                    core::ptr::NonNull::new(*val).expect("EntryStore slot"),
-                );
+                let entry = EntryLookup { entry: *val }.entry();
                 let kind = entry.kind(&FS::get().fs, true);
                 let fskind = match kind {
                     EntryKind::File => bun_sys::FileKind::File,
@@ -1564,7 +1562,7 @@ pub mod dir_entry_accessor {
                 // cached realpath is what records the entry as a symlink.
                 let symlink_target = entry.cache().symlink.as_bytes();
                 Ok(Some(walk::AccessorDirEntry {
-                    name: key,
+                    name: entry.base(),
                     kind: fskind,
                     symlink_target: (!symlink_target.is_empty()).then_some(symlink_target),
                 }))

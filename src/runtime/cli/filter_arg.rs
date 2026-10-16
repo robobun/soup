@@ -4,7 +4,8 @@ use bun_core::Global;
 use bun_core::Output;
 use bun_glob as glob;
 use bun_install::package_manager::workspace_selection::{
-    self, Candidate, NegatedWorkspaces, RootSelection, WorkspaceGraph, workspaces_entry,
+    self, Candidate, NegatedWorkspaces, RootLockfile, RootSelection, Since, WorkspaceGraph,
+    workspaces_entry,
 };
 use bun_parsers::json;
 use bun_paths::{Path, PathBuffer, dirname_or_root, without_trailing_sep};
@@ -224,6 +225,10 @@ pub(crate) fn select_packages(
         &candidates,
         graph.as_ref(),
         RootSelection::Implicit,
+        Since {
+            root: &root_dir,
+            root_lockfile: RootLockfile::ChangesAll,
+        },
     );
     let packages: Vec<WorkspacePackage> = discovered
         .into_iter()
@@ -238,6 +243,16 @@ pub(crate) fn select_packages(
         if ctx.workspaces {
             Output::err_generic("No workspace packages found", ());
             Global::exit(1);
+        }
+        // With a `[<rev>]` filter, nothing to run is what a branch without a change gives.
+        if selection.since && selection.unmatched_patterns.is_empty() {
+            bun_core::pretty_errorln!(
+                "{}, nothing to run",
+                bun_core::fmt::escape_control_chars(&workspace_selection::unmatched_message(
+                    &patterns
+                )),
+            );
+            Global::exit(0);
         }
         workspace_selection::error_unmatched(&patterns);
     }
