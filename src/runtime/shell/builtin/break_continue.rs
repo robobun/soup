@@ -3,7 +3,7 @@
 //! Neither unwinds anything itself. It leaves a [`LoopJump`] in the shell env
 //! and finishes; the sequencing states between here and the loop finish early
 //! on it (`Interpreter::interrupted`), and the loop takes it from there
-//! (`For::child_done`).
+//! (`For::child_done`, `While::child_done`).
 
 use std::io::Write as _;
 
