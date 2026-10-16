@@ -57,11 +57,15 @@ function envFor(dir: string) {
 const PROGRESS_LINES = /^(?:Resolving dependencies|Resolved, downloaded and extracted \[\d+\])\n/gm;
 
 // `--linker` is passed explicitly: an `install-strategy` in the user's ~/.npmrc overrides the bunfig linker.
-async function run(args: string[], dir: string, opts: { linker?: Linker; cwd?: string } = {}) {
+async function run(
+  args: string[],
+  dir: string,
+  opts: { linker?: Linker; cwd?: string; env?: Record<string, string> } = {},
+) {
   await using proc = Bun.spawn({
     cmd: [bunExe(), ...args, ...(opts.linker ? ["--linker", opts.linker] : [])],
     cwd: opts.cwd ?? dir,
-    env: envFor(dir),
+    env: { ...envFor(dir), ...opts.env },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -823,6 +827,157 @@ test.concurrent("install --filter with a pattern that matches nothing warns and 
 
   await expectWorkspaces(dir, [ROOT, API, WEB, PKG_A, PKG_B]);
   expect(await exists(join(dir, "node_modules", "a-dep"))).toBeFalse();
+});
+
+// `[rev]` selects the workspaces with a change since a git revision. What counts as a change is tested with
+// `bun run --filter` in test/cli/run/filter-workspace.test.ts; these are the commands that read bun.lock.
+const gitConfig = tempDir("bun-add-filter-gitconfig", { gitconfig: "" });
+afterAll(() => gitConfig[Symbol.dispose]());
+
+// Neither the machine's git config nor the user's, for the fixtures and for the git that bun starts.
+const gitEnv = {
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: join(String(gitConfig), "gitconfig"),
+  GIT_AUTHOR_NAME: "Test",
+  GIT_AUTHOR_EMAIL: "test@example.com",
+  GIT_COMMITTER_NAME: "Test",
+  GIT_COMMITTER_EMAIL: "test@example.com",
+};
+
+async function git(dir: string, ...args: string[]) {
+  await using proc = Bun.spawn({
+    cmd: ["git", ...args],
+    cwd: dir,
+    env: { ...bunEnv, ...gitEnv },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+  if (exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${stderr}`);
+}
+
+/** Makes `dir` a repository on `main` with one commit of everything that an install does not write. */
+async function commitAll(dir: string) {
+  await write(join(dir, ".gitignore"), "node_modules\n.bun-cache\n");
+  await git(dir, "init", "-q", "-b", "main");
+  await git(dir, "config", "core.autocrlf", "false");
+  await git(dir, "add", "-A");
+  await git(dir, "commit", "-q", "-m", "a commit");
+}
+
+const since = (args: string[], dir: string) => run(args, dir, { linker: "hoisted", env: gitEnv });
+
+test.concurrent("install --filter '[rev]' links what the changed workspaces depend on", async () => {
+  const dir = await makeMonorepo({
+    root: { ...ROOT, dependencies: { "basic-1": "1.0.0" } },
+    api: { name: "api", dependencies: { "no-deps": "2.0.0" } },
+    "pkg-a": { name: "pkg-a", dependencies: { "is-number": "1.0.0" } },
+  });
+  await commitAll(dir);
+  await write(join(dir, "packages", "api", "index.js"), "// changed\n");
+  const installed = () =>
+    Promise.all(["no-deps", "basic-1", "a-dep", "is-number"].map(name => exists(join(dir, "node_modules", name))));
+
+  {
+    const { stderr, exitCode } = await since(["install", "--filter", "[HEAD]"], dir);
+    expect(stderr).toBe("Saved lockfile\n");
+    expect(exitCode).toBe(0);
+    expect(await installed()).toStrictEqual([true, false, false, false]);
+  }
+
+  // bun.lock is a new file now. For the commands that write it, that is a change of no workspace.
+  {
+    const { stderr, exitCode } = await since(["install", "--filter", "[HEAD]"], dir);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(await installed()).toStrictEqual([true, false, false, false]);
+  }
+
+  // Another file of the root is a change of the root.
+  await write(join(dir, "README.md"), "# root\n");
+  {
+    const { stderr, exitCode } = await since(["install", "--filter", "[HEAD]"], dir);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(await installed()).toStrictEqual([true, true, false, false]);
+  }
+});
+
+test.concurrent("add --filter '[rev]' edits the changed workspaces, also once bun.lock has changed", async () => {
+  const dir = await makeMonorepo();
+  await installOk(dir, "hoisted");
+  await commitAll(dir);
+  await write(join(dir, "packages", "api", "index.js"), "// changed\n");
+
+  {
+    const before = await allPackageJsonTexts(dir);
+    const { stderr, exitCode } = await since(["add", "no-deps", "--filter", "[HEAD]"], dir);
+    expect(stderr).toBe("Saved lockfile\n");
+    expect(exitCode).toBe(0);
+    await expectAddedOnlyTo(dir, before, ["api"]);
+  }
+
+  // The first add changed bun.lock. The second one still writes to api alone: not to the root, not to the others.
+  {
+    const before = await allPackageJsonTexts(dir);
+    const { stderr, exitCode } = await since(["add", "is-number@1.0.0", "--filter", "...[HEAD]"], dir);
+    expect(stderr).toBe("Saved lockfile\n");
+    expect(exitCode).toBe(0);
+    await expectAddedOnlyTo(dir, before, ["api"], "is-number", "1.0.0");
+  }
+});
+
+test.concurrent("update --filter '[rev]' leaves the root alone when bun.lock is all that changed there", async () => {
+  const dir = await makeMonorepo({
+    root: { ...ROOT, dependencies: { "no-deps": "^1.0.0" } },
+    api: { name: "api", dependencies: { "no-deps": "^1.0.0" } },
+  });
+  await installOk(dir, "hoisted");
+  await commitAll(dir);
+  // What a branch does: one more dependency in api, which changes bun.lock too.
+  {
+    const { stderr, exitCode } = await since(["add", "is-number@1.0.0", "--filter", "api"], dir);
+    expect(stderr).toBe("Saved lockfile\n");
+    expect(exitCode).toBe(0);
+  }
+  const before = await allPackageJsonTexts(dir);
+
+  const { stderr, exitCode } = await since(["update", "--filter", "[HEAD]"], dir);
+  expect(stderr).not.toContain("error:");
+  expect(exitCode).toBe(0);
+
+  const after = await allPackageJsonTexts(dir);
+  expect(WORKSPACES.filter((_, i) => after[i] !== before[i])).toStrictEqual(["api"]);
+  expect((await pkg(dir, "api")).dependencies["no-deps"]).not.toBe("^1.0.0");
+});
+
+test.concurrent("when nothing changed since the revision, install links nothing and add is an error", async () => {
+  const dir = await makeMonorepo();
+  await installOk(dir, "hoisted");
+  await rm(join(dir, "node_modules"), { recursive: true, force: true });
+  await commitAll(dir);
+  const before = await allPackageJsonTexts(dir);
+
+  {
+    const { stderr, exitCode } = await since(["install", "--filter", "[HEAD]"], dir);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(await exists(join(dir, "node_modules", "a-dep"))).toBeFalse();
+  }
+
+  {
+    const { stderr, exitCode } = await since(["add", "no-deps", "--filter", "[HEAD]"], dir);
+    expect(stderr).toBe('error: No workspace packages matched the filter "[HEAD]"\n');
+    expect(exitCode).toBe(1);
+  }
+
+  {
+    const { stderr, exitCode } = await since(["add", "no-deps", "--filter", "[no-such-branch]"], dir);
+    expect(stderr).toStartWith('error: --filter "[no-such-branch]": git has no commit "no-such-branch"\n');
+    expect(exitCode).toBe(1);
+  }
+
+  expect(await allPackageJsonTexts(dir)).toStrictEqual(before);
 });
 
 test.concurrent("outdated --filter with relations", async () => {

@@ -5672,6 +5672,238 @@ Files: `src/runtime/server/ServerConfig.rs` (`expand_optional_route_params`),
 `docs/runtime/http/routing.mdx`, `test/js/bun/http/bun-serve-routes.test.ts`,
 `test/integration/bun-types/fixture/serve.ts`.
 
+### 2026-10-17: `--filter '[rev]'`, the workspaces changed since a git revision
+
+A monorepo could not run a script only where a branch changed something. `bun --filter '*' test`
+runs every workspace, so the CI of a repository with 40 packages runs 40 test suites for a pull
+request that touches one. pnpm, Turborepo, Nx and Lerna each have an answer. oven-sh/bun#27943 asks
+for one as `bun run --affected`, and its latest comment, from a repository that uses only Bun,
+calls it "the one piece we would otherwise adopt Turborepo or Nx for". Today `bun run --affected
+test` runs `test` in the current package and says nothing about the flag it dropped. Now:
+
+```sh
+# test what this branch changed, and what depends on it
+bun --filter '...[origin/main]' test
+
+# build the workspaces with a change in the working tree and what they depend on, in dependency order
+bun --filter '[HEAD]...' build
+
+# lint everything that did not change
+bun --filter '![origin/main]' lint
+
+# every command that takes --filter takes it
+bun outdated --filter '[v1.2.0]'
+bun publish --filter '[v1.2.0]'
+```
+
+```yaml
+# .github/workflows/test.yml, for pull requests
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- uses: oven-sh/setup-bun@v2
+- run: bun install --frozen-lockfile
+- run: bun run --if-present --filter "...[origin/$BASE]" test
+  env:
+    BASE: ${{ github.base_ref }}
+```
+
+It is pnpm's `[<since>]` selector, next to the `{dir}` and `...` selectors that upstream took from
+pnpm in oven-sh/bun#38333. `<rev>` is anything git resolves to a commit. What "changed" means:
+
+- The working tree against the merge base of `<rev>` and `HEAD`. Commits of the branch, staged
+  changes and plain edits count. So does a deleted file, and a file that moved counts for the
+  workspace it left too (git runs with `--no-renames`, or that one would not be listed). A commit
+  that only `<rev>` has does not count, so `[main]` keeps its meaning when `main` gets new commits.
+- Untracked files that git does not ignore.
+- A file belongs to the deepest workspace that contains it. A `package.json` without a name (the
+  `{"type": "module"}` inside a package) is not selected, as it is not by `*`, and leaves its files
+  to the workspace around it.
+- `...[rev]` adds the dependents, `[rev]...` the dependencies, `^` leaves the changed ones out, `!`
+  subtracts, and several patterns unite, as for every other selector.
+
+Why a selector and not the flag of the issue. A design check ran before the code. It compared six
+shapes, the reporter's own pull request among them (oven-sh/bun#27944: `--affected`, `--base`,
+`--head` and `--list` on `bun run`, written in Zig and closed by the stale sweep after the Rust
+rewrite, without a review). It also ran pnpm 12.14.0, Turborepo 2.11.8, Nx 23.3.0 and Lerna 10.1.1
+on scratch repositories behind a `git` that logs its arguments. What decided it:
+
+- `workspace_selection::parse()` is the one function that all twelve `--filter` entry points
+  reach: `bun run` and its `--parallel` and `--sequential` forms, install, add, remove, update with
+  and without names, `update -i`, outdated, prune, publish and `pm licenses`. One arm there gives
+  the selector to all of them. A flag on `bun run` reaches two.
+- A flag is a row in the table that every `bun <file>` start looks flags up in. The selector adds
+  no row. Without `[...]` in a pattern it costs one byte compare in `parse()` and one branch in
+  `select()`.
+- `--base` and `--head` would become top-level flags of `bun`, and a default base (`main`?
+  `origin/main`?) is a guess that is wrong in a fresh CI clone.
+
+The price is a change to the filter grammar, and it is the question for upstream. A filter that is
+only a bracket class, such as `--filter '[ab]'`, is a glob over one-letter package names today and
+a git revision after this commit. It fails loudly (`git has no commit "ab"`, with a note that says
+what brackets mean now) unless the repository has a ref of that name. oven-sh/bun#38333 made the
+same cut for a whole-pattern `{...}`. Brackets inside a longer glob (`'pkg-[ab]'`, `'[ab]*'`,
+`'[ab][cd]'`) are classes as before, and a test pins that. pnpm also has `{dir}[rev]` and
+`name[rev]`. Neither is in this commit: `name[rev]` can never be told from `pkg-[ab]`, and
+`{dir}[rev]` would change what `{x}[y]` means a second time, so it is better decided together with
+the first cut.
+
+How it is built:
+
+- `changed_since.rs` (new, in `bun_install` next to the selection code) asks git with three
+  processes for each distinct `<rev>`. `git rev-parse` with `--is-shallow-repository --show-cdup`
+  and `<rev>...HEAD` prints whether the clone is shallow, the way up to the top of the work tree
+  and, as its `^` lines, the merge base. `git diff` with `--name-only -z --no-renames` and the
+  merge base lists what differs in the working tree. `git ls-files --others --exclude-standard -z`,
+  run from the top, lists the untracked files of the whole work tree. The paths are joined onto
+  the workspace root, so they compare byte for byte with the workspace directories whatever
+  `git rev-parse --show-toplevel` would spell.
+- git runs in the workspace root, not in the directory the command was started in. A member can be
+  a submodule or hold a vendored clone, and from inside of it another repository would answer.
+- The answer is kept for the process. `bun update <glob> --filter` selects twice, and
+  `bun update -i` selects again after it has written a `package.json`. Both have to see the same
+  workspaces.
+- The text between the brackets is checked before any process starts: a leading `-`, `^` or `:`,
+  a `..` and an empty revision are errors that repeat the pattern, so no option reaches git. The
+  `diff` does not follow the user's `diff.relative`, `diff.autoRefreshIndex` or submodule
+  settings, and no pathspec is used, so `GIT_LITERAL_PATHSPECS` changes nothing. A warning of git
+  about the revision (a name that is both a tag and a branch) is passed on.
+- A missing merge base is an error. pnpm and Nx fall back to `<rev>` itself there, which makes the
+  selection depend on the depth of the clone, and these workspaces are what `bun add` and
+  `bun publish` then write to. git missing, no repository, an unknown revision and a `HEAD`
+  without a commit each have their own message. All of them exit with 1 before anything runs.
+- A shallow clone can have a merge base that is the wrong one: an older common ancestor that a
+  merged side branch still reaches, while the real one is behind a commit that was cut off. So in
+  a shallow clone a merge base counts when it is `<rev>` or `HEAD` itself (an annotated tag is
+  the commit it names), or when it is the only one and every commit between it and the two has
+  its parents (one more process, `git rev-list --parents`, only in that case). Everything else is
+  an error with a note about `git fetch --unshallow`. That refuses clones that would have been
+  right: a depth that reaches the point where the branch left is not enough when a side branch
+  that was merged later ends in a commit that was cut off, which is what merged pull requests
+  look like. The full history always works, and so does `fetch-depth: 2` with `[HEAD^1]` on the
+  merge commit that GitHub checks out for a pull request.
+- A changed `bun.lock` in the root. For `bun run` it selects every workspace: any of them may
+  resolve to other versions, and a pull request that only updates the lockfile must not pass with
+  no test run. For the commands that read and write `bun.lock` it is a change of no workspace.
+  Otherwise the second `bun add --filter '[main]'` of a branch would write to the root or to every
+  `package.json` because the first one changed the lockfile, `bun update --filter '[main]'` would
+  rewrite the root's ranges, and `bun publish --filter '[v1.2.0]'` would take the root along.
+- A submodule or an untracked nested repository is one path for git. It changes the workspace it
+  is, or the workspace it is in, and every workspace inside of it.
+- Nothing changed. `bun --filter '[main]' test` on a branch without a change exits with 0, which
+  is what a CI step needs, and prints
+  `No workspace packages matched the filter "[main]", nothing to run`. A `[rev]` pattern that
+  matches nothing is never reported as unmatched, so `bun install` and `bun outdated` stay quiet.
+  A name that matches nothing next to it is still an error, and so is a `[rev]` filter when there
+  is no workspace to select from (a typo in `"workspaces"`). The commands for which an empty
+  selection is documented as an error (add, remove, update, prune, publish, `pm licenses`) still
+  exit with 1.
+- Upper-case letters in a directory name. `bun run --filter` walked the workspaces through the
+  resolver's directory cache and got each name in lower case. On Linux a workspace in
+  `packages/Core` made every filtered run fail with `error: FileNotFound`. On macOS and Windows
+  the run worked and the directory was spelled `packages/core`, which no path from git matches, so
+  a change there would have selected nothing and exited with 0. The walk gets the real name now.
+  This is the change of oven-sh/bun#29941, which is open upstream, and the hunk in
+  `src/resolver/lib.rs` is its diff unchanged, so it falls out of this patch when that lands. With
+  it, a `./path` filter has to spell the directory as the disk does on those two systems.
+
+What it costs those who do not use it, measured with a `git` in front of the real one that logs
+each call: no git process on eleven entry points with `--filter a`, three with `--filter '[HEAD]'`,
+also for `bun update 'a*' --filter '[HEAD]'`, which selects twice. A test pins both numbers for
+`bun run`. The rest is from the code: a `Selector` grows by 16 bytes on the stack, `Selection` by
+one `bool`, `select()` by one argument. There is no release build of this commit, so no
+instruction counts and no binary size.
+
+The review. Five readers went through the commit before the push, each with one subject (git
+semantics, the commands and their selection rules, the Rust, the tests and docs, robustness), and
+a second reader tried to refute each finding against the debug build. 39 findings came back and
+none was refuted, many of them the same fault seen from two sides. What they changed in this
+commit: git ran in the start directory (from a submodule member the selection was empty, with
+exit 0); a submodule with workspaces inside selected none of them; a `{"type": "module"}`
+`package.json` took the files of its package out of every selection; a typo in `"workspaces"` was
+"nothing to run" with exit 0; the wrong merge base in a shallow clone; `diff.ignoreSubmodules`,
+`diff.autoRefreshIndex` and `GIT_LITERAL_PATHSPECS` changed the answer; a changed `bun.lock`
+selected the root for update and publish; a work tree at `/`; one directory listed by two
+`"workspaces"` entries; `[HEAD]` in a repository without a commit blamed a shallow clone; the CI
+example pasted `github.base_ref` into the shell line and failed when a changed workspace had no
+`test` script. Each fault in the code has a test now, except the work tree at `/`. Three readers
+then went through the rework in the same way and found 16 more. One was a wrong answer without
+an error: in a shallow clone with two merge bases, the check for missing history passed. One
+refused an annotated tag that `HEAD` reaches, because git prints the id of the tag and not of the
+commit. Both are fixed and tested. The docs gained `--frozen-lockfile` in the CI example, since an
+install that writes `bun.lock` makes the next step run everything. The rest were the note about
+shallow clones in a complete one, a Windows detail of a test, sentences in the docs, and the two
+cases of `GIT_DIR` and of partial clones that are under "Not done". The full self-review workflow
+was not run: it starts with the question whether the change should exist, which the design check
+had answered, and asks GitHub a few hundred times on a token that is shared.
+
+Tests. 48 new tests in `test/cli/run/filter-workspace.test.ts` build real repositories: each
+relation and combination, staged, deleted, untracked, ignored and moved files, a branch whose
+`main` moved on, nested workspaces, a workspace root below the top of the repository, a start
+inside another repository, a submodule, a nested repository with workspaces in it, the lockfile
+rule, the user's git settings, four shallow clones, the exit code when nothing changed, the error
+cases, and the count of git processes. 46 of them fail on the released 1.4.3-canary.1. The two
+that pass there are guards: classes inside a longer glob, and the error when there is no workspace
+at all. Four more in `test/cli/install/bun-add-filter.test.ts` cover install, add and update
+against the local registry, including the second `bun add` after `bun.lock` changed. All four fail
+on the released binary. On the debug build: `filter-workspace` (173 pass, 2 Windows-only skips),
+`bun-add-filter` (148 pass, 1 skip), the `--filter` tests of `bun-pm-licenses` (7), `bun-prune`
+(13) and `bun-update` (43), and `multi-run` (132 with `--timeout 60000`; with the default 5
+seconds four tests that never reach the selection ran out of time in the debug build).
+`cargo clippy` is clean for `bun_install`, `bun_resolver` and `bun_runtime`.
+`bun run rust:check-all x86_64-pc-windows-msvc` passes. The source lints pass with the released
+binary (182), as the fork's workflow runs them.
+
+Not done, and not checked:
+
+- `--affected` as a flag, and a way to only list the selection (`--list` in the issue). No
+  `--filter` command prints its selection without doing its work, so a CI job matrix still needs a
+  script.
+- `{dir}[rev]` (above), and a range such as turbo's `[main...HEAD]`: the comparison is always with
+  the working tree.
+- The lockfile rule is all or nothing. Reading the `bun.lock` of the merge base and selecting only
+  the workspaces whose resolved dependencies differ would narrow it. A changed root
+  `tsconfig.json` or root `package.json` selects nothing in `bun run`, because nothing says which
+  workspaces use them. A changed submodule selects every workspace inside of it, where asking the
+  submodule would select fewer.
+- A workspace without a name is not selected by a change in it, as it is not by `*`. Under
+  `bun add` and `bun remove`, `![rev]` does not take out a root that another pattern named, as
+  `!*` does not.
+- `bun install --filter '[rev]'` selects after it has resolved, like every filter of install, and
+  `--lockfile-only` never selects.
+- Windows and macOS were not run. On Windows the three git calls need a uv loop before
+  `bun run --filter` has made its own, and `changed_since.rs` keeps one of its own for the
+  process. That code is type-checked for the Windows target and nothing more. If the `git` in
+  `PATH` is a `.cmd` file there, the revision reaches `cmd.exe`, as it does for
+  `bun test --changed`.
+- A workspace whose directory is a symlink to a place outside of its parent is compared by the
+  path of the link, and git reports the path of the target.
+- In a shallow clone, a first commit between the merge base and the two commits looks like a
+  commit that was cut off, and more history is asked for. A real criss-cross merge (two merge
+  bases) is refused there too.
+- git exports `GIT_DIR` without `GIT_WORK_TREE` to a hook, an alias or `git rebase -x` that runs
+  in a linked worktree. If the workspace root is below the top of the repository then, git takes
+  the root for the top and every workspace is selected. `unset GIT_DIR` in the hook helps.
+- In a partial clone (`--filter=blob:none`), `git diff` may fetch blobs from the remote.
+- `git diff` may rewrite `.git/index` when it refreshes it, as it does for `bun lint --changed`.
+
+Rebase notes: this run is the timer fire of 2026-10-13, delivered on the 16th. It started on
+upstream 5866b5f13d, where the stack of 54 patches already was, so its own rebase was a no-op.
+While it worked, the run of the entry above rebased the stack onto upstream b28212a12c (seven
+commits later, with a WebKit upgrade and oven-sh/bun#45450) and pushed. This run found that push
+when it fetched before its own. It took that stack as it is and put this commit on top. None of
+the seven upstream commits touches a file of this patch, and the commit applied without a conflict
+outside of this file. It was built again on that base, and the test files named above pass there
+with the same counts, as do the source lints, `cargo clippy` and the check for the Windows target.
+Upstream has six commits more since (7f3bc6a5e0). The stack is not on them.
+
+Files: `src/install/PackageManager/changed_since.rs` (new),
+`src/install/PackageManager/workspace_selection.rs`, `src/install/PackageManager.rs`,
+`src/install/PackageManager/add_remove_with_filter.rs`, `src/runtime/cli/filter_arg.rs`,
+`src/resolver/lib.rs` (the hunk of oven-sh/bun#29941), `docs/pm/filter.mdx`,
+`docs/runtime/index.mdx`, `test/cli/run/filter-workspace.test.ts`,
+`test/cli/install/bun-add-filter.test.ts`.
+
 ## Dropped
 
 Nothing yet.

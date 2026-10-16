@@ -57,6 +57,8 @@ pub mod Command {
 pub mod add_catalog;
 #[path = "PackageManager/add_remove_with_filter.rs"]
 pub mod add_remove_with_filter;
+#[path = "PackageManager/changed_since.rs"]
+mod changed_since;
 #[path = "PackageManager/CommandLineArguments.rs"]
 pub mod command_line_arguments;
 #[path = "PackageManager/install_with_manager.rs"]

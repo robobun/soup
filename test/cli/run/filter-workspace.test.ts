@@ -2,10 +2,21 @@ import { spawnSync } from "bun";
 import { install_test_helpers } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isLinux, isWindows, runBunInstall, tempDir, tempDirWithFiles } from "harness";
-import { existsSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { constants } from "os";
 import { join } from "path";
+import { pathToFileURL } from "url";
 
 const { parseLockfile } = install_test_helpers;
 
@@ -1029,6 +1040,590 @@ describe("selectors", () => {
       target_pattern: [/scripta/],
       antipattern: [/malformed1/],
     });
+  });
+});
+
+describe.concurrent("'[rev]' selects the workspaces changed since a git revision", () => {
+  // The machine's and the user's git config do not shape the fixtures.
+  const gitConfig = tempDirWithFiles("filter-since-gitconfig", { gitconfig: "" });
+  const env: Record<string, string | undefined> = {
+    ...bunEnv,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: join(gitConfig, "gitconfig"),
+    GIT_AUTHOR_NAME: "Test",
+    GIT_AUTHOR_EMAIL: "test@example.com",
+    GIT_COMMITTER_NAME: "Test",
+    GIT_COMMITTER_EMAIL: "test@example.com",
+  };
+
+  async function exec(cmd: string[], cwd: string, more: Record<string, string | undefined> = {}) {
+    await using proc = Bun.spawn({ cmd, cwd, env: { ...env, ...more }, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  async function git(cwd: string, ...args: string[]) {
+    const { stdout, stderr, exitCode } = await exec(["git", ...args], cwd);
+    if (exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${stderr}`);
+    return stdout;
+  }
+
+  async function commit(root: string) {
+    await git(root, "add", "-A");
+    await git(root, "commit", "-q", "-m", "a commit");
+  }
+
+  const member = (name: string, dependencies?: Record<string, string>) => ({
+    "package.json": JSON.stringify({ name, dependencies, scripts: { present: `echo ran-${name}` } }),
+    "index.js": `// ${name}\n`,
+  });
+
+  // Edges: web -> api -> shared. lib and docs are on their own.
+  const members = () => ({
+    web: member("web", { api: "workspace:*" }),
+    api: member("api", { shared: "workspace:*" }),
+    shared: member("shared"),
+    lib: member("lib"),
+    docs: member("docs"),
+  });
+
+  const workspace = (packages: Record<string, unknown> = members(), workspaces = ["packages/*"]) => ({
+    "package.json": JSON.stringify({ name: "ws", workspaces, scripts: { present: "echo ran-root" } }),
+    ".gitignore": "*.log\n",
+    packages,
+  });
+
+  /** A repository on `main` with `files` in one commit. */
+  async function repository(files: Record<string, unknown> = workspace()) {
+    const dir = tempDir("filter-since", files as Parameters<typeof tempDir>[1]);
+    const root = realpathSync(String(dir));
+    await git(root, "init", "-q", "-b", "main");
+    await git(root, "config", "core.autocrlf", "false");
+    await commit(root);
+    return { root, [Symbol.dispose]: () => dir[Symbol.dispose]() };
+  }
+
+  const write = (root: string, name: string, text: string) => {
+    mkdirSync(join(root, name, ".."), { recursive: true });
+    writeFileSync(join(root, name), text);
+  };
+
+  /** The workspaces whose `present` script ran, sorted. */
+  async function ran(cwd: string, args: string[], more?: Record<string, string | undefined>) {
+    const { stdout, stderr, exitCode } = await exec([bunExe(), ...args, "present"], cwd, more);
+    const names = [...new Set(stdout.match(/ran-[\w-]+/g))].map(line => line.slice("ran-".length)).sort();
+    return { names, stderr, exitCode };
+  }
+
+  const filters = (...patterns: string[]) => ["run", ...patterns.flatMap(pattern => ["--filter", pattern])];
+
+  /** Like `ran`, for filters that have to select something. */
+  async function selected(cwd: string, ...patterns: string[]) {
+    const { names, stderr, exitCode } = await ran(cwd, filters(...patterns));
+    expect({ exitCode, stderr: exitCode === 0 ? "" : stderr }).toEqual({ exitCode: 0, stderr: "" });
+    return names;
+  }
+
+  // api is the one workspace with an edit. web depends on it, and it depends on shared.
+  test.each([
+    [["[HEAD]"], ["api"]],
+    [["...[HEAD]"], ["api", "web"]],
+    [["[HEAD]..."], ["api", "shared"]],
+    [["...^[HEAD]"], ["web"]],
+    [["[HEAD]^..."], ["shared"]],
+    [["![HEAD]"], ["docs", "lib", "shared", "web"]],
+    [
+      ["*", "![HEAD]"],
+      ["docs", "lib", "shared", "web"],
+    ],
+    [["...[HEAD]", "!web"], ["api"]],
+    [
+      ["[HEAD]", "docs"],
+      ["api", "docs"],
+    ],
+    [
+      ["[HEAD]", "{packages/lib}"],
+      ["api", "lib"],
+    ],
+  ])("with an edit in api, %j runs %j", async (patterns, expected) => {
+    using repo = await repository();
+    write(repo.root, "packages/api/index.js", "// edited\n");
+
+    expect(await selected(repo.root, ...patterns)).toEqual(expected);
+  });
+
+  test("it works from a workspace directory, with --parallel and without `run`", async () => {
+    using repo = await repository();
+    write(repo.root, "packages/api/index.js", "// edited\n");
+
+    const [fromMember, parallel, bare] = await Promise.all([
+      ran(join(repo.root, "packages", "docs"), filters("...[HEAD]")),
+      ran(repo.root, ["run", "--parallel", "--filter", "...[HEAD]"]),
+      ran(repo.root, ["--filter", "...[HEAD]"]),
+    ]);
+    expect([fromMember, parallel, bare].map(({ names, exitCode }) => ({ names, exitCode }))).toEqual(
+      Array(3).fill({ names: ["api", "web"], exitCode: 0 }),
+    );
+  });
+
+  test("staged, deleted and untracked files count, ignored files do not", async () => {
+    using repo = await repository();
+    write(repo.root, "packages/web/index.js", "// staged\n");
+    await git(repo.root, "add", "packages/web/index.js");
+    rmSync(join(repo.root, "packages", "lib", "index.js"));
+    write(repo.root, "packages/docs/new.md", "untracked\n");
+    write(repo.root, "packages/shared/debug.log", "ignored\n");
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["docs", "lib", "web"]);
+  });
+
+  test("a file that moved to another workspace changes both", async () => {
+    using repo = await repository();
+    await git(repo.root, "mv", "packages/api/index.js", "packages/lib/moved.js");
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["api", "lib"]);
+  });
+
+  test("the comparison is with the merge base, so what only the revision has does not count", async () => {
+    using repo = await repository();
+    await git(repo.root, "checkout", "-q", "-b", "feature");
+    write(repo.root, "packages/api/index.js", "// committed on the branch\n");
+    await commit(repo.root);
+    await git(repo.root, "checkout", "-q", "main");
+    write(repo.root, "packages/docs/index.js", "// committed on main after the branch left\n");
+    await commit(repo.root);
+    await git(repo.root, "checkout", "-q", "feature");
+    write(repo.root, "packages/lib/index.js", "// not committed\n");
+
+    expect(
+      await Promise.all([
+        selected(repo.root, "[main]"),
+        selected(repo.root, "...[main]"),
+        selected(repo.root, "[HEAD~1]"),
+        selected(repo.root, "[HEAD]"),
+      ]),
+    ).toEqual([["api", "lib"], ["api", "lib", "web"], ["api", "lib"], ["lib"]]);
+  });
+
+  test("when nothing changed, nothing runs and the exit code is 0", async () => {
+    using repo = await repository();
+
+    expect(await ran(repo.root, filters("...[HEAD]"))).toEqual({
+      names: [],
+      stderr: 'No workspace packages matched the filter "...[HEAD]", nothing to run\n',
+      exitCode: 0,
+    });
+  });
+
+  test("a file of the root changes no workspace, and a name that matches nothing is still an error", async () => {
+    using repo = await repository();
+    // `bun run --filter` runs members. The root is not one of them.
+    write(repo.root, "README.md", "# ws\n");
+
+    expect(
+      await Promise.all([ran(repo.root, filters("[HEAD]", "![main]")), ran(repo.root, filters("[HEAD]", "nope"))]),
+    ).toEqual([
+      {
+        names: [],
+        stderr: 'No workspace packages matched the filters "[HEAD]", "![main]", nothing to run\n',
+        exitCode: 0,
+      },
+      {
+        names: [],
+        stderr: 'error: No workspace packages matched the filters "[HEAD]", "nope"\n',
+        exitCode: 1,
+      },
+    ]);
+  });
+
+  const lockfile = (name: string) => JSON.stringify({ lockfileVersion: 1, workspaces: { "": { name } } }) + "\n";
+
+  test("a changed bun.lock at the root changes every workspace", async () => {
+    using repo = await repository({ ...workspace(), "bun.lock": lockfile("ws") });
+    write(repo.root, "bun.lock", lockfile("ws") + "\n");
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["api", "docs", "lib", "shared", "web"]);
+  });
+
+  test("a bun.lock that is not the one of the root is a file like any other", async () => {
+    using repo = await repository(
+      workspace({ ...members(), docs: { ...member("docs"), "bun.lock": lockfile("docs") } }),
+    );
+    write(repo.root, "packages/docs/bun.lock", lockfile("docs") + "\n");
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["docs"]);
+  });
+
+  test("a new bun.lockb at the root changes every workspace", async () => {
+    using repo = await repository();
+    write(repo.root, "bun.lockb", "a binary lockfile");
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["api", "docs", "lib", "shared", "web"]);
+  });
+
+  test("the deepest workspace owns a file", async () => {
+    using repo = await repository(
+      workspace({ ...members(), web: { ...member("web"), plugins: { seo: member("seo") } } }, [
+        "packages/*",
+        "packages/web/plugins/*",
+      ]),
+    );
+    write(repo.root, "packages/web/plugins/seo/index.js", "// edited\n");
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["seo"]);
+  });
+
+  test("the workspace root can be below the top of the repository", async () => {
+    using repo = await repository({ mono: workspace(), other: { "notes.txt": "notes\n" } });
+    write(repo.root, "mono/packages/api/index.js", "// edited\n");
+    write(repo.root, "other/notes.txt", "more notes\n");
+
+    expect(await selected(join(repo.root, "mono"), "[HEAD]")).toEqual(["api"]);
+  });
+
+  test("the git settings of the user and GIT_LITERAL_PATHSPECS do not change the answer", async () => {
+    using repo = await repository({ mono: workspace(), other: { "notes.txt": "notes\n" } });
+    using settings = tempDir("filter-since-settings", {
+      gitconfig: "[diff]\n\trelative = true\n\tautoRefreshIndex = false\n\tignoreSubmodules = all\n",
+    });
+    write(repo.root, "mono/packages/api/index.js", "// edited\n");
+    write(repo.root, "mono/packages/docs/new.md", "untracked\n");
+    write(repo.root, "other/notes.txt", "more notes\n");
+    // The same content with another time: git has to look into the file to know.
+    utimesSync(join(repo.root, "mono/packages/lib/index.js"), new Date(2001, 0, 1), new Date(2001, 0, 1));
+
+    const { names, exitCode } = await ran(join(repo.root, "mono"), filters("[HEAD]"), {
+      GIT_CONFIG_GLOBAL: join(String(settings), "gitconfig"),
+      GIT_LITERAL_PATHSPECS: "1",
+    });
+    expect({ names, exitCode }).toEqual({ names: ["api", "docs"], exitCode: 0 });
+  });
+
+  test("git runs in the workspace root, also when the command starts in another repository", async () => {
+    using repo = await repository({ ...workspace(), ".gitignore": "*.log\nvendor/\n" });
+    write(repo.root, "packages/api/index.js", "// edited\n");
+    // A repository of its own inside of a workspace, as a vendored clone or a submodule is.
+    const nested = join(repo.root, "packages", "lib", "vendor");
+    write(repo.root, "packages/lib/vendor/file.txt", "vendored\n");
+    await git(nested, "init", "-q", "-b", "main");
+    await commit(nested);
+
+    expect(await selected(nested, "...[HEAD]")).toEqual(["api", "web"]);
+  });
+
+  test("a nested repository that git lists as one path changes the workspaces inside of it", async () => {
+    using repo = await repository(workspace(members(), ["packages/*", "vendor/*/*"]));
+    for (const name of ["fmt", "lint"]) {
+      write(repo.root, `vendor/tools/${name}/package.json`, member(name)["package.json"]);
+    }
+    const nested = join(repo.root, "vendor", "tools");
+    await git(nested, "init", "-q", "-b", "main");
+    await commit(nested);
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["fmt", "lint"]);
+  });
+
+  test("a workspace that is a submodule changes with an untracked file in it", async () => {
+    const both = await Promise.all([repository({ ...member("sub") }), repository()]);
+    using library = both[0];
+    using repo = both[1];
+    const url = pathToFileURL(library.root).href;
+    await git(repo.root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", url, "packages/sub");
+    await commit(repo.root);
+    using settings = tempDir("filter-since-settings", { gitconfig: "[diff]\n\tignoreSubmodules = all\n" });
+    write(repo.root, "packages/sub/new.js", "untracked\n");
+
+    // Started inside of the submodule, which is a repository of its own without a change that it knows of.
+    const { names, exitCode } = await ran(join(repo.root, "packages", "sub"), filters("[HEAD]"), {
+      GIT_CONFIG_GLOBAL: join(String(settings), "gitconfig"),
+    });
+    expect({ names, exitCode }).toEqual({ names: ["sub"], exitCode: 0 });
+  });
+
+  test('a workspace that two "workspaces" entries list is one workspace', async () => {
+    using repo = await repository(workspace(members(), ["packages/*", "packages/api"]));
+    write(repo.root, "packages/api/index.js", "// edited\n");
+
+    expect(await selected(repo.root, "![HEAD]")).toEqual(["docs", "lib", "shared", "web"]);
+  });
+
+  test("a package.json without a name inside of a workspace leaves its files to that workspace", async () => {
+    using repo = await repository(
+      workspace(
+        {
+          ...members(),
+          api: {
+            ...member("api", { shared: "workspace:*" }),
+            esm: { "package.json": JSON.stringify({ type: "module" }), "index.js": "" },
+          },
+        },
+        ["packages/**"],
+      ),
+    );
+    write(repo.root, "packages/api/esm/index.js", "// edited\n");
+
+    expect(await Promise.all([selected(repo.root, "...[HEAD]"), selected(repo.root, "![HEAD]")])).toEqual([
+      ["api", "web"],
+      ["docs", "lib", "shared", "web"],
+    ]);
+  });
+
+  test("without a workspace to select from, it is the error of every other filter", async () => {
+    using repo = await repository(workspace(members(), ["pakages/*"]));
+    write(repo.root, "packages/api/index.js", "// edited\n");
+
+    expect(await ran(repo.root, filters("...[HEAD]"))).toEqual({
+      names: [],
+      stderr: 'error: No workspace packages matched the filter "...[HEAD]"\n',
+      exitCode: 1,
+    });
+  });
+
+  test("a workspace directory with an upper-case letter in its name", async () => {
+    using repo = await repository(workspace({ Core: member("core"), lower: member("lower") }));
+    write(repo.root, "packages/Core/index.js", "// edited\n");
+
+    expect(await selected(repo.root, "[HEAD]")).toEqual(["core"]);
+  });
+
+  test("a class inside a longer glob still matches package names, and needs no repository", async () => {
+    using dir = tempDir("filter-class", workspace({ ...members(), db: member("db") }));
+    const root = String(dir);
+
+    expect(
+      await Promise.all([
+        selected(root, "[al]*"),
+        selected(root, "we[b]"),
+        selected(root, "[ad][po]*"),
+        selected(root, "[cd][ab]"),
+      ]),
+    ).toEqual([["api", "lib"], ["web"], ["api", "docs"], ["db"]]);
+  });
+
+  test.each([
+    ["[nope]", 'error: --filter "[nope]": git has no commit "nope"\n'],
+    ["[nope*]", 'error: --filter "[nope*]": git has no commit "nope*"\n'],
+    [
+      "...[main..HEAD]",
+      'error: --filter "...[main..HEAD]": "main..HEAD" is a range, and a filter takes one revision\n',
+    ],
+    ["[main...HEAD]", 'error: --filter "[main...HEAD]": "main...HEAD" is a range, and a filter takes one revision\n'],
+    ["[-p]", 'error: --filter "[-p]": "-p" is not a git revision\n'],
+    ["[^HEAD]", 'error: --filter "[^HEAD]": "^HEAD" is not a git revision\n'],
+    ["[:/edited]", 'error: --filter "[:/edited]": a revision that starts with ":" is not supported\n'],
+    ["![]", 'error: --filter "![]" is missing a git revision\n'],
+  ])("%s is an error and runs nothing", async (pattern, message) => {
+    using repo = await repository();
+    write(repo.root, "packages/api/index.js", "// edited\n");
+
+    const { names, stderr, exitCode } = await ran(repo.root, filters(pattern, "*"));
+    expect({ names, error: stderr.slice(0, message.length), exitCode }).toEqual({
+      names: [],
+      error: message,
+      exitCode: 1,
+    });
+  });
+
+  test("no option reaches git through the revision", async () => {
+    using repo = await repository();
+    write(repo.root, "packages/api/index.js", "// edited\n");
+    const output = join(repo.root, "written-by-git");
+
+    const { names, stderr, exitCode } = await ran(repo.root, filters(`[--output=${output}]`));
+    expect({ names, exitCode, written: existsSync(output) }).toEqual({ names: [], exitCode: 1, written: false });
+    expect(stderr).toStartWith(`error: --filter "[--output=${output}]": "--output=${output}" is not a git revision\n`);
+  });
+
+  test("without git in PATH it is an error", async () => {
+    using dir = tempDir("filter-since-no-git", workspace());
+
+    expect(await ran(String(dir), filters("[HEAD]"), { PATH: "", Path: "" })).toEqual({
+      names: [],
+      stderr: 'error: --filter "[HEAD]" needs git, and git is not in PATH\n',
+      exitCode: 1,
+    });
+  });
+
+  test("a warning of git about the revision is passed on", async () => {
+    using repo = await repository();
+    await git(repo.root, "tag", "twice");
+    await git(repo.root, "branch", "twice");
+    write(repo.root, "packages/api/index.js", "// edited\n");
+
+    const { names, stderr, exitCode } = await ran(repo.root, filters("[twice]"));
+    expect({ names, exitCode }).toEqual({ names: ["api"], exitCode: 0 });
+    expect(stderr).toContain(`warn: --filter "[twice]": refname 'twice' is ambiguous.\n`);
+  });
+
+  test("outside of a repository it is an error", async () => {
+    using dir = tempDir("filter-since-no-repository", workspace());
+    const root = realpathSync(String(dir));
+
+    const { names, stderr, exitCode } = await ran(root, filters("[HEAD]"), {
+      GIT_CEILING_DIRECTORIES: join(root, ".."),
+    });
+    expect({ names, exitCode }).toEqual({ names: [], exitCode: 1 });
+    expect(stderr).toStartWith('error: --filter "[HEAD]" needs a git repository: ');
+  });
+
+  test("a revision without a common ancestor is an error, and so is a HEAD without a commit", async () => {
+    using repo = await repository();
+    await git(repo.root, "checkout", "-q", "--orphan", "unborn");
+
+    expect(await Promise.all([ran(repo.root, filters("[main]")), ran(repo.root, filters("[HEAD]"))])).toEqual([
+      { names: [], stderr: 'error: --filter "[main]": HEAD is not a commit yet\n', exitCode: 1 },
+      { names: [], stderr: 'error: --filter "[HEAD]": HEAD is not a commit yet\n', exitCode: 1 },
+    ]);
+
+    // A tree of its own: with the tree of main, a commit in the same second would be the commit of main.
+    write(repo.root, "packages/lib/index.js", "// a history without main\n");
+    await commit(repo.root);
+    // The note about a shallow clone is for a shallow clone.
+    expect(await ran(repo.root, filters("...[main]"))).toEqual({
+      names: [],
+      stderr: 'error: --filter "...[main]": "main" and HEAD have no common ancestor in this clone\n',
+      exitCode: 1,
+    });
+  });
+
+  describe("in a shallow clone", () => {
+    // main: init, B, m1, m2, m3, a merge of side, tip. side leaves at init, feature and other at B.
+    async function source() {
+      const repo = await repository();
+      // Every file is in the first commit, so a commit is one process.
+      const edit = async (file: string, text: string) => {
+        write(repo.root, file, `// ${text}\n`);
+        await git(repo.root, "commit", "-q", "-a", "-m", text);
+      };
+      await git(repo.root, "checkout", "-q", "-b", "side");
+      await edit("packages/docs/index.js", "side");
+      await git(repo.root, "checkout", "-q", "main");
+      await edit("packages/lib/index.js", "B");
+      await git(repo.root, "checkout", "-q", "-b", "feature");
+      await edit("packages/api/index.js", "feature");
+      await git(repo.root, "checkout", "-q", "-b", "other", "main");
+      await edit("packages/shared/index.js", "other");
+      await git(repo.root, "checkout", "-q", "main");
+      for (const name of ["m1", "m2", "m3"]) await edit(".gitignore", name);
+      await git(repo.root, "merge", "-q", "--no-ff", "-m", "a merge", "side");
+      await edit(".gitignore", "tip");
+      return repo;
+    }
+
+    /** A clone of `branch` with `depth` commits of it, and as many of each of `refs`. */
+    async function shallow(from: string, depth: number, branch: string, ...refs: string[]) {
+      const dir = tempDir("filter-since-shallow", {});
+      const root = join(realpathSync(String(dir)), "clone");
+      const url = pathToFileURL(from).href;
+      await git(String(dir), "clone", "-q", "--depth", `${depth}`, "--branch", branch, url, root);
+      if (refs.length > 0) await git(root, "fetch", "-q", "--depth", `${depth}`, "origin", ...refs);
+      return { root, [Symbol.dispose]: () => dir[Symbol.dispose]() };
+    }
+
+    const remote = (branch: string) => `${branch}:refs/remotes/origin/${branch}`;
+    const cannotTell =
+      'error: --filter "[origin/main]": this shallow clone cannot tell where "origin/main" and HEAD parted\n';
+
+    test("a merge base is taken when no history is missing up to it", async () => {
+      using repo = await source();
+      using clone = await shallow(repo.root, 2, "feature", remote("other"));
+
+      // B is the last commit the clone has of either branch, and both reach it.
+      expect(await Promise.all([selected(clone.root, "[origin/other]"), selected(clone.root, "[HEAD~1]")])).toEqual([
+        ["api"],
+        ["api"],
+      ]);
+    });
+
+    test("a merge base behind which history is missing is an error", async () => {
+      using repo = await source();
+      using clone = await shallow(repo.root, 4, "feature", remote("main"));
+
+      // The clone has main down to m2 and, through the merge, side down to init. git finds init,
+      // and the full history finds B: feature did not change lib, and from init it looks as if it did.
+      const { names, stderr, exitCode } = await ran(clone.root, filters("[origin/main]"));
+      expect({ names, exitCode }).toEqual({ names: [], exitCode: 1 });
+      expect(stderr).toStartWith(cannotTell);
+
+      await git(repo.root, "checkout", "-q", "feature");
+      expect(await selected(repo.root, "[main]")).toEqual(["api"]);
+    });
+
+    test("an annotated tag that HEAD reaches is a merge base without a doubt", async () => {
+      using repo = await source();
+      await git(repo.root, "tag", "-a", "-m", "a release", "release", "main~2");
+      using clone = await shallow(repo.root, 3, "main", "refs/tags/release:refs/tags/release");
+
+      // The tag is m3. After it, main merged side (docs), whose history the clone cuts off.
+      expect(await selected(clone.root, "[release]")).toEqual(["docs"]);
+    });
+
+    test("two merge bases are an error", async () => {
+      // main: init, X, J, R1, a merge of a. feature: J, H1, a merge of b. a and b leave at init.
+      using repo = await repository();
+      const edit = async (file: string, text: string) => {
+        write(repo.root, file, `// ${text}\n`);
+        await git(repo.root, "commit", "-q", "-a", "-m", text);
+      };
+      await git(repo.root, "checkout", "-q", "-b", "a");
+      await edit("packages/web/index.js", "a");
+      await git(repo.root, "checkout", "-q", "-b", "b", "main");
+      await edit("packages/shared/index.js", "b");
+      await git(repo.root, "checkout", "-q", "main");
+      await edit("packages/lib/index.js", "X");
+      await edit("packages/docs/index.js", "J");
+      await git(repo.root, "checkout", "-q", "-b", "feature");
+      await edit("packages/api/index.js", "H1");
+      await git(repo.root, "merge", "-q", "--no-ff", "-m", "a merge of b", "b");
+      await git(repo.root, "checkout", "-q", "main");
+      await edit(".gitignore", "R1");
+      await git(repo.root, "merge", "-q", "--no-ff", "-m", "a merge of a", "a");
+      using clone = await shallow(repo.root, 3, "feature", remote("main"));
+
+      // J is where feature left main, and the clone does not have what is behind J. So git also
+      // names init, which both reach through a and b, and from init lib and docs look changed.
+      const { names, stderr, exitCode } = await ran(clone.root, filters("[origin/main]"));
+      expect({ names, exitCode }).toEqual({ names: [], exitCode: 1 });
+      expect(stderr).toStartWith(cannotTell);
+
+      await git(repo.root, "checkout", "-q", "feature");
+      expect(await selected(repo.root, "[main]")).toEqual(["api", "shared"]);
+    });
+  });
+
+  // A `git` in front of the real one that writes down each call.
+  test.skipIf(isWindows)("git runs three times for a revision, and not at all without one", async () => {
+    using repo = await repository();
+    write(repo.root, "packages/api/index.js", "// edited\n");
+    const realGit = Bun.which("git")!;
+    using shim = tempDir("filter-since-git-shim", {
+      git: `#!/bin/sh\necho "$*" >> "$GIT_CALLS"\nexec "${realGit}" "$@"\n`,
+    });
+    chmodSync(join(String(shim), "git"), 0o755);
+    const calls = async (name: string, args: string[]) => {
+      const log = join(String(shim), name);
+      writeFileSync(log, "");
+      const { names } = await ran(repo.root, args, { PATH: `${shim}:${process.env.PATH}`, GIT_CALLS: log });
+      return {
+        names,
+        git: readFileSync(log, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map(line => line.split(" ").find(word => !word.startsWith("-") && !word.includes("="))),
+      };
+    };
+
+    expect(
+      await Promise.all([
+        calls("without", filters("api", "...api", "{packages/lib}", "./packages/d*", "!web", "[al]*")),
+        calls("with", filters("[HEAD]")),
+        calls("twice", filters("...[HEAD]", "![HEAD]", "docs")),
+      ]),
+    ).toEqual([
+      { names: ["api", "docs", "lib"], git: [] },
+      { names: ["api"], git: ["rev-parse", "diff", "ls-files"] },
+      { names: ["docs", "web"], git: ["rev-parse", "diff", "ls-files"] },
+    ]);
   });
 });
 
