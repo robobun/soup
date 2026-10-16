@@ -5333,6 +5333,210 @@ Files: `src/runtime/cli/pm_sbom_command.rs` (new), `src/runtime/cli/spdx-license
 `pub(crate)`), `.gitattributes`, `docs/pm/cli/pm.mdx`, `completions/bun.{zsh,bash,fish}`,
 `completions/bun-cli.json`, `test/cli/install/bun-pm-sbom.test.ts` (new).
 
+### 2026-10-16: `while` and `until` loops in Bun Shell
+
+Bun Shell got `for` on 2026-09-23, and that entry ended with "`while` and `until` are not supported
+yet". They are the loops a script uses when it does not know how often it has to go around: wait
+until a server answers, run a flaky step again until it passes, poll for a file.
+`` $`until curl -sf localhost:3000; do sleep 1; done` `` answered `bun: command not found: until`,
+then the same for `do` and `done`, and a `package.json` script with such a loop worked on Linux and
+macOS, where `bun run` hands it to `sh`, and failed on Windows, where `bun run` uses Bun Shell. Now:
+
+```ts
+import { $ } from "bun";
+
+// wait for a server to come up
+await $`
+  until curl -sf http://localhost:3000/health; do
+    echo waiting for the server
+    sleep 1
+  done
+`;
+
+// run a flaky command again until it passes
+await $`until bun test integration.test.ts; do echo "failed, trying again"; done`;
+
+// an endless loop with a way out
+await $`
+  while true; do
+    bun run sync.ts && break
+    echo "sync failed, next attempt in 5 seconds"
+    sleep 5
+  done
+`;
+```
+
+```json
+{
+  "scripts": {
+    "test:retry": "until bun test; do echo retrying; done"
+  }
+}
+```
+
+`while` runs its body for as long as the condition exits with 0, `until` for as long as it does
+not. The condition is a list of commands like the one of `if`, so it can be a program, a `[[ ]]`
+test, a pipeline or several commands, of which the last one decides. The loop exits with the status
+of the last command its body ran, or 0 if the body never ran. It can be a member of a pipeline, an
+operand of `&&` and `||`, the condition of an `if`, and it nests with `for` and with itself.
+`break [n]` and `continue [n]` work in the body and, as in bash, in the condition.
+
+Every test script that bash can run (38 of them) was run in bash 5.2 first, and the test expects
+what bash printed. The one difference is the text of the warning for a `break` outside a loop, which
+the `for` patch chose. The cases that are not obvious are all about a `break` or `continue` in the
+condition, and they follow from how bash's `execute_while_or_until` is written:
+
+- The condition is inside the loop, so `break` there ends the loop and does not warn.
+- `continue` in the condition starts the next round. `while continue; do ...; done` never ends.
+- A condition that ends the loop uses the jump up, whichever it is: `until continue; do ...; done`
+  ends at once, because `continue` succeeds and a condition that succeeds ends an `until`.
+- Otherwise the body counts as run with the status the condition left, which is why
+  `while break 0; ...` exits with 0 and `until break 0; ...` with 1.
+
+How it is built:
+
+- Parser. `while` and `until` join the reserved words of `if` and `for` (`IfClauseTok`), so they
+  are only reserved where a command can start (`echo while until` prints both), and an interpolated
+  `${"until"}` is data. The clause is two statement lists, parsed with the function that parses the
+  lists of `if`. An empty condition, an empty body, a missing `do` or `done` and `done > file` are
+  parse errors that say what is expected. Loops nest by recursion in this parser, so more than 128
+  of them inside each other (`for` included) are a parse error and not a stack overflow.
+- Interpreter. A `While` state next to `For`: run the statements of the condition, look at the
+  status of the last one, run the statements of the body, go around. `until` is the same state
+  with the test inverted. It takes the `LoopJump` that `break` and `continue` leave in the shell
+  environment the way `For` does, plus the rules above for a jump that arrives from the condition.
+  A statement without a command (`;;`) has no status, so it cannot decide the loop.
+- A reader that is gone. bash dies of SIGPIPE when `while true; do echo y; done | head -n 3` writes
+  its fourth line. Bun Shell runs `echo` in its own process, where the write only fails, and a loop
+  without an end would go on failing for good. So a loop, `for` too, ends when a builtin in it has
+  written to a stdout or stderr that nothing reads any more (`IOWriter` already knew).
+- The event loop. A loop of builtins never waits for anything, and `while true; do true; done`
+  would keep the thread for good: no timer, no I/O, no `.kill()`. Loops give the event loop a turn
+  every 128 rounds through the task `for` already used.
+
+The diff then went through an adversarial review: four readers with bash as the reference and the
+ASAN build, one each for semantics, the state machine, the parser, and the tests and docs. It ran
+600 generated scripts against bash without a difference in what the loops do, and it found what the
+tests had not. All of this is fixed in this commit or, where `for` had the same fault since
+2026-09-23, in the `for` patch:
+
+- The dead reader above: the first version never ended in `| head`.
+- `bun script.sh` and `bun run` use a small event loop of their own that only polls when no task is
+  queued, and a loop that puts itself back every 128 rounds is always queued. Other pipeline
+  members stalled, children that had exited were not reaped and Ctrl+C was swallowed. The task now
+  polls before it queues itself. The test is a loop of builtins that can only end once the other
+  side of its pipeline has seen a program exit.
+- The 128 rounds were counted per loop, so loops nested with fewer rounds each never gave the event
+  loop a turn: 200,000 rounds ran to their end inside `.run()` and a `.kill()` after 100 ms did
+  nothing. The count is one per script now.
+- A compound command that is a pipeline member (`( ... ) | cat`, a loop, an `if`) starts outside of
+  every loop in bash, so `break` in it warns and a count stops at the member. Only a simple
+  `break | cat` stays silent. `for` had counted the loops around the pipeline for both.
+- One of the new tests was a race between `setImmediate` and a `stat` on the thread pool and failed
+  6 to 10 of 60 reruns. It is deterministic now, and the tests that used `while true` where the end
+  was not the point count to a bound, so a regression fails an assertion and does not hang.
+
+The review also hit faults of upstream's shell that this change makes easier to meet. They
+reproduce on released bun, so they are upstream's to fix and are not patched in this stack: a tab
+is not whitespace for the lexer (a tab-indented loop body is `command not found`), a `# comment` at
+the end of a line swallows the newline, a newline after `&&`, `||` or `|` is a parse error,
+``x=`cmd` `` is broken, a reserved word right after a compound command is taken for a command
+(`fi done` needs a `;`, and `done extra` runs `extra`), and a second builtin that reads the same
+pipe waits forever (`seq 1 5 | while ...; do head -n 1; done`).
+
+Found on 2026-10-18. The run that started on the evening of 2026-10-15 built these loops a second
+time, did not know of this entry, and never pushed: its self-review took 58 hours and sent the
+commit back. Three of the review's findings are about this implementation as well. All three were
+confirmed on a debug build of this stack, and the first one is fixed:
+
+- Two loops in one pipeline could hold each other back. A loop that comes back from its turn of the
+  event loop asked the count of the script again, and a loop on the other side of the pipe could
+  have filled it in the meantime by counting its 128 rounds and then waiting for a write. The
+  script below printed its three `pass` lines after the forty others, with stderr on a pipe, under
+  `bun exec` and from `$`. bash prints them in between. The count now starts again when a loop
+  comes back (`Interpreter::loop_round_resumed`, in the `for` patch), and under `bun exec` the
+  lines are the 3rd, 5th and 7th. The test is in `for_loop` and fails without the change.
+
+  ```sh
+  for a in $(seq 1 40); do for j in $(seq 1 127); do true; done; echo a$a 1>&2; done |
+    for i in 1 2 3; do echo pass$i 1>&2; done
+  ```
+
+- With a loop that has no end, two of the lexer faults named above are no longer an error message.
+  They are a script that never ends. A body that is indented with a tab,
+  `while true; do<newline><tab>break<newline>done`, looks up `\tbreak` for good, and a body line
+  `echo once # note` before `break` runs `echo once break` for good. bash ends both. So does the
+  released 1.4.2, which prints its errors and goes on. The fixes are open upstream as
+  oven-sh/bun#43861 and oven-sh/bun#41468 and are not in this stack. Until they land, a `while true`
+  in a script file needs spaces for its indent and comments on lines of their own, and the docs
+  say so now.
+- `while ! cmd; do ...; done && next` prints `command not found: !` once, ends the loop with 0 and
+  runs `next`. The released 1.4.2 fails with 1 there, and bash waits. Bun Shell has no `!`, and
+  oven-sh/bun#43922 (open) makes it a parse error. The docs now say to write `until cmd`.
+
+The same push repairs the `bun-types` workflow of the fork, which was red since the push of
+2026-10-18. A new test of upstream (oven-sh/bun#45794) lists every bindgen schema next to the type
+that `bun-types` publishes for it. Three schemas of this stack were missing from the list:
+`CSVObject.bind.ts`, `INIObject.bind.ts` and `node_sea.bind.ts`. Each of the three patches adds its
+line now, and the test passes with the released binary (24 of 24).
+
+Not done: arithmetic expansion (`$((i + 1))`) and `read`, which the other classic `while` loops are
+made of (`for i in $(seq 1 10)` covers the counting ones), and redirecting a whole loop
+(`done < file`), which is a parse error that says so, as it is for `for`. `exit` does not leave a
+loop: in Bun Shell it ends only its own command, on purpose, so `while true; do ...; exit 1; done`
+never ends, and the docs say to use `break`. `sleep` is not a builtin, so the delay in a polling
+loop is the program of the system, and Windows has none: the docs say to run
+`bun -e "await Bun.sleep(1000)"` there. A `sleep` builtin is the obvious next step.
+
+Rebase notes: upstream moved 15 commits, and three of them reached into the stack:
+oven-sh/bun#45104 (one bindgen for everything), oven-sh/bun#45307 (fixes after the package manager
+consolidation, with a new git runner and a new pack flow) and the WebKit upgrade of
+oven-sh/bun#45303. 13 of the 53 patches needed a hand, 9 for conflicts and 4 more to compile:
+
+- `ignore` for `Bun.Glob`: the scan options are a bindgen schema now (`Glob.bind.ts`), so `ignore`
+  is a union of a string and an array of strings there and the Rust side gets it converted. The
+  type error is bindgen's (`ERR_INVALID_ARG_TYPE`, "GlobScanOptions.ignore must be of type string
+  or array of string"), and the test expects that text.
+- zip in `Bun.Archive`: upstream gave the tar reader an `npm` mode and rewrote the read loops, so
+  `open_read` takes both flags. A new upstream test (a tar hard link whose header states a size has
+  no bytes) showed that "read every entry to its end" was too much: a reader now reads to the end
+  only when the header states a size above 0 or no size at all, which is the streamed zip case the
+  rule was for (`Entry::size_is_set`). `extract()` with a glob is upstream's code again plus that
+  test.
+- `publishConfig` overrides: `pack()` now lists the files before it edits a copy of the manifest.
+  The overrides are applied to a copy before the listing as well, so an overriding `bin` is still
+  the one that is packed. A workspace that is packed as a bundled dependency gets its own overrides
+  (new test).
+- `#semver:` for git dependencies: the `Tags` step is back in upstream's new git runner, and a
+  `github:` dependency waits for its tags with upstream's `wait_for_remote_task`.
+- `bun pm sbom`: upstream's `bun pm licenses` now lists a package whose installed copy has another
+  version, so the shared `InstalledPackages` hands that copy back too (`read_or_other_version`)
+  and `sbom` keeps asking for the locked version.
+- Merged `bun.lock`, `engines.bun`, `import.meta.glob()` and `eventLoopUtilization()`: context
+  only. The first also needed its field in a new `LoadResultOk` initializer.
+- Trusted publishing: `AsyncHTTP::init_sync` has a proxy settings argument.
+- `collectCoverageFrom` and `Bun.msgpack`, for the new WebKit: `VM::clearSourceProviderCaches()` is
+  gone (the map is cleared directly), and `Latin1Character` is a type of its own (`byteCast`).
+
+After the rebase the tests of these 13 patches pass, and so do the other test files of the stack
+that were run (shell, bundler, Web Storage, Web Locks, EventSource, `Bun.Queue`, JWT, CSV, INI,
+S3 metadata, watch, coverage, `bun pm`, `bun outdated --json`, SOCKS5, sqlite functions, streams).
+What does not pass is the machine: six recursive scans of the repository in `scan.test.ts`, one
+`bun pm pack` lifecycle test under load and two source lints of the new type checker's parser run
+out of their 5 or 30 seconds in the debug build and pass alone or with a longer timeout,
+`test/cli/install/semver.test.ts` cannot load the `semver` package this checkout never installed,
+and `sql-debug.test.ts` has no MySQL login here.
+
+Files: `src/runtime/shell/states/While.rs` (new), `src/runtime/shell/states/For.rs`,
+`src/runtime/shell/states/Pipeline.rs`, `src/runtime/shell/states/Async.rs`,
+`src/runtime/shell/interpreter.rs`, `src/runtime/shell/mod.rs`, `src/runtime/shell/IO.rs` and
+`src/runtime/shell/IOWriter.rs` (`has_broken_pipe`), `src/runtime/shell/builtin/break_continue.rs`
+(comment), `src/shell_parser/parse.rs`, `src/shell_parser/json_fmt.rs`, `docs/runtime/shell.mdx`,
+`test/js/bun/shell/bunshell.test.ts`, `test/js/bun/shell/parse.test.ts`,
+`test/js/bun/shell/leak.test.ts`. In the `for` patch: `src/runtime/shell/dispatch_tasks.rs`,
+`src/runtime/shell/interpreter.rs` (`loop_round_should_yield`), `src/runtime/shell/states/For.rs`,
+`src/runtime/shell/states/Pipeline.rs`, `src/shell_parser/parse.rs` and its tests.
+
 ## Dropped
 
 Nothing yet.

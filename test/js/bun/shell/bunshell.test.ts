@@ -2978,6 +2978,293 @@ for f in last; do false; done
   });
 });
 
+describe("while_loop", () => {
+  TestBuilder.command`n=; while [[ $n != xxx ]]; do n=x$n; echo $n; done`.stdout("x\nxx\nxxx\n").runAsTest("while");
+
+  TestBuilder.command`n=; until [[ $n == xxx ]]; do n=x$n; echo $n; done`.stdout("x\nxx\nxxx\n").runAsTest("until");
+
+  TestBuilder.command`
+n=
+while [[ $n != xx ]]
+do
+  n=x$n
+  echo round $n
+done
+until [[ $n == xxxx ]]
+do
+  n=x$n
+  echo round $n
+done
+echo end`
+    .stdout("round x\nround xx\nround xxx\nround xxxx\nend\n")
+    .runAsTest("newlines instead of semicolons");
+
+  TestBuilder.command`while false; do echo never; done; until true; do echo never; done; echo end`
+    .stdout("end\n")
+    .runAsTest("the body does not run when the first condition says stop");
+
+  TestBuilder.command`until [[ -f ready ]]; do echo waiting; touch ready; done; echo ready`
+    .ensureTempDir()
+    .stdout("waiting\nready\n")
+    .runAsTest("until a file exists");
+
+  TestBuilder.command`until ${BUN} -e "process.exit(0)"; do echo never; done; echo end`
+    .stdout("end\n")
+    .runAsTest("the exit code of a program is the condition");
+
+  TestBuilder.command`n=; while n=x$n; echo cond $n; [[ $n != xxx ]]; do echo body $n; done`
+    .stdout("cond x\nbody x\ncond xx\nbody xx\ncond xxx\n")
+    .runAsTest("the condition is a list and its last command decides");
+
+  TestBuilder.command`while false;; do echo never; break; done; n=; until [[ $n == x ]]; ; do n=x; echo $n; done`
+    .stdout("x\n")
+    .runAsTest("a statement without a command does not decide");
+
+  TestBuilder.command`for i in 1 2; do n=; while [[ $n != xx ]]; do n=x$n; echo $i$n; done; done`
+    .stdout("1x\n1xx\n2x\n2xx\n")
+    .runAsTest("nested in a for loop");
+
+  TestBuilder.command`a=; until [[ $a == xx ]]; do a=x$a; b=; while [[ $b != yy ]]; do b=y$b; echo $a$b; done; done`
+    .stdout("xy\nxyy\nxxy\nxxyy\n")
+    .runAsTest("while nested in until");
+
+  TestBuilder.command`n=; while [[ $n != xx ]]; do n=x$n; echo $n; done | cat`
+    .stdout("x\nxx\n")
+    .runAsTest("as the first member of a pipeline");
+
+  TestBuilder.command`echo in | while true; do cat; break; done`
+    .stdout("in\n")
+    .runAsTest("the body reads the loop's stdin");
+
+  TestBuilder.command`n=outer; while true; do n=inner; echo $n; break; done | cat; echo $n`
+    .stdout("inner\nouter\n")
+    .runAsTest("a loop in a pipeline runs in a subshell");
+
+  TestBuilder.command`echo $(n=; while [[ $n != xx ]]; do n=x$n; echo $n; done); (until false; do echo sub; break; done)`
+    .stdout("x xx\nsub\n")
+    .runAsTest("in a command substitution and in a subshell");
+
+  TestBuilder.command`while false; do true; done && echo and; n=; until [[ $n == x ]]; do n=x; false; done || echo or`
+    .stdout("and\nor\n")
+    .runAsTest("with && and ||");
+
+  TestBuilder.command`n=; if while [[ $n != xx ]]; do n=x$n; [[ $n == x ]]; done; then echo yes; else echo no; fi`
+    .stdout("no\n")
+    .runAsTest("exits with the status of the last command the body ran");
+
+  TestBuilder.command`false; while false; do echo never; done`
+    .exitCode(0)
+    .runAsTest("exits with 0 when the body never ran");
+
+  TestBuilder.command`while echo while until do done; false; do echo never; done; until echo ${"done"}; do echo never; done`
+    .stdout("while until do done\ndone\n")
+    .runAsTest("reserved words are ordinary words in arguments");
+
+  TestBuilder.command`n=; while [[ $n != xxx ]]; do n=x$n; cd $n; pwd; done`
+    .directory("x/xx/xxx")
+    .stdout(out =>
+      expect(
+        out
+          .trim()
+          .split("\n")
+          .map(dir => dir.split(/[\\/]/).at(-1)),
+      ).toEqual(["x", "xx", "xxx"]),
+    )
+    .runAsTest("cd in the body moves the shell");
+
+  test("in a script file", async () => {
+    using dir = tempDir("shell-while-loop", {
+      "loops.sh": `
+n=
+while [[ $n != xxx ]]
+do
+  n=x$n
+  if [[ $n == xx ]]; then continue; fi
+  echo while $n
+done
+until [[ -f stop ]]; do
+  echo until
+  touch stop
+done
+while true; do
+  for i in 1 2; do
+    echo for $i
+    break 2
+  done
+done
+until false; do false; break; done
+`,
+    });
+    await using proc = Bun.spawn({
+      cmd: [BUN, "loops.sh"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("while x\nwhile xxx\nuntil\nfor 1\n");
+    expect(exitCode).toBe(0);
+  });
+
+  // `bun script.sh` has an event loop of its own, which only polls when no task is queued. The
+  // left loop never waits for anything, and ends once the right side has seen its program exit.
+  test.skipIf(isWindows)("a loop of builtins lets the rest of a script file run", async () => {
+    using dir = tempDir("shell-while-script-poll", {
+      "poll.sh": `until cd marker 2> /dev/null; do true; done | (bun -e "0"; mkdir marker)\necho end\n`,
+    });
+    await using proc = Bun.spawn({
+      cmd: [BUN, "poll.sh"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 30_000,
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("end\n");
+    expect(exitCode).toBe(0);
+  });
+
+  test("a loop of builtins gives the event loop a turn", async () => {
+    let turns = 0;
+    let running = true;
+    const turn = () => {
+      if (!running) return;
+      turns++;
+      setImmediate(turn);
+    };
+    setImmediate(turn);
+    const target = Buffer.alloc(2000, "x").toString();
+    const { stdout } = await $`n=; while [[ $n != ${target} ]]; do n=x$n; done; echo finished`.quiet();
+    running = false;
+    expect(stdout.toString()).toBe("finished\n");
+    expect(turns).toBeGreaterThanOrEqual(5);
+  });
+
+  test("a loop can wait for something the same process does", async () => {
+    using dir = tempDir("shell-while-poll", {});
+    setImmediate(() => mkdirSync(join(String(dir), "ready")));
+    const { stdout, stderr, exitCode } = await $`until [[ -d ready ]]; do true; done; echo found`
+      .cwd(String(dir))
+      .quiet()
+      .nothrow();
+    expect(stderr.toString()).toBe("");
+    expect(stdout.toString()).toBe("found\n");
+    expect(exitCode).toBe(0);
+  });
+
+  // The loop is in a subshell so that the test can see where it stopped: it has 1000 rounds
+  // in it and its reader leaves after the first line.
+  TestBuilder.command`(n=; while [[ $n != ${Buffer.alloc(1000, "x").toString()} ]]; do n=x$n; echo y; done; echo $n 1>&2) | head -n 1`
+    .stdout("y\n")
+    .stderr(rounds => expect(rounds.trim().length).toBeWithin(1, 1000))
+    .runAsTest("ends when nothing reads its output any more");
+
+  // ShellPromise.kill() is not in every build these tests run against.
+  test.skipIf(typeof ($`true` as any).kill !== "function")("kill() stops a loop of builtins", async () => {
+    const target = Buffer.alloc(3000, "x").toString();
+    const script = $`n=; while [[ $n != ${target} ]]; do n=x$n; done; echo finished`.quiet().nothrow() as any;
+    const running = script.run();
+    running.kill();
+    const result = await running;
+    expect(result.stdout.toString()).toBe("");
+    expect(result.exitCode).toBe(143);
+  });
+
+  describe("break and continue", () => {
+    TestBuilder.command`while true; do echo once; break; echo never; done; echo end`
+      .stdout("once\nend\n")
+      .runAsTest("break leaves an endless loop");
+
+    TestBuilder.command`n=; while [[ $n != xxxx ]]; do n=x$n; [[ $n == xx ]] && continue; echo $n; done`
+      .stdout("x\nxxx\nxxxx\n")
+      .runAsTest("continue runs the condition again");
+
+    TestBuilder.command`for i in 1 2; do while true; do echo $i; break 2; done; echo never; done; echo end`
+      .stdout("1\nend\n")
+      .runAsTest("break 2 leaves the for loop around it");
+
+    TestBuilder.command`for i in 1 2; do while true; do echo $i; continue 2; done; echo never; done; echo end`
+      .stdout("1\n2\nend\n")
+      .runAsTest("continue 2 goes on with the for loop around it");
+
+    TestBuilder.command`n=; until [[ $n == xx ]]; do n=x$n; for i in a b; do echo $n$i; continue 2; done; echo never; done; echo end`
+      .stdout("xa\nxxa\nend\n")
+      .runAsTest("continue 2 from a for loop runs the condition again");
+
+    TestBuilder.command`while true; do until false; do while true; do echo deep; break 3; done; done; done; echo end`
+      .stdout("deep\nend\n")
+      .runAsTest("three deep");
+
+    TestBuilder.command`while true; do false; break; done`
+      .exitCode(0)
+      .runAsTest("break is the last command of the loop");
+
+    TestBuilder.command`while break; do echo never; done; until break; do echo never; done; echo end`
+      .stdout("end\n")
+      .runAsTest("break in the condition ends the loop");
+
+    TestBuilder.command`n=; while n=x$n; [[ $n == x ]] && continue; [[ $n != xxx ]]; do echo $n; done; echo end`
+      .stdout("xx\nend\n")
+      .runAsTest("continue in the condition starts the next round");
+
+    TestBuilder.command`until continue; do echo never; done; echo end`
+      .stdout("end\n")
+      .runAsTest("a condition that ends the loop uses up the continue");
+
+    TestBuilder.command`for i in 1 2; do while continue 2; do echo never; done; echo never; done; echo end`
+      .stdout("end\n")
+      .runAsTest("continue 2 in the condition goes on with the loop around it");
+
+    TestBuilder.command`for i in 1 2; do until continue 2; do echo never; done; echo never; done; echo end`
+      .stdout("end\n")
+      .runAsTest("also when the condition ends the loop");
+
+    TestBuilder.command`for i in 1 2; do until break 2; do echo never; done; echo never; done; echo end`
+      .stdout("end\n")
+      .runAsTest("break 2 in the condition leaves the loop around it");
+
+    TestBuilder.command`n=; while [[ $n != xx ]] || break; do n=x$n; false; done`
+      .exitCode(0)
+      .runAsTest("a loop that break ends in the condition exits with 0");
+
+    TestBuilder.command`if while break 0; do true; done; then echo yes; else echo no; fi`
+      .stdout("yes\n")
+      .stderr("break: 0: loop count out of range\n")
+      .runAsTest("a bad count in a condition that ends the loop is not the status of the loop");
+
+    TestBuilder.command`if until break 0; do true; done; then echo yes; else echo no; fi`
+      .stdout("no\n")
+      .stderr("break: 0: loop count out of range\n")
+      .runAsTest("in a condition that goes on it is");
+
+    TestBuilder.command`while true; do break; done; break; until false; do break; done; continue; echo end`
+      .stdout("end\n")
+      .stderr("break: only meaningful in a loop\ncontinue: only meaningful in a loop\n")
+      .runAsTest("after the loop they are outside a loop again");
+
+    TestBuilder.command`for i in 1 2; do n=; while [[ $n != xx ]]; do n=x$n; echo $i$n; continue 2; echo never; done | cat; done; echo end`
+      .stdout("1x\n1xx\n2x\n2xx\nend\n")
+      .runAsTest("a count stops at a loop that is a pipeline member");
+
+    TestBuilder.command`while true; do (break; echo subshell); break; done`
+      .stdout("subshell\n")
+      .stderr("break: only meaningful in a loop\n")
+      .runAsTest("a subshell is outside the loop");
+
+    TestBuilder.command`while true; do echo "[$(break; echo never)]"; break; done`
+      .stdout("[]\n")
+      .runAsTest("in a command substitution they end the substitution, not the loop");
+
+    TestBuilder.command`n=; while [[ $n != xx ]]; do n=x$n; break | cat; echo $n; done`
+      .stdout("x\nxx\n")
+      .runAsTest("break in a pipeline member does not reach the loop");
+  });
+});
+
 describe("condexprs", () => {
   TestBuilder.command`[[ -f package.json ]] && echo yes!`.file("package.json", "hi").stdout("yes!\n").runAsTest("-f");
   TestBuilder.command`[[ -f mumbo.jumbo ]] && echo yes!`.exitCode(1).runAsTest("-f non-existent");
@@ -3864,6 +4151,11 @@ describe("interpolated values in reserved-word position", () => {
     .stdout("B\n")
     .stderr("bun: command not found: for\n")
     .runAsTest("interpolated for stays a single command word");
+
+  TestBuilder.command`${"while"} BUNISBAD; echo B; ${"until"} BUNISBAD; echo C`
+    .stdout("B\nC\n")
+    .stderr("bun: command not found: while\nbun: command not found: until\n")
+    .runAsTest("interpolated while and until stay single command words");
 
   TestBuilder.command`for i ${"in"} a; do echo $i; done`
     .error('Expected "in" after "for i" but got: in')

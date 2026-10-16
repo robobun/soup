@@ -247,6 +247,12 @@ impl IOWriter {
         self.state().flags.is_socket
     }
 
+    /// A write failed with EPIPE: nothing reads from the other end any more.
+    #[inline]
+    pub(crate) fn is_broken_pipe(&self) -> bool {
+        self.state().flags.broken_pipe
+    }
+
     pub(crate) fn init(fd: Fd, flags: Flags, evtloop: EventLoopHandle) -> std::rc::Rc<IOWriter> {
         let mut writer = WriterImpl::default();
         // Tell the PipeWriter impl to *not* close the file descriptor.
