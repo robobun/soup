@@ -23,7 +23,9 @@ use super::update_package_json_and_install::{
     remove_leftover_node_modules, save_entry,
 };
 use super::workspace_package_json_cache::{GetJSONOptions, GetResult, MapEntry};
-use super::workspace_selection::{self, Candidate, LinkTargets, RootSelection, WorkspaceGraph};
+use super::workspace_selection::{
+    self, Candidate, LinkTargets, RootLockfile, RootSelection, Since, WorkspaceGraph,
+};
 use super::{
     Command, PackageManager, PackageUpdateInfo, Subcommand, UpdateRequest, UpdateTargetWorkspace,
 };
@@ -202,7 +204,17 @@ pub(crate) fn select_targets(
                 is_root: target.name_hash.is_none(),
             })
             .collect();
-        workspace_selection::select(patterns, original_cwd, &subjects, graph.as_ref(), root_rule)
+        workspace_selection::select(
+            patterns,
+            original_cwd,
+            &subjects,
+            graph.as_ref(),
+            root_rule,
+            Since {
+                root: top_level,
+                root_lockfile: RootLockfile::Ignored,
+            },
+        )
     };
     let unmatched_patterns = selection.unmatched_patterns;
 
