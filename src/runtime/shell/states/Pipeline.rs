@@ -12,6 +12,7 @@ use crate::shell::states::cond_expr::CondExpr;
 use crate::shell::states::r#for::For;
 use crate::shell::states::r#if::If;
 use crate::shell::states::subshell::Subshell;
+use crate::shell::states::r#while::While;
 use crate::shell::yield_::Yield;
 
 pub(crate) struct Pipeline {
@@ -249,6 +250,9 @@ impl Pipeline {
                 ast::PipelineItem::Subshell(s) => Subshell::init(interp, env, s, this, child_io),
                 ast::PipelineItem::If(f) => If::init(interp, Env::Owned(env), f, this, child_io),
                 ast::PipelineItem::For(f) => For::init(interp, Env::Owned(env), f, this, child_io),
+                ast::PipelineItem::While(w) => {
+                    While::init(interp, Env::Owned(env), w, this, child_io)
+                }
                 ast::PipelineItem::CondExpr(c) => {
                     CondExpr::init(interp, Env::Owned(env), c, this, child_io)
                 }

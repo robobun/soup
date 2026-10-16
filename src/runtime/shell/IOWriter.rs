@@ -238,6 +238,12 @@ impl IOWriter {
         self.state().flags.is_socket
     }
 
+    /// A write failed with EPIPE: nothing reads from the other end any more.
+    #[inline]
+    pub(crate) fn is_broken_pipe(&self) -> bool {
+        self.state().flags.broken_pipe
+    }
+
     pub(crate) fn init(
         file: sys::File,
         flags: Flags,

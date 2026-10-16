@@ -22,6 +22,11 @@ const TESTS: [name: string, builder: () => TestBuilder, runs?: number][] = [
   ["pipeline", () => TestBuilder.command`echo hi | cat`.stdout("hi\n")],
   ["pipeline2", () => TestBuilder.command`echo hi | echo lol | cat`.stdout("lol\n")],
   [
+    "loop_in_pipeline",
+    () => TestBuilder.command`n=; while [[ $n != xx ]]; do n=x$n; echo $n; done | cat`.stdout("x\nxx\n"),
+    100,
+  ],
+  [
     "ls",
     () =>
       TestBuilder.command`mkdir foo; touch ./foo/lol ./foo/nice ./foo/lmao; mkdir foo/bar; touch ./foo/bar/great; touch ./foo/bar/wow; ls -R foo/`
