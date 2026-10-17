@@ -126,6 +126,36 @@ Bun.serve({
 
 Bun automatically decodes percent-encoded route parameter values, including Unicode characters. Bun replaces invalid Unicode with the Unicode replacement character (`\uFFFD`).
 
+### Optional route parameters
+
+A parameter whose name ends in `?` can be left out of the request, together with the `/` in front of it. The route then matches with and without that segment, and the parameter is `undefined` when it is not there.
+
+```ts title="server.ts" icon="/icons/typescript.svg"
+Bun.serve({
+  routes: {
+    // GET /posts    -> page 1
+    // GET /posts/3  -> page 3
+    "/posts/:page?": req => {
+      // req.params.page is string | undefined
+      const page = Number(req.params.page ?? 1);
+      return Response.json({ page });
+    },
+
+    // GET /docs/routing     -> { page: "routing" }
+    // GET /de/docs/routing  -> { lang: "de", page: "routing" }
+    "/:lang?/docs/:page": req => Response.json(req.params),
+  },
+});
+```
+
+`"/posts/:page?"` is shorthand for the two routes `"/posts"` and `"/posts/:page"` with the same value, so it works for handlers, per-method objects, static responses, HTML imports and `false`. What follows from that:
+
+- The expanded routes take part in [route precedence](#route-precedence) like routes you write out. An exact route such as `"/posts/new"` still wins over `"/posts/:page?"`.
+- A trailing slash is not optional. `"/posts/:page?"` does not match `/posts/`, as `"/posts"` does not.
+- A parameter that is left out is not a key of `req.params`: `"page" in req.params` is `false`.
+- With several optional parameters next to each other, a request fills them from the left: for `"/files/:dir?/:name?"`, `/files/a` sets `dir`.
+- A route can have up to 8 optional parameters.
+
 ### Static responses
 
 Routes can also be `Response` objects (without the handler function). `Bun.serve()` optimizes them for zero-allocation dispatch, which suits health checks, redirects, and fixed content:
