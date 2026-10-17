@@ -616,12 +616,17 @@ declare module "bun" {
     type ExtractRouteParams<T> = string extends T
       ? Record<string, string>
       : T extends `${string}:${infer Param}/${infer Rest}`
-        ? { [K in Param]: string } & ExtractRouteParams<Rest>
+        ? RouteParam<Param> & ExtractRouteParams<Rest>
         : T extends `${string}:${infer Param}`
-          ? { [K in Param]: string }
+          ? RouteParam<Param>
           : T extends `${string}*`
             ? {}
             : {};
+
+    /** A segment `:id` is a parameter that is always there, and `:id?` one that can be left out. */
+    type RouteParam<Param extends string> = Param extends `${infer Name}?`
+      ? { [K in Name]?: string }
+      : { [K in Param]: string };
 
     /**
      * Development configuration for {@link Bun.serve}
@@ -1449,6 +1454,12 @@ declare module "bun" {
    *     ) => {
    *       return new Response(JSON.stringify(req.params));
    *       // Output: {"postId": "123", "commentId": "456"}
+   *     },
+   *
+   *     // Optional parameter: this route also matches "/archive"
+   *     "/archive/:year?": (req: BunRequest<"/archive/:year?">) => {
+   *       // req.params.year is string | undefined
+   *       return new Response(`Archive of ${req.params.year ?? "all years"}`);
    *     }
    *   }
    * });

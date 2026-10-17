@@ -5613,6 +5613,105 @@ Files: `src/runtime/shell/states/While.rs` (new), `src/runtime/shell/states/For.
 `src/runtime/shell/interpreter.rs` (`loop_round_should_yield`), `src/runtime/shell/states/For.rs`,
 `src/runtime/shell/states/Pipeline.rs`, `src/shell_parser/parse.rs` and its tests.
 
+### 2026-10-17: optional route parameters for `Bun.serve`, `"/users/:id?"`
+
+A route of `Bun.serve` takes parameters (`/users/:id`) and wildcards (`/files/*`), and a parameter
+was always required. A list with pages, a page with an optional locale in front, or a collection
+and its items under one handler took two keys with the same value, `"/posts"` and `"/posts/:page"`,
+and then the handler was typed for neither of them. Hono, Elysia, Fastify and Express 4 write this
+as `:page?`. In Bun that key was accepted and did something else: it declared a parameter whose
+name is `page?`, so `/posts/2` answered with `req.params["page?"]` and `/posts` was not matched at
+all. oven-sh/bun#17491 asks for the `?`. Now:
+
+```ts
+Bun.serve({
+  routes: {
+    // GET /posts    -> page 1
+    // GET /posts/3  -> page 3
+    "/posts/:page?": req => {
+      // req.params.page is string | undefined
+      const page = Number(req.params.page ?? 1);
+      return Response.json({ page });
+    },
+
+    // GET /docs/routing     -> { page: "routing" }
+    // GET /de/docs/routing  -> { lang: "de", page: "routing" }
+    "/:lang?/docs/:page": req => Response.json(req.params),
+
+    // every kind of route value
+    "/items/:id?": { GET: listOrGet, POST: createOrReplace },
+    "/dashboard/:tab?": dashboardHtml,
+    "/legacy/:anything?": false,
+  },
+});
+```
+
+A segment that is a parameter name followed by `?` can be left out of the request, together with
+the `/` in front of it. The parameter is then not a key of `req.params`, so `req.params.page` is
+`undefined` and `"page" in req.params` is `false`.
+
+It is done where the `routes` object is read, not in the router. `"/posts/:page?"` is replaced by
+the paths it stands for, `"/posts/:page"` and `"/posts"`, and each of them goes on exactly as a key
+that was written out: the same handler, method object, static `Response`, HTML import or `false`,
+the same validation of the parameter names, and its own cached structure for `req.params`. The
+router and the request path are not touched, so a server without such a route does one scan of
+each route key for a `?` when it starts, and nothing per request. What follows from the expansion:
+
+- The expanded routes rank like any other route. `"/posts/new"` wins over `"/posts/:page?"`, and a
+  wildcard `"/posts/*"` only gets what neither of the two paths matches.
+- A trailing slash is not optional: `"/posts/:page?"` does not match `/posts/`, because `"/posts"`
+  does not.
+- Several optional parameters are allowed, anywhere in the path. `"/a/:x?/b/:y?"` is four paths.
+  Where two of the paths would match the same requests, as `/files/:dir` and `/files/:name` of
+  `"/files/:dir?/:name?"` do, the one that fills the leftmost parameter is kept, which is what the
+  pattern means when it is read as a regular expression (Express 4). So `/files/a` sets `dir`.
+- A route can have 8 optional parameters, which is at most 256 paths. A ninth is an error when the
+  server starts.
+- Only a `?` that ends a parameter segment is read. `"/x/:id?.json"` and a `?` in a segment that
+  is not a parameter mean what they meant before.
+- A key that declares one of the expanded paths again for the same method is a duplicate like
+  `"/a/:x"` next to `"/a/:y"`, and as there the key that comes later in `routes` wins. Keys for
+  different methods do not collide: `"/posts": { POST }` and `"/posts/:id?": { GET }` both work.
+
+`BunRequest<"/posts/:page?">` and the inferred type of a handler's `req.params` now have `page` as
+an optional key (`{ page?: string }`). Before, the key of the type was `"page?"`.
+
+Not done: a `?` does not make a wildcard or a fixed segment optional, and there is no syntax for a
+default value or for a pattern the parameter has to match.
+
+Rebase notes: upstream #45450 moved eighteen `Bun.*` functions to the bindings generator, and with
+it `Bun.semver`, `Bun.CSRF` and `Bun.unsafe` became generated namespaces. Five patches needed a
+hand merge:
+
+- `Bun.semver.parse()` and `Bun.semver.inc()`, `maxSatisfying()`, `minSatisfying()`: the table of
+  host functions these patches extended is gone, so the four functions are now entries of the
+  `semver` namespace in `SemverObject.bind.ts`, with `capability: "js"` and `returns: b.any`. The
+  version of `parse()` and `inc()` and the range of the two searches are declared as strings and
+  arrive converted. `release`, `identifier`, `identifierBase` and `versions` stay `b.any`, because
+  the functions check them by hand and the tests hold the wording of those errors. One thing a
+  caller can see: a string argument is now converted before the other arguments are checked, so
+  `maxSatisfying("1.2.3", Symbol())` throws for the symbol and no longer for the first argument.
+  Upstream's new test of the shape of `Bun.semver` lists the four functions as well.
+- `Bun.CSV`, `Bun.JWT` and `Bun.unescapeHTML()`: their lines in `BunObject.cpp`,
+  `BunObject+exports.h` and `BunObject.rs` sat next to lines of `CSRF`, `allocUnsafe`, `unsafe` and
+  `which` that upstream rewrote or removed.
+
+One patch merged cleanly and did not compile: response compression for `Bun.serve` named the field
+`IntegerRange::always_allow_zero`, which upstream removed with its last user.
+
+After the rebase the test files of these six patches pass, `test/cli/install/semver.test.ts`
+included (484 tests; the checkout has the `semver` package now). So do the other files of the
+stack that were run because upstream changed code near them: watch mode, `legalComments` and
+`globalName` of the bundler, the bytes loader, `eventLoopUtilization()`, `expect.poll()`, `%c`,
+`bun serve`, `bun pm sbom`, `Bun.Queue`, `Bun.INI` and the shell. `cargo clippy` is clean for
+`bun_runtime` and `bun_semver_jsc`. In `test/internal/source-lints/` the two recursion lints of the
+type checker's parser still run out of their 5 seconds in the debug build, as on the days before.
+
+Files: `src/runtime/server/ServerConfig.rs` (`expand_optional_route_params`),
+`packages/bun-types/serve.d.ts` (`Serve.ExtractRouteParams`, `Serve.RouteParam`),
+`docs/runtime/http/routing.mdx`, `test/js/bun/http/bun-serve-routes.test.ts`,
+`test/integration/bun-types/fixture/serve.ts`.
+
 ## Dropped
 
 Nothing yet.
