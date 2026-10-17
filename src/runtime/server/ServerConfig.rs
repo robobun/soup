@@ -571,6 +571,90 @@ fn validate_route_name(global: &JSGlobalObject, path: &[u8]) -> JsResult<()> {
     Ok(())
 }
 
+/// Each optional parameter can double the paths a route stands for.
+const MAX_OPTIONAL_ROUTE_PARAMS: usize = 8;
+
+/// `/users/:id?` is both `/users` and `/users/:id`: a segment that is a parameter name followed
+/// by `?` may be left out of the request, together with its `/`.
+///
+/// Returns the path with every optional parameter in it, then the other paths the route stands
+/// for. Two of them can match the same requests (`/:a` and `/:b` of `/:a?/:b?`). The one that
+/// fills the leftmost parameters is kept, which is what the pattern means as a regular expression.
+fn expand_optional_route_params(
+    global: &JSGlobalObject,
+    path: Box<[u8]>,
+) -> JsResult<(Box<[u8]>, Vec<Box<[u8]>>)> {
+    fn is_optional(segment: &[u8]) -> bool {
+        segment.len() > 2 && segment[0] == b':' && segment[segment.len() - 1] == b'?'
+    }
+
+    if !strings::contains_char(&path, b'?') {
+        return Ok((path, Vec::new()));
+    }
+    // The caller checked that `path` starts with '/'.
+    let segments: Vec<&[u8]> = strings::split(&path[1..], b"/").collect();
+    let optional_count = segments
+        .iter()
+        .filter(|segment| is_optional(segment))
+        .count();
+    if optional_count == 0 {
+        return Ok((path, Vec::new()));
+    }
+    if optional_count > MAX_OPTIONAL_ROUTE_PARAMS {
+        return Err(global.throw_invalid_arguments(format_args!(
+            "Invalid route {}. A route can have at most {} optional parameters",
+            bun_fmt::quote(&path),
+            MAX_OPTIONAL_ROUTE_PARAMS,
+        )));
+    }
+
+    // Bit `optional_count - 1` of `present` is the leftmost optional parameter. The second
+    // result is the path with the parameter names taken out: what the router tells paths apart by.
+    let expand = |present: u32| -> (Vec<u8>, Vec<u8>) {
+        let mut expanded = Vec::with_capacity(path.len());
+        let mut shape = Vec::with_capacity(path.len());
+        let mut bit = optional_count;
+        for &segment in &segments {
+            let mut segment = segment;
+            if is_optional(segment) {
+                bit -= 1;
+                if present & (1 << bit) == 0 {
+                    continue;
+                }
+                segment = &segment[..segment.len() - 1];
+            }
+            expanded.push(b'/');
+            expanded.extend_from_slice(segment);
+            shape.push(b'/');
+            shape.extend_from_slice(if segment.first() == Some(&b':') {
+                b":"
+            } else {
+                segment
+            });
+        }
+        if expanded.is_empty() {
+            expanded.push(b'/');
+            shape.push(b'/');
+        }
+        (expanded, shape)
+    };
+
+    let all_present = (1u32 << optional_count) - 1;
+    let (full_path, full_shape) = expand(all_present);
+    let mut shapes = vec![full_shape];
+    let mut other_paths = Vec::new();
+    // From the most parameters down to none, so the first path of a shape is the one to keep.
+    for present in (0..all_present).rev() {
+        let (expanded, shape) = expand(present);
+        if shapes.contains(&shape) {
+            continue;
+        }
+        shapes.push(shape);
+        other_paths.push(expanded.into_boxed_slice());
+    }
+    Ok((full_path.into_boxed_slice(), other_paths))
+}
+
 fn get_routes_object(global: &JSGlobalObject, arg: JSValue) -> JsResult<Option<JSValue>> {
     for key in ["routes", "static"] {
         if let Some(routes) = arg.get(global, key)? {
@@ -752,141 +836,146 @@ impl ServerConfig {
                     )));
                 }
 
-                if value == JSValue::FALSE {
-                    // Appends a sentinel NUL without rejecting interior NULs
-                    // (which already passed `is_all_ascii`).
-                    let duped = ZBox::from_bytes(&*path);
-                    args.negative_routes.push(duped);
-                    continue;
-                }
-
-                if value.is_callable() {
-                    validate_route_name(global, &path)?;
-                    args.user_routes_to_build.push(UserRouteBuilder {
-                        route: RouteDeclaration {
-                            path: ZBox::from_bytes(&*path),
-                            method: RouteMethod::Any,
-                        },
-                        callback: Strong::create(
-                            value.with_async_context_if_needed(global),
-                            global,
-                        ),
-                    });
-                    continue;
-                } else if value.is_object() {
-                    const METHODS: [Method; 9] = [
-                        Method::CONNECT,
-                        Method::DELETE,
-                        Method::GET,
-                        Method::HEAD,
-                        Method::OPTIONS,
-                        Method::PATCH,
-                        Method::POST,
-                        Method::PUT,
-                        Method::TRACE,
-                    ];
-                    let mut found = false;
-                    // HEAD must behave like GET without a body (RFC 9110 section 9.3.2),
-                    // so a route object with a GET handler and no HEAD entry also answers HEAD.
-                    let mut derived_head_route: Option<UserRouteBuilder> = None;
-                    let mut has_head_route = false;
-                    for method in METHODS {
-                        let method_name = bun_core::String::static_(method.as_str());
-                        if let Some(function) = value.get_own(global, &method_name)? {
-                            if !found {
-                                validate_route_name(global, &path)?;
-                            }
-                            found = true;
-
-                            if function.is_callable() {
-                                let callback = function.with_async_context_if_needed(global);
-                                args.user_routes_to_build.push(UserRouteBuilder {
-                                    route: RouteDeclaration {
-                                        path: ZBox::from_bytes(&*path),
-                                        method: RouteMethod::Specific(method),
-                                    },
-                                    callback: Strong::create(callback, global),
-                                });
-                                match method {
-                                    Method::GET => {
-                                        derived_head_route = Some(UserRouteBuilder {
-                                            route: RouteDeclaration {
-                                                path: ZBox::from_bytes(&*path),
-                                                method: RouteMethod::Specific(Method::HEAD),
-                                            },
-                                            callback: Strong::create(callback, global),
-                                        });
-                                    }
-                                    Method::HEAD => has_head_route = true,
-                                    _ => {}
-                                }
-                            } else if let Some(html_route) =
-                                AnyRoute::from_js(global, &path, function, &mut *init_ctx)?
-                            {
-                                let mut method_set = http_method::Set::empty();
-                                method_set.insert(method);
-
-                                init_ctx.user_routes.push(StaticRouteEntry {
-                                    path: Box::<[u8]>::from(&*path),
-                                    route: html_route,
-                                    method: http_method::Optional::Method(method_set),
-                                });
-                                if method == Method::HEAD {
-                                    has_head_route = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(builder) = derived_head_route {
-                        if !has_head_route {
-                            args.user_routes_to_build.push(builder);
-                        }
-                    }
-
-                    if found {
+                // `/users/:id?` is also `/users`.
+                let (path, optional_paths) = expand_optional_route_params(global, path)?;
+                for path in core::iter::once(path).chain(optional_paths) {
+                    if value == JSValue::FALSE {
+                        // Appends a sentinel NUL without rejecting interior NULs
+                        // (which already passed `is_all_ascii`).
+                        let duped = ZBox::from_bytes(&*path);
+                        args.negative_routes.push(duped);
                         continue;
                     }
-                }
 
-                let Some(route) = AnyRoute::from_js(global, &path, value, &mut *init_ctx)? else {
-                    return Err(global.throw_invalid_arguments(format_args!(
-                        "'routes' expects a Record<string, Response | HTMLBundle | {{[method: string]: (req: BunRequest) => Response|Promise<Response>}}>\n\n\
-                         To bundle frontend apps on-demand with Bun.serve(), import HTML files.\n\n\
-                         Example:\n\n\
-                         ```js\n\
-                         import {{ serve }} from \"bun\";\n\
-                         import app from \"./app.html\";\n\n\
-                         serve({{\n\
-                         \x20 routes: {{\n\
-                         \x20   \"/index.json\": Response.json({{ message: \"Hello World\" }}),\n\
-                         \x20   \"/app\": app,\n\
-                         \x20   \"/path/:param\": (req) => {{\n\
-                         \x20     const param = req.params.param;\n\
-                         \x20     return Response.json({{ message: `Hello ${{param}}` }});\n\
-                         \x20   }},\n\
-                         \x20   \"/path\": {{\n\
-                         \x20     GET(req) {{\n\
-                         \x20       return Response.json({{ message: \"Hello World\" }});\n\
-                         \x20     }},\n\
-                         \x20     POST(req) {{\n\
-                         \x20       return Response.json({{ message: \"Hello World\" }});\n\
-                         \x20     }},\n\
-                         \x20   }},\n\
-                         \x20 }},\n\n\
-                         \x20 fetch(request) {{\n\
-                         \x20   return new Response(\"fallback response\");\n\
-                         \x20 }},\n\
-                         }});\n\
-                         ```\n\n\
-                         See https://bun.com/docs/api/http for more information.",
-                    )));
-                };
-                init_ctx.user_routes.push(StaticRouteEntry {
-                    path,
-                    route,
-                    method: http_method::Optional::Any,
-                });
+                    if value.is_callable() {
+                        validate_route_name(global, &path)?;
+                        args.user_routes_to_build.push(UserRouteBuilder {
+                            route: RouteDeclaration {
+                                path: ZBox::from_bytes(&*path),
+                                method: RouteMethod::Any,
+                            },
+                            callback: Strong::create(
+                                value.with_async_context_if_needed(global),
+                                global,
+                            ),
+                        });
+                        continue;
+                    } else if value.is_object() {
+                        const METHODS: [Method; 9] = [
+                            Method::CONNECT,
+                            Method::DELETE,
+                            Method::GET,
+                            Method::HEAD,
+                            Method::OPTIONS,
+                            Method::PATCH,
+                            Method::POST,
+                            Method::PUT,
+                            Method::TRACE,
+                        ];
+                        let mut found = false;
+                        // HEAD must behave like GET without a body (RFC 9110 section 9.3.2),
+                        // so a route object with a GET handler and no HEAD entry also answers HEAD.
+                        let mut derived_head_route: Option<UserRouteBuilder> = None;
+                        let mut has_head_route = false;
+                        for method in METHODS {
+                            let method_name = bun_core::String::static_(method.as_str());
+                            if let Some(function) = value.get_own(global, &method_name)? {
+                                if !found {
+                                    validate_route_name(global, &path)?;
+                                }
+                                found = true;
+
+                                if function.is_callable() {
+                                    let callback = function.with_async_context_if_needed(global);
+                                    args.user_routes_to_build.push(UserRouteBuilder {
+                                        route: RouteDeclaration {
+                                            path: ZBox::from_bytes(&*path),
+                                            method: RouteMethod::Specific(method),
+                                        },
+                                        callback: Strong::create(callback, global),
+                                    });
+                                    match method {
+                                        Method::GET => {
+                                            derived_head_route = Some(UserRouteBuilder {
+                                                route: RouteDeclaration {
+                                                    path: ZBox::from_bytes(&*path),
+                                                    method: RouteMethod::Specific(Method::HEAD),
+                                                },
+                                                callback: Strong::create(callback, global),
+                                            });
+                                        }
+                                        Method::HEAD => has_head_route = true,
+                                        _ => {}
+                                    }
+                                } else if let Some(html_route) =
+                                    AnyRoute::from_js(global, &path, function, &mut *init_ctx)?
+                                {
+                                    let mut method_set = http_method::Set::empty();
+                                    method_set.insert(method);
+
+                                    init_ctx.user_routes.push(StaticRouteEntry {
+                                        path: Box::<[u8]>::from(&*path),
+                                        route: html_route,
+                                        method: http_method::Optional::Method(method_set),
+                                    });
+                                    if method == Method::HEAD {
+                                        has_head_route = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(builder) = derived_head_route {
+                            if !has_head_route {
+                                args.user_routes_to_build.push(builder);
+                            }
+                        }
+
+                        if found {
+                            continue;
+                        }
+                    }
+
+                    let Some(route) = AnyRoute::from_js(global, &path, value, &mut *init_ctx)?
+                    else {
+                        return Err(global.throw_invalid_arguments(format_args!(
+                            "'routes' expects a Record<string, Response | HTMLBundle | {{[method: string]: (req: BunRequest) => Response|Promise<Response>}}>\n\n\
+                             To bundle frontend apps on-demand with Bun.serve(), import HTML files.\n\n\
+                             Example:\n\n\
+                             ```js\n\
+                             import {{ serve }} from \"bun\";\n\
+                             import app from \"./app.html\";\n\n\
+                             serve({{\n\
+                             \x20 routes: {{\n\
+                             \x20   \"/index.json\": Response.json({{ message: \"Hello World\" }}),\n\
+                             \x20   \"/app\": app,\n\
+                             \x20   \"/path/:param\": (req) => {{\n\
+                             \x20     const param = req.params.param;\n\
+                             \x20     return Response.json({{ message: `Hello ${{param}}` }});\n\
+                             \x20   }},\n\
+                             \x20   \"/path\": {{\n\
+                             \x20     GET(req) {{\n\
+                             \x20       return Response.json({{ message: \"Hello World\" }});\n\
+                             \x20     }},\n\
+                             \x20     POST(req) {{\n\
+                             \x20       return Response.json({{ message: \"Hello World\" }});\n\
+                             \x20     }},\n\
+                             \x20   }},\n\
+                             \x20 }},\n\n\
+                             \x20 fetch(request) {{\n\
+                             \x20   return new Response(\"fallback response\");\n\
+                             \x20 }},\n\
+                             }});\n\
+                             ```\n\n\
+                             See https://bun.com/docs/api/http for more information.",
+                        )));
+                    };
+                    init_ctx.user_routes.push(StaticRouteEntry {
+                        path,
+                        route,
+                        method: http_method::Optional::Any,
+                    });
+                }
             }
 
             // When HTML bundles are provided, ensure DevServer options are ready

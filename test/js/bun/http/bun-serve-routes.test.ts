@@ -1,6 +1,6 @@
 import type { BunRequest, ServeOptions, Server } from "bun";
 import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
-import { bunEnv, bunExe } from "harness";
+import { bunEnv, bunExe, tempDir } from "harness";
 import net from "node:net";
 
 describe("path parameters", () => {
@@ -91,6 +91,281 @@ describe("path parameters", () => {
     const response = await promise;
     expect(response).toContain("HTTP/1.1 200");
     expect(JSON.parse(response.slice(response.indexOf("\r\n\r\n") + 4))).toEqual({ id: expected, method: "GET" });
+  });
+});
+
+describe("optional path parameters", () => {
+  const fallback = () => new Response("fallback", { status: 404 });
+  const params = (req: BunRequest) => Response.json(req.params);
+
+  async function get(server: Server<undefined>, path: string, init?: RequestInit) {
+    const res = await fetch(new URL(path, server.url), init);
+    const text = await res.text();
+    return res.headers.get("content-type")?.startsWith("application/json") ? JSON.parse(text) : text;
+  }
+
+  it("matches with and without a trailing optional parameter", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/users/:id?": req => Response.json({ params: req.params, hasId: "id" in req.params }),
+      },
+    });
+
+    expect(await get(server, "/users")).toEqual({ params: {}, hasId: false });
+    expect(await get(server, "/users/42")).toEqual({ params: { id: "42" }, hasId: true });
+    expect(await get(server, "/users/user%40example.com")).toEqual({
+      params: { id: "user@example.com" },
+      hasId: true,
+    });
+    // The slash belongs to the parameter: "/users/" is neither "/users" nor "/users/:id".
+    expect(await get(server, "/users/")).toBe("fallback");
+    expect(await get(server, "/users/42/posts")).toBe("fallback");
+    expect(await get(server, "/user")).toBe("fallback");
+  });
+
+  it("matches an optional parameter in front of other segments", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/:lang?/docs/:page": params,
+      },
+    });
+
+    expect(await get(server, "/docs/routing")).toEqual({ page: "routing" });
+    expect(await get(server, "/de/docs/routing")).toEqual({ lang: "de", page: "routing" });
+    expect(await get(server, "/docs")).toBe("fallback");
+    expect(await get(server, "/de/docs")).toBe("fallback");
+  });
+
+  it("matches the root when every segment is optional", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/:section?": params,
+      },
+    });
+
+    expect(await get(server, "/")).toEqual({});
+    expect(await get(server, "/about")).toEqual({ section: "about" });
+    expect(await get(server, "/about/team")).toBe("fallback");
+  });
+
+  it("fills optional parameters that follow each other from the left", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/files/:dir?/:name?": params,
+        "/m/:a?/:b/:c?": params,
+      },
+    });
+
+    expect(await get(server, "/files")).toEqual({});
+    expect(await get(server, "/files/a")).toEqual({ dir: "a" });
+    expect(await get(server, "/files/a/b")).toEqual({ dir: "a", name: "b" });
+    expect(await get(server, "/files/a/b/c")).toBe("fallback");
+
+    expect(await get(server, "/m")).toBe("fallback");
+    expect(await get(server, "/m/1")).toEqual({ b: "1" });
+    expect(await get(server, "/m/1/2")).toEqual({ a: "1", b: "2" });
+    expect(await get(server, "/m/1/2/3")).toEqual({ a: "1", b: "2", c: "3" });
+  });
+
+  it("matches every combination of optional parameters that are apart", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/a/:x?/b/:y?": params,
+        "/t/:id?/": params,
+      },
+    });
+
+    expect(await get(server, "/a/b")).toEqual({});
+    expect(await get(server, "/a/1/b")).toEqual({ x: "1" });
+    expect(await get(server, "/a/b/2")).toEqual({ y: "2" });
+    expect(await get(server, "/a/1/b/2")).toEqual({ x: "1", y: "2" });
+    expect(await get(server, "/a")).toBe("fallback");
+
+    expect(await get(server, "/t/")).toEqual({});
+    expect(await get(server, "/t/1/")).toEqual({ id: "1" });
+    expect(await get(server, "/t")).toBe("fallback");
+    expect(await get(server, "/t/1")).toBe("fallback");
+  });
+
+  it("applies to method objects, static responses and false", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/items/:id?": {
+          GET: req => Response.json({ method: "GET", ...req.params }),
+          POST: req => Response.json({ method: "POST", ...req.params }),
+        },
+        "/static/:anything?": new Response("static"),
+        "/off/:id?": false,
+        "/off/*": () => new Response("wildcard"),
+      },
+    });
+
+    expect(await get(server, "/items")).toEqual({ method: "GET" });
+    expect(await get(server, "/items/7")).toEqual({ method: "GET", id: "7" });
+    expect(await get(server, "/items", { method: "POST" })).toEqual({ method: "POST" });
+    expect(await get(server, "/items/7", { method: "POST" })).toEqual({ method: "POST", id: "7" });
+    expect(await get(server, "/items/7", { method: "DELETE" })).toBe("fallback");
+    for (const path of ["/items", "/items/7"]) {
+      const head = await fetch(new URL(path, server.url), { method: "HEAD" });
+      expect({ path, status: head.status, body: await head.text() }).toEqual({ path, status: 200, body: "" });
+    }
+
+    expect(await get(server, "/static")).toBe("static");
+    expect(await get(server, "/static/x")).toBe("static");
+    expect(await get(server, "/static/x/y")).toBe("fallback");
+
+    // `false` sends both paths to fetch(), past the wildcard route.
+    expect(await get(server, "/off")).toBe("fallback");
+    expect(await get(server, "/off/1")).toBe("fallback");
+    expect(await get(server, "/off/1/2")).toBe("wildcard");
+  });
+
+  it("applies to HTML imports", async () => {
+    using dir = tempDir("serve-optional-param-html", {
+      "index.html": `<!doctype html><html><head><title>optional</title></head><body></body></html>`,
+      "server.ts": `
+        import page from "./index.html";
+        const server = Bun.serve({
+          port: 0,
+          development: false,
+          routes: { "/app/:tab?": page },
+          fetch: () => new Response("fallback", { status: 404 }),
+        });
+        const results = [];
+        for (const path of ["/app", "/app/settings", "/app/settings/more"]) {
+          const res = await fetch(new URL(path, server.url));
+          results.push([path, res.status, (await res.text()).includes("<title>optional</title>")]);
+        }
+        console.log(JSON.stringify(results));
+        server.stop(true);
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "server.ts"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    if (exitCode !== 0) expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual([
+      ["/app", 200, true],
+      ["/app/settings", 200, true],
+      ["/app/settings/more", 404, false],
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  it("ranks the expanded routes like routes that are written out", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/posts/new": () => new Response("new post"),
+        "/posts/:page?": req => new Response(`page ${req.params.page ?? 1}`),
+        "/posts/*": () => new Response("wildcard"),
+      },
+    });
+
+    expect(await get(server, "/posts")).toBe("page 1");
+    expect(await get(server, "/posts/2")).toBe("page 2");
+    expect(await get(server, "/posts/new")).toBe("new post");
+    expect(await get(server, "/posts/2/comments")).toBe("wildcard");
+  });
+
+  it("works with reload()", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/v/:id": params,
+      },
+    });
+    expect(await get(server, "/v")).toBe("fallback");
+
+    server.reload({
+      fetch: fallback,
+      routes: {
+        "/v/:id?": params,
+      },
+    });
+    expect(await get(server, "/v")).toEqual({});
+    expect(await get(server, "/v/1")).toEqual({ id: "1" });
+  });
+
+  it("only reads a '?' that ends a parameter segment", async () => {
+    await using server = Bun.serve({
+      port: 0,
+      fetch: fallback,
+      routes: {
+        "/x/:id?.json": params,
+      },
+    });
+
+    expect(await get(server, "/x")).toBe("fallback");
+    expect(await get(server, "/x/1")).toEqual({ "id?.json": "1" });
+  });
+
+  it("validates the names of optional parameters", () => {
+    expect(() => Bun.serve({ port: 0, fetch: fallback, routes: { "/a/:id?/:id?": params } })).toThrow(
+      "Support for duplicate route parameter names is not yet implemented.",
+    );
+    expect(() => Bun.serve({ port: 0, fetch: fallback, routes: { "/a/:1?": params } })).toThrow(
+      "Route parameter names cannot start with a number.",
+    );
+  });
+
+  it("allows 8 optional parameters and no more", async () => {
+    const path = (count: number) => "/n" + Array.from({ length: count }, (_, i) => `/:p${i}?`).join("");
+
+    expect(() => Bun.serve({ port: 0, fetch: fallback, routes: { [path(9)]: params } })).toThrow(
+      `Invalid route "${path(9)}". A route can have at most 8 optional parameters`,
+    );
+
+    await using server = Bun.serve({ port: 0, fetch: fallback, routes: { [path(8)]: params } });
+    expect(await get(server, "/n")).toEqual({});
+    expect(await get(server, "/n/a/b/c")).toEqual({ p0: "a", p1: "b", p2: "c" });
+    expect(await get(server, "/n/a/b/c/d/e/f/g/h")).toEqual({
+      p0: "a",
+      p1: "b",
+      p2: "c",
+      p3: "d",
+      p4: "e",
+      p5: "f",
+      p6: "g",
+      p7: "h",
+    });
+    expect(await get(server, "/n/a/b/c/d/e/f/g/h/i")).toBe("fallback");
+
+    // Apart from each other, 8 optional parameters are 256 paths.
+    const apart = Array.from({ length: 8 }, (_, i) => `/s${i}/:p${i}?`).join("");
+    await using wide = Bun.serve({ port: 0, fetch: fallback, routes: { [apart]: params } });
+    expect(await get(wide, "/s0/s1/s2/s3/s4/s5/s6/s7")).toEqual({});
+    expect(await get(wide, "/s0/s1/b/s2/s3/d/s4/s5/s6/s7/h")).toEqual({ p1: "b", p3: "d", p7: "h" });
+    expect(await get(wide, "/s0/a/s1/b/s2/c/s3/d/s4/e/s5/f/s6/g/s7/h")).toEqual({
+      p0: "a",
+      p1: "b",
+      p2: "c",
+      p3: "d",
+      p4: "e",
+      p5: "f",
+      p6: "g",
+      p7: "h",
+    });
+    expect(await get(wide, "/s0/s1/s2/s3/s4/s5/s6")).toBe("fallback");
   });
 });
 
