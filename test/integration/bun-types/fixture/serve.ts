@@ -17,6 +17,30 @@ Bun.serve({
   },
 });
 
+Bun.serve({
+  routes: {
+    "/posts/:page?": req => {
+      expectType(req.params).is<{ page?: string }>();
+      expectType(req.params.page).is<string | undefined>();
+      return new Response(req.params.page ?? "1");
+    },
+    "/:lang?/docs/:page": req => {
+      expectType(req.params).is<{ lang?: string; page: string }>();
+      return new Response(req.params.page);
+    },
+    "/files/:dir?/:name?": {
+      GET: req => {
+        expectType(req.params).is<{ dir?: string; name?: string }>();
+        return new Response(req.params.name);
+      },
+    },
+  },
+});
+
+function optionalRouteParam(req: Bun.BunRequest<"/users/:id?">) {
+  expectType(req.params.id).is<string | undefined>();
+}
+
 const s1 = Bun.serve({
   routes: {
     "/ws/:name": req => {
