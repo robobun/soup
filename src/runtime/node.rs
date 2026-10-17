@@ -31,6 +31,9 @@ pub(crate) mod process;
 // codegen (`generated_js2native.rs`) addresses this by its file-stem name.
 pub(crate) use process as node_process;
 
+#[path = "node/node_sea.rs"]
+pub(crate) mod sea;
+
 #[path = "node/node_crypto_binding.rs"]
 pub(crate) mod crypto;
 
