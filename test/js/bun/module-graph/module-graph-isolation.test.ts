@@ -4067,6 +4067,7 @@ test("ModuleGraph isolation: every node: builtin module is classified", () => {
     cluster: "host", // forks the whole process
     inspector: "host",
     "inspector/promises": "host",
+    "node:sea": "host", // the files in the executable, as Bun.embeddedFiles
     process: "host",
     readline: "host", // process.stdin
     "readline/promises": "host",

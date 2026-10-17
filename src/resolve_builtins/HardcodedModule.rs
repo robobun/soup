@@ -143,6 +143,8 @@ pub enum HardcodedModule {
     NodeHttp2,
     #[strum(serialize = "node:quic")]
     NodeQuic,
+    #[strum(serialize = "node:sea")]
+    NodeSea,
     #[strum(serialize = "node:diagnostics_channel")]
     NodeDiagnosticsChannel,
     #[strum(serialize = "node:dgram")]
@@ -256,6 +258,7 @@ bun_core::comptime_string_map! {
         b"node:querystring" => HardcodedModule::NodeQuerystring,
         b"node:readline/promises" => HardcodedModule::NodeReadlinePromises,
         b"node:repl" => HardcodedModule::NodeRepl,
+        b"node:sea" => HardcodedModule::NodeSea,
         b"node:sqlite" => HardcodedModule::NodeSqlite,
         b"node:stream" => HardcodedModule::NodeStream,
         b"node:stream/consumers" => HardcodedModule::NodeStreamConsumers,
@@ -457,6 +460,7 @@ const COMMON_ALIAS_KVS: &[AliasKv] = &[
     node_entry_only_prefix!("node:sqlite"),
     node_entry_only_prefix!("node:test"),
     node_entry_only_prefix!("node:quic"),
+    node_entry_only_prefix!("node:sea"),
     //
     node_entry!("assert"),
     node_entry!("assert/strict"),
