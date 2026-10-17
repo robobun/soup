@@ -368,5 +368,7 @@ const errors: ErrorCodeMapping = [
   ["HPE_INVALID_URL", Error],
   ["ERR_HTTP2_TOO_MANY_ORIGINS", Error],
   ["ERR_PATCH_DOES_NOT_APPLY", Error],
+  ["ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION", Error],
+  ["ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND", Error],
 ];
 export default errors;
