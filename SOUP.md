@@ -5868,6 +5868,178 @@ Files: `src/install/PackageManager/changed_since.rs` (new),
 `docs/runtime/index.mdx`, `test/cli/run/filter-workspace.test.ts`,
 `test/cli/install/bun-add-filter.test.ts`.
 
+### 2026-10-17: `node:sea`, on top of `bun build --compile`
+
+`node:sea` is the Node.js API of a single executable application: `isSea()` says whether the
+program runs as one, and `getAsset()` and its siblings read the files that were packed into it. It
+was the one `node:` module that the compatibility page still marked "Not implemented", and it did
+not resolve at all, so `import "node:sea"` threw `No such built-in module: node:sea`.
+oven-sh/bun#39728 lists it, and a comment there describes the effect: code that imports the module
+statically, only to ask `isSea()`, cannot load on Bun. Bun has what the module describes, under
+another name: an executable made by `bun build --compile`, with files embedded in it. The module
+now exists and answers from that.
+
+```sh
+bun build --compile ./cli.ts --asset ./config.json --asset ./templates --outfile mycli
+```
+
+```ts
+import sea from "node:sea";
+
+if (sea.isSea()) {
+  sea.getAssetKeys(); // ["config.json", "templates/page.html"]
+  const config = JSON.parse(sea.getAsset("config.json", "utf8"));
+  const bytes = sea.getAsset("templates/page.html"); // an ArrayBuffer, a copy
+  const page = sea.getAssetAsBlob("templates/page.html"); // a Blob of the bytes in the executable
+} else {
+  // under `bun run`: the files are on disk
+}
+```
+
+What it does:
+
+- `isSea()` is `true` in a compiled executable and `false` under `bun run`, the answer that
+  `Bun.isStandaloneExecutable` gives.
+- An asset is an embedded file, and its key is the name `Bun.embeddedFiles` has for it. A file
+  passed to `--asset` is named after its last path component (`config.json`), and a file inside a
+  directory passed to `--asset` after that directory and its path inside it
+  (`templates/page.html`). A file imported with `with { type: "file" }` is renamed by
+  `--asset-naming`, so by default its key carries a content hash, and is the `basename()` of the
+  path that the import returns.
+- `getAsset(key)` returns a copy in an `ArrayBuffer`, `getAsset(key, encoding)` a string from a
+  `TextDecoder`, `getAssetAsBlob(key, options)` a `Blob`, and `getAssetKeys()` the keys in the
+  order of `Bun.embeddedFiles`.
+- Outside of an executable everything but `isSea()` throws
+  `ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION`, and a key without an asset throws
+  `ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND`. The codes, the messages, the order of the
+  checks (the encoding, the key, then whether this is an executable) and the `length` of each
+  function were compared with Node.js 26.3.0. The bundled source code is not an asset, which is
+  the rule of `Bun.embeddedFiles`.
+- The module resolves with the `node:` prefix only, as in Node.js (`sea` is a package on npm),
+  and is in `module.builtinModules`.
+
+Where it differs from Node.js:
+
+- There is no `sea-config.json`. What is embedded, and under which name, is what
+  `bun build --compile` was told.
+- `getRawAsset()` returns a copy. In Node.js it returns the memory of the executable, and its
+  documentation warns that a write to it is likely to crash the process. A copy cannot.
+- `getAssetAsBlob()` does not copy: the `Blob` shares the bytes in the executable, as the ones in
+  `Bun.embeddedFiles` do. Without `options.type` it has the type of the file extension, where
+  Node.js has `""`. With one it is `new Blob([blob], options)`, which shares the bytes of a single
+  `Blob` part.
+
+How it is built. `src/js/node/sea.ts` is `lib/sea.js` of Node.js. Under it are four functions
+declared in `node_sea.bind.ts`, for the bindings generator that `node:os` uses, with their bodies
+in `node_sea.rs`. They read the module graph of the executable and not `Bun.embeddedFiles`, which
+is an ordinary array that a program can sort, empty or replace. A key is one hash lookup of its
+exact bytes, then the rule that keeps source code out of `Bun.embeddedFiles`. The rest is
+registration:
+`HardcodedModule.rs` (prefix only), the two lists behind `isBuiltin()` and `builtinModules`, and
+two error codes. A program that does not import the module runs nothing of it. There is no
+release build of this commit, so no binary size.
+
+Tests: `test/js/node/sea/sea.test.ts`, four tests. Three run in the test process: the module is a
+builtin under its prefix only, `isSea()` is `false` and the other functions throw, and the
+argument checks come first. The fourth compiles an executable with an `--asset` file, an
+`--asset` directory and a `type: "file"` import, and compares one JSON document that the
+executable prints: the keys, the text, the bytes, a Latin-1 decoding, that writing to a copy does
+not reach the next read, the `Blob` with and without a type, an empty file, the errors, and that
+the entry point, which is embedded too, is not an asset. All four fail on the released
+1.4.3-canary.1, where the import does not resolve. `module-graph-isolation.test.ts` classifies
+every builtin module, and lists `node:sea` as the host's, like `Bun.embeddedFiles`.
+`node-module-module.test.js` counts `builtinModules`, 77 now.
+
+The review. Two readers went through the work before the commit, one through this module and one
+through the two parsers that the rebase ported (below). In this module they found: the test that
+counts `builtinModules`; a lookup that normalized the key as a path, which on Windows panics for
+a key longer than a path buffer (it is an exact lookup now); an empty asset that lost the `type`
+it was asked for, because `Blob.slice()` returns a new empty blob for a size of zero (the `Blob`
+constructor is used now); an assertion that could not fail, because it asked for `index.js` and
+the entry point is embedded under the name of the executable; and a sentence of the docs about
+how `--asset` names a file. The design review and the self-review workflows were not run: both
+ask GitHub a few hundred times, and the search API of the shared token was already refusing
+requests today.
+
+Not done, and not checked:
+
+- Reading a `sea-config.json`. Its `assets` map (key to path) could feed the embedding, so that a
+  Node.js project compiles without naming its assets a second time.
+- A `getRawAsset()` without the copy, and `""` as the default type of `getAssetAsBlob()`.
+- The tests of Node.js for this module
+  (`test/sequential/test-single-executable-application-*.js`) inject a blob into a `node` binary
+  with postject. They were not ported.
+- Windows and macOS were not run. Nothing in the Rust is specific to a platform, and the bundler
+  writes the keys of `--asset` files with `/` on Windows.
+- Found on the way and reported, not fixed here: in Bun `new Blob([blob])` with a single part
+  keeps the type, the name and the `File`-ness of that part, and `file.slice()` returns a `File`.
+  That is why `getAssetAsBlob()` does not build its result with the `Blob` constructor.
+
+Rebase notes: 56 patches onto oven-sh/bun 017b2439a7, 15 commits after the last base. Two of the
+15 rewrote code that the stack stands on. oven-sh/bun#45590 declares thirty-five `Bun.*` functions
+with the bindings generator and removes the argument helper that `Bun.TOML.parse` and its
+siblings shared. oven-sh/bun#45304 rewrites the `Bun.sql` client and much of `bun:sqlite`. Eight
+patches stopped the rebase. One is dropped (see [Dropped](#dropped)), seven are resolved:
+
+- `Bun.INI.parse()` and `Bun.CSV` used the removed helper. Both are declared in a `.bind.ts` file
+  now, like the five formats next to them, and the error for a missing document is the
+  generator's (`input must be a string, ArrayBuffer, ArrayBufferView or Blob`).
+  `Bun.CSV.parse()` reads its options before it looks at the bytes and defines its rows where it
+  pushed them, so nothing runs JavaScript while the bytes of a buffer are borrowed. Before, an
+  options getter did. On the ASAN build, a getter that detaches or shrinks the buffer now gives an
+  empty parse, and setters on `Object.prototype` and `Array.prototype` are not called.
+- Query logging for `Bun.SQL` hooked two `handle.run()` calls of a file that no longer has them.
+  It is ported to the one `runOn()` of the new client, and the option is parsed in
+  `internal/sql/options.ts`. Its 22 tests pass against SQLite, PostgreSQL and MariaDB. Two of
+  them started seven and four debug processes at a time, and seventeen such processes now take 5
+  seconds here (the debug binary grew from 0.8 to 1.2 GB), so those two check the parsed option in
+  the test process and start one process each.
+- `EventSource`, `Bun.JWT`, `Bun.Queue` and `Bun.msgpack` had changed lines next to theirs
+  (`undici.js`, the property table and a deleted function in `BunObject.cpp`).
+
+Running the tests of the stack on the new base, and the second reader, found three faults that
+are older than this rebase. Each is fixed in the commit it belongs to:
+
+- `Bun.unescapeHTML` (2026-10-15) was missing from the list in
+  `module-graph-isolation.test.ts` that classifies every property of `Bun`, so that test failed.
+- `Bun.CSV.parse("a", { header: new Array(2 ** 32 - 1) })`, and `columns` of `stringify()`,
+  reserved memory for the length of the array and aborted on a 96 GB allocation. They throw the
+  `TypeError` for the first element now, with a test.
+- `Bun.INI.parse()` read a `SharedArrayBuffer` in place while the parsed values point into the
+  input. A writer on another thread could make the parser panic. The bytes of a shared buffer are
+  copied now, as `Bun.TOML.parse()` does.
+
+Seen and not fixed: `Bun.CSV.stringify()` writes a record whose only field is empty as an empty
+line, which `parse()` skips by default, so such a row does not come back.
+
+On the new base, with the debug build: `ini` (72), `csv` (54), `sql-debug` (22), `eventsource`
+(16), `jwt` (87), `queue` (50), `msgpack` (228), `escapeHTML` (21), `storage` (36),
+`wpt-webstorage` (22), `bun-write` (117), `bun-serve-compress` (22), `bun-serve-routes` (73),
+`expect-poll` (16), `console-log` (13), `bytes-loader` (6), `s3-metadata` (38), `locks` (36),
+`perf_hooks` (16), `static-server` (9), the shell builtins `head`, `tail`, `wc`, `sort` and `uniq`,
+`kill` (34), `parse` (32), `bunshell` (599), `import-meta-glob` (36 and 16), `test-last-failed`
+(8), `archive` (140), `semver` (484), `bun-pm-sbom` (22), `bun-build-watch` (36),
+`filter-workspace` (173), `proxy` (147), `coverage` (65), `bundler_comments` (76), `bundler_iife`
+(59), `bundler_loader` (70) and `node-module-module` (73) pass. Three files have failures that are
+not the stack's: `glob/scan` (215 pass, 6 tests that walk the whole checkout run into their 30
+second limit), `snapshot` (75 pass, 1 upstream test that expects colors in an error message) and
+`module-graph-isolation` (338 pass; 74 tests that each start a debug process ran into the 5
+second limit while another test file ran next to them, and the two that classify `Bun` and the
+builtin modules pass with the fix above). The MariaDB of this container refuses `root` over TCP,
+so the MySQL tests of `sql-debug` ran after its local account was changed. The install tests
+were not run. The source lints pass with the released binary (182), as the fork's workflow runs
+them, the bun-types test passes (23), and `bun run rust:check-all x86_64-pc-windows-msvc` passes.
+
+Files: `src/js/node/sea.ts` (new), `src/runtime/node/node_sea.bind.ts` (new),
+`src/runtime/node/node_sea.rs` (new), `src/runtime/node.rs`,
+`src/resolve_builtins/HardcodedModule.rs`, `src/jsc/bindings/isBuiltinModule.cpp`,
+`src/jsc/modules/NodeModuleModule.cpp`, `src/jsc/bindings/ErrorCode.ts`, `src/js/builtins.d.ts`,
+`docs/bundler/executables.mdx`, `docs/runtime/nodejs-compat.mdx`,
+`test/js/node/sea/sea.test.ts` (new), `test/js/node/module/node-module-module.test.js`,
+`test/js/bun/module-graph/module-graph-isolation.test.ts`.
+
 ## Dropped
 
-Nothing yet.
+- 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
+  oven-sh/bun#45304 adds `db.function()` upstream, with the same better-sqlite3 signature and
+  options, and `db.aggregate()` next to it.

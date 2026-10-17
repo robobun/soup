@@ -29,6 +29,9 @@ pub(crate) mod os;
 #[path = "node/node_process.rs"]
 pub(crate) mod process;
 
+#[path = "node/node_sea.rs"]
+pub(crate) mod sea;
+
 #[path = "node/node_crypto_binding.rs"]
 pub(crate) mod crypto;
 

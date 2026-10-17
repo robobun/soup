@@ -565,6 +565,8 @@ declare function $ERR_INSPECTOR_NOT_CONNECTED(): Error;
 declare function $ERR_INSPECTOR_NOT_WORKER(): Error;
 declare function $ERR_INSPECTOR_COMMAND(message: string): Error;
 declare function $ERR_WORKER_UNSUPPORTED_OPERATION(message: string): TypeError;
+declare function $ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION(message: string): Error;
+declare function $ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND(message: string): Error;
 declare function $ERR_SERVER_NOT_RUNNING(): Error;
 declare function $ERR_SOCKET_BAD_TYPE(): Error;
 declare function $ERR_ZLIB_INITIALIZATION_FAILED(): Error;

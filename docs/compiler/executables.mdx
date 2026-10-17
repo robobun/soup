@@ -1013,6 +1013,8 @@ if (Bun.isStandaloneExecutable) {
 
 Unlike `Bun.embeddedFiles.length > 0`, this check does not allocate `Blob` objects for each embedded file, so it is safe to call at startup in binaries that embed large assets.
 
+`isSea()` from [`node:sea`](#node-sea) gives the same answer, for code that also runs on Node.js.
+
 ### Listing embedded files
 
 `Bun.embeddedFiles` exposes all embedded files as `Blob` objects:
@@ -1092,6 +1094,53 @@ By default, Bun appends a content hash to the name of each embedded file, which 
     ```
   </Tab>
 </Tabs>
+
+### `node:sea`
+
+[`node:sea`](https://nodejs.org/api/single-executable-applications.html) is the Node.js API for single executable applications. In Bun, the application is the executable that `bun build --compile` makes, and its assets are the embedded files. Code written for a Node.js single executable application reads them the same way:
+
+```bash terminal icon="terminal"
+bun build --compile ./index.ts --asset ./config.json --asset ./public --outfile myapp
+```
+
+```ts index.ts icon="/icons/typescript.svg"
+import sea from "node:sea";
+
+if (sea.isSea()) {
+  sea.getAssetKeys(); // ["config.json", "public/index.html", "public/logo.png"]
+
+  const config = JSON.parse(sea.getAsset("config.json", "utf8")); // a string
+  const logo = sea.getAsset("public/logo.png"); // an ArrayBuffer
+  const page = sea.getAssetAsBlob("public/index.html"); // a Blob
+}
+```
+
+The key of an asset is its name in `Bun.embeddedFiles`. A file passed to `--asset` is named after its last path component (`config.json`), and a file inside a directory passed to `--asset` is named after that directory and its path inside it (`public/index.html`). A file imported with `with { type: "file" }` is renamed according to `--asset-naming`. With the default naming its key has a content hash, and is the last part of the path that the import returns:
+
+```ts index.ts icon="/icons/typescript.svg"
+import { basename } from "node:path";
+import sea from "node:sea";
+import icon from "./icon.png" with { type: "file" };
+
+const bytes = sea.getAsset(basename(icon)); // "icon-a1b2c3d4.png"
+```
+
+| Function                         | Returns                                                                                      |
+| -------------------------------- | -------------------------------------------------------------------------------------------- |
+| `isSea()`                        | `true` in a compiled executable, `false` under `bun run`                                     |
+| `getAssetKeys()`                 | the keys of the assets, in the order of `Bun.embeddedFiles`                                  |
+| `getAsset(key)`                  | a copy of the asset in an `ArrayBuffer`                                                      |
+| `getAsset(key, encoding)`        | the asset as a string, decoded by a `TextDecoder` for `encoding`                             |
+| `getRawAsset(key)`               | a copy of the asset in an `ArrayBuffer`                                                      |
+| `getAssetAsBlob(key, { type }?)` | the asset as a `Blob`, which is not copied; the default `type` is that of the file extension |
+
+Outside of a compiled executable, every function but `isSea()` throws `ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION`, as in Node.js. A key that no asset has throws `ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND`. Bundled source code is not an asset, like in `Bun.embeddedFiles`.
+
+There are three differences from Node.js:
+
+- Bun does not read a `sea-config.json`. `bun build --compile` decides what is embedded.
+- `getRawAsset()` returns a copy. In Node.js it returns the memory of the executable, and a write to it can crash the process.
+- `getAssetAsBlob()` does not copy the asset, and its `type` is that of the file extension unless `options.type` names another. In Node.js the asset is copied and the `type` is empty by default.
 
 ---
 

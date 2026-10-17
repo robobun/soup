@@ -189,7 +189,7 @@ We update this page regularly. It reflects the latest version of Bun's compatibi
 
 ### [`node:sea`](https://nodejs.org/api/single-executable-applications.html)
 
-🔴 Not implemented. Use [`bun build --compile`](/compiler/executables) to build single-file executables instead.
+🟡 Implemented on top of [`bun build --compile`](/compiler/executables#node-sea), which is how Bun builds a single-file executable: `isSea()` is `true` in one, and `getAsset()`, `getRawAsset()`, `getAssetAsBlob()` and `getAssetKeys()` read the files embedded in it. Bun does not read a `sea-config.json`. `getRawAsset()` returns a copy.
 
 ## Node.js globals
 
