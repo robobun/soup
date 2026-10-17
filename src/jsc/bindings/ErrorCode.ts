@@ -366,5 +366,7 @@ const errors: ErrorCodeMapping = [
   ["ERR_REDIS_SERVER_ERROR", Error, "RedisError"],
   ["ERR_FFI_CC_DISABLED", Error],
   ["HPE_INVALID_URL", Error],
+  ["ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION", Error],
+  ["ERR_SINGLE_EXECUTABLE_APPLICATION_ASSET_NOT_FOUND", Error],
 ];
 export default errors;
