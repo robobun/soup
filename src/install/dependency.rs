@@ -882,6 +882,24 @@ impl TagExt for Tag {
                     return Tag::Catalog;
                 }
             }
+            // jsr:^1.2.3
+            // jsr:@scope/package@1.2.3
+            // jsr:owner/repo.git is further down: the host of a git remote
+            b'j' => {
+                if let Some(crate::jsr::Specifier { version, .. }) =
+                    crate::jsr::specifier(dependency)
+                {
+                    // A version, a range or a dist-tag of the registry. What else it could be
+                    // (a protocol of its own) is an error where the specifier is read.
+                    if !version.is_empty()
+                        && !strings::contains_char(version, b':')
+                        && Tag::infer(version) == Tag::DistTag
+                    {
+                        return Tag::DistTag;
+                    }
+                    return Tag::Npm;
+                }
+            }
             // git_user/repo
             // git_tarball.tgz
             // github:user/repo
@@ -1237,6 +1255,11 @@ pub(crate) fn parse_with_tag(
 ) -> Option<Version> {
     // `to_version` (bun.lockb) and `clone_with_different_buffers` pass the literal untrimmed.
     let dependency = trim_literal(dependency);
+    // `jsr::stored` runs where a specifier is read, because the alias names a package and that
+    // name has to be in the buffer of the literal. A `Dependency` never holds the `jsr:` spelling.
+    if matches!(tag, Tag::Npm | Tag::DistTag) && crate::jsr::is_jsr(dependency) {
+        return None;
+    }
     match tag {
         Tag::Npm => {
             let mut input = dependency;

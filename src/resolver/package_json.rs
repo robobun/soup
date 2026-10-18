@@ -3,10 +3,12 @@ use bun_collections::{ArrayHashMap, StringArrayHashMap};
 use bun_core::Output;
 use bun_core::StackCheck;
 use bun_core::strings;
+use bun_install_types::jsr;
 use bun_js_parser::lexer as js_lexer;
 use bun_paths::{self as resolve_path, MAX_PATH_BYTES, PathBuffer, SEP_STR};
 use bun_semver as Semver;
 use bun_semver::String as SemverString;
+use std::borrow::Cow;
 
 use bun_options_types::bundle_enums::ModuleType;
 use bun_sys::Fd;
@@ -913,7 +915,11 @@ impl PackageJSON {
                                 for prop in group_obj.get().properties() {
                                     visit(prop.key.slice());
                                     if let Some(version) = prop.value.as_str() {
-                                        visit(version);
+                                        // A `jsr:` specifier is read as the `npm:` alias it stands for.
+                                        visit(
+                                            &jsr::stored(prop.key.slice(), version)
+                                                .unwrap_or(Cow::Borrowed(version)),
+                                        );
                                     }
                                 }
                             }
@@ -955,26 +961,39 @@ impl PackageJSON {
                                     let Some(version_str) = prop.value.as_str() else {
                                         continue;
                                     };
+                                    let stored = jsr::stored(prop.key.slice(), version_str);
+                                    let is_valid = stored.is_ok();
+                                    let stored = stored.unwrap_or(Cow::Borrowed(version_str));
                                     let version_str = slice_in_source_buf(
                                         source_buf,
                                         copied,
                                         &mut cursor,
-                                        version_str,
+                                        &stored,
                                     );
                                     let sliced_str =
                                         Semver::SlicedString::init(source_buf, version_str);
 
-                                    if let Some(dependency_version) = r.parse_dependency(
-                                        name,
-                                        name_hash,
-                                        version_str,
-                                        &sliced_str,
-                                        Some(&mut *r_log),
-                                        !strings::contains(
-                                            package_json_path,
-                                            NODE_MODULES_PATH.as_bytes(),
-                                        ),
-                                    ) {
+                                    let dependency_version = if is_valid {
+                                        r.parse_dependency(
+                                            name,
+                                            name_hash,
+                                            version_str,
+                                            &sliced_str,
+                                            Some(&mut *r_log),
+                                            !strings::contains(
+                                                package_json_path,
+                                                NODE_MODULES_PATH.as_bytes(),
+                                            ),
+                                        )
+                                    } else {
+                                        // Stays listed, with the specifier as it is written, so that
+                                        // an import of it is an error and not a package to look up.
+                                        let mut unusable = DependencyVersion::default();
+                                        unusable.literal =
+                                            SemverString::init(source_buf, version_str);
+                                        Some(unusable)
+                                    };
+                                    if let Some(dependency_version) = dependency_version {
                                         let dependency = Dependency {
                                             name,
                                             version: dependency_version,

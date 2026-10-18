@@ -902,7 +902,7 @@ fn add_own_package(
 
     let json = match manifest {
         Some((source, json)) => {
-            let edited = if needs_workspace_manifests(*json) || has_publish_config_overrides(json) {
+            let edited = if needs_substitutions(*json) || has_publish_config_overrides(json) {
                 let indentation = JSON::guess_indentation(&source.contents);
                 Some(edit_root_package_json(
                     workspace_manifests,
@@ -2466,7 +2466,7 @@ fn add_archive_entry(
     }
 }
 
-/// What replaces a `workspace:` or `catalog:` specifier in the tarball's package.json.
+/// What replaces a `workspace:`, `catalog:` or `jsr:` specifier in the tarball's package.json.
 pub(crate) enum Substitution<'a> {
     /// For `workspace:^`, `workspace:~` and `workspace:*`: the workspace's current version with
     /// that prefix.
@@ -2474,6 +2474,8 @@ pub(crate) enum Substitution<'a> {
     /// `workspace:@acme/core@*` (alias), `workspace:../core`, or `workspace:1.x` on a workspace.
     WorkspaceRangeOrDirectory(&'a [u8]),
     Catalog(&'a [u8]),
+    /// `jsr:^1.0.0`: the `npm:` alias it stands for, which a client without `jsr:` can install.
+    Jsr(&'a [u8]),
 }
 
 impl<'a> Substitution<'a> {
@@ -2487,6 +2489,9 @@ impl<'a> Substitution<'a> {
                 _ => Substitution::WorkspaceRangeOrDirectory(range),
             });
         }
+        if bun_install::jsr::is_jsr(spec) {
+            return Some(Substitution::Jsr(spec));
+        }
         let catalog_name = strings::without_prefix_if_possible_comptime(spec, b"catalog:")?;
         Some(Substitution::Catalog(strings::trim(
             catalog_name,
@@ -2494,13 +2499,25 @@ impl<'a> Substitution<'a> {
         )))
     }
 
+    /// `workspace:` and `catalog:` are read from the package.json files of the workspace.
+    pub(crate) fn needs_workspace_manifests(&self) -> bool {
+        !matches!(self, Substitution::Jsr(_))
+    }
+
     /// On failure, `Err` says which protocol couldn't be resolved and why.
     pub(crate) fn published(
         self,
-        manifests: &WorkspaceManifests,
+        manifests: Option<&WorkspaceManifests>,
         package_dir: &[u8],
         dependency_name: &[u8],
     ) -> Result<Vec<u8>, (&'static str, String)> {
+        if let Substitution::Jsr(spec) = self {
+            return match bun_install::jsr::to_npm_alias(dependency_name, spec) {
+                Ok(alias) => Ok(alias.unwrap_or_else(|| spec.to_vec())),
+                Err(err) => Err(("JSR", err.message().to_owned())),
+            };
+        }
+        let manifests = manifests.expect("pack() loads the manifests when a spec needs them");
         match self {
             Substitution::WorkspaceVersion(prefix) => {
                 match manifests.workspace_version(dependency_name) {
@@ -2536,9 +2553,10 @@ impl<'a> Substitution<'a> {
                         "catalog",
                         "catalog entry refers to another catalog".to_owned(),
                     )),
-                    Some(found) => found.published(manifests, package_dir, dependency_name),
+                    Some(found) => found.published(Some(manifests), package_dir, dependency_name),
                 }
             }
+            Substitution::Jsr(_) => unreachable!("returned above"),
         }
     }
 }
@@ -2567,18 +2585,28 @@ pub(crate) fn for_each_dependency(
     }
 }
 
-/// Packages without such specs must pack whatever state the rest of the workspace is in.
-fn needs_workspace_manifests(package_json: Expr) -> bool {
-    let mut needed = false;
+fn any_substitution(package_json: Expr, is_wanted: impl Fn(&Substitution) -> bool) -> bool {
+    let mut found = false;
     for_each_dependency(package_json, |_, dependency| {
-        needed |= dependency
+        found |= dependency
             .value
             .as_ref()
             .and_then(Expr::as_utf8_string_literal)
             .and_then(Substitution::for_spec)
-            .is_some();
+            .is_some_and(|substitution| is_wanted(&substitution));
     });
-    needed
+    found
+}
+
+/// Packages without such specs must pack whatever state the rest of the workspace is in.
+fn needs_workspace_manifests(package_json: Expr) -> bool {
+    any_substitution(package_json, |substitution| {
+        substitution.needs_workspace_manifests()
+    })
+}
+
+fn needs_substitutions(package_json: Expr) -> bool {
+    any_substitution(package_json, |_| true)
 }
 
 /// The alias is checked first, like the installer does. A directory is checked before a range,
@@ -2745,9 +2773,9 @@ fn apply_publish_config_overrides(root: &Expr) -> Result<(), AllocError> {
     Ok(())
 }
 
-/// Replaces the `workspace:` and `catalog:` specs in `root`, which was parsed from `source`, applies
-/// the `publishConfig` overrides, and returns the printed JSON. `bun publish` sends the edited tree
-/// to the registry.
+/// Replaces the `workspace:`, `catalog:` and `jsr:` specs in `root`, which was parsed from `source`,
+/// applies the `publishConfig` overrides, and returns the printed JSON. `bun publish` sends the
+/// edited tree to the registry.
 fn edit_root_package_json(
     workspace_manifests: Option<&WorkspaceManifests>,
     package_dir: &[u8],
@@ -2773,26 +2801,23 @@ fn edit_root_package_json(
             );
             Global::crash();
         };
-        let replacement: &[u8] = match substitution.published(
-            workspace_manifests.expect("pack() loads the manifests when a spec needs them"),
-            package_dir,
-            dependency_name,
-        ) {
-            // `E::EString::init` keeps a pointer to the bytes, so they go into the pack arena.
-            Ok(published) => bump.alloc_slice_copy(&published),
-            Err((what, why)) => {
-                Output::err_generic(
-                    "Failed to resolve {} version for \"{}\" in `{}` ({}).",
-                    (
-                        what,
-                        bstr::BStr::new(dependency_name),
-                        bstr::BStr::new(dependency_group),
-                        why,
-                    ),
-                );
-                Global::crash();
-            }
-        };
+        let replacement: &[u8] =
+            match substitution.published(workspace_manifests, package_dir, dependency_name) {
+                // `E::EString::init` keeps a pointer to the bytes, so they go into the pack arena.
+                Ok(published) => bump.alloc_slice_copy(&published),
+                Err((what, why)) => {
+                    Output::err_generic(
+                        "Failed to resolve {} version for \"{}\" in `{}` ({}).",
+                        (
+                            what,
+                            bstr::BStr::new(dependency_name),
+                            bstr::BStr::new(dependency_group),
+                            why,
+                        ),
+                    );
+                    Global::crash();
+                }
+            };
         dependency.value = Some(Expr::init(
             E::EString::init(replacement),
             Default::default(),
