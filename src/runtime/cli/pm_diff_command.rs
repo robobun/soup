@@ -167,6 +167,7 @@ fn split_filter(arg: &[u8]) -> Option<(&[u8], &[u8])> {
         || strings::contains(arg, b"://")
         || strings::has_prefix_comptime(arg, b"file:")
         || strings::has_prefix_comptime(arg, b"npm:")
+        || strings::has_prefix_comptime(arg, b"jsr:")
     {
         return None;
     }
@@ -226,6 +227,18 @@ fn classify(spec: &[u8]) -> Spec {
         }
         return Spec::Dir(spec.to_vec());
     }
+    // `jsr:@scope/name[@version]` is the npm package that JSR serves it as.
+    let jsr_alias = match bun_install::jsr::to_npm_alias(b"", spec) {
+        Ok(alias) => alias,
+        Err(err) => {
+            Status::clear();
+            Output::err_generic("{}: {}", (err.message(), BStr::new(spec)));
+            Global::exit(1);
+        }
+    };
+    let spec = jsr_alias
+        .as_deref()
+        .map_or(spec, |alias| &alias[b"npm:".len()..]);
     let (name, version) = dependency::split_name_and_version_or_latest(spec);
     // Distinguish "no version given" from an explicit `@latest`.
     let explicit = spec.len() > name.len();
@@ -583,7 +596,7 @@ fn read_tarball_into(bytes: &[u8], tree: &mut Tree) -> Result<(), crate::Error> 
     Ok(())
 }
 
-/// With `as_published_by`, `workspace:` and `catalog:` versions read as `bun pm pack` publishes them.
+/// With `as_published_by`, `workspace:`, `catalog:` and `jsr:` versions read as `bun pm pack` publishes them.
 fn read_dir_tree(
     root: &[u8],
     as_published_by: Option<&mut PackageManager>,
@@ -616,6 +629,7 @@ fn read_dir_tree(
     // bins — not the whole checkout with its vendor/ and build/.
     'package: {
         if let Ok(pkg) = bun_sys::File::read_from(root_fd, b"package.json") {
+            let as_published = as_published_by.is_some();
             // This has to come before the parse below, because it parses other package.json files.
             let manifests = as_published_by.and_then(|pm| manifests_for(pm, root, &pkg));
             let bump = Bump::new();
@@ -663,9 +677,12 @@ fn read_dir_tree(
                         Err(err) => fail(err, rel),
                     }
                 }
-                let pkg = match &manifests {
-                    Some(manifests) => with_published_versions(&pkg, json, manifests, root),
-                    None => pkg,
+                let pkg = if manifests.is_some()
+                    || (as_published && strings::contains(&pkg, bun_install::jsr::PROTOCOL))
+                {
+                    with_published_versions(&pkg, json, manifests.as_ref(), root)
+                } else {
+                    pkg
                 };
                 tree.files.insert(b"package.json".to_vec(), pkg);
                 root_fd.close();
@@ -767,11 +784,11 @@ fn manifests_for(
         .filter(|manifests| manifests.contains_package_dir(dir))
 }
 
-/// `manifest` (`dir`'s package.json, parsed as `json`) with its `workspace:` and `catalog:` versions as published.
+/// `manifest` (`dir`'s package.json, parsed as `json`) with its `workspace:`, `catalog:` and `jsr:` versions as published.
 fn with_published_versions(
     manifest: &[u8],
     json: bun_ast::Expr,
-    manifests: &WorkspaceManifests,
+    manifests: Option<&WorkspaceManifests>,
     dir: &[u8],
 ) -> Vec<u8> {
     use crate::cli::pack_command::{Substitution, for_each_dependency};
@@ -788,8 +805,9 @@ fn with_published_versions(
             return;
         };
         // A version that doesn't resolve is left as written. pack would refuse to publish it.
-        let Some(Ok(published)) =
-            Substitution::for_spec(spec).map(|found| found.published(manifests, dir, name))
+        let Some(Ok(published)) = Substitution::for_spec(spec)
+            .filter(|found| manifests.is_some() || !found.needs_workspace_manifests())
+            .map(|found| found.published(manifests, dir, name))
         else {
             return;
         };
@@ -2349,7 +2367,9 @@ fn package_json_notes(left: &Tree, right: &Tree, notes: &mut Vec<String>, colors
         // A version bump goes from one range to another, like `^1.0.0` → `^1.0.1`. A range that
         // becomes a URL, a repository or an alias of another package is not a bump.
         let is_range = |version: &[u8]| {
-            dependency::Tag::infer(version) == dependency::Tag::Npm && !version.starts_with(b"npm:")
+            dependency::Tag::infer(version) == dependency::Tag::Npm
+                && !version.starts_with(b"npm:")
+                && !bun_install::jsr::is_jsr(version)
         };
         let mut bumps: Vec<String> = Vec::new();
         for (name, ver) in &n {

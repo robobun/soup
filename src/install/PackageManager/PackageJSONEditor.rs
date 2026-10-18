@@ -1,4 +1,5 @@
 use bun_collections::{StringArrayHashMap, VecExt};
+use std::borrow::Cow;
 use std::io::Write as _;
 
 use bun_ast as js_ast;
@@ -10,6 +11,7 @@ use bun_semver as semver;
 
 use crate::bun_fs::FileSystem;
 use bun_install::dependency::{self, DependencyExt as _, TagExt as _};
+use bun_install::jsr;
 use bun_install::lockfile::CatalogMap;
 use bun_install::lockfile::package::PackageColumns as _;
 use bun_install::{Dependency, INVALID_PACKAGE_ID, Lockfile, resolution};
@@ -40,8 +42,17 @@ fn arena_dup<'a>(arena: &'a bun_alloc::Arena, bytes: &[u8]) -> &'a [u8] {
 }
 
 /// `npm:@foo/bar@~1.2.3` -> (`npm:@foo/bar`, `~1.2.3`); `npm:foo` -> (`npm:foo`, `""`).
-fn split_npm_alias(literal: &[u8]) -> Option<(&[u8], &[u8])> {
+/// `jsr:@foo/bar@~1.2.3` -> (`jsr:@foo/bar`, `~1.2.3`); `jsr:~1.2.3` -> (`jsr:`, `~1.2.3`).
+fn split_alias(literal: &[u8]) -> Option<(&[u8], &[u8])> {
     let literal = strings::trim(literal, &strings::WHITESPACE_CHARS);
+    if let Some(jsr::Specifier { name, version }) = jsr::specifier(literal) {
+        let alias = match name {
+            // through the end of the name, which is a slice of `literal`
+            Some(name) => name.as_ptr() as usize - literal.as_ptr() as usize + name.len(),
+            None => jsr::PROTOCOL.len(),
+        };
+        return Some((&literal[..alias], version));
+    }
     let literal = dependency::without_npm_protocol(literal);
     let (name, version) = Dependency::split_name_and_maybe_version(literal.strip_prefix(b"npm:")?);
     if name.is_empty() || name == b"@" {
@@ -53,21 +64,63 @@ fn split_npm_alias(literal: &[u8]) -> Option<(&[u8], &[u8])> {
     ))
 }
 
-/// `version` behind `from`'s `npm:<name>@` (if any), unless it already names a target.
+/// Both literals are aliases of one package: `npm:foo@1` and `npm:foo@^2`.
+pub(crate) fn same_alias_target(a: &[u8], b: &[u8]) -> bool {
+    match (split_alias(a), split_alias(b)) {
+        (Some((a, _)), Some((b, _))) => a == b,
+        _ => false,
+    }
+}
+
+/// What a version follows: `npm:foo@`, `jsr:@foo/bar@`, or `jsr:` when the alias names no package.
+fn push_alias(literal: &mut Vec<u8>, alias: &[u8]) {
+    literal.extend_from_slice(alias);
+    if alias != jsr::PROTOCOL {
+        literal.push(b'@');
+    }
+}
+
+/// `version` behind `from`'s `npm:<name>@` or `jsr:` (if any), unless it already names a target.
 fn with_alias_of<'a>(arena: &'a bun_alloc::Arena, from: &[u8], version: &'a [u8]) -> &'a [u8] {
-    match split_npm_alias(from) {
-        Some((alias, _)) if split_npm_alias(version).is_none() => {
+    match split_alias(from) {
+        Some((alias, _)) if split_alias(version).is_none() => {
             let mut v = Vec::new();
-            write!(
-                &mut v,
-                "{}@{}",
-                bstr::BStr::new(alias),
-                bstr::BStr::new(version)
-            )
-            .expect("infallible: in-memory write");
+            push_alias(&mut v, alias);
+            v.extend_from_slice(version);
             arena_dup(arena, &v)
         }
         _ => version,
+    }
+}
+
+/// A `jsr:` dependency is installed and locked as an `npm:` alias, and `literal` may be that
+/// alias. The package.json gets `jsr:` when the request was typed that way, and when `bun update`
+/// moves an entry that is `declared` that way, in the form it is declared in.
+fn jsr_spelling<'a>(
+    arena: &'a bun_alloc::Arena,
+    request: &UpdateRequest,
+    declared: Option<&[u8]>,
+    literal: &'a [u8],
+) -> &'a [u8] {
+    let declared = declared.filter(|declared| jsr::is_jsr(declared));
+    if !request.is_jsr && declared.is_none() {
+        return literal;
+    }
+    if let Some(declared) = declared
+        && let Ok(declared_alias) = jsr::stored(request.name, declared)
+        && same_alias_target(&declared_alias, literal)
+        && let (Some((prefix, _)), Some((_, version))) =
+            (split_alias(declared), split_alias(literal))
+        && !(version.is_empty() && prefix == jsr::PROTOCOL)
+    {
+        let mut spelled = Vec::new();
+        push_alias(&mut spelled, prefix);
+        spelled.extend_from_slice(version);
+        return arena_dup(arena, &spelled);
+    }
+    match jsr::from_npm_alias(request.name, literal) {
+        Some(spelled) => arena_dup(arena, &spelled),
+        None => literal,
     }
 }
 
@@ -141,9 +194,9 @@ pub fn updated_version_literal(
     update_to_latest: bool,
 ) -> Option<Vec<u8>> {
     let mut v = Vec::new();
-    let version_literal = match split_npm_alias(original_version_literal) {
+    let version_literal = match split_alias(original_version_literal) {
         Some((alias, version_literal)) => {
-            write!(&mut v, "{}@", bstr::BStr::new(alias)).expect("infallible: in-memory write");
+            push_alias(&mut v, alias);
             version_literal
         }
         None => dependency::without_npm_protocol(original_version_literal),
@@ -342,7 +395,9 @@ fn edit_update_aliases_of_requests(
 ) -> Result<bool, bun_alloc::AllocError> {
     let is_request = |name: &[u8]| updates.iter().any(|r| r.is_aliased && r.name == name);
     let is_alias_of_request = |key: &[u8], literal: &[u8]| {
-        split_npm_alias(literal).is_some_and(|(alias, _)| is_request(&alias[b"npm:".len()..]))
+        // A `jsr:` entry is the `npm:` alias it stands for, which is how the lockfile names it.
+        let literal = jsr::stored(key, literal).unwrap_or(Cow::Borrowed(literal));
+        split_alias(&literal).is_some_and(|(alias, _)| is_request(&alias[b"npm:".len()..]))
             && !is_request(key)
     };
     edit_update_entries(
@@ -1492,6 +1547,7 @@ pub(crate) fn edit(
                 if let Some(existing) = existing {
                     version_literal = with_alias_of(arena, existing, version_literal);
                 }
+                let version_literal = jsr_spelling(arena, request, existing, version_literal);
                 if e_string.data.slice() != version_literal {
                     changed = true;
                     e_string.data = arena_dup(arena, version_literal).into();
@@ -1519,12 +1575,19 @@ pub(crate) fn edit(
                     {
                         if let Some(entry) = manager.updating_packages.get(request.name) {
                             let original: &[u8] = &entry.original_version_literal;
-                            let original = match split_npm_alias(installed) {
+                            // The row of a `jsr:` entry has its alias. The text in the file is what
+                            // moves, unless the request names another package.
+                            let declared_alias = jsr::stored(request.name, original).ok();
+                            let moves_as_declared = jsr::is_jsr(original)
+                                && declared_alias
+                                    .as_deref()
+                                    .is_some_and(|alias| same_alias_target(alias, installed));
+                            let original = match split_alias(installed) {
+                                _ if moves_as_declared => original,
                                 Some(_) => with_alias_of(
                                     arena,
                                     installed,
-                                    split_npm_alias(original)
-                                        .map_or(original, |(_, version)| version),
+                                    split_alias(original).map_or(original, |(_, version)| version),
                                 ),
                                 None => original,
                             };
@@ -1546,12 +1609,11 @@ pub(crate) fn edit(
                                 Some(new_version) => break 'npm arena_dup(arena, &new_version),
                                 // no explicit `@range`: the row still spells the declared literal, which stays as written
                                 None => {
-                                    if strings::eql_long(
-                                        installed,
-                                        &entry.original_version_literal,
-                                        true,
-                                    ) {
-                                        break 'npm arena_dup(arena, installed);
+                                    if declared_alias.is_some_and(|alias| *alias == *installed) {
+                                        break 'npm arena_dup(
+                                            arena,
+                                            &entry.original_version_literal,
+                                        );
                                     }
                                 }
                             }
@@ -1559,7 +1621,7 @@ pub(crate) fn edit(
                     }
                     // `foo@npm:bar` (no version part) is saved like `foo` would be: `npm:bar@^<resolved>`.
                     let bare_alias =
-                        split_npm_alias(installed).is_some_and(|(_, version)| version.is_empty());
+                        split_alias(installed).is_some_and(|(_, version)| version.is_empty());
                     if request.version.tag == dependency::Tag::DistTag
                         || bare_alias
                         || ((manager.subcommand == Subcommand::Update || options.exact_versions)
@@ -1588,11 +1650,14 @@ pub(crate) fn edit(
                     dependency::Tag::Workspace => e_string.data.slice(),
                     // An `npm:` alias stays as written. `workspace:*` would look the workspace up
                     // by the entry's key, which is the alias and not the workspace's name.
-                    _ if split_npm_alias(e_string.data.slice()).is_some() => e_string.data.slice(),
+                    _ if split_alias(e_string.data.slice()).is_some() => e_string.data.slice(),
                     _ => b"workspace:*",
                 },
                 _ => arena_dup(arena, request.version.literal.slice(request.version_buf())),
             };
+            let declared =
+                (manager.subcommand == Subcommand::Update).then(|| e_string.data.slice());
+            let new_literal = jsr_spelling(arena, request, declared, new_literal);
             if e_string.data.slice() != new_literal {
                 changed = true;
                 e_string.data = bun_ast::StoreStr::new(new_literal);

@@ -8,6 +8,7 @@ use bun_js_parser as js_ast;
 use bun_semver::{SlicedString, String as SemverString, string::Builder as StringBuilder};
 
 use bun_install::dependency::{self, DependencyExt as _};
+use bun_install::jsr;
 use bun_install::{
     Dependency, INVALID_PACKAGE_ID, Lockfile, PackageID, PackageManager, PackageNameHash,
 };
@@ -32,6 +33,10 @@ pub struct UpdateRequest {
     pub(crate) version_buf: bun_ptr::RawSlice<u8>,
     pub(crate) package_id: PackageID,
     pub(crate) is_aliased: bool,
+    /// Asked for as `jsr:`. `version` is the `npm:` alias it stands for; package.json gets `jsr:`.
+    pub(crate) is_jsr: bool,
+    /// `bun add jsr:@scope/name`: the `latest` in `version` was not typed.
+    pub(crate) version_implied: bool,
     pub failed: bool,
     /// This must be cloned to handle when the AST store resets.
     /// ARENA-owned (AST `Expr.Data` store) — raw pointer per LIFETIMES.tsv;
@@ -48,6 +53,8 @@ impl Default for UpdateRequest {
             version_buf: bun_ptr::RawSlice::EMPTY,
             package_id: INVALID_PACKAGE_ID,
             is_aliased: false,
+            is_jsr: false,
+            version_implied: false,
             failed: false,
             e_string: None,
         }
@@ -65,6 +72,74 @@ pub struct UpdateRequestIndex(
         bun_collections::IdentityContext<PackageNameHash>,
     >,
 );
+
+/// What a `jsr:` positional is read as.
+struct JsrPositional {
+    /// `<name>@npm:@jsr/<scope>__<name>[@version]`, or only `<name>`.
+    input: Vec<u8>,
+    /// `input` has the alias.
+    is_alias: bool,
+    /// `input` ends in an `@latest` that was not typed.
+    version_implied: bool,
+}
+
+/// `jsr:@scope/name[@version]` and `<name>@jsr:...`. Without a name in front, the package goes
+/// under its own. `adds`: the command is `bun add`.
+fn jsr_positional(
+    input: &[u8],
+    subcommand: Subcommand,
+    adds: bool,
+) -> Result<Option<JsrPositional>, jsr::Error> {
+    let (name, literal, named) = match jsr::specifier(input) {
+        Some(specifier) => (
+            specifier.name.ok_or(jsr::Error::MissingScope)?,
+            input,
+            false,
+        ),
+        None => {
+            let Some(at) = input
+                .get(1..)
+                .and_then(|rest| strings::index_of_char_usize(rest, b'@'))
+            else {
+                return Ok(None);
+            };
+            let (name, literal) = (&input[..at + 1], &input[at + 2..]);
+            // `git@jsr:owner/repo.git` is a git remote, and so is every `<user>@jsr:<path>`.
+            if !strings::is_npm_package_name(name) || !jsr::is_jsr(literal) {
+                return Ok(None);
+            }
+            (name, literal, true)
+        }
+    };
+    let Some(mut alias) = jsr::to_npm_alias(name, literal)? else {
+        return Ok(None);
+    };
+    let mut version_implied = false;
+    if !strings::contains_char(&alias[b"npm:@".len()..], b'@') {
+        match subcommand {
+            // `bun update jsr:@scope/name` is `bun update @scope/name`: the entry keeps its range.
+            Subcommand::Update | Subcommand::Remove if !named => {
+                return Ok(Some(JsrPositional {
+                    input: name.to_vec(),
+                    is_alias: false,
+                    version_implied: false,
+                }));
+            }
+            // `bun add jsr:@scope/name` is the version that `latest` names, as for `bun add <name>`.
+            // A bare `<name>@npm:<package>` is not: it keeps the version the lockfile has.
+            Subcommand::Add if adds => {
+                alias.extend_from_slice(b"@latest");
+                version_implied = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(JsrPositional {
+        input: [name, b"@", &alias].concat(),
+        is_alias: true,
+        version_implied,
+    }))
+}
 
 /// Park CLI-lifetime bytes in a process-lifetime static so LSan sees them as
 /// reachable. `UpdateRequest::name`/`version_buf` store raw `&'static`/
@@ -188,6 +263,7 @@ impl UpdateRequest {
                 input[..new_len].copy_from_slice(input2);
                 input.truncate(new_len);
             }
+            let (mut is_jsr, mut version_implied) = (false, false);
             match subcommand {
                 Subcommand::Link | Subcommand::Unlink => {
                     if !input.starts_with(b"link:") {
@@ -197,7 +273,16 @@ impl UpdateRequest {
                         input = buf;
                     }
                 }
-                _ => {}
+                // `bunx` parses its package as `bun add` does, without a manager.
+                _ => match jsr_positional(&input, subcommand, pm.is_some()) {
+                    Ok(Some(jsr)) => {
+                        input = jsr.input;
+                        is_jsr = jsr.is_alias;
+                        version_implied = jsr.version_implied;
+                    }
+                    Ok(None) => {}
+                    Err(err) => return Err(invalid_jsr(log, positional, err, fatal)),
+                },
             }
 
             // CLI-lifetime allocation: `version_buf` is later reassigned to
@@ -274,6 +359,8 @@ impl UpdateRequest {
             let mut request = UpdateRequest {
                 version,
                 version_buf: bun_ptr::RawSlice::new(input),
+                is_jsr,
+                version_implied,
                 ..UpdateRequest::default()
             };
             if let Some(name) = alias {
@@ -295,6 +382,21 @@ impl UpdateRequest {
 
         Ok(update_requests.as_mut_slice())
     }
+}
+
+#[cold]
+fn invalid_jsr(log: &mut Log, positional: &[u8], err: jsr::Error, fatal: bool) -> crate::Error {
+    let positional = bun_core::fmt::for_terminal(bstr::BStr::new(positional));
+    if fatal {
+        Output::err_generic("{}: {}", (err.message(), positional));
+    } else {
+        log.add_error_fmt(
+            None,
+            Loc::EMPTY,
+            format_args!("{}: {}", err.message(), positional),
+        );
+    }
+    crate::Error::UnrecognizedDependencyFormat
 }
 
 #[cold]

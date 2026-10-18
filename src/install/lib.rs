@@ -79,6 +79,7 @@ pub mod dependency;
 pub mod engines;
 pub mod hosted_git_info;
 pub mod integrity;
+pub use bun_install_types::jsr;
 mod padding_checker;
 pub mod postinstall_optimizer;
 

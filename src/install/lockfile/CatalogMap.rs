@@ -1,5 +1,6 @@
 use bun_collections::VecExt;
 use core::cmp::Ordering;
+use std::borrow::Cow;
 
 use crate::bun_json::{E, Expr, ExprData, value_loc_of_property};
 use bstr::BStr;
@@ -277,7 +278,10 @@ impl CatalogMap {
         group.for_each_property(|dep_name, _, version| {
             builder.count(dep_name);
             if let Some(version_str) = version.as_utf8_string_literal() {
-                builder.count(version_str);
+                builder.count(
+                    &crate::jsr::stored(dep_name, version_str)
+                        .unwrap_or(Cow::Borrowed(version_str)),
+                );
             }
         });
     }
@@ -356,7 +360,18 @@ impl CatalogMap {
             let Some(version_str) = value.as_utf8_string_literal() else {
                 return Ok(());
             };
-            let version_literal = builder.append::<String>(version_str);
+            let version_str = match crate::jsr::stored(dep_name_str, version_str) {
+                Ok(version_str) => version_str,
+                Err(err) => {
+                    log.add_error(
+                        Some(source),
+                        value_loc_of_property(&source.contents, key_loc, &value),
+                        err.message().as_bytes(),
+                    );
+                    return Ok(());
+                }
+            };
+            let version_literal = builder.append::<String>(&version_str);
             let buf = builder.string_bytes.as_slice();
             let version_sliced = version_literal.sliced(buf);
 
@@ -654,7 +669,11 @@ fn parse_entry(
     log: Option<&mut Log>,
     string_buf: &mut StringBuf,
 ) -> Result<Option<Dependency>, AllocError> {
-    let version = string_buf.append(specifier)?;
+    let Ok(specifier) = crate::jsr::stored(dep_name.slice(string_buf.bytes.as_slice()), specifier)
+    else {
+        return Ok(None);
+    };
+    let version = string_buf.append(&specifier)?;
     let version_sliced = version.sliced(string_buf.bytes.as_slice());
     let Some(version) = Dependency::parse(
         dep_name,
