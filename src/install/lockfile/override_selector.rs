@@ -133,8 +133,10 @@ fn parse_yarn_path(key: &[u8]) -> Result<Selector<'_>, SelectorError> {
             }
             end = name_start + name.len();
         }
-        // In `name@npm:@scope/other@^1` the `/` is part of the alias target, not a path separator.
-        if strings::contains(&key[start..end], b"@npm:@")
+        // In `name@npm:@scope/other@^1` and `name@jsr:@scope/other@^1` the `/` is part of the
+        // alias target, not a path separator.
+        if (strings::contains(&key[start..end], b"@npm:@")
+            || strings::contains(&key[start..end], b"@jsr:@"))
             && let Some(rest_start) = cursor
         {
             let (rest, after) = next_token(key, rest_start);
