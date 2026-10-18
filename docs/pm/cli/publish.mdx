@@ -5,7 +5,7 @@ description: Use `bun publish` to publish a package to the npm registry
 
 import Publish from "/snippets/cli/publish.mdx";
 
-`bun publish` packs your package into a tarball and strips catalog and workspace protocols from the `package.json`, resolving versions if necessary. It then publishes to the registry specified in your configuration files or in the package's `publishConfig`. Both `bunfig.toml` and `.npmrc` files are supported.
+`bun publish` packs your package into a tarball and strips catalog and workspace protocols from the `package.json`, resolving versions if necessary. A [`jsr:`](/pm/cli/add#jsr-packages) version is published as the `npm:` alias it stands for. It then publishes to the registry specified in your configuration files or in the package's `publishConfig`. Both `bunfig.toml` and `.npmrc` files are supported.
 
 ```sh terminal icon="terminal"
 ## Publishing the package from the current working directory

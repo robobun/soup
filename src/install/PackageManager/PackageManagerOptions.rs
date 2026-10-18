@@ -45,6 +45,8 @@ pub struct Options {
     pub(crate) registries: Npm::registry::Map,
     /// `.npmrc` `//host/path/` credential lines, resolved by request URL.
     pub(crate) url_auth: Vec<Npm::registry::UrlAuth>,
+    /// See [`Self::jsr_scope_without_entry`]. Made when a package of the scope is first looked up.
+    pub(crate) jsr_scope: std::sync::OnceLock<Npm::registry::Scope>,
     pub(crate) cache_directory: &'static [u8],
     pub enable: Enable,
     pub do_: Do,
@@ -139,6 +141,7 @@ impl Default for Options {
             scope: Npm::registry::Scope::default(),
             registries: Npm::registry::Map::default(),
             url_auth: Vec::new(),
+            jsr_scope: std::sync::OnceLock::new(),
             cache_directory: b"",
             enable: Enable::default(),
             do_: Do::default(),
@@ -296,8 +299,26 @@ impl Options {
         // Fall back to the default registry on a mismatch.
         match self.registries.get(&Npm::registry::Scope::hash(scope_name)) {
             Some(scope) if *scope.name == *scope_name => scope,
+            None if scope_name == crate::jsr::SCOPE
+                && self.scope.url_hash == *Npm::registry::DEFAULT_URL_HASH =>
+            {
+                self.jsr_scope
+                    .get_or_init(|| self.jsr_scope_without_entry())
+            }
             _ => &self.scope,
         }
+    }
+
+    /// JSR serves the `@jsr` scope to npm clients from a registry of its own, and npm's registry
+    /// has none of it. A default registry that stands in for npm's may serve the scope, and an
+    /// entry for the scope says where it is, so this one is only for npm's registry and no entry.
+    #[cold]
+    fn jsr_scope_without_entry(&self) -> Npm::registry::Scope {
+        let registry = Api::NpmRegistry::from_url(crate::jsr::REGISTRY_URL);
+        let mut scope = Npm::registry::Scope::from_api(crate::jsr::SCOPE, registry, None)
+            .expect("a registry without a credential is not refused");
+        fill_scope_from_url_auth(&self.url_auth, &mut scope);
+        scope
     }
 
     /// Follows the order of npm's `getAuth`: the `.npmrc` line for the tarball's own URL, or else

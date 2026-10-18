@@ -1,5 +1,6 @@
 use core::cell::RefCell;
 use core::cmp::Ordering;
+use std::borrow::Cow;
 
 use crate::DependencyID;
 use crate::Error;
@@ -213,6 +214,8 @@ struct ParseContext<'a, 'b> {
     pm: &'a mut PackageManager,
     lockfile_dependencies: &'a [Dependency],
     root_package: &'a Package,
+    /// The root package.json, for a specifier as it is written.
+    root_json: Expr,
     log: &'a mut bun_ast::Log,
     source: &'a bun_ast::Source,
     workspace_names: &'a WorkspaceMap,
@@ -709,7 +712,11 @@ impl OverrideMap {
         };
 
         let is_flat = parent.is_none() && target_range.tag == VersionTag::Uninitialized;
-        let value = buf.append(value)?;
+        // A value that the root package.json is warned about and does not get a rule for.
+        let Ok(value) = crate::jsr::stored(target.name, value) else {
+            return Ok(true);
+        };
+        let value = buf.append(&value)?;
         let sliced = value.sliced(buf.bytes.as_slice());
         let Some(version) = dependency::parse(name, name_hash, sliced.slice, &sliced, log, None)
         else {
@@ -758,13 +765,24 @@ impl OverrideMap {
                     if let Ok(Selector { parent, target }) = parse_selector(key) {
                         builder.count(target.name);
                         builder.count(target.range);
+                        count_jsr_alias(target.name.len(), target.range, builder);
                         if let Some(parent) = parent {
                             builder.count(parent.name);
                             builder.count(parent.range);
                         }
                     }
                     builder.count(value);
-                    count_ref_value(pm, log, json_source, workspace_names, &expr, value, builder);
+                    count_jsr_alias(key.len(), value, builder);
+                    count_ref_value(
+                        pm,
+                        log,
+                        json_source,
+                        workspace_names,
+                        &expr,
+                        value,
+                        key.len(),
+                        builder,
+                    );
                     return;
                 }
                 if field != Field::Overrides || !value.is_object() {
@@ -781,9 +799,11 @@ impl OverrideMap {
                     if let Ok(selector) = parse_selector(child_key) {
                         builder.count(selector.target.name);
                         builder.count(selector.target.range);
+                        count_jsr_alias(selector.target.name.len(), selector.target.range, builder);
                     }
                     if let Some(child_value) = child_value.as_utf8_string_literal() {
                         builder.count(child_value);
+                        count_jsr_alias(key.len() + child_key.len(), child_value, builder);
                         count_ref_value(
                             pm,
                             log,
@@ -791,6 +811,7 @@ impl OverrideMap {
                             workspace_names,
                             &expr,
                             child_value,
+                            key.len() + child_key.len(),
                             builder,
                         );
                     }
@@ -819,6 +840,7 @@ impl OverrideMap {
             pm,
             lockfile_dependencies,
             root_package,
+            root_json: expr,
             log,
             source: json_source,
             workspace_names,
@@ -1097,7 +1119,14 @@ fn lockfile_range(
     if range.is_empty() {
         return Ok(Some(dependency::Version::default()));
     }
-    let range = buf.append(range)?;
+    let range = match is_target {
+        true => crate::jsr::stored(name.slice(buf.bytes.as_slice()), range),
+        false => Ok(Cow::Borrowed(range)),
+    };
+    let Ok(range) = range else {
+        return Ok(None);
+    };
+    let range = buf.append(&range)?;
     let sliced = range.sliced(buf.bytes.as_slice());
     Ok(
         match dependency::parse(
@@ -1216,7 +1245,14 @@ fn parse_range(
     if range.is_empty() {
         return Some(dependency::Version::default());
     }
-    let appended = ctx.builder.append::<SemverString>(range);
+    // `name@jsr:^1` selects the dependencies that are declared with that `jsr:` specifier, which
+    // are its alias. One that names no JSR package is left for the warning below.
+    let stored = match is_target {
+        true => crate::jsr::stored(name.slice(ctx.builder.string_bytes.as_slice()), range)
+            .unwrap_or(Cow::Borrowed(range)),
+        false => Cow::Borrowed(range),
+    };
+    let appended = ctx.builder.append::<SemverString>(&stored);
     let sliced = appended.sliced(ctx.builder.string_bytes.as_slice());
     match dependency::parse(
         name,
@@ -1296,16 +1332,28 @@ fn parse_override_value(
             })
             .map(|dep| dep.version.literal);
 
-        match root_ref {
-            Some(root_ref) => root_ref,
-            None => match workspace_ref_literal(
+        // `$name` stands for the specifier as it is written. A `jsr:<version>` names its package
+        // after the key it is under, so it is read again under this one.
+        let declared = root_ref.and_then(|_| declared_dependency(&ctx.root_json, ref_name));
+        let written_jsr = declared
+            .as_ref()
+            .and_then(|declared| declared.as_utf8_string_literal())
+            .filter(|written| crate::jsr::is_jsr(written));
+        match (root_ref, written_jsr) {
+            (Some(_), Some(written)) => ctx.builder.append::<SemverString>(
+                &crate::jsr::stored(key, written).unwrap_or(Cow::Borrowed(written)),
+            ),
+            (Some(root_ref), None) => root_ref,
+            (None, _) => match workspace_ref_literal(
                 ctx.pm,
                 ctx.log,
                 ctx.source,
                 ctx.workspace_names,
                 ref_name,
             ) {
-                Ok(Some(literal)) => ctx.builder.append::<SemverString>(&literal),
+                Ok(Some(literal)) => ctx.builder.append::<SemverString>(
+                    &crate::jsr::stored(key, &literal).unwrap_or(Cow::Borrowed(&literal)),
+                ),
                 Ok(None) => {
                     ctx.log.add_warning_fmt(
                         Some(ctx.source),
@@ -1333,7 +1381,9 @@ fn parse_override_value(
             },
         }
     } else {
-        ctx.builder.append::<SemverString>(value)
+        // A `jsr:` value that names no JSR package is left as it is, for the warning below.
+        ctx.builder
+            .append::<SemverString>(&crate::jsr::stored(key, value).unwrap_or(Cow::Borrowed(value)))
     };
 
     let sliced = literal.sliced(ctx.builder.string_bytes.as_slice());
@@ -1386,6 +1436,8 @@ fn count_ref_value(
     workspace_names: &WorkspaceMap,
     root_json: &Expr,
     value: &[u8],
+    // See `count_jsr_alias`.
+    names_len: usize,
     builder: &mut StringBuilder,
 ) {
     let Some(ref_name) = value.strip_prefix(b"$") else {
@@ -1394,11 +1446,21 @@ fn count_ref_value(
     if let Some(declared) = declared_dependency(root_json, ref_name) {
         if let Some(literal) = declared.as_utf8_string_literal() {
             builder.count(literal);
+            count_jsr_alias(names_len, literal, builder);
         }
         return;
     }
     if let Ok(Some(literal)) = workspace_ref_literal(pm, log, source, workspace_names, ref_name) {
         builder.count(&literal);
+        count_jsr_alias(names_len, &literal, builder);
+    }
+}
+
+/// Room for the `npm:` alias that a `jsr:` value or selector range is stored as. It is longer
+/// than `value` by less than the name it is for, and that name is a part of the `names_len` bytes.
+fn count_jsr_alias(names_len: usize, value: &[u8], builder: &mut StringBuilder) {
+    if crate::jsr::is_jsr(value) {
+        builder.cap += b"npm:@jsr/".len() + names_len + value.len();
     }
 }
 

@@ -1,5 +1,6 @@
 use bun_collections::VecExt;
 use core::mem;
+use std::borrow::Cow;
 
 use bun_collections::{ArrayHashMap, AutoBitSet, MultiArrayList, StringSet, index_sort};
 use bun_core::strings;
@@ -615,8 +616,13 @@ impl Package<u64> {
 
                 debug_assert_eq!(keys.len(), version_strings.len());
                 for (key, ver) in keys.iter().zip(version_strings.iter()) {
-                    string_builder.count(key.slice(&manifest.string_buf));
-                    string_builder.count(ver.slice(&manifest.string_buf));
+                    let (key, ver) = (
+                        key.slice(&manifest.string_buf),
+                        ver.slice(&manifest.string_buf),
+                    );
+                    string_builder.count(key);
+                    string_builder
+                        .count(&crate::jsr::stored(key, ver).unwrap_or(Cow::Borrowed(ver)));
                 }
             }
 
@@ -720,10 +726,30 @@ impl Package<u64> {
                         }
                     }
 
+                    // Not verbose only, unlike the unnamed dependency above: a client that reads
+                    // `jsr:` would have installed a package here.
+                    let Ok(stored) = crate::jsr::stored(key.slice(&manifest.string_buf), declared)
+                    else {
+                        log.add_warning_fmt(
+                            None,
+                            bun_ast::Loc::EMPTY,
+                            format_args!(
+                                "skipping invalid JSR dependency of {}@{} (\"{}\": \"{}\" in \"{}\")",
+                                bun_core::fmt::escape_control_chars(manifest.name()),
+                                version.fmt(&manifest.string_buf),
+                                bun_core::fmt::escape_control_chars(
+                                    key.slice(&manifest.string_buf)
+                                ),
+                                bun_core::fmt::escape_control_chars(declared),
+                                bstr::BStr::new(group.prop),
+                            ),
+                        );
+                        continue 'list;
+                    };
+
                     let name: ExternalString =
                         string_builder.append::<ExternalString>(key.slice(&manifest.string_buf));
-                    let dep_version = string_builder
-                        .append::<String>(version_string_.slice(&manifest.string_buf));
+                    let dep_version = string_builder.append::<String>(&stored);
                     let sliced = dep_version.sliced(string_builder.string_bytes.as_slice());
 
                     let mut behavior = group.behavior;
@@ -2873,7 +2899,9 @@ impl Package<u64> {
                             };
 
                             string_builder.count(key);
-                            string_builder.count(value);
+                            string_builder.count(
+                                &crate::jsr::stored(key, value).unwrap_or(Cow::Borrowed(value)),
+                            );
 
                             // If it's a folder or workspace, pessimistically assume we will need a maximum path
                             match dependency::version::Tag::infer(dependency::trim_literal(value)) {
@@ -3333,7 +3361,34 @@ impl Package<u64> {
                         .expect("validated above: a dependency group is an object");
                     for (key, version, key_loc) in rows {
                         let external_name = string_builder.append::<ExternalString>(key);
-                        let version = version.unwrap_or(b"");
+                        let version = match crate::jsr::stored(key, version.unwrap_or(b"")) {
+                            Ok(version) => version,
+                            // The resolver reports it when something imports the dependency. The
+                            // rest of the package.json is what the program runs with.
+                            Err(_) if pm.options.runtime_auto_install => continue,
+                            // Packages that others publish do have these, and that is not this project's error.
+                            Err(err) if !(FEATURES.is_main || FEATURES.is_workspace) => {
+                                log.add_warning_fmt_no_excerpt(
+                                    source,
+                                    key_loc,
+                                    format_args!(
+                                        "skipping dependency \"{}\": {}",
+                                        bun_core::fmt::escape_control_chars(key),
+                                        err.message(),
+                                    ),
+                                );
+                                continue;
+                            }
+                            Err(err) => {
+                                log.add_error_fmt(
+                                    source,
+                                    value_loc_of(source, key_loc),
+                                    format_args!("{}", err.message()),
+                                );
+                                return Err(crate::Error::InstallFailed);
+                            }
+                        };
+                        let version: &[u8] = &version;
 
                         if let Some(dep_) = Self::parse_dependency(
                             &mut lockfile.workspace_paths,

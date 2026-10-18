@@ -1382,7 +1382,10 @@ fn append_dependency(
     behavior: Behavior,
 ) -> Result<bool, AllocError> {
     let name = sbuf!(lockfile).append_external_with_hash(name_str, string_hash(name_str))?;
-    let spec = sbuf!(lockfile).append(spec)?;
+    let Ok(spec) = crate::jsr::stored(name_str, spec) else {
+        return Ok(false);
+    };
+    let spec = sbuf!(lockfile).append(&spec)?;
     let sliced = spec.sliced(string_bytes!(lockfile));
     let Some(version) = Dependency::parse(name.value, name.hash, sliced.slice, &sliced, log, None)
     else {

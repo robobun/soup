@@ -168,6 +168,7 @@ Two more selectors match a dependency by how it is declared, like Yarn's `"resol
 
 - `"foo@catalog:"` (or `"foo@catalog:name"`) applies to dependents that declare `foo` with that [catalog](/pm/catalogs).
 - `"my-foo@npm:foo@^1"` applies to an `npm:` alias named `my-foo` that points at `foo` with an overlapping range. No other rule overrides an alias that has a version range. An alias of a dist-tag, such as `"my-foo": "npm:foo@latest"`, takes the rules for `foo`.
+- `"@std/path@jsr:^1"` applies to a [`jsr:` dependency](/pm/cli/add#jsr-packages) named `@std/path` with an overlapping range. A `jsr:` dependency is an alias, so this is the rule that overrides one that has a version range.
 
 ## Limitations
 

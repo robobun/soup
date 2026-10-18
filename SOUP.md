@@ -6114,6 +6114,312 @@ Files: `src/js/node/sea.ts` (new), `src/runtime/node/node_sea.bind.ts` (new),
 `test/js/node/sea/sea.test.ts` (new), `test/js/node/module/node-module-module.test.js`,
 `test/js/bun/module-graph/module-graph-isolation.test.ts`.
 
+### 2026-10-18: `jsr:` dependencies
+
+[JSR](https://jsr.io) is the registry of `@std/*`, Hono, Oak and a growing part of the TypeScript
+world. pnpm (10.9), Yarn (4.9), vlt and Deno install from it with a `jsr:` specifier in
+`package.json`. bun read the same specifier the way it reads `git@github.com:user/repo`, as a git
+remote in scp form:
+
+```
+$ bun install          # "@std/path": "jsr:^1.0.0"
+fatal: unable to access 'https://jsr/^1.0.0/': Could not resolve host: jsr
+ssh: Could not resolve hostname jsr: Name or service not known
+error: "git clone" for "@std/path" failed
+```
+
+so a project that someone set up with pnpm or Yarn and a JSR package did not install, and
+`bun add jsr:@std/path` ended the same way. What did work is what JSR's own page says to do for
+bun: `bunx jsr add`, which writes the npm alias by hand (`"@std/path": "npm:@jsr/std__path@^1.0.0"`)
+and a scope into `bunfig.toml`. Now:
+
+```sh
+bun add jsr:@std/path              # "@std/path": "jsr:^1.1.0"
+bun add jsr:@std/path@~1.0.0       # "@std/path": "jsr:~1.0.0"
+bun add std-path@jsr:@std/path     # "std-path": "jsr:@std/path@^1.1.0", under another name
+bun info jsr:@std/path versions
+```
+
+```json
+{
+  "dependencies": {
+    "@std/path": "jsr:^1.0.0",
+    "hono": "jsr:@hono/hono@^4"
+  }
+}
+```
+
+JSR serves every package to npm clients as `@jsr/<scope>__<name>` from a registry of its own,
+`https://npm.jsr.io`. So `jsr:` is a short way to write an `npm:` alias in the `@jsr` scope, and
+that is all the package manager makes of it: `jsr:^1.0.0` for `@std/path` is
+`npm:@jsr/std__path@^1.0.0`. `jsr:<version>` takes the package from the name of the dependency,
+`jsr:@scope/name[@version]` names it, and the version is a version, a range or a dist-tag. A name
+without a scope, a name that is none, and a "version" that is a path, a URL or another protocol are
+errors that point at the specifier in `package.json`. They are no longer a `git clone`.
+`jsr:owner/repo.git`, which cannot be a JSR specifier, stays what it was: a git remote on a host
+that is named `jsr`.
+
+What follows from "it is the alias":
+
+- `bun install` takes `jsr:` in every dependency group, in workspace members, in catalogs, as the
+  value of an override and in its key (`"@std/path@jsr:^1": "jsr:1.0.8"`), in `packageExtensions`,
+  and in the dependencies of another package, from the registry or in a folder (`npm publish`
+  publishes the specifier as it is written, so such packages exist). Both linkers,
+  `--frozen-lockfile`, and the runtime's auto-install (`bun index.ts` without a `node_modules`)
+  work.
+- `bun add` writes `jsr:` with the range it would write for any package, `bun update` and
+  `bun update --latest` move the range and keep the spelling (also in a catalog),
+  `bun add --catalog jsr:...` puts the specifier into the catalog or takes the entry that is
+  there, and `bun remove`, `bun info` and `bun pm diff` take `jsr:@scope/name`.
+- `bun pm pack` and `bun publish` write the alias into the `package.json` they publish, because
+  npm and every older client cannot read `jsr:`. `bun pm diff` compares a folder against a tarball
+  or a published version in that form, and two folders as they are written.
+- `bun.lock` has the alias, next to the package it resolves to:
+
+  ```jsonc
+  "dependencies": { "@std/path": "npm:@jsr/std__path@^1.0.0" },
+  // ...
+  "@std/path": ["@jsr/std__path@1.1.0", "https://npm.jsr.io/~/11/@jsr/std__path/1.1.0.tgz", { ... }, "sha512-..."],
+  ```
+
+- While the default registry is npm's and the `@jsr` scope has no entry, the scope is fetched from
+  `https://npm.jsr.io`, as in pnpm and Yarn. That also makes `npm:@jsr/...` aliases work with no
+  configuration, which is what `bunx jsr add` needed its `bunfig.toml` entry for. An entry for the
+  scope in `bunfig.toml` or `.npmrc` replaces it. With any other default registry nothing changes:
+  `@jsr/*` is fetched from that registry like every other scope, and a project there that wants
+  JSR says so (`@jsr:registry=...`).
+
+The reference was pnpm 10.18.3, run against the same stand-in for npm.jsr.io that the tests use
+(npm.jsr.io itself cannot be reached from the machine this was built on, so nothing here was run
+against the real registry). For the same `package.json` the two install the same versions, and
+these agree to the letter:
+
+- what `add` writes for `jsr:@std/path`, `jsr:@std/path@1.0.0`, `name@jsr:@std/path` and
+  `--save-exact`
+- what `update` and `update --latest` leave behind (`jsr:^1.0.0` to `jsr:^1.1.0`,
+  `jsr:@std/path@~1.0.0` to `jsr:@std/path@~1.0.8`, a pinned `jsr:1.0.0` untouched without
+  `--latest`)
+- what `pack` publishes (`npm:@jsr/std__path@^1.0.0`, `npm:@jsr/std__internal` for a specifier
+  without a version, `npm:@jsr/std__internal@latest`)
+- the two errors for a name without a scope
+
+Two differences are bun's conventions for every package and stay: `bun add name@~1.0.0` keeps the
+range as typed where pnpm writes `~1.0.8`, and bun accepts an alias as a peer dependency where
+pnpm refuses it. Two more are choices, under "Not done": the registry of the scope when the
+default registry is not npm's, and what another package gets that depends on the same name.
+
+How it is built:
+
+- One function, `jsr::stored(name, literal)`, turns a specifier into its alias, and it runs where
+  a specifier is read: `package.json` (`Package::parse_with_json`, both the pass that sizes the
+  string buffer and the one that fills it), a registry manifest (`Package::from_npm` and the
+  look-ahead that asks for the manifests of its dependencies), a catalog, `overrides` and
+  `packageExtensions`, `bun.lock`, `pnpm-lock.yaml`, the command line, and the two readers of
+  `package.json` that the resolver has for auto-install. After that a `Dependency` holds the
+  alias and nothing else, so the resolver, both linkers, hoisting, dedupe, prune, the audit and
+  everything else that asks "is this an alias" or looks for `npm:` at the front of a literal
+  (some forty places) did not change. The other way around, keeping `jsr:^1.0.0` as the literal
+  of the dependency, does not work without a new lockfile format: the name of an aliased package
+  is a slice of the buffer the literal is in, `@jsr/std__path` is not a slice of `jsr:^1.0.0`,
+  and a lockfile is parsed again from that buffer every time it is loaded or cleaned. The mapping
+  is in `bun_install_types`, the crate that the package manager and the resolver share.
+- `Tag::infer` has an arm for `jsr:` (a range or a dist-tag, never git), and `parse_with_tag`
+  refuses a `jsr:` literal that was not turned into its alias first, so a reader of specifiers
+  that this patch missed gets "invalid" and not a clone.
+- The edits of `package.json` work on text, and their helper that splits `npm:name@range` now
+  also splits `jsr:name@range` and `jsr:range`, which is what keeps the spelling in `bun update`,
+  in the form the entry is written in. `bun add jsr:...` is an ordinary request for the alias
+  with a flag, and the flag turns the literal back when it is written. Without a version it asks
+  for `latest` like `bun add <name>` does: a bare `name@npm:other` does not, it keeps what the
+  lockfile has. `bun update jsr:@scope/name` is `bun update @scope/name`.
+- `bun pm pack` has a third substitution next to `workspace:` and `catalog:`. Unlike those it
+  needs no other `package.json`, so a package with only `jsr:` dependencies does not start to
+  read the workspace.
+- The registry of the scope is not an entry in the map of scopes. `scope_for_package_name`
+  answers with it when the map has no `@jsr` and the default registry is npm's at that moment,
+  and makes it when it is first asked. So `--registry`, `publishConfig.registry` and whatever else
+  replaces the default registry need no code of their own, no credential of another registry is
+  near it, and a process that never looks up an `@jsr` package makes nothing.
+
+The review. Five readers went through the first version, each with the debug build, a stand-in
+registry and pnpm: the grammar, the lockfile, the commands that edit `package.json`, the registry
+and the other commands, and the tests and docs. They reproduced ten bugs, and two of them changed
+the design:
+
+- `bun.lock` kept the specifier as it was written in that version (`"@std/path": "jsr:^1.0.0"`).
+  The text came from a list for the whole process that `stored` filled, keyed by the name of the
+  dependency and the alias. Rows got the spelling of other rows (two workspaces that spell one
+  dependency in two ways, a package of the registry that declares it), and the file depended on
+  the order in which things were read: `bun install --force` right after `bun install` rewrote
+  it. The list is gone and `bun.lock` has the alias, which is one text for one dependency. What
+  that costs is in "Not done".
+- The `@jsr` scope had its registry whatever the default registry was, as in pnpm. A project with
+  a mirror as its default registry and `@jsr/*` tarballs pinned there in `bun.lock` then asked
+  the mirror for them without the mirror's credentials and got a 401, with no `jsr:` anywhere in
+  it. A patch must not break a project that does not use it, so the default now stands only in
+  place of npm's own registry, which has no `@jsr` packages. An upstream test of the Yarn
+  migration that the first version had to change passes again unchanged.
+- `bun update <name>` wrote `^<resolved>` over a range that `bun update` keeps (`jsr:1.x`,
+  `jsr:>=1.0.0 <2.0.0`, `jsr:*`) and re-spelled `jsr:@scope/name@range` in the short form.
+- `bun update jsr:@scope/name` and `bun add --catalog jsr:@scope/name` read the missing version as
+  the tag `latest`: the first wrote `jsr:latest`, the second replaced the entry of the catalog
+  and moved every workspace that uses it.
+- A `jsr:` dependency of a registry package made the look-ahead ask the default registry for the
+  name of the dependency (`@std/path`), a package that has nothing to do with it. Auto-install
+  did worse for a package in `node_modules`: it installed that other package.
+- The loader of `bun.lock` refused a whole lockfile for one `jsr:` row that names no package,
+  where the reader of a manifest skips it.
+- `bun pm diff` of two folders rewrote `jsr:` on both sides, so a real difference did not show.
+- Smaller: a version with an `@` in it was accepted, whitespace was trimmed in some positions
+  only, `bun add git@jsr:owner/repo.git` was an error, an import of a dependency of the project
+  with an invalid `jsr:` specifier installed `<name>@latest` from the default registry (it is an
+  error now, and nothing is requested), a registry package's invalid `jsr:` dependency was
+  skipped without a word (it is a warning now), `bun pm diff` did not take `jsr:` specs, and the
+  docs said three things that the binary did not do.
+
+A second pass, three readers on the reworked commit, reproduced five more, all in corners, and
+all fixed:
+
+- `bun add jsr:@scope/name` without a version took any catalog entry under that name as its
+  answer, also an entry for a package of another registry, which was then installed. It takes an
+  entry, or a range that the `package.json` already has, only where that is the same JSR package.
+- An override value `$name` took the alias of the dependency it refers to, so a `jsr:1.0.0` that
+  was written for one package pinned another to that package. `$name` is the specifier as it is
+  written, read under the name that the rule is for, as in pnpm.
+- An entry for the `@jsr` scope with a token and no address was moved to npm.jsr.io, which the
+  first pass had asked for. With a mirror in the config files and `--registry` for npm's, that
+  sent the mirror's token to npm.jsr.io. Such an entry is at the default registry again, like
+  every scope's, and the registry of the scope became the lookup that is described above.
+- That lookup also repairs `bun publish` of a package named `@jsr/...`, which ignored
+  `publishConfig.registry` while the scope was an entry.
+- One `jsr:` dependency without a scope in the root `package.json`, imported by nothing, made the
+  runtime's auto-install drop the catalogs, workspaces and overrides of the project without a
+  word, because the root was read as for an install and the error was swallowed.
+
+The two passes above are the review that this commit had. No wider design review gave a result.
+
+Found on the way, upstream's, and reported instead of fixed here:
+`bun update -r --latest '<pattern>'` moves `bun.lock` for an `npm:` alias and leaves
+`package.json`, so the next frozen install fails, and `bun update -i` links an alias to the
+npmjs.org page of its key.
+
+Cost for a project without `jsr:`: a four byte comparison per specifier that is read (twice for
+the dependencies of a registry package, which are sized and then copied), one per npm dependency
+that is parsed and per override, one more arm in a `match` on the first byte, and a comparison of
+the scope name when a scoped package has no entry for its scope. No allocation, no request and
+no file read. There is no release build of this commit, so no binary size.
+
+Not done:
+
+- An older bun and a `bun.lock` that this one wrote. Released bun reads `jsr:` in `package.json`
+  as git, so its frozen install refuses a lockfile with the alias. That only matters for projects
+  that released bun could install at all, and there is one kind: when it migrates a
+  `pnpm-lock.yaml` with JSR packages it copies `jsr:^1.0.0` into `bun.lock`, reads it as git from
+  then on, and never asks git, because the package is pinned. This bun reads such a lockfile and
+  leaves it byte for byte while nothing changes, so both versions install from it. The first
+  `bun add` or `bun update` writes the aliases, and from then on the project needs this bun.
+- A mirror as the default registry that does not serve `@jsr/*`: `jsr:` needs an entry for the
+  scope there, where pnpm and Yarn go to npm.jsr.io on their own.
+- A plain override key does not reach a `jsr:` dependency (`"@std/path": "jsr:1.0.8"`), because
+  no plain key overrides an alias. The key has to say `@std/path@jsr:^1`.
+- A plain dependency of another package on the same name follows the `jsr:` entry of the project
+  when the JSR version is in its range, as it follows an `npm:` alias. pnpm installs npm's
+  package next to the JSR one. For a package that is published to both registries that is one
+  copy and not two. For two unrelated packages with one name it is the wrong one.
+- A `jsr:` dependency that is written with a dist-tag (`jsr:canary`) is not reached by a
+  `name@jsr:` override key, like an `npm:` alias with a tag. `@jsr/<scope>__<name>` as the key
+  reaches it.
+- `bun update jsr:@scope/name` and `bun remove jsr:@scope/name` go by the name `@scope/name` in
+  `package.json`. The package under another name is updated with that name or with
+  `bun update @jsr/<scope>__<name>`.
+- A registry package with a `jsr:` dependency that names no JSR package installs without that
+  dependency, with a warning. If its code imports the name and the runtime auto-installs, the
+  import still gets `<name>@latest` of the default registry, because the lockfile no longer knows
+  that the name was declared. For the project's own `package.json` and for a package that is
+  only in `node_modules` the import is an error.
+- `http://registry.npmjs.org` is not npm's registry for the rule above. Only the https address is.
+- `jsr:` descriptors in a Yarn `yarn.lock`. A `pnpm-lock.yaml` with them migrates (the test is
+  pnpm's real output for three dependencies).
+- A `bun.lockb` that an older bun wrote with a `jsr:` literal still holds it as git. The next
+  install that is not frozen resolves it again.
+- `bun why`, `bun outdated`, the frozen-lockfile error and the line `bun add` prints show the
+  alias (`@std/path@npm:@jsr/std__path`).
+- Importing `jsr:@std/path` in code, which is Deno's other use of the word, is a different
+  feature.
+- Windows and macOS were not run. Nothing in the change is specific to a platform.
+
+Tests: `test/cli/install/jsr.test.ts`, 92 tests against one local server that is both registries
+(`/<project>/npm/` is the default registry of a project and `/<project>/jsr/` the one of its
+`@jsr` scope, with the tarballs where npm.jsr.io has them), so a test can say which registry was
+asked for what. The default registry has a package of its own under the name `@std/path`, and no
+`jsr:` dependency may get it. Every project has a token for its default registry, and a request
+to the other registry that carries it fails the list of requests that the test expects. Ten tests
+watch where an install goes when the scope is not configured, through a proxy that refuses every
+connection and records the `CONNECT` lines. Where a credential goes needs a proxy that ends TLS,
+which the tests do not have. That was checked by hand with such a proxy: 20 arrangements of
+tokens and registries, and 35 projects without `jsr:` against released bun, which differ only in
+`@jsr/*` going to npm.jsr.io in the 14 that have npm's registry and no entry for the scope. All
+92 fail on the released 1.4.3-canary.1.
+
+Rebase notes: 56 patches onto oven-sh/bun 4354b80d7b, 20 commits after the last base. The feature
+took two days and upstream moved under it, so this was two rebases: onto bc1030a97b, where six
+patches stopped, and then onto 4354b80d7b, where all applied as they were. The next one will
+not be clean: oven-sh/bun#45828 landed while the last tests ran, it changes the entry points of
+`run_command.rs` again, and `bun serve` conflicts with it. The six patches:
+
+- `bun serve`: `bun bake` (oven-sh/bun#45682) replaced the entry point for HTML files with a list
+  of builtin entry points. The static server is one more of them (`MainEntryPoint`,
+  `BuiltinEntryPoint`, `BootMain` in `run_command.rs`), and its arm moved from
+  `HTMLEntryPoint.cpp`, which is gone, to `BuiltinEntryPoint.cpp`.
+- `--watch-path`: its two fields sit next to the new ones in `context.rs` and `Arguments.rs`, and
+  the watcher starts before the new check for type errors in `run_command.rs`.
+- Query logging for `Bun.SQL`: oven-sh/bun#45711 changed `dispatchToPool()` in `sql.ts`, and the
+  hook is written for the new function.
+- `Bun.INI`, `Bun.CSV` and `Bun.Queue`: their rows in `BunObject.cpp`, next to the rows that
+  oven-sh/bun#45851 moved to the bindings generator.
+
+On the new base, with the debug build: `jsr` (92) and these files of the package manager pass:
+`bun-install` (803), `npmrc` (606), `bun-install-registry` (493), `bun-lock` (386), `bun-pack`
+(349), `bun-update-transitive` (323), `run-autoinstall` (303), `bun-publish` (295),
+`bun-workspaces` (290), `nested-overrides` (283), `isolated-install` (283), `bun-audit` (257),
+`bun-add` (221), `frozen-lockfile-pruned` (184), `bun-update` (175), `bunx` (174),
+`bun-update-lockfile-sync` (172), `pnpm-lock-v9` (168), `hoist` (160), `bun-pm` (155),
+`bun-add-catalog` (153), `catalogs` (150), `bun-add-filter` (148), `config-precedence` (141),
+`yarn-berry` (116), `bun-pm-why` (116), `migrate` (108), `frozen-lockfile-outdated` (107),
+`overrides` (93), `frozen-lockfile-workspace-names` (91), `bun-dedupe` (82), `bun-info` (75),
+`bun-pm-diff` (74), `yarn-lock-migration` (69), `bun-link` (57),
+`bun-install-package-extensions` (43), `bun-remove` (37), `frozen-lockfile-member-pins` (27),
+`bun-pm-sbom` (22), `pnpm-lock-migration` (18), `pnpm-migration` (14) and `pnpm-comprehensive`
+(5). So do the tests of the patches that the rebase touched: `filter-workspace` (176), `watch`
+(27), `static-server` (9), `ini` (72), `csv` (54), `queue` (50), `jwt` (87) and `msgpack` (228).
+`sql-debug` passes for SQLite and PostgreSQL (19) and fails its three MySQL tests, because the
+MariaDB of this container refuses `root` over TCP. The tests ran with `--timeout 120000`, which
+is less than the CI runner gives a debug build: a test that runs a few installs in a row takes
+more than the 5 seconds that `bun test` allows by default. The source lints pass with the debug
+build (182). The fixes of the second review pass came after this run. `jsr`, the source lints
+and the 22 files that those fixes can reach ran again after them, with the same counts:
+`bun-install`, `npmrc`, `bun-install-registry`, `bun-lock`, `bun-pack`, `run-autoinstall`,
+`bun-publish`, `bun-workspaces`, `nested-overrides`, `bun-add`, `bun-update`, `bunx`,
+`pnpm-lock-v9`, `bun-add-catalog`, `catalogs`, `bun-add-filter`, `config-precedence`,
+`yarn-berry`, `overrides`, `bun-info`, `bun-pm-diff` and `bun-install-package-extensions`. The
+other files in the list ran on the build before those fixes. The other test files of the stack
+were not run on this base.
+
+Files: `src/install_types/jsr.rs` (new), `src/install_types/lib.rs`, `src/install/lib.rs`,
+`src/install/dependency.rs`, `src/install/lockfile/Package.rs`,
+`src/install/lockfile/CatalogMap.rs`, `src/install/lockfile/OverrideMap.rs`,
+`src/install/lockfile/override_selector.rs`, `src/install/lockfile/package_extensions.rs`,
+`src/install/lockfile/bun.lock.rs`, `src/install/pnpm.rs`,
+`src/install/PackageManager/PackageManagerOptions.rs`,
+`src/install/PackageManager/PackageManagerEnqueue.rs`,
+`src/install/PackageManager/UpdateRequest.rs`,
+`src/install/PackageManager/PackageJSONEditor.rs`, `src/install/PackageManager/add_catalog.rs`,
+`src/resolver/package_json.rs`, `src/resolver/resolver.rs`, `src/runtime/cli/pack_command.rs`,
+`src/runtime/cli/pm_diff_command.rs`, `src/runtime/cli/pm_view_command.rs`,
+`docs/pm/cli/add.mdx`, `docs/pm/cli/install.mdx`, `docs/pm/cli/pm.mdx`,
+`docs/pm/cli/publish.mdx`, `docs/pm/overrides.mdx`, `docs/pm/scopes-registries.mdx`,
+`test/cli/install/jsr.test.ts` (new).
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

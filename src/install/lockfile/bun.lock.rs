@@ -1760,7 +1760,15 @@ fn parse_catalog(
             return Err(invalid);
         };
 
-        let version = string_buf.append(version_str)?;
+        let Ok(version_str) = crate::jsr::stored(dep_name_str, version_str) else {
+            log.add_error(
+                Some(source),
+                value_loc_of(source, row.key_loc),
+                b"Invalid catalog version",
+            );
+            return Err(invalid);
+        };
+        let version = string_buf.append(&version_str)?;
         let version_sliced = version.sliced(string_buf.bytes.as_slice());
 
         let Some(version) = dependency::parse(
@@ -3436,7 +3444,18 @@ fn parse_append_dependencies(
                     );
                 };
 
-                let version = sbuf!(lockfile).append(version_str)?;
+                // A lockfile of a bun that read `jsr:` as a git remote has the specifier as written.
+                let version_str = match crate::jsr::stored(name_str, version_str) {
+                    Ok(version_str) => version_str,
+                    // Of a package, as `Package::from_npm` reads its manifest: not a dependency.
+                    Err(_) if bundled.is_some() => continue,
+                    Err(_) => fail!(
+                        InvalidDependencyVersion,
+                        at_value(row.key_loc),
+                        b"Invalid dependency version"
+                    ),
+                };
+                let version = sbuf!(lockfile).append(&version_str)?;
                 let version_sliced = version.sliced(lockfile.buffers.string_bytes.as_slice());
 
                 let mut dep = Dependency {

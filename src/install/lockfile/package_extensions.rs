@@ -107,6 +107,9 @@ impl Rule {
                 let Some(literal) = literal.as_string(arena) else {
                     return Err("expected a map of specifiers");
                 };
+                // An edge holds what a `Dependency` does: the alias of a `jsr:` specifier.
+                let literal = crate::jsr::stored(name, literal).map_err(|err| err.message())?;
+                let literal: &[u8] = &literal;
                 if name.is_empty() || !is_supported_specifier(literal) {
                     // A path would be read against the extended package, not the project.
                     return Err(

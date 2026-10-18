@@ -41,7 +41,21 @@ pub(crate) struct State {
     adds: Vec<Add>,
     /// (name, text) of every entry the flag's catalog had before this command; filled by prepare() in --catalog mode.
     root_entries: Vec<RootEntry>,
+    /// (name, catalog, text) of the entries under the names that [`takes_as_it_is`] is asked about.
+    package_entries: Vec<(PackageNameHash, Box<[u8]>, Box<[u8]>)>,
     members: Vec<WorkspaceTarget>,
+}
+
+impl State {
+    /// The entry that the catalog `group` had for a request that names a package and no version.
+    fn package_entry(&self, request: &UpdateRequest, group: &[u8]) -> Option<&[u8]> {
+        self.package_entries
+            .iter()
+            .find(|(name_hash, entry_group, _)| {
+                *name_hash == request.name_hash && CatalogMap::same_name(entry_group, group)
+            })
+            .map(|(_, _, text)| &text[..])
+    }
 }
 
 struct Add {
@@ -298,6 +312,89 @@ fn has_explicit_version(request: &UpdateRequest) -> bool {
     request.version.tag != dependency::Tag::Uninitialized && !request_literal(request).is_empty()
 }
 
+/// `bun add jsr:@scope/name` names a package and no version. Where `text` is a specifier for that
+/// package, the request takes it as it is, like `bun add <name>` takes any. For another package
+/// under the same name it is the explicit request that `has_explicit_version` says it is.
+fn takes_as_it_is(request: &UpdateRequest, text: &[u8]) -> bool {
+    request.version_implied
+        && bun_install::jsr::stored(request.name, text).is_ok_and(|stored| {
+            PackageJSONEditor::same_alias_target(&stored, request_literal(request))
+        })
+}
+
+/// The two specifiers are one dependency: `jsr:^1` and the `npm:` alias it stands for.
+fn same_dependency(name: &[u8], a: &[u8], b: &[u8]) -> bool {
+    match (
+        bun_install::jsr::stored(name, a),
+        bun_install::jsr::stored(name, b),
+    ) {
+        (Ok(a), Ok(b)) => *a == *b,
+        _ => false,
+    }
+}
+
+/// Every catalog's entry under `name`, for [`State::package_entries`].
+fn collect_package_entries(
+    root: &Expr,
+    name: &[u8],
+    name_hash: PackageNameHash,
+    out: &mut Vec<(PackageNameHash, Box<[u8]>, Box<[u8]>)>,
+) {
+    let text_in = |entries: &Expr| -> Option<Box<[u8]>> {
+        let q = entries.as_property(name)?;
+        q.expr.as_utf8_string_literal().map(Box::from)
+    };
+    if let Some(text) = entries_object(root, b"", name, None).and_then(|entries| text_in(&entries))
+    {
+        out.push((name_hash, Box::default(), text));
+    }
+    let Some(catalogs) = catalogs_container(root)
+        .and_then(|container| object_property(container, b"catalogs", None))
+    else {
+        return;
+    };
+    let Some(catalogs) = catalogs.data.e_object() else {
+        return;
+    };
+    for property in catalogs.properties.slice() {
+        let (Some(group), Some(entries)) = (
+            property
+                .key
+                .as_ref()
+                .and_then(|key| key.as_utf8_string_literal()),
+            property.value.as_ref(),
+        ) else {
+            continue;
+        };
+        if CatalogMap::same_name(group, b"") {
+            continue;
+        }
+        if let Some(text) = text_in(entries) {
+            out.push((name_hash, group.into(), text));
+        }
+    }
+}
+
+/// What the request's literal is in a package.json: `jsr:` again if it was asked for that way.
+fn request_spelling(request: &UpdateRequest) -> std::borrow::Cow<'_, [u8]> {
+    let literal = request_literal(request);
+    match (request.is_jsr)
+        .then(|| bun_install::jsr::from_npm_alias(request.name, literal))
+        .flatten()
+    {
+        Some(spelled) => spelled.into(),
+        None => literal.into(),
+    }
+}
+
+/// A catalog entry says what the request asks for.
+fn is_entry_of(request: &UpdateRequest, entry_text: &[u8]) -> bool {
+    match bun_install::jsr::stored(request.name, entry_text) {
+        Ok(entry) => *entry == *request_literal(request),
+        Err(_) => false,
+    }
+}
+
 fn collect_root_entries(root: &Expr, group: &[u8], out: &mut Vec<RootEntry>) {
     let Some(container) = catalogs_container(root) else {
         return;
@@ -415,6 +512,10 @@ pub(crate) fn prepare(manager: &mut PackageManager, updates: &[UpdateRequest]) {
             Global::crash();
         }
         collect_root_entries(&root, group, &mut manager.catalog_add.root_entries);
+        for request in updates.iter().filter(|request| request.version_implied) {
+            let entries = &mut manager.catalog_add.package_entries;
+            collect_package_entries(&root, request.name, request.name_hash, entries);
+        }
         manager.catalog_add.members = member_targets(&ws);
         manager.catalog_add.enabled = true;
         return;
@@ -425,6 +526,10 @@ pub(crate) fn prepare(manager: &mut PackageManager, updates: &[UpdateRequest]) {
         return;
     }
     manager.catalog_add.enabled = true;
+    for request in updates.iter().filter(|request| request.version_implied) {
+        let entries = &mut manager.catalog_add.package_entries;
+        collect_package_entries(&root, request.name, request.name_hash, entries);
+    }
     for request in updates.iter().filter(|request| request.is_aliased) {
         let Some(entries) = entries_object(&root, b"", request.name, None) else {
             continue;
@@ -435,7 +540,10 @@ pub(crate) fn prepare(manager: &mut PackageManager, updates: &[UpdateRequest]) {
         let Some(entry_text) = q.expr.as_utf8_string_literal() else {
             continue;
         };
-        if !has_explicit_version(request) || request_literal(request) == entry_text {
+        if !has_explicit_version(request)
+            || is_entry_of(request, entry_text)
+            || takes_as_it_is(request, entry_text)
+        {
             manager.catalog_add.auto_use.push(request.name_hash);
         }
     }
@@ -509,11 +617,16 @@ fn record_add(
         });
     };
 
-    if has_explicit_version(request) {
+    let is_bare_name = !has_explicit_version(request)
+        || match state.package_entry(request, group) {
+            Some(entry) => takes_as_it_is(request, entry),
+            None => declared.is_some_and(|declared| takes_as_it_is(request, declared)),
+        };
+    if !is_bare_name {
         if find_add(&mut state.adds, request.name_hash, group).is_none() {
             push(
                 &mut state.adds,
-                Candidate::Explicit(request_literal(request).into()),
+                Candidate::Explicit(request_spelling(request).into()),
             );
         }
         let add =
@@ -810,7 +923,13 @@ pub(crate) fn edit_target(
                     );
                     reference
                 }
-                (Some(reference), None) if !has_explicit_version(request) => reference,
+                (Some(reference), None)
+                    if !has_explicit_version(request)
+                        || (state.package_entry(request, catalog_group_of(reference.slice())))
+                            .is_some_and(|entry| takes_as_it_is(request, entry)) =>
+                {
+                    reference
+                }
                 (None, Some(name)) => {
                     let declared = existing.map(|slot| slot.slice());
                     match record_add(state, request, name, declared, &label, quiet) {
@@ -894,7 +1013,11 @@ pub(crate) fn edit_root_before_install(
                 .as_property(&add.name)
                 .and_then(|q| q.expr.as_utf8_string_literal().map(Box::from));
             add.outcome = match (existing, &add.candidate) {
-                (Some(entry), Candidate::Explicit(wanted)) if *entry == **wanted => Outcome::Reused,
+                (Some(entry), Candidate::Explicit(wanted))
+                    if *entry == **wanted || same_dependency(&add.name, &entry, wanted) =>
+                {
+                    Outcome::Reused
+                }
                 (Some(entry), Candidate::Explicit(wanted)) => {
                     set_property(entries, arena, &add.name, estring(arena, wanted));
                     if exact_within(wanted, &entry) {
@@ -1105,7 +1228,13 @@ pub(crate) fn edit_root_after_install(
         let Some(q) = obj.as_property(&add.name) else {
             continue;
         };
-        if q.expr.as_utf8_string_literal() == Some(&literal[..]) {
+        let declared = q.expr.as_utf8_string_literal();
+        // The lockfile has the `npm:` alias of an entry that is spelled `jsr:`.
+        let literal = (declared.is_some_and(bun_install::jsr::is_jsr))
+            .then(|| bun_install::jsr::from_npm_alias(&add.name, &literal))
+            .flatten()
+            .unwrap_or(literal);
+        if declared == Some(&literal[..]) {
             continue;
         }
         obj.properties.slice_mut()[q.i as usize].value = Some(estring(arena, &literal));

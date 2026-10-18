@@ -2532,6 +2532,31 @@ impl<'a> Resolver<'a> {
         a || b
     }
 
+    /// Ends [`Self::load_node_modules`] for a dependency that `package_json` lists with a `jsr:`
+    /// specifier that names no JSR package. Without this the import would install `latest` of
+    /// the package that the dependency is named after, which is another package.
+    fn unusable_jsr_dependency(
+        &mut self,
+        name: &[u8],
+        package_json: &PackageJSON,
+        err: bun_install_types::jsr::Error,
+    ) -> MatchStatus {
+        self.log_mut().add_error_fmt(
+            None,
+            bun_ast::Loc::EMPTY,
+            format_args!(
+                "\"{}\" in \"{}\": {}",
+                bstr::BStr::new(name),
+                bstr::BStr::new(package_json.source.path.text),
+                err.message(),
+            ),
+        );
+        if let Some(d) = self.debug_logs.as_mut() {
+            d.decrease_indent();
+        }
+        MatchStatus::NotFound
+    }
+
     pub(crate) fn load_node_modules(
         &mut self,
         import_path: &[u8],
@@ -3039,6 +3064,13 @@ impl<'a> Resolver<'a> {
                                     [dependency_id];
                             }
 
+                            if let Err(err) = bun_install_types::jsr::stored(
+                                esm.name,
+                                dependency_version.literal.slice(string_buf),
+                            ) {
+                                return self.unusable_jsr_dependency(esm.name, package_json, err);
+                            }
+
                             if !package_json.source.path.is_node_module() {
                                 package_json_dir =
                                     bun_paths::dirname(package_json.source.path.text);
@@ -3048,7 +3080,18 @@ impl<'a> Resolver<'a> {
 
                         let installed = package_json.installed_dependency_versions(esm.name);
                         for (range, behavior) in installed.filter(|_| !resolve_from_lockfile) {
-                            let buf = [esm.name, range].concat();
+                            // A `jsr:` range is the `npm:` alias it stands for.
+                            let range = match bun_install_types::jsr::stored(esm.name, range) {
+                                Ok(range) => range,
+                                Err(err) => {
+                                    return self.unusable_jsr_dependency(
+                                        esm.name,
+                                        package_json,
+                                        err,
+                                    );
+                                }
+                            };
+                            let buf = [esm.name, &range].concat();
                             let (name, range) = buf.split_at(esm.name.len());
                             let version = __bun_resolver_parse_dependency(
                                 Semver::String::init(&buf, name),
