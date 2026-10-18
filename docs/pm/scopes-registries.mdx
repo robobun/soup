@@ -32,6 +32,13 @@ To configure a private registry scoped to a particular organization:
 
 If the environment variable is not set, Bun warns and treats the field as empty. It then uses the credentials `.npmrc` has for that registry, if any.
 
+One scope has a registry without being configured. While the default registry is npm's (`https://registry.npmjs.org`), `@jsr` is fetched from `https://npm.jsr.io`, the registry [JSR](https://jsr.io) serves to npm clients. Bun uses it for [`jsr:` dependencies](/pm/cli/add#jsr-packages) and for packages named `@jsr/...`. An entry for `@jsr` in `bunfig.toml` or `.npmrc` replaces it. With another default registry, `@jsr` is fetched from that registry like every other scope, so a mirror that also serves the packages of JSR needs no entry, and one that does not needs this one:
+
+```toml bunfig.toml icon="settings"
+[install.scopes]
+"@jsr" = "https://npm.jsr.io"
+```
+
 Credentials written into a URL are percent-encoded, like the rest of the URL: the password `p@ss` is written `p%40ss`. Bun decodes them before it sends them. The `username`, `password` and `token` fields are sent as written.
 
 ### `.npmrc`

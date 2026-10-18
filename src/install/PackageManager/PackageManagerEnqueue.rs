@@ -1616,6 +1616,9 @@ impl Follow<'_> {
         use dependency::version::Tag;
         let lockfile = self.lockfile;
         let buf = lockfile.buffers.string_bytes.as_slice();
+        // A manifest has a `jsr:` range as it was published. The dependency is its alias.
+        let range = crate::jsr::stored(alias, range).ok()?;
+        let range: &[u8] = &range;
         let is_npm_alias = dependency::trim_literal(range).starts_with(b"npm:");
         if !is_npm_alias && self.look_ahead.seen.contains_key(&alias_hash) {
             return None;

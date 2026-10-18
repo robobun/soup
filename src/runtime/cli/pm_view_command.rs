@@ -109,6 +109,20 @@ pub(crate) fn view(
             break 'brk bun_paths::basename(bun_paths::fs::FileSystem::instance().top_level_dir());
         }
 
+        // `jsr:@scope/name[@version]` is the npm package that JSR serves it as.
+        match bun_install::jsr::to_npm_alias(b"", spec_) {
+            Ok(Some(alias)) => break 'brk bump.alloc_slice_copy(&alias[b"npm:".len()..]),
+            Ok(None) => {}
+            Err(err) => {
+                if json_output {
+                    print_json_error(err.message(), spec_, None);
+                } else {
+                    Output::err_generic("{}: {}", (err.message(), BStr::new(spec_)));
+                }
+                Global::exit(1);
+            }
+        }
+
         break 'brk spec_;
     });
 
