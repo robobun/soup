@@ -201,6 +201,49 @@ To tell Bun to allow lifecycle scripts for a particular package, add the package
 
 Bun reads this field and runs lifecycle scripts for `my-trusted-package`.
 
+## JSR packages
+
+To add a package from [JSR](https://jsr.io), write `jsr:` in front of its name:
+
+```bash terminal icon="terminal"
+bun add jsr:@std/path
+```
+
+`bun add` writes the version behind `jsr:`, like pnpm and Yarn:
+
+```json package.json icon="file-json"
+{
+  "dependencies": {
+    "@std/path": "jsr:^1.1.0"
+  }
+}
+```
+
+A version, a range or a tag after the name is used as for any other package: `bun add jsr:@std/path@~1.0.0` writes `"jsr:~1.0.0"`.
+
+To install the package under another name, put that name first. The specifier then names the JSR package:
+
+```bash terminal icon="terminal"
+bun add std-path@jsr:@std/path
+```
+
+```json package.json icon="file-json"
+{
+  "dependencies": {
+    "std-path": "jsr:@std/path@^1.1.0"
+  }
+}
+```
+
+JSR serves every package to npm clients as `@jsr/<scope>__<name>`, from the registry `https://npm.jsr.io`. A `jsr:` specifier is a short way to write the `npm:` alias of that package, and the alias is what Bun installs: `"@std/path": "jsr:^1.1.0"` and `"@std/path": "npm:@jsr/std__path@^1.1.0"` are the same dependency. `bun.lock` records the alias.
+
+- `bun update` moves the range and keeps `jsr:`. `bun outdated`, `bun why`, [catalogs](/pm/catalogs) and [workspaces](/pm/workspaces) treat the dependency like the alias.
+- `bun info jsr:@std/path` shows the versions that JSR has.
+- `bun pm pack` and `bun publish` write the `npm:` alias to the `package.json` they publish, because npm and older package managers do not read `jsr:`. Whoever installs your package needs the `@jsr` scope to point at `https://npm.jsr.io`. Bun, pnpm 10.9 and Yarn 4.9 do that by default. For npm and for older versions it is one line in `.npmrc`: `@jsr:registry=https://npm.jsr.io`.
+- The `@jsr` scope is fetched from `https://npm.jsr.io` while the default registry is npm's and the scope is not configured. If you changed the default registry, `@jsr` packages are fetched from that registry like every other package, until you [configure a registry](/pm/scopes-registries) for the scope.
+- Like an `npm:` alias of your project, a `jsr:` dependency is also what another package gets when it depends on the same name with a range that the JSR version is in.
+- An [override](/pm/overrides) takes a `jsr:` value. To override a dependency that is declared with `jsr:`, put the specifier in the key, as for an `npm:` alias: `"@std/path@jsr:^1": "jsr:1.0.8"`.
+
 ## Git dependencies
 
 To add a dependency from a public or private git repository:

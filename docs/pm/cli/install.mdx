@@ -249,7 +249,7 @@ To write `yarn.lock`, run `bun install --yarn` without `--dry-run`.
 
 ## Non-npm dependencies
 
-Bun supports installing dependencies from Git, GitHub, and local or remotely-hosted tarballs. See [`bun add`](/pm/cli/add).
+Bun supports installing dependencies from Git, GitHub, local or remotely-hosted tarballs, and [JSR](/pm/cli/add#jsr-packages). See [`bun add`](/pm/cli/add).
 
 ```json package.json icon="file-json"
 {
@@ -260,7 +260,8 @@ Bun supports installing dependencies from Git, GitHub, and local or remotely-hos
     "zod": "github:colinhacks/zod",
     "uWebSockets.js": "github:uNetworking/uWebSockets.js#semver:^20.31.0",
     "react": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
-    "bun-types": "npm:@types/bun"
+    "bun-types": "npm:@types/bun",
+    "@std/path": "jsr:^1.1.0"
   }
 }
 ```
@@ -695,7 +696,7 @@ The migration process handles:
 - Preserves peer dependency ranges and `peerDependenciesMeta`, so the next `bun install` leaves the migrated lockfile unchanged
 - Writes every catalog entry declared in `pnpm-workspace.yaml` to `bun.lock`, including entries no workspace uses yet (`pnpm-lock.yaml` lists only the entries in use), so the next `bun install` leaves the catalog unchanged
 - Keeps `catalog:` and `workspace:` specifiers as written and records each workspace package's version, so `bun install --frozen-lockfile` accepts the migrated lockfile and the versions pnpm locked for each workspace are the ones installed
-- Migrates git, GitHub, tarball URL, `file:`, and `npm:` alias dependencies, including transitive ones
+- Migrates git, GitHub, tarball URL, `file:`, `npm:` alias and `jsr:` dependencies, including transitive ones
 - Resolves pnpm named registries (`name@registry:version`) via `namedRegistries` in `pnpm-workspace.yaml`
 - Converts injected workspace packages (`dependenciesMeta.*.injected`) to ordinary workspace dependencies
 - Handles patched dependencies, matching pnpm's hash-only `patchedDependencies` entries to the patch files
@@ -809,7 +810,7 @@ Limitations:
 The lockfile is not migrated when it has:
 
 - a dependency with no lockfile entry (`yarn.lock` is older than `package.json`), unless a workspace's version satisfies its range and `enableTransparentWorkspaces` is on; or a workspace that the `package.json` `workspaces` globs do not match
-- a registry for Yarn (`npmRegistryServer` or `npmScopes` in a `.yarnrc.yml` of the project, a parent folder or the home folder, or `YARN_NPM_REGISTRY_SERVER`) that is not the registry Bun is configured with for that package, or that is written with an environment variable (`${VAR}`). Configure the registry in `bunfig.toml` or `.npmrc` and run the migration again. Yarn fetches the `@jsr` scope from `npm.jsr.io` by default, so that scope needs the same configuration
+- a registry for Yarn (`npmRegistryServer` or `npmScopes` in a `.yarnrc.yml` of the project, a parent folder or the home folder, or `YARN_NPM_REGISTRY_SERVER`) that is not the registry Bun is configured with for that package, or that is written with an environment variable (`${VAR}`). Configure the registry in `bunfig.toml` or `.npmrc` and run the migration again. Yarn fetches the `@jsr` scope from `npm.jsr.io` by default, and so does Bun while its default registry is npm's. With another default registry, that scope needs the same configuration
 - a package whose integrity the registry manifest does not give, for example an `__archiveUrl` on another host. The migration reads the integrity of every package from the registry Bun is configured with, so it needs that registry
 - a patch that `patchedDependencies` cannot express: several patch files for one package, a patch on a `file:` / `portal:` / `link:` folder, or a patch file outside the project
 - a `file:`, `portal:` or `link:` path that a registry, git or tarball package declares
