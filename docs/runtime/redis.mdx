@@ -267,6 +267,122 @@ await client.unsubscribe(channel); // Unsubscribe a particular channel.
 await client.unsubscribe(channel, listener); // Unsubscribe a particular listener.
 ```
 
+## Transactions
+
+`redis.multi()` starts a transaction. The object it returns has the command methods of the client. Each method queues its command and returns the transaction, so calls chain. The client sends nothing until you call `.exec()`.
+
+```ts redis.ts icon="/icons/typescript.svg"
+import { redis } from "bun";
+
+await redis.mset("account:1", "100", "account:2", "100");
+
+const replies = await redis.multi().decrby("account:1", 10).incrby("account:2", 10).exec();
+
+console.log(replies); // [ 90, 110 ]
+```
+
+`.exec()` sends `MULTI`, the queued commands and `EXEC` to the server as one unit. The server runs the commands of a transaction one after the other, with no command of any client in between. That includes the other commands of the same client: whatever else your program sends through `redis` reaches the server before `MULTI` or after `EXEC`, never between them.
+
+Each method checks its arguments when you call it, as on the client:
+
+```ts redis.ts icon="/icons/typescript.svg"
+const transaction = redis.multi();
+transaction.set("greeting", "hello");
+transaction.expire("greeting"); // TypeError: The "seconds" property must be of type number
+```
+
+You can send a transaction once. After `.exec()`, that method and the command methods throw `ERR_REDIS_INVALID_STATE`. To drop a transaction without sending it, drop the object: the server has not seen any of it. `multi()` takes no arguments.
+
+### Results
+
+`.exec()` resolves with an array that holds the reply of each command, in the order you queued the commands. Each reply is what the method resolves with outside a transaction: `exists()` gives a boolean, `getBuffer()` a `Buffer`, `hgetall()` an object.
+
+```ts redis.ts icon="/icons/typescript.svg"
+const [stored, created, found, fields, bytes] = (await redis
+  .multi()
+  .set("greeting", "hello")
+  .hset("user:1", { name: "Ana", plan: "pro" })
+  .exists("user:1")
+  .hgetall("user:1")
+  .getBuffer("greeting")
+  .exec())!;
+
+console.log(stored, created, found, fields.plan, bytes);
+// OK 2 true pro <Buffer 68 65 6c 6c 6f>
+```
+
+In TypeScript, the result of a chain like this one is a tuple of the reply types. The type only knows the commands of the chain that ends in `.exec()`. If you queue commands in separate statements or in a loop, the result is typed `unknown[]`.
+
+`.exec()` resolves with `null` when the server ran none of the transaction because a watched key changed (see [`WATCH`](#watch) below). That is why the example has a `!`.
+
+### Errors
+
+`.exec()` rejects with the code `ERR_REDIS_SERVER_ERROR` when the server answered with an error. There are three cases:
+
+- **The server refused a command when you queued it**: an unknown command, or the wrong number of arguments. The server then ran none of the transaction. The error is the one of the first refused command.
+- **A command failed when the server ran the transaction**: for example `INCR` on a key that holds a list. Redis does not roll back, so the other commands took effect. The error is the one of the first command that failed, and it has two more properties: `replies` holds the reply of every command, with an error in the place of each command that failed, and `errorIndexes` holds the places of the failed commands.
+- **The server refused `MULTI` itself**: an ACL rule forbids it, or a `MULTI` that you sent with `.send()` is still open on the connection. The error is the one of `MULTI` and has no `replies`. The server still received the commands. Depending on the server and the case, it ran each of them on its own or queued them into the open transaction.
+
+```ts redis.ts icon="/icons/typescript.svg"
+await redis.lpush("queue", "job");
+
+try {
+  await redis.multi().set("status", "busy").incr("queue").get("status").exec();
+} catch (error) {
+  console.log(error.message); // WRONGTYPE Operation against a key holding the wrong kind of value
+  console.log(error.errorIndexes); // [ 1 ]
+  console.log(error.replies[0], error.replies[2]); // OK busy
+}
+
+console.log(await redis.get("status")); // busy: the server kept the SET before the failed INCR
+```
+
+`.exec()` rejects with `ERR_REDIS_CONNECTION_CLOSED` or `ERR_REDIS_IDLE_TIMEOUT` when the connection ended before the reply to `EXEC` arrived. The server then ran all of the transaction or none of it, and the client cannot tell which. The client never splits a transaction across two connections. If the client reconnects, a transaction that it had not sent yet goes to the new connection whole.
+
+### `WATCH`
+
+There is no `watch()` method yet. `WATCH` through `.send()` works with `multi()`: when a watched key changed before the transaction ran, the server runs none of it and `.exec()` resolves with `null`.
+
+```ts redis.ts icon="/icons/typescript.svg"
+import { redis } from "bun";
+
+await redis.set("stock", "3");
+
+// The server keeps the watched keys per connection, so this loop uses a connection of its own.
+const client = await redis.duplicate();
+
+while (true) {
+  await client.send("WATCH", ["stock"]);
+  const stock = Number(await client.get("stock"));
+  if (stock === 0) {
+    await client.send("UNWATCH", []);
+    break;
+  }
+
+  const replies = await client
+    .multi()
+    .set("stock", String(stock - 1))
+    .exec();
+  if (replies !== null) break; // the server ran it
+  // null: "stock" changed after this loop read it. Read it again.
+}
+
+client.close();
+```
+
+The server ends a watch at the next `EXEC` on the connection, and every user of a client shares its connection. So on a shared client, another part of your program can end your watch with its `.exec()`, and your `WATCH` can make its `.exec()` resolve with `null`. Use `duplicate()` as above for code that watches.
+
+A reconnect drops the watch and the client does not tell you. A transaction after it runs even if the key changed.
+
+### What a transaction cannot do
+
+- `multi()` and `exec()` cannot be queued, and neither can `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`, `QUIT` or `RESET` through `.send()`. There is no `discard()`.
+- `connect()`, `close()`, `duplicate()`, `subscribe()` and `unsubscribe()` are not commands. On a transaction they throw `ERR_REDIS_INVALID_STATE`.
+- A client in subscriber mode cannot call `multi()` or `.exec()`.
+- A command cannot use the reply of an earlier command of the same transaction. The server sends every reply after `EXEC`.
+
+You can still send `MULTI` and `EXEC` yourself with `redis.send()`, but that is not safe on a client that other code uses at the same time. A command that the other code sends between your `MULTI` and your `EXEC` becomes part of your transaction, and its promise resolves with `"QUEUED"`. Use `multi()`.
+
 ## Advanced Usage
 
 ### Command Execution and Pipelining
@@ -353,7 +469,7 @@ Special handling for specific commands:
 - `EXISTS` returns a boolean instead of a number (1 becomes true, 0 becomes false)
 - `SISMEMBER` returns a boolean (1 becomes true, 0 becomes false)
 
-The following commands disable automatic pipelining:
+A transaction from `multi()` is pipelined like a single command. The following commands, sent on their own, disable automatic pipelining:
 
 - `AUTH`
 - `INFO`
@@ -570,11 +686,7 @@ async function getSession(sessionId) {
 
 Bun's Redis client is implemented in Rust and uses the Redis Serialization Protocol (RESP3). It reconnects automatically with exponential backoff. It also pipelines commands, so it can send multiple commands without waiting for replies to previous ones.
 
-## Limitations and Future Plans
-
-Limitations we plan to address in future versions:
-
-- Transactions (MULTI/EXEC) require raw commands
+## Limitations
 
 Unsupported features:
 

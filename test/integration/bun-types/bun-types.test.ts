@@ -683,7 +683,10 @@ describe("@types/bun integration test", () => {
       "response.bind.ts: new Request().clone() has no keepalive, duplex",
       // `undefined` once the socket is closed.
       "server.bind.ts: new ServerWebSocket().remoteAddress is string | undefined, not string",
-      // `pendingDeclarations` in test/internal/source-lints/redis-client-types.test.ts.
+      // `declaredOnTransaction` in test/internal/source-lints/redis-client-types.test.ts: only what
+      // `multi()` returns can call it, and `interface RedisTransaction` declares it.
+      "valkey.bind.ts: new RedisClient().exec is not published",
+      // `pendingDeclarations` in the same lint.
       "valkey.bind.ts: new RedisClient().psubscribe is not published",
       "valkey.bind.ts: new RedisClient().pubsub is not published",
       "valkey.bind.ts: new RedisClient().punsubscribe is not published",

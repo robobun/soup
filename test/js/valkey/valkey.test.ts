@@ -15,6 +15,7 @@ import {
   TLS_REDIS_OPTIONS,
   TLS_REDIS_URL,
 } from "./test-utils";
+import { notQueueableInTransaction } from "./transaction-not-queueable";
 import type { RedisTestStartMessage } from "./valkey.failing-subscriber";
 import type { Message } from "./valkey.failing-subscriber-no-ipc";
 
@@ -7406,8 +7407,275 @@ for (const connectionType of [ConnectionType.TLS, ConnectionType.TCP]) {
         duplicate.close();
       });
     });
+
+    describe("Transactions", () => {
+      test("exec() resolves with the reply of each command, converted as the command's method converts it", async () => {
+        const redis = ctx.redis;
+        const replies = await redis
+          .multi()
+          .set("tx:string", "1")
+          .incr("tx:string")
+          .get("tx:string")
+          .exists("tx:string")
+          .exists("tx:missing")
+          .getBuffer("tx:string")
+          .sadd("tx:set", "member")
+          .sismember("tx:set", "member")
+          .hset("tx:hash", { field: "value" })
+          .hgetall("tx:hash")
+          .send("LLEN", ["tx:list"])
+          .exec();
+
+        expect(replies).toEqual(["OK", 2, "2", true, false, Buffer.from("2"), 1, true, 1, { field: "value" }, 0]);
+        expect(await redis.get("tx:string")).toBe("2");
+      });
+
+      test("no other command of the client runs between the commands of a transaction", async () => {
+        const redis = ctx.redis;
+        await redis.set("tx:a", "100");
+        await redis.set("tx:b", "0");
+
+        // Each transfer keeps the sum at 100. Every read is of both keys in one
+        // command, and is issued in the middle of building a transaction.
+        const transfers: Promise<unknown>[] = [];
+        const sums: Promise<number>[] = [];
+        for (let i = 0; i < 50; i++) {
+          const transaction = redis.multi().decrby("tx:a", 1);
+          sums.push(redis.mget("tx:a", "tx:b").then(([a, b]) => Number(a) + Number(b)));
+          transfers.push(transaction.incrby("tx:b", 1).exec());
+          sums.push(redis.mget("tx:a", "tx:b").then(([a, b]) => Number(a) + Number(b)));
+        }
+
+        expect(await Promise.all(sums)).toEqual(Array(100).fill(100));
+        expect(await Promise.all(transfers)).toEqual(Array.from({ length: 50 }, (_, i) => [99 - i, i + 1]));
+      });
+
+      test("an empty transaction resolves with an empty array", async () => {
+        expect(await ctx.redis.multi().exec()).toEqual([]);
+      });
+
+      test("a transaction is sent once", async () => {
+        const transaction = ctx.redis.multi().incr("tx:counter");
+        const replies = transaction.exec();
+        const sent = expect.objectContaining({
+          code: "ERR_REDIS_INVALID_STATE",
+          message: "This transaction was sent. multi() starts a new one.",
+        });
+        expect(() => transaction.exec()).toThrow(sent);
+        expect(() => transaction.incr("tx:counter")).toThrow(sent);
+        expect(await replies).toEqual([1]);
+        expect(await ctx.redis.get("tx:counter")).toBe("1");
+      });
+
+      test("a command that fails when the transaction runs rejects exec(), and the others take effect", async () => {
+        const redis = ctx.redis;
+        await redis.lpush("tx:list", "element");
+
+        const error = await redis
+          .multi()
+          .set("tx:string", "5")
+          .incr("tx:list")
+          .get("tx:string")
+          .exec()
+          .then(
+            () => undefined,
+            error => error,
+          );
+
+        expect(error).toBeInstanceOf(Error);
+        expect(error.code).toBe("ERR_REDIS_SERVER_ERROR");
+        expect(error.message).toStartWith("WRONGTYPE");
+        expect(error.errorIndexes).toEqual([1]);
+        expect(error.replies).toHaveLength(3);
+        expect(error.replies[0]).toBe("OK");
+        expect(error.replies[1]).toBeInstanceOf(Error);
+        expect(error.replies[1].message).toBe(error.message);
+        expect(error.replies[2]).toBe("5");
+        // Redis does not roll back.
+        expect(await redis.get("tx:string")).toBe("5");
+      });
+
+      test("a command the server refuses to queue rejects exec() with its error, and nothing runs", async () => {
+        const redis = ctx.redis;
+
+        const error = await redis
+          .multi()
+          .set("tx:string", "never")
+          .send("NOSUCHCOMMAND", ["argument"])
+          .exec()
+          .then(
+            () => undefined,
+            error => error,
+          );
+
+        expect(error).toBeInstanceOf(Error);
+        expect(error.code).toBe("ERR_REDIS_SERVER_ERROR");
+        expect(error.message).toContain("NOSUCHCOMMAND");
+        expect(error.replies).toBeUndefined();
+        expect(await redis.get("tx:string")).toBeNull();
+        // The client is not left inside MULTI.
+        expect(await redis.set("tx:string", "after")).toBe("OK");
+      });
+
+      test("exec() resolves with null when a watched key changed, and runs when it did not", async () => {
+        const watcher = await ctx.redis.duplicate();
+        try {
+          expect(await watcher.send("WATCH", ["tx:watched", "tx:also-watched"])).toBe("OK");
+          await ctx.redis.set("tx:watched", "changed by another connection");
+          expect(await watcher.multi().set("tx:watched", "mine").exec()).toBeNull();
+          expect(await watcher.get("tx:watched")).toBe("changed by another connection");
+
+          // EXEC ended the watch: the same change does not abort the next transaction.
+          await ctx.redis.set("tx:watched", "changed again");
+          expect(await watcher.multi().set("tx:watched", "mine").exec()).toEqual(["OK"]);
+
+          await watcher.send("WATCH", ["tx:watched"]);
+          expect(await watcher.multi().set("tx:watched", "unchanged").exec()).toEqual(["OK"]);
+
+          await watcher.send("WATCH", ["tx:watched"]);
+          expect(await watcher.send("UNWATCH", [])).toBe("OK");
+          await ctx.redis.set("tx:watched", "changed after unwatch()");
+          expect(await watcher.multi().get("tx:watched").exec()).toEqual(["changed after unwatch()"]);
+        } finally {
+          watcher.close();
+        }
+      });
+
+      test("a subscriber cannot start or send a transaction", async () => {
+        const subscriber = await ctx.redis.duplicate();
+        try {
+          const transaction = subscriber.multi().set("tx:string", "1");
+          await subscriber.subscribe("tx:channel", () => {});
+          expect(() => subscriber.multi()).toThrow(
+            expect.objectContaining({
+              code: "ERR_REDIS_INVALID_STATE",
+              message: "RedisClient.prototype.multi cannot be called while in subscriber mode.",
+            }),
+          );
+          expect(() => transaction.exec()).toThrow(
+            expect.objectContaining({
+              code: "ERR_REDIS_INVALID_STATE",
+              message: "RedisClient.prototype.exec cannot be called while in subscriber mode.",
+            }),
+          );
+          await subscriber.unsubscribe();
+          expect(await transaction.exec()).toEqual(["OK"]);
+        } finally {
+          subscriber.close();
+        }
+      });
+    });
   });
 }
+
+describe("RedisClient transactions", () => {
+  // A transaction only holds commands until exec(), so no server is needed.
+  const client = new RedisClient("redis://127.0.0.1:1", { autoReconnect: false });
+  const invalidState = expect.objectContaining({ code: "ERR_REDIS_INVALID_STATE" });
+
+  test("multi() returns an object whose command methods return it", () => {
+    const transaction = client.multi();
+    expect(transaction).not.toBe(client);
+    expect(transaction.set("a", "1")).toBe(transaction);
+    expect(transaction.get("a").exists("a").getBuffer("a").send("PING", [])).toBe(transaction);
+    expect(client.multi()).not.toBe(transaction);
+    // Nothing was sent, so nothing dialed.
+    expect(client.connected).toBe(false);
+  });
+
+  test.each([[[["set", "a", "1"]]], [{ pipeline: false }], [() => {}], [undefined]])(
+    "multi(%p) throws: commands are queued with the methods of the transaction",
+    argument => {
+      // @ts-expect-error: testing runtime behavior with an argument
+      expect(() => client.multi(argument)).toThrow(
+        expect.objectContaining({
+          code: "ERR_INVALID_ARG_TYPE",
+          message: "multi() takes no arguments. Queue the commands with the methods of the transaction it returns.",
+        }),
+      );
+    },
+  );
+
+  test("a command method checks its arguments when it is called on a transaction", () => {
+    const transaction = client.multi();
+    // @ts-expect-error: testing runtime behavior with a missing argument
+    expect(() => transaction.get()).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+    // @ts-expect-error: testing runtime behavior with a missing argument
+    expect(() => transaction.expire("key")).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+  });
+
+  test("exec() throws on a client", () => {
+    // @ts-expect-error: exec() is only declared on a transaction
+    expect(() => client.exec()).toThrow(
+      expect.objectContaining({
+        code: "ERR_REDIS_INVALID_STATE",
+        message: "RedisClient.prototype.exec can only be called on a transaction. multi() starts one.",
+      }),
+    );
+  });
+
+  test.each([
+    "MULTI",
+    "exec",
+    "Discard",
+    "WATCH",
+    "unwatch",
+    "QUIT",
+    "reset",
+    "SUBSCRIBE",
+    "psubscribe",
+    "UNSUBSCRIBE",
+  ])("send(%p) throws on a transaction", command => {
+    const transaction = client.multi();
+    expect(() => transaction.send(command, [])).toThrow(
+      expect.objectContaining({
+        code: "ERR_REDIS_INVALID_STATE",
+        message: `${command} cannot be queued in a transaction.`,
+      }),
+    );
+  });
+
+  // Arguments that every method takes far enough to queue its command. Four
+  // methods check the type of what follows the key.
+  const argumentsFor = (name: string): unknown[] =>
+    (
+      ({
+        expire: ["a", 1],
+        hset: ["a", "field", "value"],
+        hmset: ["a", "field", "value"],
+        send: ["PING", []],
+      }) as Record<string, unknown[]>
+    )[name] ?? ["a", "1", "2", "3", "4", "5"];
+  const methods = Object.getOwnPropertyNames(RedisClient.prototype).filter(
+    name =>
+      name !== "constructor" &&
+      typeof Object.getOwnPropertyDescriptor(RedisClient.prototype, name)!.value === "function",
+  );
+
+  test("the methods that throw on a transaction are the ones the list names, and every other method queues a command", () => {
+    const outcome = (name: string) => {
+      const transaction: any = client.multi();
+      try {
+        return transaction[name](...argumentsFor(name)) === transaction ? "queued" : "returned something else";
+      } catch (error: any) {
+        return error?.code === "ERR_REDIS_INVALID_STATE" ? "refused" : `threw ${error?.code}: ${error?.message}`;
+      }
+    };
+    // exec() is the one method of the list that a transaction has.
+    const others = methods.filter(name => name !== "exec");
+    const outcomes = Object.fromEntries(others.map(name => [name, outcome(name)]));
+
+    const listed = (notQueueableInTransaction as readonly string[]).filter(name => others.includes(name));
+    expect(others.filter(name => outcomes[name] === "refused").sort()).toEqual(listed.sort());
+    expect(Object.entries(outcomes).filter(([, result]) => result !== "refused" && result !== "queued")).toEqual([]);
+    expect(others.length - listed.length).toBeGreaterThan(190);
+  });
+
+  test("every name of the list is a member of the client", () => {
+    const members = Object.getOwnPropertyNames(RedisClient.prototype);
+    expect(notQueueableInTransaction.filter(name => !members.includes(name))).toEqual([]);
+  });
+});
 
 describe("RedisClient URL parsing", () => {
   test.each(["/notadb", "/5abc", "/-2", "/5/6", "/4294967296", "/99999999999999999999"])(

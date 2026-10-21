@@ -2417,3 +2417,586 @@ describe("Valkey: Offline Queue", () => {
     }
   });
 });
+
+describe("Valkey: Transactions", () => {
+  type Connection = {
+    /** 1 for the first connection the client opened. */
+    index: number;
+    socket: net.Socket;
+    /** Every command received, in order. */
+    commands: string[][];
+    /** MULTI was received and EXEC was not yet. */
+    inTransaction: boolean;
+  };
+
+  // A RESP server in this process. It answers each command with what `reply`
+  // returns for it ("" for no answer). Where `reply` returns undefined, it
+  // answers as a server that queues the commands of a transaction and holds no
+  // key: HELLO and MULTI with +OK, a command after MULTI with +QUEUED, EXEC
+  // with an empty array and any other command with a null. With `dribble`, the
+  // client gets the answers one byte per read.
+  async function fakeServer(
+    reply: (command: string[], connection: Connection) => string | undefined = () => undefined,
+    { dribble = false } = {},
+  ) {
+    const connections: Connection[] = [];
+    const server = net.createServer(socket => {
+      const connection: Connection = { index: connections.length + 1, socket, commands: [], inTransaction: false };
+      connections.push(connection);
+      socket.setNoDelay(true);
+      const state = { buffer: Buffer.alloc(0) };
+      const bytes: number[] = [];
+      let dribbling = false;
+      const dribbleNext = () => {
+        if (bytes.length === 0 || socket.destroyed) return void (dribbling = false);
+        socket.write(Buffer.from([bytes.shift()!]), () => setImmediate(dribbleNext));
+      };
+      socket.on("data", chunk => {
+        state.buffer = Buffer.concat([state.buffer, chunk as Buffer]);
+        let answers = "";
+        for (const command of readCommands(state)) {
+          // A large value is recorded by its size.
+          connection.commands.push(command.map(part => (part.length > 4096 ? `${part.length} bytes` : part)));
+          const name = command[0].toUpperCase();
+          answers +=
+            reply(command, connection) ??
+            (name === "HELLO" || name === "MULTI"
+              ? "+OK\r\n"
+              : name === "EXEC"
+                ? "*0\r\n"
+                : connection.inTransaction
+                  ? "+QUEUED\r\n"
+                  : "_\r\n");
+          if (name === "MULTI") connection.inTransaction = true;
+          if (name === "EXEC") connection.inTransaction = false;
+        }
+        if (!answers || socket.destroyed) return;
+        if (!dribble) return void socket.write(answers);
+        bytes.push(...Buffer.from(answers, "latin1"));
+        if (!dribbling) {
+          dribbling = true;
+          dribbleNext();
+        }
+      });
+      socket.on("error", () => {});
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    return {
+      url: `redis://127.0.0.1:${(server.address() as net.AddressInfo).port}`,
+      connections,
+      /** What a connection received after HELLO, as command names. */
+      received: (index: number) => connections[index - 1].commands.map(command => command[0].toUpperCase()).slice(1),
+      async [Symbol.asyncDispose]() {
+        for (const connection of connections) connection.socket.destroy();
+        await new Promise(resolve => server.close(resolve));
+      },
+    };
+  }
+
+  const rejection = (promise: Promise<unknown>) =>
+    promise.then(
+      value => ({ resolved: value }),
+      (error: Error & { code?: string }) => ({ code: error.code, message: error.message }),
+    );
+  const closed = { code: "ERR_REDIS_CONNECTION_CLOSED", message: "Connection closed" };
+  const nextTurn = () => new Promise<void>(resolve => setImmediate(resolve));
+
+  test.each([true, false])(
+    "what the client sends before exec() arrives before MULTI, and what it sends after arrives after EXEC (enableAutoPipelining: %p)",
+    async enableAutoPipelining => {
+      await using server = await fakeServer(([name]) => ({ EXEC: "*2\r\n+OK\r\n:2\r\n", GET: "$1\r\n2\r\n" })[name]);
+      const client = new RedisClient(server.url, { enableAutoPipelining });
+      try {
+        await client.connect();
+
+        const transaction = client.multi().set("a", "1");
+        const before = client.get("before");
+        transaction.incr("a");
+        const replies = transaction.exec();
+        const after = client.get("after");
+
+        expect(await Promise.all([before, replies, after])).toEqual(["2", ["OK", 2], "2"]);
+        expect(server.connections[0].commands.slice(1)).toEqual([
+          ["GET", "before"],
+          ["MULTI"],
+          ["SET", "a", "1"],
+          ["INCR", "a"],
+          ["EXEC"],
+          ["GET", "after"],
+        ]);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  // The URL names database 2, so the handshake is HELLO and then SELECT. With
+  // auto-pipelining off, a command waits for the reply to SELECT, and so does a transaction.
+  test.each([
+    ["accepts", "+OK\r\n", { resolved: ["OK"] }, ["SELECT", "MULTI", "SET", "EXEC"]],
+    [
+      "refuses",
+      "-ERR DB index is out of range\r\n",
+      { code: "ERR_REDIS_INVALID_COMMAND", message: "ERR DB index is out of range" },
+      ["SELECT"],
+    ],
+  ])(
+    "with auto-pipelining off, a transaction is not written before the server %s the database of the URL",
+    async (_, answer, outcome, received) => {
+      const beforeAnswer = Promise.withResolvers<string[]>();
+      await using server = await fakeServer(([name], connection) => {
+        if (name === "EXEC") return "*1\r\n+OK\r\n";
+        if (name !== "SELECT") return undefined;
+        // Three turns of the loop for anything the client wrote meanwhile to arrive, then the answer.
+        setImmediate(() =>
+          setImmediate(() =>
+            setImmediate(() => {
+              beforeAnswer.resolve(connection.commands.map(command => command[0]).slice(1));
+              connection.socket.write(answer);
+            }),
+          ),
+        );
+        return "";
+      });
+      const client = new RedisClient(server.url + "/2", { enableAutoPipelining: false, autoReconnect: false });
+      try {
+        // Resolves with the reply to HELLO.
+        await client.connect();
+        const replies = rejection(client.multi().set("a", "1").exec());
+
+        expect(await beforeAnswer.promise).toEqual(["SELECT"]);
+        expect(await replies).toEqual(outcome);
+        expect(server.received(1)).toEqual(received);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  test.each([true, false])(
+    "a transaction that takes many writes stays in one piece (enableAutoPipelining: %p)",
+    async enableAutoPipelining => {
+      // 4 MB in 64 commands.
+      const value = Buffer.alloc(64 * 1024, "v").toString();
+      await using server = await fakeServer(([name]) =>
+        name === "EXEC" ? "*64\r\n" + "+OK\r\n".repeat(64) : name === "GET" ? "$1\r\nv\r\n" : undefined,
+      );
+      const client = new RedisClient(server.url, { enableAutoPipelining });
+      try {
+        await client.connect();
+        // The server stops reading, so the client cannot write the transaction in one go.
+        server.connections[0].socket.pause();
+
+        const before = client.get("before");
+        const transaction = client.multi();
+        for (let i = 0; i < 64; i++) transaction.set("key" + i, value);
+        const replies = transaction.exec();
+        const after = client.get("after");
+        await nextTurn();
+        expect(client.bufferedAmount).toBeGreaterThan(0);
+
+        server.connections[0].socket.resume();
+        expect(await Promise.all([before, replies, after])).toEqual(["v", Array(64).fill("OK"), "v"]);
+        expect(server.received(1)).toEqual(["GET", "MULTI", ...Array(64).fill("SET"), "EXEC", "GET"]);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  test("a transaction sent before the client is connected waits as one piece", async () => {
+    await using server = await fakeServer(([name]) => (name === "EXEC" ? "*1\r\n+OK\r\n" : undefined));
+    const client = new RedisClient(server.url);
+    try {
+      const replies = client.multi().set("a", "1").exec();
+      const after = client.get("after");
+      expect(await Promise.all([replies, after])).toEqual([["OK"], null]);
+      expect(server.received(1)).toEqual(["MULTI", "SET", "EXEC", "GET"]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("exec() with the offline queue off and no connection rejects like a command", async () => {
+    await using server = await fakeServer();
+    const client = new RedisClient(server.url, { enableOfflineQueue: false });
+    try {
+      expect(await Promise.all([rejection(client.multi().set("a", "1").exec()), rejection(client.get("a"))])).toEqual(
+        Array(2).fill({
+          code: "ERR_REDIS_CONNECTION_CLOSED",
+          message: "Connection is closed and offline queue is disabled",
+        }),
+      );
+    } finally {
+      client.close();
+    }
+  });
+
+  test.each([true, false])(
+    "exec() converts each reply as the method of its command does, also when the replies arrive byte by byte (enableAutoPipelining: %p)",
+    async enableAutoPipelining => {
+      await using server = await fakeServer(
+        ([name]) =>
+          name === "EXEC"
+            ? "*5\r\n:1\r\n:0\r\n$3\r\nabc\r\n%1\r\n+field\r\n+value\r\n:7\r\n"
+            : name === "GET"
+              ? "$5\r\nafter\r\n"
+              : undefined,
+        { dribble: true },
+      );
+      const client = new RedisClient(server.url, { enableAutoPipelining });
+      try {
+        const replies = client
+          .multi()
+          .exists("k")
+          .sismember("s", "m")
+          .getBuffer("k")
+          .hgetall("h")
+          .send("EXISTS", ["k"])
+          .exec();
+        const after = client.get("k");
+        expect(await Promise.all([replies, after])).toEqual([
+          [true, false, Buffer.from("abc"), { field: "value" }, 7],
+          "after",
+        ]);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  test.each(["_\r\n", "*-1\r\n", "$-1\r\n"])(
+    "exec() resolves with null when the server aborts the transaction with %j",
+    async aborted => {
+      await using server = await fakeServer(([name]) => (name === "EXEC" ? aborted : undefined));
+      const client = new RedisClient(server.url);
+      try {
+        expect(await client.multi().set("a", "1").exec()).toBeNull();
+        // The reply to the next command is its own.
+        expect(await client.get("a")).toBeNull();
+        expect(server.received(1)).toEqual(["MULTI", "SET", "EXEC", "GET"]);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  test.each([
+    ["refuses EXEC", "-EXECABORT Transaction discarded because of previous errors.\r\n"],
+    ["runs the others anyway", "*1\r\n+OK\r\n"],
+  ])(
+    "a command the server refuses to queue rejects exec() with that command's error when the server %s",
+    async (_, exec) => {
+      await using server = await fakeServer(([name]) =>
+        name === "BAD" || name === "WORSE" ? `-ERR unknown command '${name}'\r\n` : name === "EXEC" ? exec : undefined,
+      );
+      const client = new RedisClient(server.url);
+      try {
+        expect(await rejection(client.multi().set("a", "1").send("BAD", []).send("WORSE", []).exec())).toEqual({
+          code: "ERR_REDIS_SERVER_ERROR",
+          message: "ERR unknown command 'BAD'",
+        });
+        // Every reply of the transaction was read: the next reply is the next command's.
+        expect(await client.get("a")).toBeNull();
+        expect(client.connected).toBe(true);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  test.each([
+    ["more", "*3\r\n+OK\r\n:1\r\n:2\r\n", 3],
+    ["fewer", "*1\r\n+OK\r\n", 1],
+  ])("exec() rejects when EXEC answers with %s replies than the transaction has commands", async (_, exec, count) => {
+    await using server = await fakeServer(([name]) => (name === "EXEC" ? exec : undefined));
+    const client = new RedisClient(server.url);
+    try {
+      expect(await rejection(client.multi().set("a", "1").exists("a").exec())).toEqual({
+        code: "ERR_REDIS_INVALID_RESPONSE",
+        message: `EXEC replied with ${count} replies to a transaction of 2 commands`,
+      });
+      expect(await client.get("a")).toBeNull();
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a command that fails when the transaction runs rejects exec() with its error, every reply and the failed places", async () => {
+    await using server = await fakeServer(([name]) =>
+      name === "EXEC"
+        ? "*4\r\n+OK\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n:1\r\n-ERR value is not an integer or out of range\r\n"
+        : undefined,
+    );
+    const client = new RedisClient(server.url);
+    try {
+      const error = await client
+        .multi()
+        .set("a", "1")
+        .incr("list")
+        .exists("a")
+        .incr("text")
+        .exec()
+        .then(
+          () => undefined,
+          error => error,
+        );
+
+      expect(error).toBeInstanceOf(Error);
+      expect({ code: error.code, message: error.message, errorIndexes: error.errorIndexes }).toEqual({
+        code: "ERR_REDIS_SERVER_ERROR",
+        message: "WRONGTYPE Operation against a key holding the wrong kind of value",
+        errorIndexes: [1, 3],
+      });
+      expect(error.replies).toHaveLength(4);
+      expect([error.replies[0], error.replies[2]]).toEqual(["OK", true]);
+      expect(error.replies[1]).toBeInstanceOf(Error);
+      expect(error.replies[1]).not.toBe(error);
+      expect(error.replies[1].message).toBe(error.message);
+      expect(error.replies[3].message).toBe("ERR value is not an integer or out of range");
+      expect(await client.get("a")).toBeNull();
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a refused MULTI rejects exec() with the error of MULTI and without replies", async () => {
+    // Without MULTI this server runs each command as it arrives.
+    await using server = await fakeServer(([name]) =>
+      name === "MULTI"
+        ? "-NOPERM this user has no permissions to run the 'multi' command\r\n"
+        : name === "INCR"
+          ? ":1\r\n"
+          : name === "EXEC"
+            ? "-ERR EXEC without MULTI\r\n"
+            : undefined,
+    );
+    const client = new RedisClient(server.url);
+    try {
+      const error = await client
+        .multi()
+        .incr("a")
+        .incr("b")
+        .exec()
+        .then(
+          () => undefined,
+          error => error,
+        );
+      expect({ code: error.code, message: error.message, replies: error.replies }).toEqual({
+        code: "ERR_REDIS_SERVER_ERROR",
+        message: "NOPERM this user has no permissions to run the 'multi' command",
+        replies: undefined,
+      });
+      expect(await client.get("a")).toBeNull();
+    } finally {
+      client.close();
+    }
+  });
+
+  test.each([true, false])(
+    "a transaction in flight when the connection is lost is rejected, and none of it goes to the next connection (enableAutoPipelining: %p)",
+    async enableAutoPipelining => {
+      const reconnected = Promise.withResolvers<void>();
+      await using server = await fakeServer(([name], connection) => {
+        if (connection.index === 2 && name === "HELLO") reconnected.resolve();
+        if (connection.index === 1 && name === "MULTI") {
+          connection.socket.destroy();
+          return "";
+        }
+        return name === "EXEC" ? "*2\r\n:1\r\n:2\r\n" : undefined;
+      });
+      const client = new RedisClient(server.url, { enableAutoPipelining });
+      try {
+        await client.connect();
+        // INFO is not pipelined when it is sent on its own.
+        expect(await rejection(client.multi().set("a", "1").send("INFO", []).set("b", "2").exec())).toEqual(closed);
+        await reconnected.promise;
+
+        // Two commands where the lost transaction had three: it is read by its own plan.
+        expect(await client.multi().incr("a").incr("a").exec()).toEqual([1, 2]);
+        expect(await client.get("a")).toBeNull();
+        expect(server.received(2)).toEqual(["MULTI", "INCR", "INCR", "EXEC", "GET"]);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  test("a large transaction that the server stops reading after MULTI is rejected, and none of it goes to the next connection", async () => {
+    const value = Buffer.alloc(64 * 1024, "v").toString();
+    const reconnected = Promise.withResolvers<void>();
+    await using server = await fakeServer(([name], connection) => {
+      if (connection.index === 2 && name === "HELLO") reconnected.resolve();
+      if (connection.index === 1 && name === "MULTI") {
+        connection.socket.destroy();
+        return "";
+      }
+    });
+    const client = new RedisClient(server.url);
+    try {
+      await client.connect();
+      const transaction = client.multi();
+      for (let i = 0; i < 64; i++) transaction.set("key" + i, value);
+      expect(await rejection(transaction.exec())).toEqual(closed);
+      await reconnected.promise;
+      expect(await client.get("a")).toBeNull();
+      expect(server.received(2)).toEqual(["GET"]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("the transaction after close() and connect() is read by its own plan", async () => {
+    await using server = await fakeServer(([name], connection) =>
+      name === "EXEC" ? (connection.index === 1 ? "" : "*2\r\n:1\r\n:2\r\n") : undefined,
+    );
+    const client = new RedisClient(server.url);
+    try {
+      await client.connect();
+      const lost = rejection(client.multi().set("a", "1").exec());
+      await nextTurn();
+      client.close();
+      expect(await lost).toEqual(closed);
+
+      await client.connect();
+      expect(await client.multi().incr("a").incr("a").exec()).toEqual([1, 2]);
+      expect(await client.get("a")).toBeNull();
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a transaction not yet sent when the connection is lost goes to the next connection whole", async () => {
+    await using server = await fakeServer(([name], connection) => {
+      // The first connection is lost before it answers HELLO.
+      if (connection.index === 1) {
+        connection.socket.destroy();
+        return "";
+      }
+      return name === "EXEC" ? "*2\r\n:1\r\n:2\r\n" : undefined;
+    });
+    const client = new RedisClient(server.url);
+    try {
+      expect(await client.multi().incr("a").incr("a").exec()).toEqual([1, 2]);
+      expect(server.received(1)).toEqual([]);
+      expect(server.received(2)).toEqual(["MULTI", "INCR", "INCR", "EXEC"]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a transaction whose EXEC is never answered rejects with the idle timeout", async () => {
+    await using server = await fakeServer(([name]) => (name === "EXEC" ? "" : undefined));
+    const client = new RedisClient(server.url, { idleTimeout: 50, autoReconnect: false });
+    try {
+      await client.connect();
+      expect(await rejection(client.multi().set("a", "1").exec())).toEqual({
+        code: "ERR_REDIS_IDLE_TIMEOUT",
+        message: "Idle timeout reached after 50ms",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  test("an error inside a transaction does not fail a client that became a subscriber with the transaction in flight", async () => {
+    const message = Promise.withResolvers<string>();
+    const subscribed = ">3\r\n$9\r\nsubscribe\r\n$7\r\nchannel\r\n:1\r\n";
+    const published = ">3\r\n$7\r\nmessage\r\n$7\r\nchannel\r\n$5\r\nhello\r\n";
+    // SUBSCRIBE is answered when MULTI arrives, and a message follows the transaction.
+    await using server = await fakeServer(([name]) =>
+      name === "SUBSCRIBE"
+        ? ""
+        : name === "MULTI"
+          ? subscribed + "+OK\r\n"
+          : name === "BAD"
+            ? "-ERR unknown command 'BAD'\r\n"
+            : name === "EXEC"
+              ? "-EXECABORT Transaction discarded because of previous errors.\r\n" + published
+              : undefined,
+    );
+    const client = new RedisClient(server.url);
+    try {
+      await client.connect();
+      const subscription = client.subscribe("channel", received => message.resolve(received));
+      const transaction = rejection(client.multi().set("a", "1").send("BAD", []).exec());
+
+      expect(await subscription).toBe(1);
+      expect(await transaction).toEqual({ code: "ERR_REDIS_SERVER_ERROR", message: "ERR unknown command 'BAD'" });
+      expect(await message.promise).toBe("hello");
+      expect(client.connected).toBe(true);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("the second confirmation of a PSUBSCRIBE is not read as a reply of the transaction behind it", async () => {
+    const confirmed = (pattern: string, count: number) =>
+      `>3\r\n$10\r\npsubscribe\r\n$${pattern.length}\r\n${pattern}\r\n:${count}\r\n`;
+    await using server = await fakeServer(([name]) =>
+      name === "PSUBSCRIBE"
+        ? confirmed("a*", 1) + confirmed("b*", 2)
+        : name === "EXEC"
+          ? "*2\r\n+OK\r\n:1\r\n"
+          : undefined,
+    );
+    const client = new RedisClient(server.url);
+    try {
+      await client.connect();
+      const subscription = client.send("PSUBSCRIBE", ["a*", "b*"]);
+      const replies = client.multi().set("a", "1").exists("a").exec();
+      await subscription;
+      expect(await replies).toEqual(["OK", true]);
+      expect(client.connected).toBe(true);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("a transaction keeps the process alive until exec() settles, and not longer", async () => {
+    await using server = await fakeServer(([name]) => (name === "EXEC" ? "*1\r\n+OK\r\n" : undefined), {
+      dribble: true,
+    });
+    // Nothing else holds the child open: no top-level await, and it does not close the client.
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+        const client = new Bun.RedisClient(${JSON.stringify(server.url)});
+        client.connect().then(() => {
+          setImmediate(() => {
+            client.multi().set("a", "1").exec().then(replies => console.log(JSON.stringify(replies)));
+          });
+        });
+        `,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: '["OK"]\n', stderr: "", exitCode: 0 });
+  });
+
+  test("the estimated memory counts the commands of a transaction, first on the transaction and then on the client", async () => {
+    await using server = await fakeServer(([name]) => (name === "EXEC" ? "*1\r\n+OK\r\n" : undefined));
+    const client = new RedisClient(server.url);
+    try {
+      await client.connect();
+      const value = Buffer.alloc(4096, "v").toString();
+      const transaction = client.multi().set("a", value);
+      const heldCost = estimateShallowMemoryUsageOf(transaction);
+      expect(heldCost).toBeGreaterThanOrEqual(value.length);
+
+      const idleCost = estimateShallowMemoryUsageOf(client);
+      const replies = transaction.exec();
+      expect(estimateShallowMemoryUsageOf(client) - idleCost).toBeGreaterThanOrEqual(value.length);
+      expect(heldCost - estimateShallowMemoryUsageOf(transaction)).toBeGreaterThanOrEqual(value.length);
+      expect(await replies).toEqual(["OK"]);
+    } finally {
+      client.close();
+    }
+  });
+});

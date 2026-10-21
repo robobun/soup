@@ -152,3 +152,67 @@ expectType(redis.xinfo("STREAM", "stream")).is<Promise<any>>();
 expectType(redis.xgroup("CREATE", "stream", "g", "$", "MKSTREAM")).is<Promise<any>>();
 expectType(redis.xsetid("stream", "0-0")).is<Promise<"OK">>();
 expectType(redis.xsetid("stream", "5-0", "ENTRIESADDED", 5)).is<Promise<"OK">>();
+
+// Transactions
+const tx = redis.multi();
+expectType(tx).is<Bun.RedisTransaction<[]>>();
+expectType(redis.multi().exec()).is<Promise<unknown[] | null>>();
+expectType(
+  redis
+    .multi()
+    .set("k", "v", "EX", 10)
+    .incrby("k", 2)
+    .exists("k")
+    .getBuffer("k")
+    .set("k", "v", "NX")
+    .hsetex("h", "FIELDS", 1, "f", "v")
+    .exec(),
+).is<Promise<["OK", number, boolean, Uint8Array<ArrayBuffer> | null, "OK" | null, number, ...unknown[]] | null>>();
+expectType(redis.multi().send("PING", []).hgetall("h").zrange("z", 0, -1, "WITHSCORES").exec()).is<
+  Promise<[any, Record<string, string>, [string, number][], ...unknown[]] | null>
+>();
+const replies = await redis.multi().get("a").set("a", buf).sismember("s", "m").exec();
+if (replies) {
+  const [got, ok, member] = replies;
+  expectType(got).is<string | null>();
+  expectType(ok).is<"OK">();
+  expectType(member).is<boolean>();
+}
+// The type of a transaction that statements or a loop fill does not know the replies.
+const filledByStatements = redis.multi();
+filledByStatements.set("k", "v");
+filledByStatements.get("k");
+expectType(filledByStatements.exec()).is<Promise<unknown[] | null>>();
+const filledByLoop = redis.multi();
+for (const key of ["a", "b"]) filledByLoop.incr(key);
+expectType(filledByLoop.exec()).is<Promise<unknown[] | null>>();
+// A parameter of type RedisTransaction takes a transaction with any replies.
+function queueAudit(transaction: Bun.RedisTransaction) {
+  return transaction.lpush("audit", "entry");
+}
+queueAudit(redis.multi());
+expectType(queueAudit(redis.multi().set("k", "v").exists("k")).exec()).is<Promise<unknown[] | null>>();
+declare const execError: Bun.RedisTransaction.ExecError<["OK", number]>;
+expectType(execError.code).is<"ERR_REDIS_SERVER_ERROR">();
+expectType(execError.replies).is<["OK" | Error, number | Error]>();
+expectType(execError.errorIndexes).is<number[]>();
+// @ts-expect-error - multi() takes no commands
+redis.multi([["set", "k", "v"]]);
+// @ts-expect-error - a transaction does not connect
+redis.multi().connect();
+// @ts-expect-error - a transaction cannot subscribe
+redis.multi().subscribe("hello", listener);
+// @ts-expect-error - MULTI does not nest
+redis.multi().multi();
+// @ts-expect-error - exec() exists only on a transaction
+redis.exec();
+// @ts-expect-error - increment is a number, as on the client
+redis.multi().incrby("k", "two");
+// @ts-expect-error - bit must be 0 or 1, as on the client
+redis.multi().bitpos("k", 2);
+// @ts-expect-error - NOT takes exactly one source key, as on the client
+redis.multi().bitop("NOT", "dest", "k1", "k2");
+// @ts-expect-error - an explicit undefined unit is rejected, as on the client
+redis.multi().geodist("geo", "Palermo", "Catania", undefined);
+// @ts-expect-error - at least one key is required, as on the client
+redis.multi().pfcount();

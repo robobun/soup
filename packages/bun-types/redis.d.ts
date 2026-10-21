@@ -2812,6 +2812,24 @@ declare module "bun" {
     duplicate(): Promise<RedisClient>;
 
     /**
+     * Start a transaction (`MULTI` ... `EXEC`).
+     *
+     * The returned object has the command methods of the client. Each of them
+     * queues its command and returns the transaction. The client sends nothing
+     * until you call {@link RedisTransaction.exec `.exec()`}, which sends
+     * `MULTI`, the queued commands and `EXEC` as one unit. The server runs them
+     * with no other command in between, not even another command of this
+     * client.
+     *
+     * @example
+     * ```ts
+     * const replies = await redis.multi().decrby("account:1", 10).incrby("account:2", 10).exec();
+     * // [90, 110]
+     * ```
+     */
+    multi(): RedisTransaction<[]>;
+
+    /**
      * Copy the value stored at the source key to the destination key
      *
      * By default, the destination key is created in the logical database used
@@ -3982,6 +4000,148 @@ declare module "bun" {
      * @returns Promise that resolves with "OK"
      */
     xsetid(key: RedisClient.KeyLike, lastId: string, ...options: (string | number)[]): Promise<"OK">;
+  }
+
+  export namespace RedisTransaction {
+    /** The members of {@link RedisClient} that are not commands to queue. */
+    type NotQueueable =
+      | "connected"
+      | "bufferedAmount"
+      | "onconnect"
+      | "onclose"
+      | "connect"
+      | "close"
+      | "duplicate"
+      | "subscribe"
+      | "unsubscribe"
+      | "psubscribe"
+      | "punsubscribe"
+      | "multi"
+      | "exec";
+
+    type Queue<Args extends unknown[], Replies extends unknown[]> = (...args: Args) => RedisTransaction<Replies>;
+
+    /**
+     * What {@link RedisTransaction.exec `.exec()`} rejects with when the
+     * server ran the transaction and a command in it failed.
+     */
+    interface ExecError<Replies extends unknown[] = unknown[]> extends Error {
+      code: "ERR_REDIS_SERVER_ERROR";
+      /** The reply of every command, with an error in the place of each command that failed. */
+      replies: { [Index in keyof Replies]: Replies[Index] | Error };
+      /** The places of the failed commands in `replies`. */
+      errorIndexes: number[];
+    }
+
+    /** The command methods of {@link RedisClient}, each returning the transaction. */
+    type Commands<Replies extends unknown[]> = {
+      [Command in keyof RedisClient as Exclude<Command, NotQueueable>]: Queued<RedisClient[Command], Replies>;
+    };
+
+    /**
+     * Every overload of a {@link RedisClient} method, returning the transaction
+     * with the reply type added, instead of a promise of the reply. TypeScript
+     * fills the 18 slots from the last overload backwards and repeats the
+     * first overload in the slots that are left, so this covers methods with
+     * up to 18 overloads.
+     */
+    type Queued<Method, Replies extends unknown[]> = Method extends {
+      (...args: infer A1): infer R1;
+      (...args: infer A2): infer R2;
+      (...args: infer A3): infer R3;
+      (...args: infer A4): infer R4;
+      (...args: infer A5): infer R5;
+      (...args: infer A6): infer R6;
+      (...args: infer A7): infer R7;
+      (...args: infer A8): infer R8;
+      (...args: infer A9): infer R9;
+      (...args: infer A10): infer R10;
+      (...args: infer A11): infer R11;
+      (...args: infer A12): infer R12;
+      (...args: infer A13): infer R13;
+      (...args: infer A14): infer R14;
+      (...args: infer A15): infer R15;
+      (...args: infer A16): infer R16;
+      (...args: infer A17): infer R17;
+      (...args: infer A18): infer R18;
+    }
+      ? Queue<A1, [...Replies, Awaited<R1>]> &
+          Queue<A2, [...Replies, Awaited<R2>]> &
+          Queue<A3, [...Replies, Awaited<R3>]> &
+          Queue<A4, [...Replies, Awaited<R4>]> &
+          Queue<A5, [...Replies, Awaited<R5>]> &
+          Queue<A6, [...Replies, Awaited<R6>]> &
+          Queue<A7, [...Replies, Awaited<R7>]> &
+          Queue<A8, [...Replies, Awaited<R8>]> &
+          Queue<A9, [...Replies, Awaited<R9>]> &
+          Queue<A10, [...Replies, Awaited<R10>]> &
+          Queue<A11, [...Replies, Awaited<R11>]> &
+          Queue<A12, [...Replies, Awaited<R12>]> &
+          Queue<A13, [...Replies, Awaited<R13>]> &
+          Queue<A14, [...Replies, Awaited<R14>]> &
+          Queue<A15, [...Replies, Awaited<R15>]> &
+          Queue<A16, [...Replies, Awaited<R16>]> &
+          Queue<A17, [...Replies, Awaited<R17>]> &
+          Queue<A18, [...Replies, Awaited<R18>]>
+      : never;
+  }
+
+  /**
+   * A transaction started by {@link RedisClient.multi `redis.multi()`}.
+   *
+   * Each command method takes the arguments of the {@link RedisClient} method
+   * of the same name, queues the command and returns the transaction, so calls
+   * chain. The client sends nothing until you call
+   * {@link RedisTransaction.exec `.exec()`}.
+   *
+   * `Replies` holds the reply types of the commands that one chain of calls
+   * queued, in order. A command that you queue in a statement of its own is
+   * not in it: after `const tx = redis.multi(); tx.get("a");` the type of
+   * `tx` still has no replies. Use `RedisTransaction` without `Replies` as the
+   * type of a transaction that some other code fills.
+   *
+   * @example
+   * ```ts
+   * const replies = await redis.multi().set("key", "value").exists("key").getBuffer("key").exec();
+   * // ["OK", true, <Buffer 76 61 6c 75 65>]
+   * ```
+   */
+  export interface RedisTransaction<Replies extends unknown[] = unknown[]> extends RedisTransaction.Commands<Replies> {
+    /**
+     * Send `MULTI`, the queued commands and `EXEC` to the server as one unit.
+     *
+     * A transaction is sent once. After `exec()`, this method and the command
+     * methods throw `ERR_REDIS_INVALID_STATE`.
+     *
+     * @returns Promise that resolves with the reply of each queued command, in
+     * order and converted as the method of the command converts it. The type
+     * lists the replies of the call chain that ends in `exec()`, and replies of
+     * commands that were queued in other statements can follow them.
+     *
+     * The promise resolves with `null` when the server ran nothing because a
+     * key that was watched on this connection changed. It does not matter
+     * which code sent the `WATCH`.
+     *
+     * The promise rejects with code `ERR_REDIS_SERVER_ERROR` when the server
+     * answered with an error:
+     * - The server refused a command when it was queued (an unknown command,
+     *   the wrong number of arguments). Nothing ran. The error is the one of
+     *   that command.
+     * - A command failed when the server ran it (for example `WRONGTYPE`).
+     *   Redis does not roll back, so the other commands took effect. The
+     *   error is a {@link RedisTransaction.ExecError}: the error of the first
+     *   failed command, with `replies` and `errorIndexes`.
+     * - The server refused `MULTI` itself (an ACL rule, or a raw `MULTI` is
+     *   open on this connection). The error is the one of `MULTI` and has no
+     *   `replies`, but the server still received the commands, and depending
+     *   on the server it ran them.
+     *
+     * The promise rejects with `ERR_REDIS_CONNECTION_CLOSED` or
+     * `ERR_REDIS_IDLE_TIMEOUT` when the connection ended before the reply to
+     * `EXEC` arrived. The server then ran all of the transaction or none of
+     * it, and the client cannot tell which.
+     */
+    exec(): Promise<[...Replies, ...unknown[]] | null>;
   }
 
   /**
