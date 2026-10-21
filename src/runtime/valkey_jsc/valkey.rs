@@ -12,7 +12,7 @@ use bun_valkey::valkey_protocol as protocol;
 use bun_valkey::valkey_protocol::{RESPValue, RedisError};
 
 use super::js_valkey_body::JSValkeyClient;
-use super::protocol_jsc::{resp_value_to_js, valkey_error_to_js};
+use super::protocol_jsc::{resp_value_to_js, resp_value_to_js_with_options, valkey_error_to_js};
 use super::valkey_command_body as command;
 use super::valkey_command_body::{Args, Command};
 
@@ -254,6 +254,9 @@ pub(crate) struct ValkeyClient {
     /// Commands that are waiting to be sent to the server. When pipelining is implemented, this usually will be empty.
     pub(crate) queue: command::entry::Queue,
 
+    /// One plan per `Meta::TRANSACTION_UNIT` entry in `in_flight` and `queue`, oldest first.
+    pub(crate) unit_plans: Option<Box<command::unit_plan::Queue>>,
+
     // Connection parameters
     // `connection_strings` is retained because `js_valkey.rs` still slices it
     // when constructing/duplicating clients.
@@ -335,17 +338,81 @@ fn reader_pos(reader: &protocol::ValkeyReader<'_>) -> usize {
     reader.pos()
 }
 
+/// EXEC's array, converted per command. `Ok(Err(error))`: a command failed; `error` has `replies` and `errorIndexes`.
+fn unit_replies_to_js(
+    global: &JSGlobalObject,
+    replies: &mut [RESPValue],
+    metas: &[command::Meta],
+) -> JsResult<Result<JSValue, JSValue>> {
+    debug_assert_eq!(replies.len(), metas.len());
+    let array = JSValue::create_empty_array(global, replies.len())?;
+    let mut failed: Vec<u32> = Vec::new();
+    for (index, (reply, meta)) in replies.iter_mut().zip(metas).enumerate() {
+        if matches!(reply, RESPValue::Error(_)) {
+            failed.push(index as u32);
+        }
+        meta.convert_reply(reply);
+        let value = resp_value_to_js_with_options(reply, global, meta.to_js_options())?;
+        array.put_index(global, index as u32, value)?;
+    }
+
+    let Some(RESPValue::Error(message)) = failed.first().map(|first| &replies[*first as usize])
+    else {
+        return Ok(Ok(array));
+    };
+    // A second object: `error.replies` must not hold `error`.
+    let error = valkey_error_to_js(global, &**message, RedisError::ServerError);
+    let error_indexes = JSValue::create_array_from_iter(global, failed.iter(), |index| {
+        Ok(JSValue::js_number(f64::from(*index)))
+    })?;
+    error.put(global, b"replies", array);
+    error.put(global, b"errorIndexes", error_indexes);
+    Ok(Err(error))
+}
+
 // SAFETY: `ValkeyClient` lives at `JSValkeyClient.client` (intrusive embed).
 // `JsCell<ValkeyClient>` is `#[repr(transparent)]`, so the field offset is
 // unchanged. Every `JSValkeyClient` method this reaches is `&self`.
 bun_core::impl_field_parent! { ValkeyClient => JSValkeyClient.client; fn parent; fn mut parent_ptr; }
 
 impl ValkeyClient {
+    /// The client inside a transaction: it has no server and stays `NeverConnected`.
+    pub(crate) fn detached(vm: &'static VirtualMachine) -> Self {
+        ValkeyClient {
+            socket: AnySocket::SocketTcp(uws::SocketTCP::detached()),
+            status: Status::NeverConnected,
+            write_buffer: Default::default(),
+            read_buffer: Default::default(),
+            reply_scanner: Default::default(),
+            in_flight: command::promise_pair::Queue::new(),
+            queue: command::entry::Queue::new(),
+            unit_plans: None,
+            password: Box::default(),
+            username: Box::default(),
+            database: 0,
+            address: Address::Host {
+                host: Box::default(),
+                port: 0,
+            },
+            protocol: Protocol::Standalone,
+            connection_strings: Box::default(),
+            tls: TLS::None,
+            idle_timeout_interval_ms: 0,
+            connection_timeout_ms: 0,
+            retry_attempts: 0,
+            max_retries: 0,
+            flags: ConnectionFlags::default(),
+            auto_flusher: Default::default(),
+            vm,
+        }
+    }
+
     /// Clean up resources used by the Valkey client
     // Cannot be `Drop` — takes a JSGlobalObject param and has JS side effects.
     pub(crate) fn shutdown(&mut self, global_object_or_finalizing: Option<&JSGlobalObject>) {
         let mut pending = core::mem::take(&mut self.in_flight);
         let mut commands = core::mem::take(&mut self.queue);
+        self.unit_plans = None;
 
         // When finalizing we cannot call into JS; the queues just drop.
         if let Some(global_this) = global_object_or_finalizing {
@@ -515,6 +582,15 @@ impl ValkeyClient {
             return Ok(());
         }
 
+        if let Some(plans) = self.unit_plans.as_deref_mut() {
+            let in_flight_units = self
+                .in_flight
+                .iter()
+                .filter(|pair| pair.meta.contains(command::Meta::TRANSACTION_UNIT))
+                .count();
+            plans.drain(..in_flight_units.min(plans.len()));
+        }
+
         if self.flags.finalized {
             let vm = self.vm;
             let deferred_failure = Box::new(DeferredFailure {
@@ -584,6 +660,7 @@ impl ValkeyClient {
                     in_flight: core::mem::take(&mut self.in_flight),
                     queue: core::mem::take(&mut self.queue),
                 });
+                self.unit_plans = None;
                 deferred_failure.enqueue();
             }
 
@@ -605,6 +682,7 @@ impl ValkeyClient {
         }
         self.flags.failed = true;
         self.flags.is_reconnecting = false;
+        self.unit_plans = None;
         let val = Self::reject_all_pending_commands(
             &mut self.in_flight,
             &mut self.queue,
@@ -1147,12 +1225,20 @@ impl ValkeyClient {
         }
 
         // We handle subscriptions specially because they are not regular commands and their failure will potentially
-        // cause the client to drop out of subscriber mode.
-        let request_is_subscribe = pair_maybe
-            .as_ref()
-            .map(|p| p.meta.contains(command::Meta::SUBSCRIPTION_REQUEST))
-            .unwrap_or(false);
-        if self.parent().is_subscriber() || request_is_subscribe {
+        // cause the client to drop out of subscriber mode. A transaction is not settled by one reply either.
+        let request_is_subscribe_or_unit = pair_maybe.as_ref().is_some_and(|p| {
+            p.meta.intersects(
+                command::Meta::SUBSCRIPTION_REQUEST.union(command::Meta::TRANSACTION_UNIT),
+            )
+        });
+        if self.parent().is_subscriber() || request_is_subscribe_or_unit {
+            // First: below, an error reply fails the connection of a subscriber.
+            if let Some(pair) =
+                pair_maybe.take_if(|p| p.meta.contains(command::Meta::TRANSACTION_UNIT))
+            {
+                return self.handle_unit_reply(pair, value);
+            }
+
             debug!("This client is a subscriber. Handling as subscriber...");
 
             match value {
@@ -1199,12 +1285,7 @@ impl ValkeyClient {
         let meta = pair.meta;
 
         // Handle the response based on command type
-        if meta.contains(command::Meta::RETURN_AS_BOOL) {
-            // EXISTS returns 1 if key exists, 0 if not - we convert to boolean
-            if let RESPValue::Integer(int_value) = *value {
-                *value = RESPValue::Boolean(int_value > 0);
-            }
-        }
+        meta.convert_reply(value);
 
         // Resolve the promise with the potentially transformed value
         let promise_ptr = &mut pair.promise;
@@ -1222,6 +1303,104 @@ impl ValkeyClient {
             promise_ptr.resolve(&global_this, value)?;
         }
         Ok(())
+    }
+
+    /// One of the replies to a transaction: MULTI's, then one per command, then EXEC's.
+    #[cold]
+    fn handle_unit_reply(
+        &mut self,
+        pair: command::PromisePair,
+        value: &mut RESPValue,
+    ) -> JsResult<()> {
+        let Some(plan) = self
+            .unit_plans
+            .as_deref_mut()
+            .and_then(|plans| plans.front_mut())
+        else {
+            // Back in `in_flight`, so that `fail()` rejects it with the rest.
+            self.in_flight.push_front(pair);
+            return self.fail(
+                b"Received a transaction reply without a transaction",
+                RedisError::InvalidResponse,
+            );
+        };
+
+        plan.seen += 1;
+        if (plan.seen as usize) < plan.reply_count() {
+            if let RESPValue::Error(message) = value {
+                let first = if plan.seen == 1 {
+                    &mut plan.multi_error
+                } else {
+                    &mut plan.queue_error
+                };
+                if first.is_none() {
+                    *first = Some(core::mem::take(message));
+                }
+            }
+            // The pair waits at the front for EXEC's reply.
+            self.in_flight.push_front(pair);
+            return Ok(());
+        }
+
+        let plan = self
+            .unit_plans
+            .as_deref_mut()
+            .and_then(|plans| plans.pop_front())
+            .expect("front_mut() was Some");
+        self.settle_unit(pair, plan, value)
+    }
+
+    /// EXEC's reply settles the transaction's promise.
+    fn settle_unit(
+        &mut self,
+        mut pair: command::PromisePair,
+        mut plan: command::UnitPlan,
+        exec_reply: &mut RESPValue,
+    ) -> JsResult<()> {
+        let global_this = self.global_object();
+        let _exit = self.vm.enter_event_loop_scope();
+        let promise = &mut pair.promise;
+
+        // MULTI's error or a refused command's says more than EXEC's reply to either.
+        if let Some(message) = plan.multi_error.take().or_else(|| plan.queue_error.take()) {
+            let error = valkey_error_to_js(&global_this, &*message, RedisError::ServerError);
+            return promise.reject(&global_this, Ok(error));
+        }
+
+        match exec_reply {
+            RESPValue::Error(message) => {
+                let error = valkey_error_to_js(&global_this, &**message, RedisError::ServerError);
+                promise.reject(&global_this, Ok(error))
+            }
+            // A watched key changed: `_`, or `*-1` and `$-1` from a server that answers in RESP2.
+            RESPValue::Null | RESPValue::BulkString(None) => {
+                promise.promise.resolve(&global_this, JSValue::NULL)
+            }
+            RESPValue::Array(replies) if replies.len() == plan.metas.len() => {
+                match unit_replies_to_js(&global_this, replies, &plan.metas) {
+                    Ok(Ok(replies)) => promise.promise.resolve(&global_this, replies),
+                    Ok(Err(command_error)) => promise.reject(&global_this, Ok(command_error)),
+                    Err(err) => promise.reject(&global_this, Ok(global_this.take_error(err))),
+                }
+            }
+            RESPValue::Array(replies) => {
+                let message = format!(
+                    "EXEC replied with {} replies to a transaction of {} commands",
+                    replies.len(),
+                    plan.metas.len()
+                );
+                let error = valkey_error_to_js(&global_this, message, RedisError::InvalidResponse);
+                promise.reject(&global_this, Ok(error))
+            }
+            _ => {
+                let error = valkey_error_to_js(
+                    &global_this,
+                    b"EXEC replied with neither an array nor null",
+                    RedisError::InvalidResponseType,
+                );
+                promise.reject(&global_this, Ok(error))
+            }
+        }
     }
 
     /// Send authentication command to Valkey server
@@ -1367,22 +1546,19 @@ impl ValkeyClient {
         self.send_next_command();
     }
 
-    fn enqueue(
+    fn enqueue<A: Admitted>(
         &mut self,
-        command: &Command,
+        admitted: A,
         mut promise: command::Promise,
     ) -> Result<(), crate::Error> {
-        let can_pipeline = command
-            .meta
-            .contains(command::Meta::SUPPORTS_AUTO_PIPELINING)
+        let meta = admitted.meta();
+        let can_pipeline = meta.contains(command::Meta::SUPPORTS_AUTO_PIPELINING)
             && self.flags.enable_auto_pipelining;
 
         // For commands that don't support pipelining, we need to wait for the queue to drain completely
         // before sending the command. This ensures proper order of execution for state-changing commands.
-        let must_wait_for_queue = !command
-            .meta
-            .contains(command::Meta::SUPPORTS_AUTO_PIPELINING)
-            && !self.queue.is_empty();
+        let must_wait_for_queue =
+            !meta.contains(command::Meta::SUPPORTS_AUTO_PIPELINING) && !self.queue.is_empty();
 
         if
         // If there are any pending commands, queue this one
@@ -1397,7 +1573,7 @@ impl ValkeyClient {
             || can_pipeline
         {
             // We serialize the bytes in here, so we don't need to worry about the lifetime of the Command itself.
-            let entry = command::Entry::create(command, promise)?;
+            let entry = admitted.into_entry(self, promise)?;
             self.queue.push_back(entry);
 
             // If we're connected and using auto pipelining, schedule a flush
@@ -1410,7 +1586,7 @@ impl ValkeyClient {
 
         match self.status {
             Status::Connecting | Status::Connected => {
-                if command.write(self.writer()).is_err() {
+                if !admitted.write_now(self) {
                     let global = self.global_object();
                     let _ = promise.reject(&global, Ok(global.create_out_of_memory_error()));
                     return Ok(());
@@ -1419,10 +1595,7 @@ impl ValkeyClient {
             _ => unreachable!(),
         }
 
-        let cmd_pair = command::PromisePair {
-            meta: command.meta,
-            promise,
-        };
+        let cmd_pair = command::PromisePair { meta, promise };
 
         // Add to queue with command type
         self.in_flight.push_back(cmd_pair);
@@ -1440,7 +1613,32 @@ impl ValkeyClient {
         let mut checked_command = *command;
         checked_command.meta = command.meta.check(command);
 
-        let mut promise = command::Promise::create(global_this, checked_command.meta);
+        self.admit(global_this, &checked_command)
+    }
+
+    /// A transaction, serialized as MULTI, its commands and EXEC, goes the way of one command.
+    pub(crate) fn send_unit(
+        &mut self,
+        global_this: &JSGlobalObject,
+        serialized: Box<[u8]>,
+        metas: Box<[command::Meta]>,
+    ) -> Result<*mut JSPromise, crate::Error> {
+        self.admit(
+            global_this,
+            Unit {
+                serialized,
+                plan: command::UnitPlan::new(metas),
+            },
+        )
+    }
+
+    fn admit<A: Admitted>(
+        &mut self,
+        global_this: &JSGlobalObject,
+        admitted: A,
+    ) -> Result<*mut JSPromise, crate::Error> {
+        let meta = admitted.meta();
+        let mut promise = command::Promise::create(global_this, meta);
 
         let js_promise: *mut JSPromise = std::ptr::from_mut::<JSPromise>(promise.promise.get());
         if let Some(message) = self.send_rejection() {
@@ -1449,13 +1647,11 @@ impl ValkeyClient {
                 Ok(Self::send_rejection_error(global_this, message)),
             );
         } else {
-            self.enqueue(&checked_command, promise)?;
+            self.enqueue(admitted, promise)?;
 
             // Schedule auto-flushing to process this command if pipelining is enabled
             if self.flags.enable_auto_pipelining
-                && checked_command
-                    .meta
-                    .contains(command::Meta::SUPPORTS_AUTO_PIPELINING)
+                && meta.contains(command::Meta::SUPPORTS_AUTO_PIPELINING)
                 && self.status == Status::Connected
                 && !self.queue.is_empty()
             {
@@ -1576,6 +1772,77 @@ impl bun_io::Write for ValkeyClient {
 /// write buffer directly when other `&self` field borrows (username/password)
 /// are still live — Rust's split-borrow rules permit `&self.username` +
 /// `&mut self.write_buffer`, but not `&self.username` + `&mut self`.
+/// What `enqueue` takes: a command, serialized when it is queued or written, or a transaction.
+trait Admitted {
+    fn meta(&self) -> command::Meta;
+    /// For `queue`.
+    fn into_entry(
+        self,
+        client: &mut ValkeyClient,
+        promise: command::Promise,
+    ) -> Result<command::Entry, crate::Error>;
+    /// Straight to the write buffer. `false`: out of memory.
+    fn write_now(self, client: &mut ValkeyClient) -> bool;
+}
+
+impl Admitted for &Command<'_> {
+    #[inline]
+    fn meta(&self) -> command::Meta {
+        self.meta
+    }
+
+    #[inline]
+    fn into_entry(
+        self,
+        _client: &mut ValkeyClient,
+        promise: command::Promise,
+    ) -> Result<command::Entry, crate::Error> {
+        command::Entry::create(self, promise)
+    }
+
+    #[inline]
+    fn write_now(self, client: &mut ValkeyClient) -> bool {
+        self.write(client.writer()).is_ok()
+    }
+}
+
+/// MULTI, the commands of a transaction and EXEC, serialized, and how to read their replies.
+struct Unit {
+    serialized: Box<[u8]>,
+    plan: command::UnitPlan,
+}
+
+impl Admitted for Unit {
+    fn meta(&self) -> command::Meta {
+        // Pipelined, unlike a raw MULTI or EXEC: nothing can come between the two.
+        command::Meta::SUPPORTS_AUTO_PIPELINING | command::Meta::TRANSACTION_UNIT
+    }
+
+    fn into_entry(
+        self,
+        client: &mut ValkeyClient,
+        promise: command::Promise,
+    ) -> Result<command::Entry, crate::Error> {
+        let meta = self.meta();
+        client
+            .unit_plans
+            .get_or_insert_default()
+            .push_back(self.plan);
+        Ok(command::Entry::from_parts(self.serialized, meta, promise))
+    }
+
+    fn write_now(self, client: &mut ValkeyClient) -> bool {
+        if client.write(&self.serialized).is_err() {
+            return false;
+        }
+        client
+            .unit_plans
+            .get_or_insert_default()
+            .push_back(self.plan);
+        true
+    }
+}
+
 struct WriteBufWriter<'a>(&'a mut OffsetByteList);
 
 impl bun_io::Write for WriteBufWriter<'_> {

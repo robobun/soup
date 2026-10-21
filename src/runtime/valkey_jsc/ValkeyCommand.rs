@@ -37,6 +37,8 @@ impl<'a> Args<'a> {
 }
 
 impl<'a> Command<'a> {
+    // Always inlined, so that a second caller cannot cost every queued command a call.
+    #[inline(always)]
     pub(crate) fn write(&self, writer: &mut impl bun_io::Write) -> Result<(), crate::Error> {
         // Serialize as RESP array format directly
         write!(writer, "*{}\r\n", 1 + self.args.len())?;
@@ -109,6 +111,15 @@ impl Entry {
             promise,
         })
     }
+
+    /// An entry whose bytes are serialized already.
+    pub(crate) fn from_parts(serialized_data: Box<[u8]>, meta: Meta, promise: Promise) -> Entry {
+        Entry {
+            serialized_data,
+            meta,
+            promise,
+        }
+    }
 }
 
 bitflags::bitflags! {
@@ -119,7 +130,9 @@ bitflags::bitflags! {
         const SUPPORTS_AUTO_PIPELINING = 1 << 1;
         const RETURN_AS_BUFFER        = 1 << 2;
         const SUBSCRIPTION_REQUEST    = 1 << 3;
-        // bits 4..8 are padding
+        /// The entry holds MULTI, the commands of a transaction and EXEC; see [`UnitPlan`].
+        const TRANSACTION_UNIT        = 1 << 5;
+        // bit 4 and bits 6..8 are padding
     }
 }
 
@@ -164,8 +177,58 @@ impl Meta {
         }
         new
     }
+
+    /// `exists()` and its like give a boolean for the integer reply.
+    #[inline]
+    pub(crate) fn convert_reply(self, value: &mut protocol::RESPValue) {
+        if self.contains(Meta::RETURN_AS_BOOL)
+            && let protocol::RESPValue::Integer(int_value) = *value
+        {
+            *value = protocol::RESPValue::Boolean(int_value > 0);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn to_js_options(self) -> ToJSOptions {
+        ToJSOptions {
+            return_as_buffer: self.contains(Meta::RETURN_AS_BUFFER),
+        }
+    }
 }
 
+/// How the `metas.len() + 2` replies to one [`Meta::TRANSACTION_UNIT`] entry settle its promise.
+pub(crate) struct UnitPlan {
+    /// Each command's `Meta`, which converts its element of EXEC's reply.
+    pub(crate) metas: Box<[Meta]>,
+    /// Replies read so far.
+    pub(crate) seen: u32,
+    /// The error reply to MULTI, after which this MULTI queued nothing.
+    pub(crate) multi_error: Option<Box<[u8]>>,
+    /// The first error reply to a command.
+    pub(crate) queue_error: Option<Box<[u8]>>,
+}
+
+impl UnitPlan {
+    pub(crate) fn new(metas: Box<[Meta]>) -> Self {
+        UnitPlan {
+            metas,
+            seen: 0,
+            multi_error: None,
+            queue_error: None,
+        }
+    }
+
+    /// MULTI, the commands, EXEC.
+    pub(crate) fn reply_count(&self) -> usize {
+        self.metas.len() + 2
+    }
+}
+
+pub(crate) mod unit_plan {
+    pub(crate) type Queue = std::collections::VecDeque<super::UnitPlan>;
+}
+
+#[inline(always)]
 fn is_subscription_command(name: &[u8]) -> bool {
     [
         &b"SUBSCRIBE"[..],
@@ -177,6 +240,25 @@ fn is_subscription_command(name: &[u8]) -> bool {
     ]
     .iter()
     .any(|c| bun_core::strings::eql_case_insensitive_ascii(name, c, true))
+}
+
+pub(crate) const MULTI_FRAME: &[u8] = b"*1\r\n$5\r\nMULTI\r\n";
+pub(crate) const EXEC_FRAME: &[u8] = b"*1\r\n$4\r\nEXEC\r\n";
+
+/// After MULTI the server runs these six at once instead of queueing them; UNWATCH goes with WATCH.
+const NOT_QUEUED_AFTER_MULTI: [&[u8]; 7] = [
+    b"MULTI", b"EXEC", b"DISCARD", b"WATCH", b"QUIT", b"RESET", b"UNWATCH",
+];
+
+/// A transaction cannot hold these, nor a subscription, which the server answers with pushes.
+pub(crate) fn is_refused_in_transaction(command: &Command<'_>) -> bool {
+    command
+        .meta
+        .check(command)
+        .contains(Meta::SUBSCRIPTION_REQUEST)
+        || NOT_QUEUED_AFTER_MULTI
+            .iter()
+            .any(|c| bun_core::strings::eql_case_insensitive_ascii(command.command, c, true))
 }
 
 /// Promise for a Valkey command
@@ -196,9 +278,7 @@ impl Promise {
         global_object: &JSGlobalObject,
         value: &mut protocol::RESPValue,
     ) -> JsResult<()> {
-        let options = ToJSOptions {
-            return_as_buffer: self.meta.contains(Meta::RETURN_AS_BUFFER),
-        };
+        let options = self.meta.to_js_options();
 
         let js_value = match resp_value_to_js_with_options(value, global_object, options) {
             Ok(v) => v,
@@ -231,6 +311,16 @@ pub(crate) struct PromisePair {
 pub(crate) mod promise_pair {
     pub(crate) type Queue = std::collections::VecDeque<super::PromisePair>;
 }
+
+// Every queued command pays for these two; what only a transaction needs goes in its `UnitPlan`.
+const _: () = assert!(
+    core::mem::size_of::<PromisePair>()
+        == core::mem::size_of::<Promise>() + core::mem::size_of::<usize>()
+);
+const _: () = assert!(
+    core::mem::size_of::<Entry>()
+        == core::mem::size_of::<Box<[u8]>>() + core::mem::size_of::<PromisePair>()
+);
 
 impl PromisePair {
     pub(crate) fn reject_command(
