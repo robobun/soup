@@ -29,6 +29,7 @@ const commands: Record<string, readonly [args: readonly string[], length: number
   echo: [["message"], 1],
   eval: [["...args"], 2],
   evalsha: [["...args"], 2],
+  exec: [[], 0],
   exists: [["key"], 1],
   expire: [["key", "seconds"], 2],
   expireat: [["key", "timestamp"], 2],
@@ -101,6 +102,7 @@ const commands: Record<string, readonly [args: readonly string[], length: number
   mget: [["...args"], 0],
   mset: [["...args"], 0],
   msetnx: [["...args"], 0],
+  multi: [["...args"], 0],
   object: [["...args"], 2],
   persist: [["key"], 0],
   pexpire: [["key", "milliseconds"], 2],
@@ -214,6 +216,11 @@ const args = (names: readonly string[]): Record<string, b.Type> =>
   Object.fromEntries(names.map(name => (name.startsWith("...") ? [name.slice(3), b.any.variadic] : [name, b.any])));
 
 const promise = b.any.returning("Promise");
+/** A transaction queues the command and answers itself. */
+const promiseOrThis = b.any.returning("Promise", "this");
+/** `multi()` answers the transaction, which `interface RedisTransaction` of redis.d.ts describes. */
+const transaction = b.any.returning("object");
+const resultOf = (name: string) => (name === "connect" ? promise : name === "multi" ? transaction : promiseOrThis);
 
 const eventHandler = { getter: b.any, setter: { capability: "js" }, passThis: true } as const;
 
@@ -228,7 +235,14 @@ export const RedisClient = b.class({
     throws: true,
     length: 0,
   },
-  internalFields: ["onconnect", "onclose", "connectionPromise", "hello", "subscriptionCallbackMap"],
+  internalFields: [
+    "onconnect",
+    "onclose",
+    "connectionPromise",
+    "hello",
+    "subscriptionCallbackMap",
+    "transactionParent",
+  ],
   /** Every member needs a declaration in packages/bun-types/redis.d.ts: redis-client-types.test.ts compares the two. */
   proto: Object.fromEntries(
     [
@@ -238,7 +252,7 @@ export const RedisClient = b.class({
             name,
             {
               args: args(names),
-              returns: promise,
+              returns: resultOf(name),
               capability: "js",
               throws: true,
               passThis: true,

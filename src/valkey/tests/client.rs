@@ -1,5 +1,5 @@
 use bun_valkey::client::{Acked, Attempt, Client, Close, Config, Event, Lost, Reason, Sent};
-use bun_valkey::command::Reply;
+use bun_valkey::command::{Reply, Transaction};
 use bun_valkey::valkey_protocol::RESPValue;
 
 /// Stands in for wtf-bindings.cpp; no test sends a double.
@@ -149,6 +149,20 @@ impl Driver {
         self.send_as(command, Reply::Value);
     }
 
+    fn transact(&mut self, commands: &[(&str, Reply)]) {
+        self.sent += 1;
+        let mut transaction = Transaction::default();
+        for (command, reply) in commands {
+            let words: Vec<&str> = command.split_ascii_whitespace().collect();
+            transaction.push(words[0].as_bytes(), &words[1..], *reply);
+        }
+        match self.client.send_transaction(transaction, self.sent) {
+            Sent::Buffered => self.flush(),
+            Sent::Batched => self.batch_is_due = true,
+            Sent::Queued => {}
+        }
+    }
+
     fn read(&mut self, data: &str) {
         let mut input = self.client.feed(data.as_bytes());
         while let Some(event) = self.client.next_event(&mut input) {
@@ -171,6 +185,24 @@ impl Driver {
                 Event::Rejected { promise, message } => {
                     format!("reject #{promise} {}", message.escape_ascii())
                 }
+                Event::Executed {
+                    promise,
+                    values,
+                    replies,
+                } => {
+                    let mut line = format!("execute #{promise}");
+                    for (value, reply) in values.iter().zip(&replies[..]) {
+                        let as_buffer = *reply == Reply::Buffer;
+                        let buffer = if as_buffer { " as buffer" } else { "" };
+                        line += &format!(" {}{buffer}", show(value));
+                    }
+                    line
+                }
+                Event::Invalid {
+                    promise,
+                    message,
+                    error,
+                } => format!("invalid #{promise} {error:?} {}", message.escape_ascii()),
                 Event::Message(data) => format!("message {}", show(&data[0])),
                 Event::PatternMessage => "pattern message".into(),
                 Event::Subscribed(it) => acked("subscribed", it),
@@ -875,6 +907,135 @@ mod pipeline {
     }
 }
 
+mod transactions {
+    use super::*;
+
+    const SET: (&str, Reply) = ("SET a 1", Reply::Value);
+    const EXISTS: (&str, Reply) = ("EXISTS a", Reply::Bool);
+    const WRONG_COUNT: &str =
+        "invalid #1 InvalidResponse EXEC replied with 1 replies to a transaction of 2 commands";
+    const NOT_AN_ARRAY: &str =
+        "invalid #1 InvalidResponseType EXEC replied with neither an array nor null";
+
+    #[test]
+    fn encoding() {
+        let mut it = Driver::connected(Config {
+            enable_auto_pipelining: false,
+            ..Config::default()
+        });
+        let mut transaction = Transaction::default();
+        transaction.push(b"GET", &["k"], Reply::Value);
+        assert!(it.client.send_transaction(transaction, 1) == Sent::Buffered);
+        assert_eq!(
+            it.client.output(),
+            b"*1\r\n$5\r\nMULTI\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n*1\r\n$4\r\nEXEC\r\n"
+        );
+    }
+
+    #[test]
+    fn one_reply_for_each_command_settles_it() {
+        let mut it = Driver::connected(Config::default());
+        it.transact(&[SET, EXISTS, ("GET a", Reply::Buffer)]);
+        it.checkpoint();
+        it.read("+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n*3\r\n+OK\r\n:1\r\n$1\r\n1\r\n");
+        assert_eq!(
+            it.take(),
+            [
+                "write MULTI SET a 1 EXISTS a GET a EXEC",
+                "ignored",
+                "ignored",
+                "ignored",
+                "ignored",
+                "execute #1 OK true 1 as buffer",
+            ]
+        );
+        assert!(!it.client.has_pending_commands());
+    }
+
+    #[test]
+    fn it_waits_and_shares_a_write_like_one_command() {
+        let mut it = Driver::connected(Config {
+            enable_auto_pipelining: false,
+            ..Config::default()
+        });
+        it.send("GET a");
+        it.transact(&[SET]);
+        it.send("GET b");
+        it.read("+A\r\n");
+        assert_eq!(
+            it.take(),
+            [
+                "write GET a",
+                "resolve #1 A",
+                "write MULTI SET a 1 EXEC GET b",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_error_before_exec_says_more_than_the_reply_to_exec() {
+        for (replies, rejected) in [
+            ("+OK\r\n-one\r\n-two\r\n-ABORT\r\n", "one"),
+            ("+OK\r\n-one\r\n+QUEUED\r\n*1\r\n+OK\r\n", "one"),
+            ("-NOPERM\r\n:1\r\n-two\r\n-ERR\r\n", "NOPERM"),
+            ("+OK\r\n+QUEUED\r\n+QUEUED\r\n-ABORT\r\n", "ABORT"),
+        ] {
+            let mut it = Driver::connected(Config::default());
+            it.transact(&[SET, ("BAD", Reply::Value)]);
+            it.checkpoint();
+            it.log.clear();
+            it.read(replies);
+            let rejected = format!("reject #1 {rejected}");
+            assert_eq!(it.take(), ["ignored", "ignored", "ignored", &rejected]);
+        }
+    }
+
+    #[test]
+    fn what_exec_answers() {
+        for (exec, expected) in [
+            ("*2\r\n-WRONGTYPE\r\n:0\r\n", "execute #1 ? false"),
+            ("_\r\n", "resolve #1 ?"),
+            ("*-1\r\n", "resolve #1 ?"),
+            ("$-1\r\n", "resolve #1 ?"),
+            ("*1\r\n+OK\r\n", WRONG_COUNT),
+            ("+OK\r\n", NOT_AN_ARRAY),
+        ] {
+            let mut it = Driver::connected(Config::default());
+            it.transact(&[SET, EXISTS]);
+            it.send("PING");
+            it.checkpoint();
+            it.read("+OK\r\n+QUEUED\r\n+QUEUED\r\n");
+            it.log.clear();
+            it.read(&format!("{exec}+PONG\r\n"));
+            assert_eq!(it.take(), [expected, "resolve #2 PONG"]);
+        }
+    }
+
+    #[test]
+    fn a_lost_connection_takes_the_plan_of_what_was_in_flight() {
+        let mut it = Driver::connected(Config::default());
+        it.transact(&[SET, SET, SET]);
+        it.checkpoint();
+        it.read("+OK\r\n+QUEUED\r\n");
+        it.transact(&[EXISTS]);
+        it.lost();
+        it.handshake();
+        it.read("+OK\r\n+QUEUED\r\n*1\r\n:1\r\n");
+        assert_eq!(it.take(), ["ignored", "ignored", "execute #2 true"]);
+    }
+
+    #[test]
+    fn what_a_transaction_cannot_hold() {
+        let refused = "MULTI exec Discard WATCH unwatch QUIT reset SUBSCRIBE psubscribe";
+        for name in refused.split_ascii_whitespace() {
+            assert!(Transaction::refuses(name.as_bytes()), "{name}");
+        }
+        for name in ["GET", "INFO", "SELECT", "PUBLISH", "MULTIX", ""] {
+            assert!(!Transaction::refuses(name.as_bytes()), "{name}");
+        }
+    }
+}
+
 mod subscriptions {
     use super::*;
 
@@ -976,6 +1137,48 @@ mod subscriptions {
         it.send("SUBSCRIBE a b");
         it.read("+QUEUED\r\n");
         assert_eq!(it.log.last().unwrap(), "resolve #1 QUEUED");
+    }
+
+    #[test]
+    fn an_acknowledgement_is_no_reply_to_a_transaction() {
+        let mut it = Driver::connected(Config::default());
+        it.send("PSUBSCRIBE a b");
+        it.transact(&[("SET a 1", Reply::Value)]);
+        it.checkpoint();
+        it.log.clear();
+        it.read(&(push("psubscribe", "a") + &push("psubscribe", "b")));
+        it.read("+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n");
+        assert_eq!(
+            it.take(),
+            [
+                "subscribed #1 >psubscribe a",
+                "subscribed",
+                "ignored",
+                "ignored",
+                "execute #2 OK",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_error_inside_a_transaction_does_not_fail_a_subscriber() {
+        let mut it = subscriber();
+        it.transact(&[("BAD", Reply::Value)]);
+        it.checkpoint();
+        it.read(&format!(
+            "+OK\r\n-bad\r\n-ABORT\r\n{}",
+            push("message", "a")
+        ));
+        assert_eq!(
+            it.take(),
+            [
+                "write MULTI BAD EXEC",
+                "ignored",
+                "ignored",
+                "reject #2 bad",
+                "message a",
+            ]
+        );
     }
 
     #[test]
