@@ -82,15 +82,12 @@ fn from_js(global: &JSGlobalObject, value: JSValue) -> JsResult<Option<JSArgumen
 #[inline]
 fn send_err_to_js(global: &JSGlobalObject, message: &str, err: &crate::Error) -> JsResult<JSValue> {
     use bun_valkey::valkey_protocol::RedisError;
+    // A transaction threw because it cannot take the command.
+    if let crate::Error::Js(thrown) = err {
+        return Err(*thrown);
+    }
     let redis_err = err.name().parse().unwrap_or(RedisError::ConnectionClosed);
     Ok(protocol::valkey_error_to_js(global, message, redis_err))
-}
-
-/// `JSValkeyClient::send` returns a `*mut JSPromise`; route through the
-/// `opaque_ffi!` ZST accessor instead of an open-coded raw deref.
-#[inline]
-fn promise_to_js(p: *mut JSPromise) -> JSValue {
-    JSPromise::opaque_ref(p).to_js()
 }
 
 /// Shared epilog for every Valkey prototype method: build a `Command`,
@@ -122,7 +119,7 @@ fn send_cmd(
             meta,
         },
     ) {
-        Ok(p) => Ok(promise_to_js(p)),
+        Ok(value) => Ok(value),
         Err(err) => send_err_to_js(global, err_msg, &err),
     }
 }
@@ -375,13 +372,10 @@ impl JSValkeyClient {
         let checked_meta = cmd.meta.check(&cmd);
         cmd.meta = checked_meta;
         // Send command with slices directly
-        let promise = match self.send(global, this_value.to_js(), &cmd) {
-            Ok(p) => p,
-            Err(err) => {
-                return send_err_to_js(global, "Failed to send command", &err);
-            }
-        };
-        Ok(promise_to_js(promise))
+        match self.send(global, this_value.to_js(), &cmd) {
+            Ok(value) => Ok(value),
+            Err(err) => send_err_to_js(global, "Failed to send command", &err),
+        }
     }
 
     pub(crate) fn get(
@@ -1566,6 +1560,8 @@ impl JSValkeyClient {
         // stays live across those calls.
         let _guard = self.ref_guard();
 
+        self.require_not_transaction("subscribe")?;
+
         let (channel_or_many, handler_callback) = (channel.to_js(), listener.to_js());
         let mut redis_channels: Vec<JSArgument> = Vec::with_capacity(1);
 
@@ -1637,16 +1633,14 @@ impl JSValkeyClient {
             args: CommandArgs::Args(&redis_channels),
             meta: CommandMeta::default() | CommandMeta::SUBSCRIPTION_REQUEST,
         };
-        let promise = match self.send(global, this_value.to_js(), &command) {
-            Ok(p) => p,
+        match self.send(global, this_value.to_js(), &command) {
+            Ok(promise) => Ok(promise),
             Err(err) => {
                 // If we catch an error, we need to clean up any handlers we may have added and fall out of subscription mode
                 self.clear_all_receive_handlers(global)?;
-                return send_err_to_js(global, "Failed to send SUBSCRIBE command", &err);
+                send_err_to_js(global, "Failed to send SUBSCRIBE command", &err)
             }
-        };
-
-        Ok(promise_to_js(promise))
+        }
     }
 
     /// Send redis the UNSUBSCRIBE RESP command and clean up anything necessary after the unsubscribe commoand.
@@ -1679,6 +1673,8 @@ impl JSValkeyClient {
         // Hold a ref so `*self` stays live across the handler-map updates and
         // the `send()` below.
         let _guard = self.ref_guard();
+
+        self.require_not_transaction("unsubscribe")?;
 
         // Check if we're in subscription mode
         require_subscriber(self, "unsubscribe")?;
@@ -1815,9 +1811,68 @@ impl JSValkeyClient {
         )
     }
 
+    /// `multi()`: an object with the client's command methods that keeps the commands until `exec()`.
+    pub(crate) fn multi(
+        &self,
+        this_value: JsWrapper<'_, Self>,
+        cx: &mut JsScope<'_>,
+        args: &[JsLocal<'_>],
+    ) -> JsResult<JSValue> {
+        let cx = cx.js_thread();
+        let global = cx.global();
+        self.require_not_transaction("multi")?;
+        require_not_subscriber(self, "multi")?;
+        // ioredis takes an array of commands here; it must not become an empty transaction.
+        if !args.is_empty() {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "multi() takes no arguments. Queue the commands with the methods of the transaction it returns."
+            )));
+        }
+
+        let transaction_ptr = self.new_transaction(&cx);
+        // SAFETY: new_transaction returns a freshly allocated, leaked
+        // JSValkeyClient (heap::alloc); valid for the rest of this scope.
+        let transaction: &JSValkeyClient = unsafe { &*transaction_ptr };
+
+        let transaction_js = js::to_js(transaction_ptr, global);
+        transaction.this_value.set(JsRef::init_weak(transaction_js));
+        // `exec()` sends through the client, so a reachable transaction keeps the client's wrapper.
+        js::transaction_parent_set_cached(transaction_js, global, this_value.to_js());
+        Ok(transaction_js)
+    }
+
+    /// `exec()`: MULTI, the commands and EXEC go to the client as one entry; see `settle_unit`.
+    pub(crate) fn exec(
+        &self,
+        _this_value: JsWrapper<'_, Self>,
+        cx: &mut JsScope<'_>,
+    ) -> JsResult<JSValue> {
+        let global = cx.global();
+        let Some(parent) = self.transaction_parent() else {
+            return Err(global
+                .err(
+                    ErrorCode::REDIS_INVALID_STATE,
+                    format_args!(
+                        "RedisClient.prototype.exec can only be called on a transaction. multi() starts one."
+                    ),
+                )
+                .throw());
+        };
+        require_not_subscriber(&parent, "exec")?;
+
+        let sent = self
+            .take_transaction(global)
+            .and_then(|(serialized, metas)| parent.send_unit(global, serialized, metas));
+        match sent {
+            Ok(promise) => Ok(promise),
+            Err(err) => send_err_to_js(global, "Failed to send the transaction", &err),
+        }
+    }
+
     pub(crate) fn duplicate(&self, cx: &mut JsScope<'_>) -> JsResult<JSValue> {
         let cx = cx.js_thread();
         let global = cx.global();
+        self.require_not_transaction("duplicate")?;
         // The duplicate is the calling script's, whoever made the original.
         let new_client_ptr = self.clone_without_connecting(&cx)?;
         // SAFETY: clone_without_connecting returns a freshly allocated, leaked

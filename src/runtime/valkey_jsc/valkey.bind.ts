@@ -29,6 +29,7 @@ const commands: Record<string, readonly [args: readonly string[], length: number
   echo: [["message"], 1],
   eval: [["...args"], 2],
   evalsha: [["...args"], 2],
+  exec: [[], 0],
   exists: [["key"], 1],
   expire: [["key", "seconds"], 2],
   expireat: [["key", "timestamp"], 2],
@@ -101,6 +102,7 @@ const commands: Record<string, readonly [args: readonly string[], length: number
   mget: [["...args"], 0],
   mset: [["...args"], 0],
   msetnx: [["...args"], 0],
+  multi: [["...args"], 0],
   object: [["...args"], 2],
   persist: [["key"], 0],
   pexpire: [["key", "milliseconds"], 2],
@@ -227,7 +229,14 @@ export const RedisClient = b.class({
     throws: true,
     length: 0,
   },
-  internalFields: ["onconnect", "onclose", "connectionPromise", "hello", "subscriptionCallbackMap"],
+  internalFields: [
+    "onconnect",
+    "onclose",
+    "connectionPromise",
+    "hello",
+    "subscriptionCallbackMap",
+    "transactionParent",
+  ],
   /** Every member needs a declaration in packages/bun-types/redis.d.ts: redis-client-types.test.ts compares the two. */
   proto: Object.fromEntries(
     [

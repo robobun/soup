@@ -6420,6 +6420,258 @@ Files: `src/install_types/jsr.rs` (new), `src/install_types/lib.rs`, `src/instal
 `docs/pm/cli/publish.mdx`, `docs/pm/overrides.mdx`, `docs/pm/scopes-registries.mdx`,
 `test/cli/install/jsr.test.ts` (new).
 
+### 2026-10-20: `redis.multi()`, transactions for `Bun.redis`
+
+`docs/runtime/redis.mdx` ended with one item under "Limitations we plan to address in future
+versions": "Transactions (MULTI/EXEC) require raw commands". Raw commands are not only clumsy. A
+client has one connection, and every command of every task that uses the client goes into the same
+queue, so a command that another request handler sends between `send("MULTI")` and `send("EXEC")`
+becomes part of the transaction. On Bun 1.4.3:
+
+```ts
+async function transfer() {
+  await redis.send("MULTI", []);
+  await redis.send("INCRBY", ["a", "10"]);
+  await redis.send("INCRBY", ["b", "-10"]);
+  return await redis.send("EXEC", []);
+}
+const [exec, got] = await Promise.all([transfer(), redis.get("a")]);
+// exec: [null, 10, -10]   the GET ran inside the transaction
+// got:  "QUEUED"          and its promise got the reply for a queued command
+```
+
+The typed methods are lost on that path too: nothing checks the arguments, `exists()` gives `1`
+and there is no way to ask for a `Buffer`. Now:
+
+```ts
+import { redis } from "bun";
+
+const replies = await redis
+  .multi()
+  .decrby("account:1", 10)
+  .incrby("account:2", 10)
+  .exec();
+// [90, 110]
+
+const [stored, created, found, fields, bytes] = (await redis
+  .multi()
+  .set("greeting", "hello") // "OK"
+  .hset("user:1", { name: "Ana", plan: "pro" }) // 2
+  .exists("user:1") // true, as outside a transaction
+  .hgetall("user:1") // { name: "Ana", plan: "pro" }
+  .getBuffer("greeting") // <Buffer 68 65 6c 6c 6f>
+  .exec())!;
+```
+
+`multi()` returns a transaction. It has the command methods of the client, all of them, with the
+same argument checks at the call. Each one keeps its command and returns the transaction, and the
+client sends nothing before `exec()`. `exec()` sends `MULTI`, the commands and `EXEC` as one unit
+and resolves with one reply per command, each converted as its method converts it outside a
+transaction. In TypeScript the result of one chain is a tuple of those types. In the script above,
+`transfer()` written with `multi()` gives `[10, -10]` and the `get()` gives its value.
+
+What `exec()` does in the other cases:
+
+- `null`: a key that was watched on the connection changed, and the server ran nothing.
+- The server refused a command when it was queued (unknown command, wrong number of arguments).
+  Nothing ran. `exec()` rejects with the error of the first refused command, not with `EXECABORT`.
+- A command failed when the transaction ran (`WRONGTYPE`). Redis does not roll back, so the other
+  commands took effect. `exec()` rejects with the error of the first failed command, which also has
+  `replies` (every reply, with an error in each failed place) and `errorIndexes`. That is the shape
+  of node-redis 5; ioredis resolves with `[error, value]` pairs.
+- The server refused `MULTI` (an ACL rule, or a raw `MULTI` open on the connection): `exec()`
+  rejects with that error, without `replies`.
+- `EXEC` answered with another number of replies than the transaction has commands:
+  `ERR_REDIS_INVALID_RESPONSE`, before anything is converted.
+- The connection ended with the transaction in flight: `ERR_REDIS_CONNECTION_CLOSED` or
+  `ERR_REDIS_IDLE_TIMEOUT`, like any command in flight. All of it ran or none of it.
+
+A transaction is sent once: after `exec()`, that method and the command methods throw. `multi()`
+takes no argument, so the array form of ioredis throws where it would have sent an empty
+transaction.
+
+Where it lives was decided before any code was written, by a design review that put six designs
+next to each other: a docs-only recipe, one host function that takes an array of raw commands, a
+callback like `sql.begin()`, a hidden second connection per client, guards that make the raw
+`MULTI` safe, and the one built here. The reasons for it:
+
+- One funnel in. Every command method ends in `JSValkeyClient::send`. A transaction is an object of
+  the same class over a client that never connects, and `send` keeps the serialized command and its
+  reply conversion instead of dialing. So the 200 methods are not written, declared or generated a
+  second time: the transaction runs the client's own. The check sits in the branch `send` already
+  had for "never connected", which a connected client does not take.
+- One queue entry out. `exec()` hands `MULTI`, the commands and `EXEC` to the client as one entry,
+  through the same admission as a command (`enqueue` now takes a command or such a unit). The flush
+  moves an entry to the socket whole, and a lost connection rejects the entries in flight and keeps
+  the waiting ones. So the two properties that matter need no code of their own: no other command
+  of the client lands between `MULTI` and `EXEC`, and no transaction is finished on another
+  connection than the one it began on. The entry is pipelined like one command, where a raw `MULTI`
+  and a raw `EXEC` each wait for every earlier reply.
+- One promise. The server answers the entry with N + 2 replies. How they are read is a small plan
+  (the conversion of each command, the first error) in a queue beside the command queue, allocated
+  with the client's first transaction. The two structs that every queued command pays for do not
+  grow, which the build now asserts.
+- The reply path has one test for "this pair is not settled by one reply", which pub/sub had. A
+  transaction shares it (one more bit in the mask).
+
+What a transaction refuses, each with `ERR_REDIS_INVALID_STATE` when the method is called:
+`multi()`, the commands the server would run at once instead of queueing (`MULTI`, `EXEC`,
+`DISCARD`, `WATCH`, `QUIT`, `RESET` through `send()`, and `UNWATCH` with them), subscriptions, and
+`connect()`, `close()` and `duplicate()`. `exec()` on a client that is not a transaction throws
+too, and TypeScript does not offer it there. There is no `discard()`: the server has seen nothing
+before `exec()`, so dropping the object is the discard.
+
+The type of a transaction is derived, not written out: `RedisTransaction<Replies>` maps over the
+members of `RedisClient`, leaves out the thirteen names that are not commands and re-types every
+overload to return the transaction with the reply added to the tuple. `exec()` is typed
+`[...Replies, ...unknown[]] | null`: a transaction that statements or a loop fill has no known
+replies, and its result is `unknown[]`. `RedisTransaction.ExecError` declares `replies` and
+`errorIndexes`. A lint holds the list of names to the list the runtime uses, requires every
+accessor of the client to be on it, and checks that no method has more overloads than the mapping
+keeps (18, which `hsetex` needs).
+
+What it costs a client that never calls `multi()`, measured on two release builds (the stack
+without this commit and with it, same toolchain). One call was single-stepped in gdb after 600
+warm-up rounds against a RESP stub in the same process:
+
+|                                                          | without                                                | with              |
+| -------------------------------------------------------- | ------------------------------------------------------ | ----------------- |
+| `redis.get(k)`, callees included                         | 2,854 instructions, 374 conditional branches, 69 calls | 2,815, 373, 67    |
+| `redis.send("GET", [k])`, callees included               | 3,351, 436, 81                                         | 3,316, 436, 79    |
+| reply path (`handle_response`, its own body) for a `+OK` | 89 instructions, 10 conditional branches               | 87, 10            |
+| the same for a message push on a subscribed client       | 248, 36                                                | 251, 38           |
+| one client (`estimateShallowMemoryUsageOf`)              | 560 bytes                                              | 576 bytes         |
+| host functions of `RedisClient`                          | 209                                                    | 211               |
+| binary (`size`, text)                                    | 108,098,150 bytes                                      | 108,085,606 bytes |
+
+So a command and a reply cost no more than they did, a pub/sub push takes two more branches (the
+test for a transaction sits in the block that only subscribers and subscription requests enter),
+and a client is two words larger. The binary is 12.5 KB smaller because the error path of the 200
+command thunks is no longer inlined into each. The first version did cost every command a call
+(2,881 instructions for `get()`): the capture serialized with the same generic function as the
+queue, and asked the same helper whether a command is a subscription, and with a second caller the
+compiler stopped inlining both into the send path. Both are `#[inline(always)]` now. The measured
+build is from before the last lint fix (`or` to `or_else` in `settle_unit`), which none of the
+measured paths runs.
+
+What one transaction costs its caller, against the awaited raw flow, counted at a RESP stub: 1,000
+transactions of two commands are 1,000 writes instead of 4,000, and a transaction of 100 commands
+creates 1 promise instead of 102. `exec()` moves the serialized commands into the queue entry
+without a copy.
+
+For TypeScript, the fixture of bun-types goes from 116,137 type instantiations to 192,388 with
+tsc 6.0.2, nearly all of it for the transaction chains the fixture now has. The declarations alone
+cost a project that never calls `multi()` about 2,400.
+
+Tests. `test/js/valkey/reliability/connection-failures.test.ts` has 29 new tests against a RESP
+server in the test process, so they need no Redis: the order on the wire with auto-pipelining on
+and off, a transaction of 4 MB that the socket takes in many writes, replies that arrive one byte
+per read, every result and error shape (three encodings of the null, `EXEC` with too many and too
+few replies), a refused `MULTI`, a connection lost with the transaction in flight (rejected, none
+of it on the next connection) and before it was sent (sent whole on the next one), the reply plan
+after each of those, a client that becomes a subscriber with a failing transaction in flight, a
+`PSUBSCRIBE` with two confirmations in front of a transaction, the idle timeout, the process
+lifetime and the memory estimate. `test/js/valkey/valkey.test.ts` has 8 against a real server for
+each connection type (the conversions, 50 transfers with reads issued in the middle of each, the
+error shapes, `WATCH` against a second connection, subscriber mode) and 19 that need no server
+(what a transaction refuses, checked against the list the types use, and that every other method
+of the client queues and returns the transaction). `test/js/valkey/valkey-gc.test.ts` has one that
+counts the live objects: a transaction keeps its client alive, and both are collected when it is
+dropped. All 57 fail on Bun 1.4.3 (`client.multi is not a function`). The existing Redis test files
+pass on the new build, the raw `MULTI`/`EXEC` test in `integration/complex-operations.test.ts`
+unchanged.
+
+A review pass read the first version before the push (17.5 hours) and said not to commit it as
+it was. What it found, and what this commit does about each:
+
+- `exec()` had its own admission next to `enqueue` and started the flush whenever the client was
+  connected. With auto-pipelining off that wrote a transaction while the `SELECT` of the handshake
+  had no reply yet, and when the server refused the database, the transaction ran on database 0
+  while `exec()` rejected. The unit now goes through `enqueue` like a command. Two tests hold it,
+  and both fail on the first version.
+- `exec()` was typed with the exact tuple, which is `[]` for a transaction that statements fill.
+  It is the open tuple described above.
+- `multi([["set", "a", "1"]])` sent an empty transaction and resolved with `[]`. It throws.
+- An error reply to a queued command followed by an `EXEC` that returns an array resolved as a
+  success, converted with the wrong command's rules. It rejects with the refused command's error,
+  and an `EXEC` array of the wrong length rejects too.
+- A transaction could be sent twice, at the price of a copy of its buffer per `exec()` and of a
+  second `exec()` that silently repeats commands. It is sent once.
+- `watch()` and `unwatch()`, see below.
+- The tests did not prove what their names said: five "one piece" tests passed on a `multi()`
+  written in JavaScript that sends N + 2 separate commands, three clauses that keep the reply plans
+  in step could be deleted with every test green, and the test named for collection never
+  observed one. The tests above are the rewritten set.
+- The docs had a result that the page never produced, passive sentences where the reader needs the
+  actor, and no word about a refused `MULTI`. 36 multi-line comments became one line each or went.
+
+Not done, and what stays as it was:
+
+- `watch()` and `unwatch()`. The first version had them as typed methods, with a count of the
+  connections so that a transaction after `watch()` resolves with `null` when the connection that
+  watched is gone. The review found that its guard was one slot per client, which the next `exec()`
+  of any user of the client consumes, and that such a contract cannot be changed once it ships. It
+  is taken out of this commit and is its own piece of work, with the guard carried by the
+  transaction. Until then `WATCH` works through `send()` on a client from `duplicate()`, as the
+  docs show, and a reconnect drops the watch without notice.
+- Raw `send("MULTI")` ... `send("EXEC")` is unchanged, and still unsafe on a client that other code
+  uses. The docs say so and point to `multi()`.
+- A refused `MULTI` does not stop the commands: they were sent with it. Redis then runs them one by
+  one (or, when a raw `MULTI` is open, queues them into that transaction, which Valkey 8 discards
+  instead). ioredis and node-redis behave the same. Waiting for the reply to `MULTI` would cost
+  every transaction a second write and a round trip. The error has no `replies` in this case.
+- A client that becomes a subscriber while a plain command is in flight still fails its connection
+  on an error reply to that command. Only the transaction is kept out of that rule.
+- The collector is not told about the memory of the client objects (that is so for every
+  `RedisClient`). A transaction reports the growth of its buffer, and `exec()` moves the buffer to
+  the client's queue without a copy.
+- The array form of ioredis and its `[error, value]` results.
+- Editors show no JSDoc on the methods of a transaction, because the type is derived.
+- Open upstream pull requests that touch the same lines and are not taken in: #45723 removes the
+  `Result` that `JSValkeyClient::send` returns, which the refusal of a command in a transaction
+  uses. #32858 takes the next bit of `Meta` (this commit uses the one after it) and counts replies
+  per entry, which the plan of a transaction could move onto. #39965 and #41645 add fields to the
+  promise of a command, which is why the size assertions are written relative to it.
+
+Rebase notes: upstream moved by nine commits when the stack was rebased. It has moved by 18 more
+since, which the next sync takes. One of them, #46021, changes `js_valkey.rs`,
+`js_valkey_functions.rs` and `valkey-gc.test.ts`, and a trial merge takes it without a conflict in
+the files of this commit. Eleven of the 57 patches needed a hand merge and none was dropped.
+
+- Eight were lines next to lines that upstream rewrote, mostly comments: `Bun.semver.parse()`,
+  `bun outdated --json`, `Bun.CSV` (the table of published types in `bun-types.test.ts`),
+  `#semver:` for git dependencies, `--watch-path` (both sides add a field to `DebugOptions`), Web
+  Storage (the line of `TextDecoder` in `ZigGlobalObject.lut.txt`), the `bun.lock` merge,
+  `bun pm sbom` and `jsr:` (three files).
+- "Did you mean" for `bun run`: upstream #45800 reads the command after the flags of `bun` in
+  front of the chain of comparisons that this patch replaces with a table. Both are kept.
+- `bun serve`: upstream made `bun bake` always watch and turned the type check before the first
+  run into a `let ... else { unreachable!() }` that only knows a file. The static server is a
+  third case there, so it stays a `match`.
+- S3 metadata: upstream #45888 moved `S3Stat` from `S3Stat.classes.ts` to a schema of the
+  bindings generator. `stat().metadata` is now one line in `S3Stat.bind.ts`
+  (`b.record(b.string.utf8)`) and a method of the generated trait, and the hand-written getter is
+  gone. The entry of 2026-09-27 names the new file.
+
+After the rebase the stack builds, and the test files of the eleven patches pass. Three of them
+(`bun-lock`, `bun-install-git-deps`, `jsr`) only do so with a longer timeout than the default 5
+seconds, which the debug build with the other work on this machine did not meet: 386, 204 and 92
+tests. In `test/internal/source-lints/` the two recursion lints and the `<iostream>` lint run out
+of their 5 seconds in the debug build as on the days before, and pass with a longer one. `cargo
+clippy` is clean for `bun_runtime`. This entry is dated for the day its work began. Two reviews of
+8.5 and 17.5 hours made it the commit of the day after.
+
+Files: `src/runtime/valkey_jsc/valkey.rs` (`Admitted`, `Unit`, `admit`, `send_unit`,
+`handle_unit_reply`, `settle_unit`), `src/runtime/valkey_jsc/js_valkey.rs` (`Transaction`,
+`new_transaction`, `queue_in_transaction`, `take_transaction`),
+`src/runtime/valkey_jsc/js_valkey_functions.rs` (`multi`, `exec`),
+`src/runtime/valkey_jsc/ValkeyCommand.rs` (`UnitPlan`, `Meta::TRANSACTION_UNIT`,
+`Entry::from_parts`), `src/runtime/valkey_jsc/valkey.bind.ts`, `packages/bun-types/redis.d.ts`
+(`RedisTransaction`), `docs/runtime/redis.mdx`,
+`test/js/valkey/reliability/connection-failures.test.ts`, `test/js/valkey/valkey.test.ts`,
+`test/js/valkey/valkey-gc.test.ts`, `test/internal/source-lints/redis-client-types.test.ts`,
+`test/integration/bun-types/fixture/redis.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

@@ -81,9 +81,10 @@ impl SubscriptionCtx {
 /// and a `&SubscriptionCtx` carries no right to reach the client around it.
 impl JSValkeyClient {
     /// `None` while the wrapper is dead but unswept: `finalize()` has not run, socket callbacks still do.
+    /// Also `None` for a transaction, which is made without a map.
     fn try_subscription_callback_map(&self) -> Option<&mut JSMap> {
         let parent_this = self.this_value.get().try_get()?;
-        let value_js = js::subscription_callback_map_get_cached(parent_this).unwrap();
+        let value_js = js::subscription_callback_map_get_cached(parent_this)?;
         // `JSMap` is an `opaque_ffi!` ZST — `opaque_mut` is the safe deref.
         // `from_js` returns a non-null heap cell when the slot was set by
         // `init()`; single JS thread.
@@ -316,7 +317,28 @@ pub(crate) struct JSValkeyClient {
     /// The context whose script created the client: every dial, the retries
     /// its own timer starts included, joins that context's sockets.
     pub(crate) context: bun_jsc::ContextId,
+    /// `Some` only on what `multi()` returns: a client that never connects and keeps its commands here.
+    pub(crate) transaction: JsCell<Option<Box<Transaction>>>,
 }
+
+/// The commands of a transaction, until `exec()` sends them through `parent`.
+pub(crate) struct Transaction {
+    pub(crate) parent: RefPtr<JSValkeyClient>,
+    /// MULTI and the commands so far, serialized. Empty once `exec()` took it.
+    pub(crate) serialized: Vec<u8>,
+    /// One per command.
+    pub(crate) metas: Vec<command::Meta>,
+}
+
+impl Transaction {
+    fn is_sent(&self) -> bool {
+        self.serialized.is_empty()
+    }
+}
+
+// A client stays in mimalloc's 512-byte class. The debug layout is larger.
+#[cfg(all(target_pointer_width = "64", not(debug_assertions)))]
+const _: () = assert!(core::mem::size_of::<JSValkeyClient>() <= 512);
 
 /// Intrusive [`EventLoopTimer`] slot that owns one strong ref on
 /// [`JSValkeyClient`] (`held_ref`) while armed, so [`disarm`] and
@@ -734,6 +756,7 @@ impl JSValkeyClient {
                 reply_scanner: Default::default(),
                 retry_attempts: 0,
                 auto_flusher: Default::default(),
+                unit_plans: None,
             }),
             global_object: GlobalRef::from(cx.global()),
             this_value: JsCell::new(JsRef::empty()),
@@ -742,6 +765,7 @@ impl JSValkeyClient {
             timer: RefCountedTimer::new(Timer::Tag::ValkeyConnectionTimeout),
             reconnect_timer: RefCountedTimer::new(Timer::Tag::ValkeyConnectionReconnect),
             context: cx.context().id(),
+            transaction: JsCell::new(None),
         }))
     }
 
@@ -826,6 +850,7 @@ impl JSValkeyClient {
                 reply_scanner: Default::default(),
                 retry_attempts: 0,
                 auto_flusher: Default::default(),
+                unit_plans: None,
             }),
             global_object: GlobalRef::from(cx.global()),
             this_value: JsCell::new(JsRef::empty()),
@@ -834,7 +859,59 @@ impl JSValkeyClient {
             timer: RefCountedTimer::new(Timer::Tag::ValkeyConnectionTimeout),
             reconnect_timer: RefCountedTimer::new(Timer::Tag::ValkeyConnectionReconnect),
             context: cx.context().id(),
+            transaction: JsCell::new(None),
         }))
+    }
+
+    /// What `multi()` returns, without its `this_value`: no address, no credentials, no subscription map.
+    pub(crate) fn new_transaction(&self, cx: &bun_jsc::JsThread<'_>) -> *mut JSValkeyClient {
+        JSValkeyClient::new(JSValkeyClient {
+            ref_count: bun_ptr::RefCount::init(),
+            _subscription_ctx: JsCell::new(SubscriptionCtx::default()),
+            client: JsCell::new(valkey::ValkeyClient::detached(cx.global().bun_vm())),
+            global_object: GlobalRef::from(cx.global()),
+            this_value: JsCell::new(JsRef::empty()),
+            poll_ref: JsCell::new(KeepAlive::default()),
+            _secure: JsCell::new(None),
+            timer: RefCountedTimer::new(Timer::Tag::ValkeyConnectionTimeout),
+            reconnect_timer: RefCountedTimer::new(Timer::Tag::ValkeyConnectionReconnect),
+            context: cx.context().id(),
+            transaction: JsCell::new(Some(Box::new(Transaction {
+                parent: self.ref_guard(),
+                serialized: command::MULTI_FRAME.to_vec(),
+                metas: Vec::new(),
+            }))),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn is_transaction(&self) -> bool {
+        self.transaction.get().is_some()
+    }
+
+    /// The client `multi()` was called on, if `self` is a transaction.
+    pub(crate) fn transaction_parent(&self) -> Option<RefPtr<JSValkeyClient>> {
+        self.transaction
+            .get()
+            .as_deref()
+            .map(|transaction| transaction.parent.clone())
+    }
+
+    /// For the methods that need a connection, which a transaction does not have.
+    pub(crate) fn require_not_transaction(&self, function_name: &str) -> JsResult<()> {
+        if self.is_transaction() {
+            bun_core::hint::cold();
+            return Err(self
+                .global_object
+                .err(
+                    jsc::ErrorCode::REDIS_INVALID_STATE,
+                    format_args!(
+                        "RedisClient.prototype.{function_name} cannot be called on a transaction."
+                    ),
+                )
+                .throw());
+        }
+        Ok(())
     }
 
     pub(crate) fn add_subscription(&self) {
@@ -969,6 +1046,7 @@ impl JSValkeyClient {
         this_value: JsWrapper<'_, Self>,
         cx: &mut JsScope<'_>,
     ) -> JsResult<JSValue> {
+        self.require_not_transaction("connect")?;
         self.do_connect(cx.global(), this_value.to_js())
     }
 
@@ -976,6 +1054,8 @@ impl JSValkeyClient {
         // `disconnect()` -> `close()` can dispatch `on_close` synchronously,
         // which derefs. Hold a ref so `&self` stays live across the call.
         let _guard = self.ref_guard();
+
+        self.require_not_transaction("close")?;
 
         match self.client.get().status {
             valkey::Status::NeverConnected => return Ok(()),
@@ -1533,21 +1613,117 @@ impl JSValkeyClient {
         Ok(())
     }
 
+    /// The promise of the reply. On a transaction, the transaction itself: the command waits for `exec()`.
     pub(crate) fn send(
         &self,
         global_this: &JSGlobalObject,
         _this_value: JSValue,
         command: &Command,
-    ) -> Result<*mut JSPromise, crate::Error> {
+    ) -> Result<JSValue, crate::Error> {
         // Keep `*self` alive across re-entrant connect/close paths below;
         // the host-fn shim passes a bare `&self` with no ref of its own.
+        let _guard = self.ref_guard();
+
+        // A transaction never connects, so only this branch has to ask whether `self` is one.
+        if self.client.get().status == valkey::Status::NeverConnected {
+            bun_core::hint::cold();
+            if self.is_transaction() {
+                return self.queue_in_transaction(global_this, command);
+            }
+            self.dial_first();
+        }
+
+        let self_br = BackRef::new(self);
+        let _update = scopeguard::guard(self_br, |p| p.update_poll_ref());
+        let promise = self.client_mut().send(global_this, command)?;
+        Ok(JSPromise::opaque_ref(promise).to_js())
+    }
+
+    /// `send()` on a transaction. `Err(Error::Js)` is a thrown exception.
+    fn queue_in_transaction(
+        &self,
+        global_this: &JSGlobalObject,
+        command: &Command,
+    ) -> Result<JSValue, crate::Error> {
+        if command::is_refused_in_transaction(command) {
+            return Err(global_this
+                .err(
+                    jsc::ErrorCode::REDIS_INVALID_STATE,
+                    format_args!(
+                        "{} cannot be queued in a transaction.",
+                        bstr::BStr::new(command.command)
+                    ),
+                )
+                .throw()
+                .into());
+        }
+
+        let grown = self.transaction.with_mut(|transaction| {
+            let transaction = transaction.as_deref_mut().expect("is_transaction()");
+            if transaction.is_sent() {
+                return Err(Self::transaction_sent_error(global_this));
+            }
+            let capacity = transaction.serialized.capacity();
+            command.write(&mut transaction.serialized)?;
+            transaction.metas.push(command.meta);
+            Ok(transaction.serialized.capacity() - capacity)
+        })?;
+        // Only the collector frees a transaction that is dropped without `exec()`.
+        if grown > 0 {
+            global_this.vm().report_extra_memory(grown);
+        }
+
+        Ok(self
+            .this_value
+            .get()
+            .try_get()
+            .expect("the method was called on the wrapper"))
+    }
+
+    fn transaction_sent_error(global_this: &JSGlobalObject) -> crate::Error {
+        global_this
+            .err(
+                jsc::ErrorCode::REDIS_INVALID_STATE,
+                format_args!("This transaction was sent. multi() starts a new one."),
+            )
+            .throw()
+            .into()
+    }
+
+    /// `exec()` on a transaction of this client: its commands go out as one entry.
+    pub(crate) fn send_unit(
+        &self,
+        global_this: &JSGlobalObject,
+        serialized: Box<[u8]>,
+        metas: Box<[command::Meta]>,
+    ) -> Result<JSValue, crate::Error> {
         let _guard = self.ref_guard();
 
         self.ensure_dialing();
 
         let self_br = BackRef::new(self);
         let _update = scopeguard::guard(self_br, |p| p.update_poll_ref());
-        self.client_mut().send(global_this, command)
+        let promise = self
+            .client_mut()
+            .send_unit(global_this, serialized, metas)?;
+        Ok(JSPromise::opaque_ref(promise).to_js())
+    }
+
+    /// `exec()`: MULTI, the commands and EXEC, and each command's `Meta`. The transaction is sent after this.
+    pub(crate) fn take_transaction(
+        &self,
+        global_this: &JSGlobalObject,
+    ) -> Result<(Box<[u8]>, Box<[command::Meta]>), crate::Error> {
+        self.transaction.with_mut(|transaction| {
+            let transaction = transaction.as_deref_mut().expect("is_transaction()");
+            if transaction.is_sent() {
+                return Err(Self::transaction_sent_error(global_this));
+            }
+            let mut serialized = core::mem::take(&mut transaction.serialized);
+            serialized.extend_from_slice(command::EXEC_FRAME);
+            let metas = core::mem::take(&mut transaction.metas);
+            Ok((serialized.into_boxed_slice(), metas.into_boxed_slice()))
+        })
     }
 
     /// Start the first dial if the client has never connected. Every command
@@ -1560,6 +1736,11 @@ impl JSValkeyClient {
             return;
         }
         bun_core::hint::cold();
+        self.dial_first();
+    }
+
+    fn dial_first(&self) {
+        debug_assert!(self.client.get().status == valkey::Status::NeverConnected);
         match self.connect() {
             // The command is queued as for a dial in flight; the deferred
             // close then rejects it or a retry sends it, like a refused dial.
@@ -1589,6 +1770,14 @@ impl JSValkeyClient {
             memory_cost += command.serialized_data.len();
         }
         memory_cost += client.queue.len() * core::mem::size_of::<super::valkey_command::Entry>();
+        if let Some(plans) = client.unit_plans.as_deref() {
+            memory_cost += plans.capacity() * core::mem::size_of::<command::UnitPlan>();
+            memory_cost += plans.iter().map(|plan| plan.metas.len()).sum::<usize>();
+        }
+        if let Some(transaction) = self.transaction.get().as_deref() {
+            memory_cost += core::mem::size_of::<Transaction>();
+            memory_cost += transaction.serialized.capacity() + transaction.metas.capacity();
+        }
         memory_cost
     }
 

@@ -660,7 +660,10 @@ describe("@types/bun integration test", () => {
       "resolve_message.bind.ts: new ResolveMessage().requireStack is not published",
       "resolve_message.bind.ts: new ResolveMessage().stack is not published",
       "resolve_message.bind.ts: new ResolveMessage().[Symbol.toPrimitive] is not published",
-      // `pendingDeclarations` in test/internal/source-lints/redis-client-types.test.ts.
+      // `declaredOnTransaction` in test/internal/source-lints/redis-client-types.test.ts: only what
+      // `multi()` returns can call it, and `interface RedisTransaction` declares it.
+      "valkey.bind.ts: new RedisClient().exec is not published",
+      // `pendingDeclarations` in the same lint.
       "valkey.bind.ts: new RedisClient().psubscribe is not published",
       "valkey.bind.ts: new RedisClient().pubsub is not published",
       "valkey.bind.ts: new RedisClient().punsubscribe is not published",
