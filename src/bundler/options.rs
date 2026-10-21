@@ -76,6 +76,7 @@ pub(crate) fn validate_path(
 // the SAME nominal type and `ParseTask::run_with_source_code` can hand
 // `&transpiler.options.allow_unresolved` straight through.
 pub use bun_js_parser::options::AllowUnresolved;
+pub use bun_options_types::{InvalidAlias, PackageAliases};
 
 // Canonical defs live in `bun_resolver::options` (lower tier; resolver is the
 // runtime consumer of `.patterns`/`.abs_paths`/`.node_modules`). Re-export so
@@ -1313,6 +1314,8 @@ pub struct BundleOptions<'a> {
     pub log: *mut bun_ast::Log,
     pub(crate) external: ExternalModules,
     pub allow_unresolved: AllowUnresolved,
+    /// `alias`: the packages that the bundler looks up under another name.
+    pub alias: PackageAliases,
     pub entry_points: Box<[Box<[u8]>]>,
     pub entry_naming: Box<[u8]>,
     pub asset_naming: Box<[u8]>,
@@ -1562,6 +1565,7 @@ impl<'a> BundleOptions<'a> {
             log: self.log,
             external: self.external.clone(),
             allow_unresolved: self.allow_unresolved.clone(),
+            alias: self.alias.clone(),
             entry_points: self.entry_points.clone(),
             entry_naming: self.entry_naming.clone(),
             asset_naming: self.asset_naming.clone(),
@@ -1826,6 +1830,7 @@ impl<'a> BundleOptions<'a> {
             tsconfig_override: None,
             main_fields: owned_string_list(Target::default_main_fields_map()[Target::Browser]),
             allow_unresolved: AllowUnresolved::All,
+            alias: PackageAliases::default(),
             entry_naming: Box::default(),
             asset_naming: Box::default(),
             chunk_naming: Box::default(),

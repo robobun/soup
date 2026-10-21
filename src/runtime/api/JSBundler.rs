@@ -131,6 +131,7 @@ pub(crate) mod js_bundler {
         pub(crate) tree_shaking: Option<bool>,
         pub(crate) names: Names,
         pub(crate) external: StringSet,
+        pub(crate) alias: options::PackageAliases,
         pub(crate) allow_unresolved: Option<StringSet>,
         pub(crate) source_map: options::SourceMapOption,
         pub(crate) public_path: OwnedString,
@@ -207,6 +208,7 @@ pub(crate) mod js_bundler {
                 tree_shaking: None,
                 names: Names::default(),
                 external: StringSet::default(),
+                alias: options::PackageAliases::default(),
                 allow_unresolved: None,
                 source_map: options::SourceMapOption::None,
                 public_path: OwnedString::default(),
@@ -1093,6 +1095,46 @@ pub(crate) mod js_bundler {
                     let slice = entry_point.to_utf8(global_this)?;
                     this.external.insert(slice.slice())?;
                     drop(slice);
+                }
+            }
+
+            if let Some(alias) = config.get_own_object(global_this, "alias")? {
+                // SAFETY: `get_own_object` only returns non-null live JSObject*.
+                let alias_ref = unsafe { &*alias };
+                let alias_iter = jsc::JSPropertyIterator::init(
+                    global_this,
+                    alias_ref,
+                    jsc::JSPropertyIteratorOptions {
+                        skip_empty_name: false,
+                        include_value: true,
+                        ..Default::default()
+                    },
+                )?;
+
+                while let Some((name, substitute)) = alias_iter.next()? {
+                    if !substitute.is_string() {
+                        return Err(global_this.throw_invalid_arguments(format_args!(
+                            "alias \"{}\" must be a string",
+                            name
+                        )));
+                    }
+                    let name = name.to_owned_slice();
+                    let substitute = substitute.to_utf8(global_this)?;
+                    match this.alias.insert(&name, substitute.slice()) {
+                        Ok(()) => {}
+                        Err(options::InvalidAlias::Name) => {
+                            return Err(global_this.throw_invalid_arguments(format_args!(
+                                "Invalid alias name: \"{}\". An alias is for a package, such as \"react\" or \"@scope/pkg/sub\"",
+                                bstr::BStr::new(&name)
+                            )));
+                        }
+                        Err(options::InvalidAlias::Substitute) => {
+                            return Err(global_this.throw_invalid_arguments(format_args!(
+                                "Invalid alias substitution for \"{}\": it is empty",
+                                bstr::BStr::new(&name)
+                            )));
+                        }
+                    }
                 }
             }
 

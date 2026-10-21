@@ -1056,6 +1056,52 @@ To mark all imports as external, use the wildcard `*`:
   </Tab>
 </Tabs>
 
+### alias
+
+Bundles another package, or a file, in place of a package. Defaults to `{}`.
+
+<Tabs>
+  <Tab title="JavaScript">
+    ```ts title="build.ts" icon="/icons/typescript.svg"
+    await Bun.build({
+      entrypoints: ['./index.tsx'],
+      outdir: './out',
+      alias: {
+        react: 'preact/compat',
+        '@app/config': './src/config.production.ts',
+      },
+    })
+    ```
+  </Tab>
+  <Tab title="CLI">
+    ```bash terminal icon="terminal"
+    bun build ./index.tsx --outdir ./out --alias react=preact/compat --alias @app/config=./src/config.production.ts
+    ```
+  </Tab>
+</Tabs>
+
+A key is the name of a package as an import spells it: `react`, `@scope/pkg`, `pkg/sub`, `node:fs`. It stands for the package and for the paths inside it, so the build above bundles `preact/compat/jsx-runtime` for `import "react/jsx-runtime"`. It does not stand for a name that only starts the same: `react` is not an alias for `react-dom`. When two keys match an import, the longer one is used. A relative or an absolute path cannot be a key.
+
+A value is the name of a package, or the path of a file or of a directory. Bun looks it up from the working directory, not from the file that has the import. A dependency in `node_modules` that imports `react` gets the `preact` of your project, whichever `preact` is installed next to that dependency. A relative path, such as `./src/config.production.ts`, is relative to the working directory too.
+
+An alias comes before the other rules of the bundler, and is used once:
+
+- A built-in module can have an alias. `alias: { path: "path-browserify" }` bundles the package for `import "path"`, with every `target`.
+- [`external`](#external) and [`packages`](#packages) are asked about the value. With `packages: "external"`, the bundle imports `preact/compat`.
+- The value is not looked up as a key. `{ a: "b", b: "./c.ts" }` bundles the package `b` for `import "a"`.
+- [Plugins](/bundler/plugins) come first. An `onResolve` callback gets the name as the file has it, and what it returns is used. The alias is for the imports that no plugin resolves, and plugins are not asked about the value.
+- The value can be one of the in-memory [`files`](#files).
+
+An alias is for the imports in your code. An entry point is looked up as it is written, and so are [macro](/bundler/macros) imports and `with { type: "sqlite" }` imports.
+
+If the value cannot be found, the build fails with an error that has both names:
+
+```txt
+error: Could not resolve: "preact/compat" (originally "react")
+
+note: "react" was replaced with "preact/compat" by the "alias" option. An alias is resolved from the current working directory, not from the importing file.
+```
+
 ### packages
 
 Controls whether package dependencies are included in the bundle. Possible values: `bundle` (default), `external`. Bun treats any import whose path does not start with `.`, `..`, or `/` as a package.
@@ -2078,6 +2124,7 @@ interface BuildConfig {
   modulePreload?: boolean; // default true, with splitting and target "browser": <link rel=modulepreload> the chunks an entrypoint or import() depends on
   plugins?: BunPlugin[];
   external?: string[];
+  alias?: Record<string, string>; // bundle another package or a file in place of a package
   packages?: "bundle" | "external";
   publicPath?: string;
   define?: Record<string, string>;

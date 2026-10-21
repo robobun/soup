@@ -515,6 +515,9 @@ pub(crate) const BUILD_ONLY_PARAMS: &[ParamType] = concat_params!(
             "-e, --external <STR>...          Exclude module from transpilation (can use * wildcards). ex: -e react"
         ),
         parse_param!(
+            "--alias <STR>...                 Bundle another package or a file in place of a package. ex: --alias react=preact/compat"
+        ),
+        parse_param!(
             "--allow-unresolved <STR>...      Allow unresolved dynamic import()/require() specifiers matching these glob patterns. Use '\\<empty\\>' for opaque specifiers. Default is '*' (allow all)."
         ),
         parse_param!(
@@ -2213,6 +2216,48 @@ fn parse_build_command_options(
 
     if !args.options(b"--external").is_empty() {
         opts.external = slice_to_owned(args.options(b"--external"));
+    }
+
+    for alias in args.options(b"--alias") {
+        // Both halves can have a ":" in them, as in node:fs.
+        let Some((name, substitute)) = strings::split_once_char(alias, b'=') else {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r>: --alias expects name=substitute, as in --alias react=preact/compat, but got \"{}\"",
+                BStr::new(alias),
+            );
+            Global::crash();
+        };
+        match ctx.bundler_options.alias.insert(name, substitute) {
+            Ok(()) => {}
+            Err(options::InvalidAlias::Name) => {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r>: Invalid alias name: \"{}\". An alias is for a package, such as \"react\" or \"@scope/pkg/sub\"",
+                    BStr::new(name),
+                );
+                Global::crash();
+            }
+            Err(options::InvalidAlias::Substitute) => {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r>: Invalid alias substitution for \"{}\": it is empty",
+                    BStr::new(name),
+                );
+                Global::crash();
+            }
+        }
+    }
+    if !ctx.bundler_options.alias.is_empty() {
+        // Neither resolves the imports of a file through the bundler's import records.
+        let without = if ctx.bundler_options.transform_only {
+            Some("--no-bundle")
+        } else if ctx.bundler_options.bake {
+            Some("--app")
+        } else {
+            None
+        };
+        if let Some(flag) = without {
+            bun_core::pretty_errorln!("<r><red>error<r>: --alias is not supported with {}", flag);
+            Global::crash();
+        }
     }
 
     if args.flag(b"--reject-unresolved") && !args.options(b"--allow-unresolved").is_empty() {

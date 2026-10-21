@@ -366,13 +366,26 @@ struct BarrelWorkItem<'a> {
 /// Resolve the records the BFS just un-deferred in one barrel (`un_deferred`,
 /// ascending indices), schedule their modules, and patch their source indices.
 fn resolve_barrel_records(this: &mut BundleV2, barrel_idx: u32, un_deferred: &[u32]) -> i32 {
-    let idx = barrel_idx as usize;
-    let target = this.graph.ast.items_target()[idx];
+    let target = this.graph.ast.items_target()[barrel_idx as usize];
+    resolve_records(this, barrel_idx, un_deferred, target, false)
+}
+
+/// Resolve `records` (ascending indices) of a file that is in the graph, schedule their
+/// modules, and patch their source indices. Returns how many parse tasks it scheduled.
+/// `after_plugins`: see `ResolveImportRecordCtx`.
+pub(crate) fn resolve_records(
+    this: &mut BundleV2,
+    source_index: u32,
+    records: &[u32],
+    target: bun_ast::Target,
+    after_plugins: bool,
+) -> i32 {
+    let idx = source_index as usize;
     let loader = this.graph.input_files.items_loader()[idx];
     // Move the column cells out so the `&mut self` method calls below don't
     // alias borrows into `graph.ast` / `graph.input_files`.
     let heap = this.graph.heap;
-    let mut barrel_ir = core::mem::replace(
+    let mut import_records = core::mem::replace(
         &mut this.graph.ast.items_import_records_mut()[idx],
         bun_alloc::ArenaVec::new_in(heap),
     );
@@ -380,30 +393,31 @@ fn resolve_barrel_records(this: &mut BundleV2, barrel_idx: u32, un_deferred: &[u
     let source_path: &'static [u8] = source.path.text;
 
     let resolve_result = this.resolve_import_records(&mut ResolveImportRecordCtx {
-        import_records: &mut barrel_ir,
+        import_records: &mut import_records,
         source: &source,
         loader,
         target,
-        only_records: Some(un_deferred),
+        only_records: Some(records),
+        after_plugins,
     });
 
     this.graph.input_files.items_source_mut()[idx] = source;
 
-    let scheduled = this.process_resolve_queue(&resolve_result.resolve_queue, target, barrel_idx);
+    let scheduled = this.process_resolve_queue(&resolve_result.resolve_queue, target, source_index);
 
     this.patch_import_record_source_indices(
-        &mut barrel_ir,
+        &mut import_records,
         PatchImportRecordsCtx {
-            source_index: Index::init(barrel_idx),
+            source_index: Index::init(source_index),
             source_path,
             loader,
             target,
-            only_records: Some(un_deferred),
+            only_records: Some(records),
             ..Default::default()
         },
     );
 
-    this.graph.ast.items_import_records_mut()[idx] = barrel_ir;
+    this.graph.ast.items_import_records_mut()[idx] = import_records;
 
     scheduled
 }

@@ -123,6 +123,10 @@ bun build <entry points>
   Exclude modules from the bundle (supports wildcards). Alias: <code>-e</code>
 </ParamField>
 
+<ParamField path="--alias" type="string">
+  Bundle another package or a file in place of a package, as <code>name=substitute</code>. Can be repeated
+</ParamField>
+
 <ParamField path="--allow-unresolved" type="string" default="*">
   Allow unresolved dynamic import()/require() specifiers matching these glob patterns. Pass <code>''</code> to allow
   opaque specifiers
