@@ -1208,6 +1208,7 @@ impl CompletionStruct for JSBundleCompletionTask {
             ),
             None => options::AllowUnresolved::All,
         };
+        transpiler.options.alias = config.alias.clone();
         transpiler.options.code_splitting = config.code_splitting;
         transpiler.options.split_require = config.split_require;
         transpiler.options.emit_dce_annotations = config

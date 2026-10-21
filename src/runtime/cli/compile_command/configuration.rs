@@ -262,6 +262,7 @@ fn apply_bundler_options(ctx: &ContextData, this_transpiler: &mut Transpiler<'st
         } else {
             options::AllowUnresolved::All
         };
+    this_transpiler.options.alias = ctx.bundler_options.alias.clone();
     this_transpiler.options.css_chunking = ctx.bundler_options.css_chunking;
     this_transpiler.options.min_chunk_size = ctx.bundler_options.min_chunk_size;
     this_transpiler.options.module_preload = ctx.bundler_options.module_preload;

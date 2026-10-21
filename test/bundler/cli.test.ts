@@ -1243,3 +1243,64 @@ describe.concurrent("diagnostic markup", () => {
     expect(stderr).not.toContain("\x1b[");
   });
 });
+
+describe("--alias", () => {
+  async function build(cwd: string, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build", ...args],
+      env: bunEnv,
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test("takes name=substitute, and the last one for a name", async () => {
+    using dir = tempDir("alias-flag", {
+      "in.js": `import value from "pkg";\nimport other from "node:other";\nconsole.log(value, other);\n`,
+      "first.js": `export default "first";\n`,
+      "second.js": `export default "second";\n`,
+      "other.js": `export default "other";\n`,
+    });
+    const { stdout, stderr, exitCode } = await build(
+      String(dir),
+      "in.js",
+      "--alias",
+      "pkg=./first.js",
+      "--alias=pkg=./second.js",
+      "--alias=node:other=./other.js",
+    );
+    expect(stderr).toBe("");
+    expect(stdout).toContain(`"second"`);
+    expect(stdout).toContain(`"other"`);
+    expect(stdout).not.toContain(`"first"`);
+    expect(exitCode).toBe(0);
+  });
+
+  test("an alias that does not resolve is an error that names both", async () => {
+    using dir = tempDir("alias-missing", { "in.js": `import "pkg";\n` });
+    const { stdout, stderr, exitCode } = await build(String(dir), "in.js", "--alias", "pkg=not-installed");
+    expect(stdout).toBe("");
+    expect(stderr).toContain('error: Could not resolve: "not-installed" (originally "pkg")');
+    expect(stderr).toContain(
+      'note: "pkg" was replaced with "not-installed" by the "alias" option. An alias is resolved from the current working directory, not from the importing file.',
+    );
+    expect(exitCode).toBe(1);
+  });
+
+  test.each([
+    [["--alias", "react"], `--alias expects name=substitute, as in --alias react=preact/compat, but got "react"`],
+    [["--alias=./local=pkg"], `Invalid alias name: "./local"`],
+    [["--alias", "pkg="], `Invalid alias substitution for "pkg"`],
+    [["--alias", "pkg=other", "--no-bundle"], "--alias is not supported with --no-bundle"],
+    [["--alias", "pkg=other", "--app"], "--alias is not supported with --app"],
+    [["--alias", "pkg=other", "--compile", "--aot", "--outfile=app"], "TS100050: --aot does not support --alias"],
+  ])("%j is an error", async (args, message) => {
+    using dir = tempDir("alias-error", { "in.js": `import "pkg";\n` });
+    const { stdout, stderr, exitCode } = await build(String(dir), "in.js", ...args);
+    expect({ stdout, stderr }).toEqual({ stdout: "", stderr: expect.stringContaining(message) });
+    expect(exitCode).toBe(1);
+  });
+});

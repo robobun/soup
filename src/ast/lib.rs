@@ -1420,6 +1420,28 @@ impl Log {
         import_kind: ImportKind,
         err: crate::Error,
     ) {
+        self.add_resolve_error_with_notes(
+            source,
+            r,
+            args,
+            specifier_arg,
+            import_kind,
+            err,
+            Box::default(),
+        )
+    }
+
+    #[cold]
+    fn add_resolve_error_with_notes(
+        &mut self,
+        source: Option<&Source>,
+        r: Range,
+        args: fmt::Arguments<'_>,
+        specifier_arg: &[u8],
+        import_kind: ImportKind,
+        err: crate::Error,
+        notes: Box<[Data]>,
+    ) {
         let text = alloc_print(args);
         // TODO: fix this. this is stupid, the specifier should be returned by
         // `alloc_print`. `fmt::Arguments` is opaque, so callers must pass
@@ -1437,6 +1459,7 @@ impl Log {
                 import_kind,
                 err,
             }),
+            notes,
             ..Default::default()
         };
 
@@ -1459,6 +1482,28 @@ impl Log {
             specifier_arg,
             import_kind,
             crate::Error::ModuleNotFound,
+        )
+    }
+
+    /// [`Self::add_resolve_error_with_text_dupe`] with a note under the error.
+    #[cold]
+    pub fn add_resolve_error_with_note(
+        &mut self,
+        source: Option<&Source>,
+        r: Range,
+        args: fmt::Arguments<'_>,
+        specifier_arg: &[u8],
+        import_kind: ImportKind,
+        note_args: fmt::Arguments<'_>,
+    ) {
+        self.add_resolve_error_with_notes(
+            source,
+            r,
+            args,
+            specifier_arg,
+            import_kind,
+            crate::Error::ModuleNotFound,
+            Box::new([range_data(None, Range::NONE, alloc_print(note_args))]),
         )
     }
 

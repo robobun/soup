@@ -84,6 +84,7 @@ fn report_unsupported_options(options: &BundleOptions<'_>, log: &mut Log) -> boo
         hot_module_reloading, ignore_module_resolution_errors, disable_transpilation, repl_mode,
         react_compiler_parse_test_pragmas,
         global_name,
+        alias,
         loaders: _, jsx: _, react_compiler: _, root_dir: _, preserve_symlinks: _,
         tsconfig_override: _, main_fields: _, transform_options: _, external: _, packages: _,
         extension_order: _, main_field_extension_order: _, no_macros: _, custom_conditions: _,
@@ -125,6 +126,7 @@ fn report_unsupported_options(options: &BundleOptions<'_>, log: &mut Log) -> boo
         react_compiler_parse_test_pragmas.then_some("reactCompilerParseTestPragmas"),
         legal_comments_argument(*legal_comments),
         (!global_name.is_empty()).then_some("--global-name"),
+        (!alias.is_empty()).then_some("--alias"),
         is_development_server.then_some("a development server"),
         is_other_command.then_some("this command"),
     ];

@@ -6596,6 +6596,230 @@ Files: `src/runtime/valkey_jsc/valkey.rs` (`Admitted`, `Unit`, `admit`, `send_un
 `test/js/valkey/valkey-gc.test.ts`, `test/internal/source-lints/redis-client-types.test.ts`,
 `test/integration/bun-types/fixture/redis.ts`.
 
+### 2026-10-21: `alias` for `Bun.build` and `bun build --alias`
+
+esbuild, webpack, Rollup and Vite can all be told to bundle one package in place of another:
+`react` as `preact/compat`, a Node.js module as its browser port, `@app/config` as the file for
+production. `Bun.build` could not. Its migration page listed esbuild's `alias` as "Not supported",
+the two tests ported from esbuild's suite (`default/PackageAlias`, `default/PackageAliasMatchLongest`)
+have been todo since 2023, and `bun build` did not know the flag: `--alias react=preact/compat`
+read `react=preact/compat` as a second entry point, and `--alias=react=preact/compat` did nothing.
+The ways around it are a `paths` entry in tsconfig.json, which cannot name a built-in module and
+is relative to the tsconfig, or an `onResolve` plugin, which the CLI does not have. Now:
+
+```ts
+await Bun.build({
+  entrypoints: ["./src/index.tsx"],
+  outdir: "./dist",
+  alias: {
+    react: "preact/compat", // and react/jsx-runtime is preact/compat/jsx-runtime
+    "node:fs": "memfs",
+    "@app/config": "./src/config.production.ts",
+  },
+});
+```
+
+```sh
+bun build ./src/index.tsx --outdir dist --alias react=preact/compat --alias @app/config=./src/config.production.ts
+```
+
+The rules are esbuild's:
+
+- A key is the name of a package as an import spells it: `react`, `@scope/pkg`, `pkg/sub`,
+  `node:fs`. A relative or absolute path, a name with a trailing slash, with `.` or `..` in it or
+  with a backslash is an error when the option is read (`Invalid alias name: "./local"`), and so is
+  an empty value.
+- A key stands for the package and for the paths in it. The longest key that is the import, or a
+  directory above it, is used, and the rest of the import is kept: `pkg/foo/bar/baz` with a key
+  `pkg/foo` is `<value>/bar/baz`. A key is not a prefix of a name: `react` says nothing about
+  `react-dom`. `import "pkg/"`, which is how a package is told from the Node.js module of the same
+  name, is the value without the slash.
+- The value is looked up from the working directory, not from the file that has the import. A
+  dependency somewhere in `node_modules` that imports `react` gets the `preact` of the project,
+  and not one that happens to be installed next to that dependency. A relative value is relative
+  to the working directory as well.
+- It is used once, and first. The value is not looked up as a key (`{ a: "b", b: "./c.ts" }`
+  bundles the package `b` for `a`). A built-in module can have an alias with every target.
+  `external` and `packages: "external"` are asked about the value, so a library build prints
+  `import ... from "preact/compat"`, in JavaScript and in a CSS `@import` or `url()`. The value can
+  be one of the in-memory `files`, and a file there that is named like the import does not hide
+  the alias.
+- Plugins come before it. `onResolve` gets the name as the file has it and what it returns is
+  used. The alias is for what no plugin resolves, and plugins are not asked about the value. A
+  plugin can set `build.config.alias` in `setup()`.
+- An alias that cannot be found fails the build with both names, and says where it was looked for:
+
+  ```
+  error: Could not resolve: "preact/compat" (originally "react")
+  note: "react" was replaced with "preact/compat" by the "alias" option. An alias is resolved from the current working directory, not from the importing file.
+  ```
+
+  An import that is allowed to fail (`try { require("optional") } catch {}`) keeps its own name.
+
+Where it lives was the question of the day. The first draft put the step into the resolver and a
+design review moved it. The bundler reads the name of an import before the resolver does (the
+shortcut that keeps built-in modules out of a `target: "bun"` bundle, then the plugins, then the
+in-memory `files`) and after it (the name an external import is printed under, the text of the
+error), so a step in the resolver cannot give a built-in module an alias, cannot print the new
+name and cannot name both in the error. It would also put a test on every `import` and
+`require()` of the runtime, which shares that function. So it is one step in
+`BundleV2::resolve_import_records`, the loop every import record of a build goes through:
+
+- Above the built-in shortcut the loop looks the name up (`alias_substitute`, on the name the file
+  has, so a record that comes through the loop again is not given the alias of its alias) and,
+  for a record with an alias, asks the plugins at that point. From there on every rule reads
+  `specifier`, which is the value, and `(source_dir, importer)`, which are the working directory
+  and a file in it. Nothing is written to the record before the resolver has answered.
+- An import that a plugin's `onResolve` had no answer for used to go to a second copy of the
+  lookup, `run_resolver`. A record with an alias now goes back through the loop instead, with
+  `after_plugins` set, the way barrel optimization resolves the records it had put off
+  (`resolve_barrel_records`, which is now `resolve_records` with the two callers). `run_resolver`
+  is not touched, so the step exists once.
+- The resolver, the transpiler and the runtime's module loader have no line of this:
+  `git diff --stat -- src/resolver src/jsc src/bundler/transpiler.rs` is empty. A build without
+  `alias` pays one emptiness test per call of the loop and one branch per import record that is
+  not taken. `BundleOptions` and the CLI's `BundlerOptions` each grow by one empty `Vec` (24
+  bytes).
+
+The hunks sit next to `external` and `allowUnresolved`, which are upstream's lines, and the type is
+a file of its own (`src/options_types/package_aliases.rs`), so the commit applies to upstream main
+with a conflict in this file only.
+
+A review of the finished diff raised sixteen points, and all of them held. Fixed:
+
+- An external value was written into the text of the record's path only. A CSS `@import` prints
+  another field, so the stylesheet of a library build still imported the key. The whole path is
+  replaced now.
+- A plugin that wraps a package answers with a module whose path is the name of the package, and
+  has no answer for the import of the real one inside it. The graph looks records up by the text
+  of their path, so that inner import was bound to the wrapper before the loop saw it, and the
+  alias was skipped without an error. The record's index is reset before it goes back through the
+  loop, and a record with an alias whose file is already in the graph takes the path of that file.
+- With `target: "node"` the bundler's runtime imports `node:module` for `require()`. An alias for
+  `node:module` caught that import too, and the bundle threw on its first line. The runtime's
+  imports have no alias.
+- Tests for what had none: the lone trailing slash, keys that are not in the order of their
+  length, a declined import whose alias does not resolve, a built-in value after a plugin.
+
+Cut, because the same review showed it is not a small thing: an entry point that is the name of a
+key. The first version looked such an entry point up as a file and then as the value. Six of the
+sixteen points were about it: a key with a slash in it fails earlier, where the root directory of
+a single entry point is worked out; the value was not looked up in `files`; an entry point the
+`browser` field disables panicked; the error named one name; and after a plugin the output was
+named after the key instead of the file. An entry point is looked up as it is written, and the
+docs say so. esbuild gives entry points the alias, so this is the one place the rules differ.
+
+Not done, and for whoever picks this up:
+
+- `Bun.build({ watch: true })` (2026-10-09) does not watch for the file a relative value names
+  when that file is missing: it looks next to the importer, and the value is relative to the
+  working directory.
+- An external value in an HTML tag (`<script src="cdn-lib">` with an alias to a URL) builds, and
+  the tag keeps its text.
+- `with { type: "sqlite" }` imports and macro imports have no alias. The first is opened by the
+  runtime from where the output file is, the second is resolved while its file is parsed.
+- `--check` resolves imports for the type checker with tsconfig.json only.
+- No `alias` in bunfig.toml or in the shell completions, and none for `bun build --app`, the dev
+  server and HTML routes of `Bun.serve`. `--alias` with `--no-bundle` or `--app` is an error
+  rather than a flag that does nothing.
+- The working directory is the process's, read when the import is resolved, as for entry points.
+
+Measured: the two counts above, and an A/B of one 20,000-module build (the graph of
+`edgecase/DeepImportDiamondDAG`) on debug builds with and without the patch, two runs each in
+turn: 112.3 s and 93.4 s without, 119.0 s and 102.4 s with. The spread between two runs of one
+binary (19 s) is larger than the difference, so this shows nothing beyond "not slower by much".
+Instruction counts on release builds, which would be the real number for the branch per record,
+were not taken: valgrind, perf and strace are not in the build container, and no release build of
+either side was made.
+
+Rebase notes: upstream moved by 18 commits to 9b4284f788, three of them large, and 28 of the 57
+patches needed a hand merge. Nothing was dropped.
+
+This run and the run of 2026-10-20 overlapped. That run had not pushed when this one began, so this
+one started from the 57 patches of 2026-10-18 and rebased them itself: over the nine upstream
+commits that run had rebased over, and nine more. The commit of 2026-10-20 was then picked onto
+this stack, under this one. It applies without a conflict outside this file. The eleven hand merges
+its entry lists are not in this history, the ones listed here stand in for them. The first push of
+this run (53dc87b3f9) left `redis.multi()` out of `main` from 14:19 to 18:34 UTC: a `git fetch` of
+the fork right before `git push --force-with-lease` moves the lease to what another run has just
+pushed, and the push then goes through. Before a forced push, compare the fetched tip with the
+commit the run started from.
+
+- Upstream rewrote the coverage converter (oven-sh/bun#45677): a line is executable if the source
+  map has code of it, counts come from JSC's ranges, and the module itself, the function body of a
+  generator or an async function and a static block are no longer functions. The three coverage
+  patches were written against the converter it replaced.
+  - Ignore hints (2026-09-16) keep `Report::ignore_lines` and now take the lines of a function and
+    of a statement from the new converter's offsets. The function Bun wraps a CommonJS module in is
+    no longer reported as a function of the file when there is a source map, so the guard that kept
+    it from being ignored is for files without one.
+  - `collectCoverageFrom` (2026-09-26): the report of a file that nothing loaded is one range over
+    the whole text for the lines, plus the functions JSC's parser lists, through the same
+    `convert`. The C++ side lists what a load lists under the new rules (no range for the module,
+    none for generator and async bodies or static blocks). A module without functions now reports
+    0 of 0 functions, which the table shows as 100.00 next to 0.00 for lines, as Jest does. In a
+    `// @bun` file without a source map a last line without a newline is counted.
+  - The HTML reporter (2026-10-14) needed its error type merged with upstream's
+    `generate_code_coverage`, which returns whether the report was written.
+  - The expected numbers of the fixtures changed with the converter (a function that never ran
+    has its body lines uncovered now, a line with only a brace is not executable), and the tests
+    were updated to them. `coverage.test.ts` passes (68 tests, 1 skipped).
+- Upstream's hardening pass (oven-sh/bun#46021) reworked the shell's `IOReader`. It now drops its
+  listeners after EOF and after an error, which is what the `kill()` patch (2026-09-15) had done,
+  so that part of the patch is gone. Its new `cat.test.ts` found a hang in this stack: the `wc`
+  patch (2026-08-15) reads a file or a directory on stdin without polling it, the reader does not
+  read an fd again after a read of it failed, and so a second `cat` of a failed stdin waited
+  forever. `IOReader` keeps the error now and hands it to a listener that starts later. The same
+  pass added three task tags (the count the two loop tags of this stack assert is 88), a
+  `bail_out` for `bun test --bail` that `--reporter=json` and `--last-failed` write their files
+  in, and made `FileSystem::top_level_dir` a method, which four patches read as a field.
+- `S3Stat` moved to the bindings generator (oven-sh/bun#45888). The `metadata` getter of
+  2026-09-27 is a line in `S3Stat.bind.ts` (`b.record(b.string.utf8)`, cached) and a method that
+  returns the pairs.
+- Smaller ones: the transpiler cache is at version 38 (`import.meta.glob()`), the table of root
+  commands from 2026-08-28 takes upstream's skipping of flag values, `bun serve` has an arm in
+  upstream's new check of what is type-checked before a run, and a dozen test files and comments
+  that both sides had added to.
+
+After the rebase the stack builds and these test files were run on the debug build: `coverage`
+(68), the shell (`wc`, `head`, `tail`, `sort`, `uniq`, `kill`, `parse`, `bunshell`, `exec`, `cat`),
+`s3-metadata`, `perf_hooks`, `filesink`, `test-last-failed`, `semver` (484), `import-meta-glob`,
+`bun-serve-compress`, `static-server`, `run_command`, `filter-workspace`, `bun-pm-sbom`, `storage`,
+the new and changed parts of `bun-test`, `watch`, `hot`, `bun-pm` and `bun-install-git-deps`, the
+type tests (24) and the source lints (186). They pass. What does not pass on this build is slow,
+with or without this stack's code: the six recursive scans of `glob/scan.test.ts` (30 s each, 8 s
+on the release build), three `--compile` tests of `bundler/cli.test.ts` (a debug executable is 1.2
+GB), `edgecase/DeepImportDiamondDAG` and the 400-build test of `bun-build-api.test.ts` (see the A/B
+above), and the memory tests of `shell/leak.test.ts`. `snapshot.test.ts` has one upstream test that
+expects colors, which a run into a file does not have.
+
+For `redis.multi()` on this stack: the build container has no Docker daemon, so the tests ran
+against a local Redis 8.0.2 with the TCP port, the TLS port and the users of the test image.
+`valkey.test.ts` (1084, 2 skipped), `reliability/connection-failures.test.ts` (87, 1 skipped, 1
+todo) and `valkey-gc.test.ts` (26, three upstream tests of it with more than the default 5 seconds)
+pass on the debug build. So do the other twelve files of `test/js/valkey/`, except for two upstream
+snapshots of a message of the server: this Redis adds `, with args beginning with: ` to
+`ERR unknown command`, and bun 1.4.3 fails the same two against it.
+
+For `alias`: the two esbuild tests, 17 cases in `bundler_edgecase.test.ts`, 3 in
+`bun-build-api.test.ts` and 7 in `cli.test.ts` pass on the debug build and fail on bun 1.4.3. The
+bundler suites that go through the same loop pass after the change: `esbuild/default` (165),
+`bundler_plugin` (68), `bundler_barrel` (70), `bundler_files` (28), `bundler_html` (25),
+`bundler_browser`, `bundler_bun`, `bundler_allow_unresolved` and the rest of `bundler_edgecase`.
+
+Files: `src/options_types/package_aliases.rs` (new), `src/options_types/lib.rs`,
+`src/options_types/context.rs`, `src/bundler/options.rs`, `src/bundler/bundle_v2.rs`
+(`alias_substitute`, `alias_base`, `log_aliased_resolve_error`, the step in
+`resolve_import_records`, the re-entry in `on_resolve`), `src/bundler/barrel_imports.rs`
+(`resolve_records`), `src/ast/lib.rs` (`Log::add_resolve_error_with_note`),
+`src/runtime/api/JSBundler.rs`, `src/runtime/api/js_bundle_completion_task.rs`,
+`src/runtime/cli/Arguments.rs`, `src/runtime/cli/build_command.rs`,
+`packages/bun-types/bun.d.ts`, `docs/bundler/index.mdx`, `docs/bundler/esbuild.mdx`,
+`docs/snippets/cli/build.mdx`, `test/bundler/expectBundled.ts`,
+`test/bundler/esbuild/default.test.ts`, `test/bundler/bundler_edgecase.test.ts`,
+`test/bundler/bun-build-api.test.ts`, `test/bundler/cli.test.ts`,
+`test/integration/bun-types/fixture/build.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

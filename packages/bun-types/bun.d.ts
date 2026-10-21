@@ -4179,6 +4179,28 @@ declare module "bun" {
     // manifest?: boolean; // whether to return manifest
     external?: string[];
     /**
+     * Bundle another package, or a file, in place of a package.
+     *
+     * A key is the name of a package as an import spells it. It also stands for the paths
+     * inside the package: with `{ react: "preact/compat" }`, `react` is bundled as
+     * `preact/compat` and `react/jsx-runtime` as `preact/compat/jsx-runtime`. A value is the
+     * name of a package, or the path of a file or of a directory. It is looked up from the
+     * working directory, whichever file the import is in.
+     *
+     * @example
+     * ```ts
+     * await Bun.build({
+     *   entrypoints: ["./src/index.tsx"],
+     *   outdir: "./dist",
+     *   alias: {
+     *     react: "preact/compat",
+     *     "@app/config": "./src/config.production.ts",
+     *   },
+     * });
+     * ```
+     */
+    alias?: Record<string, string>;
+    /**
      * Control whether dynamic `import()`, `require()`, or `require.resolve()` specifiers (non-literal
      * arguments like `` `./locales/${lang}.json` ``) are allowed to pass through
      * to runtime without being bundled.
