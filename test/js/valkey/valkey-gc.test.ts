@@ -1038,3 +1038,95 @@ test.concurrent("RESP map keys are not leaked", async () => {
   // Unfixed: ~270 MiB (two 400 KiB keys per reply). Fixed: ~30 MiB of JS string churn.
   await expectRssDeltaBelow(["--smol", "-e", code], { release: 130, debug: 160 });
 });
+
+// What multi() returns is a wrapper of its own over a client that never
+// connects, with a native ref on the client it came from. exec() sends through
+// that client, so the transaction also keeps the client's wrapper alive: a
+// client that was never connected is held by nothing else.
+test.concurrent(
+  "a transaction keeps its client alive, and both are collected when the transaction is dropped",
+  async () => {
+    const src = `
+    const { heapStats } = require("bun:jsc");
+    const CRLF = "\\r\\n";
+    const server = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(s, d) {
+          // One reply per command: HELLO, then MULTI, SET, EXEC.
+          let out = "";
+          for (const [name] of d.toString("latin1").matchAll(/HELLO|MULTI|SET|EXEC/g)) {
+            out += name === "EXEC" ? "*1" + CRLF + "+OK" + CRLF : name === "SET" ? "+QUEUED" + CRLF : "+OK" + CRLF;
+          }
+          if (out) s.write(out);
+        },
+      },
+    });
+    const url = "redis://127.0.0.1:" + server.port;
+    // A transaction is a RedisClient object too.
+    const live = async () => {
+      Bun.gc(true);
+      await 1;
+      Bun.gc(true);
+      return heapStats().objectTypeCounts.RedisClient ?? 0;
+    };
+
+    const client = new Bun.RedisClient(url);
+    const baseline = await live();
+
+    // Dropped without exec(), with and without commands, while their client lives on.
+    (() => {
+      for (let i = 0; i < 200; i++) {
+        const transaction = client.multi();
+        if (i % 2) transaction.set("key", Buffer.alloc(64, "v")).set("key", "value");
+      }
+    })();
+    const afterDropped = await live();
+
+    // Clients that are only reachable through their transaction.
+    const N = 20;
+    let connected = 0;
+    const orphan = () => {
+      const parent = new Bun.RedisClient(url);
+      parent.onconnect = () => connected++;
+      return parent.multi().set("key", "value");
+    };
+    // In a property: a local of this function can stay in its suspended frame after it is set to null.
+    const box = { held: Array.from({ length: N }, orphan) };
+    const whileHeld = await live();
+    const stillHeld = box.held.length;
+    box.held = null;
+    const afterRelease = await live();
+
+    // And exec() on such a transaction reaches its client.
+    const replies = await Promise.all(Array.from({ length: N }, orphan).map(transaction => transaction.exec()));
+
+    console.error(JSON.stringify({ baseline, afterDropped, whileHeld, stillHeld, afterRelease, connected }));
+    console.log(JSON.stringify({
+      dropped: afterDropped - baseline <= 2,
+      kept: whileHeld - baseline >= 2 * N - 2,
+      released: afterRelease - baseline <= 2,
+      connected,
+      replies: replies.filter(r => r.length === 1 && r[0] === "OK").length,
+    }));
+    server.stop(true);
+    process.exit(0);
+  `;
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", src],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+
+    expect(stdout.trim()).toBe(
+      JSON.stringify({ dropped: true, kept: true, released: true, connected: 20, replies: 20 }),
+    );
+    expect(proc.signalCode).toBeNull();
+    expect(exitCode).toBe(0);
+  },
+);
