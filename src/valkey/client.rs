@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use bun_collections::OffsetByteList;
 use bun_core::strings;
 
-use crate::command::{self, ACKS, Ack, Reply};
+use crate::command::{self, ACKS, Ack, Reply, Transaction};
 use crate::valkey_protocol::{Push, RESPValue, RedisError, ReplyScanner, ScanResult, ValkeyReader};
 use State::{Backoff, Closed, Ending, Idle, Opening, Queuing, Ready, Spare};
 
@@ -133,13 +133,15 @@ enum Expect {
     Multi,
     /// For the results of the commands that did not ask for bytes themselves.
     Exec(Reply),
+    /// The replies to MULTI, to each command and to EXEC, which the first [`Plan`] reads.
+    Transaction,
 }
 
 impl Expect {
     fn reply(self) -> Reply {
         match self {
             Expect::Reply(reply) | Expect::Exec(reply) => reply,
-            Expect::Ack | Expect::Database(_) | Expect::Multi => Reply::Value,
+            Expect::Ack | Expect::Database(_) | Expect::Multi | Expect::Transaction => Reply::Value,
         }
     }
 
@@ -164,6 +166,45 @@ struct Queued<P> {
     request: InFlight<P>,
 }
 
+// Every queued command pays for these two; what only a transaction needs goes in its `Plan`.
+const _: () = assert!(size_of::<InFlight<usize>>() == 2 * size_of::<usize>());
+const _: () = assert!(
+    size_of::<Queued<usize>>()
+        == size_of::<Box<[u8]>>() + size_of::<InFlight<usize>>() + size_of::<usize>()
+);
+
+/// How the replies to one transaction settle its promise.
+struct Plan {
+    /// What each command's promise would resolve with.
+    replies: Box<[Reply]>,
+    /// Where each SELECT is among the commands, and its database.
+    selects: Box<[(usize, u32)]>,
+    /// Replies read so far.
+    seen: usize,
+    /// The first error reply to MULTI or to a command.
+    error: Option<Box<[u8]>>,
+}
+
+impl Plan {
+    /// Takes one reply. Whether it is the one to EXEC: of those before it, the first error is kept.
+    fn read(&mut self, value: &mut RESPValue) -> bool {
+        self.seen += 1;
+        if self.seen == self.replies.len() + 2 {
+            return true;
+        }
+        if let RESPValue::Error(message) = value
+            && self.error.is_none()
+        {
+            self.error = Some(core::mem::take(message));
+        }
+        false
+    }
+
+    fn memory_cost(&self) -> usize {
+        size_of::<Self>() + self.replies.len() + size_of_val(&*self.selects)
+    }
+}
+
 /// `P` stands for whoever waits for a command; the client only hands it back.
 pub struct Client<P> {
     config: Config,
@@ -177,6 +218,12 @@ pub struct Client<P> {
     scanner: ReplyScanner,
     in_flight: VecDeque<InFlight<P>>,
     queue: VecDeque<Queued<P>>,
+    /// One for each transaction in `in_flight` and `queue`, oldest first. The first transaction makes the queue.
+    #[allow(
+        clippy::box_collection,
+        reason = "a client that sends no transaction pays one word for the queue, not four"
+    )]
+    plans: Option<Box<VecDeque<Plan>>>,
 }
 
 /// Where the replies of one read come from.
@@ -202,6 +249,18 @@ pub enum Event<P> {
     Rejected {
         promise: P,
         message: Box<[u8]>,
+    },
+    /// A transaction of [`Client::send_transaction`] ran: the reply to each command, and what that command's promise would resolve with.
+    Transacted {
+        promise: P,
+        values: Vec<RESPValue>,
+        replies: Box<[Reply]>,
+    },
+    /// The reply to EXEC is not one for each command. Only the transaction fails: the connection is still in step.
+    Invalid {
+        promise: P,
+        message: Box<[u8]>,
+        error: RedisError,
     },
     Message(Vec<RESPValue>),
     /// Has no listeners, but is a microtask checkpoint like a message.
@@ -296,6 +355,14 @@ fn refused<P>(message: &[u8], error: RedisError) -> Event<P> {
     }
 }
 
+fn invalid<P>(promise: P, message: &[u8], error: RedisError) -> Event<P> {
+    Event::Invalid {
+        promise,
+        message: message.into(),
+        error,
+    }
+}
+
 impl<P> Client<P> {
     pub fn new(config: Config) -> Self {
         Self {
@@ -308,6 +375,7 @@ impl<P> Client<P> {
             scanner: ReplyScanner::default(),
             in_flight: VecDeque::new(),
             queue: VecDeque::new(),
+            plans: None,
         }
     }
 
@@ -372,11 +440,13 @@ impl<P> Client<P> {
     }
 
     pub fn memory_cost(&self) -> usize {
+        let plans = self.plans.iter().flat_map(|it| it.iter());
         self.output.byte_list.capacity()
             + self.input.byte_list.capacity()
             + self.in_flight.len() * size_of::<InFlight<P>>()
             + self.queue.len() * size_of::<Queued<P>>()
             + self.queue.iter().map(|it| it.bytes.len()).sum::<usize>()
+            + plans.map(Plan::memory_cost).sum::<usize>()
     }
 
     /// What bounds the current state; 0 for nothing.
@@ -572,6 +642,13 @@ impl<P> Client<P> {
 
     fn take_in_flight(&mut self) -> Vec<P> {
         let in_flight = core::mem::take(&mut self.in_flight);
+        if let Some(plans) = &mut self.plans {
+            for it in &in_flight {
+                if matches!(it.expect, Expect::Transaction) {
+                    plans.pop_front();
+                }
+            }
+        }
         in_flight.into_iter().map(|it| it.promise).collect()
     }
 
@@ -579,6 +656,7 @@ impl<P> Client<P> {
         let mut pending = self.take_in_flight();
         let queue = core::mem::take(&mut self.queue);
         pending.extend(queue.into_iter().map(|it| it.request.promise));
+        self.plans = None;
         pending
     }
 
@@ -612,10 +690,7 @@ impl<P> Client<P> {
         };
         let request = InFlight { expect, promise };
         let can_pipeline = command::can_pipeline(name);
-        let batches = can_pipeline && self.config.enable_auto_pipelining;
-        let connected = self.is_connected();
-
-        let goes_now = !batches && connected && self.queue.is_empty() && self.in_flight.is_empty();
+        let goes_now = self.goes_now(can_pipeline);
 
         let mut bytes = Vec::new();
         let out = if goes_now {
@@ -628,12 +703,50 @@ impl<P> Client<P> {
             self.in_flight.push_back(request);
             return Sent::Buffered;
         }
-        self.queue.push_back(Queued {
+        self.enqueue(Queued {
             bytes: bytes.into_boxed_slice(),
             can_pipeline,
             request,
-        });
-        if batches && connected {
+        })
+    }
+
+    /// As [`Self::send`], for MULTI, the commands and EXEC as one command that can share a write: nothing comes between them.
+    pub fn send_transaction(&mut self, transaction: Transaction, promise: P) -> Sent {
+        let command::Finished {
+            bytes,
+            replies,
+            selects,
+        } = transaction.finish();
+        let plan = Plan {
+            replies,
+            selects,
+            seen: 0,
+            error: None,
+        };
+        self.plans.get_or_insert_default().push_back(plan);
+        let expect = Expect::Transaction;
+        let queued = Queued {
+            bytes,
+            can_pipeline: true,
+            request: InFlight { expect, promise },
+        };
+        if self.goes_now(true) {
+            self.put_in_flight(queued);
+            return Sent::Buffered;
+        }
+        self.enqueue(queued)
+    }
+
+    /// Whether what is sent now goes to [`Self::output`] at once: it shares no batch, and nothing is ahead of it.
+    fn goes_now(&self, can_pipeline: bool) -> bool {
+        let batches = can_pipeline && self.config.enable_auto_pipelining;
+        !batches && self.is_connected() && self.queue.is_empty() && self.in_flight.is_empty()
+    }
+
+    fn enqueue(&mut self, queued: Queued<P>) -> Sent {
+        let batches = queued.can_pipeline && self.config.enable_auto_pipelining;
+        self.queue.push_back(queued);
+        if batches && self.is_connected() {
             Sent::Batched
         } else {
             Sent::Queued
@@ -865,12 +978,20 @@ impl<P> Client<P> {
         match value {
             RESPValue::Push(push) => self.on_push(push),
             // The request it answers stays in flight: `fail` rejects it first.
-            RESPValue::Error(message) if self.is_subscriber => Event::Broken {
-                message,
-                error: RedisError::ServerError,
-            },
+            RESPValue::Error(message) if self.is_subscriber && !self.reads_transaction() => {
+                Event::Broken {
+                    message,
+                    error: RedisError::ServerError,
+                }
+            }
             value => self.answer(value),
         }
+    }
+
+    /// The next reply is one to a transaction, which keeps its errors to itself.
+    fn reads_transaction(&self) -> bool {
+        let next = self.in_flight.front().map(|it| it.expect);
+        matches!(next, Some(Expect::Transaction))
     }
 
     fn answer(&mut self, value: RESPValue) -> Event<P> {
@@ -878,7 +999,9 @@ impl<P> Client<P> {
             return Event::Ignored;
         };
         match value {
-            RESPValue::Error(message) => Event::Rejected { promise, message },
+            RESPValue::Error(message) if !matches!(expect, Expect::Transaction) => {
+                Event::Rejected { promise, message }
+            }
             RESPValue::Integer(int) if matches!(expect, Expect::Reply(Reply::Bool)) => {
                 Event::Resolved {
                     promise,
@@ -892,6 +1015,7 @@ impl<P> Client<P> {
                     value,
                     reply,
                 },
+                Expect::Transaction => self.on_transaction_reply(value, promise),
                 expect => self.answer_tracked(value, expect, promise),
             },
         }
@@ -944,6 +1068,72 @@ impl<P> Client<P> {
         results
     }
 
+    /// One of the replies to a transaction: the one to MULTI, one for each command, then the one to EXEC.
+    #[cold]
+    fn on_transaction_reply(&mut self, mut value: RESPValue, promise: P) -> Event<P> {
+        let expect = Expect::Transaction;
+        let plans = self.plans.as_deref_mut().filter(|it| !it.is_empty());
+        let Some(plans) = plans else {
+            // `fail` rejects it with the rest.
+            self.in_flight.push_front(InFlight { expect, promise });
+            return broken(
+                b"Received a transaction reply without a transaction",
+                RedisError::InvalidResponse,
+            );
+        };
+        let Some(plan) = plans.pop_front_if(|plan| plan.read(&mut value)) else {
+            // The transaction waits at the front for the reply to EXEC.
+            self.in_flight.push_front(InFlight { expect, promise });
+            return Event::Ignored;
+        };
+        // The error of MULTI or of a command says more than the reply of EXEC to either.
+        if let Some(message) = plan.error {
+            return Event::Rejected { promise, message };
+        }
+        let replies = plan.replies;
+        match value {
+            RESPValue::Error(message) => Event::Rejected { promise, message },
+            // A watched key changed: `_`, or `*-1` and `$-1` from a server that answers in RESP2.
+            value @ (RESPValue::Null | RESPValue::BulkString(None)) => Event::Resolved {
+                promise,
+                value,
+                reply: Reply::Value,
+            },
+            RESPValue::Array(mut values) if values.len() == replies.len() => {
+                // As in `executed`: the last SELECT that the server took.
+                let took = |at: usize| matches!(&values[at], RESPValue::SimpleString(text) if **text == *b"OK");
+                if let Some(&(_, database)) = plan.selects.iter().rfind(|it| took(it.0)) {
+                    self.database = database;
+                }
+                for (each, reply) in values.iter_mut().zip(replies.iter()) {
+                    if *reply == Reply::Bool
+                        && let RESPValue::Integer(int) = *each
+                    {
+                        *each = RESPValue::Boolean(int > 0);
+                    }
+                }
+                Event::Transacted {
+                    promise,
+                    values,
+                    replies,
+                }
+            }
+            RESPValue::Array(values) => {
+                let message = format!(
+                    "EXEC replied with {} replies to a transaction of {} commands",
+                    values.len(),
+                    replies.len()
+                );
+                invalid(promise, message.as_bytes(), RedisError::InvalidResponse)
+            }
+            _ => invalid(
+                promise,
+                b"EXEC replied with neither an array nor null",
+                RedisError::InvalidResponseType,
+            ),
+        }
+    }
+
     fn on_push(&mut self, push: Push) -> Event<P> {
         let kind = match &*push.kind {
             b"message" if self.is_subscriber => return Event::Message(push.data),
@@ -985,6 +1175,7 @@ impl<P> Client<P> {
             {
                 self.answer(RESPValue::Push(push))
             }
+            Some(Expect::Transaction) => self.answer(RESPValue::Push(push)),
             _ => broken(
                 b"Unexpected push message kind without promise",
                 RedisError::InvalidResponseType,

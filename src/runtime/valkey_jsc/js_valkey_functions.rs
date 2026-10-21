@@ -291,7 +291,7 @@ impl JSValkeyClient {
         for (value, name) in values.into_iter().zip(command.args) {
             args.push(command.arg(global, value, name, "string or buffer")?);
         }
-        Ok(self.send(this, global, command.wire.as_bytes(), &args, reply))
+        self.send(this, global, command.wire.as_bytes(), &args, reply)
     }
 
     #[inline(never)]
@@ -327,7 +327,7 @@ impl JSValkeyClient {
             }
             args.push(command.arg(global, value, "additional arguments", "string or buffer")?);
         }
-        Ok(self.send(this, global, command.wire.as_bytes(), &args, reply))
+        self.send(this, global, command.wire.as_bytes(), &args, reply)
     }
 
     #[inline(never)]
@@ -358,7 +358,7 @@ impl JSValkeyClient {
             }
             args.push(command.arg(global, value, name, expected)?);
         }
-        Ok(self.send(this, global, command.wire.as_bytes(), &args, reply))
+        self.send(this, global, command.wire.as_bytes(), &args, reply)
     }
 
     /// A missing count stays `undefined`, so these never get the "requires at least" error.
@@ -404,7 +404,7 @@ impl JSValkeyClient {
             ));
         }
         let args = [key, field, increment.to_utf8(global)?];
-        Ok(self.send(this, global, command.wire.as_bytes(), &args, command.reply))
+        self.send(this, global, command.wire.as_bytes(), &args, command.reply)
     }
 }
 
@@ -574,7 +574,7 @@ impl JSValkeyClient {
             args.push(v);
         }
 
-        Ok(self.send(this, global, command.to_utf8().slice(), &args, reply))
+        self.send(this, global, command.to_utf8().slice(), &args, reply)
     }
 
     cmd!(get, "get", "GET" -> ByOption, NotSubscriber, key: "key");
@@ -625,7 +625,7 @@ impl JSValkeyClient {
             args.push(v);
         }
 
-        Ok(self.send(this, global, b"SET", &args, reply))
+        self.send(this, global, b"SET", &args, reply)
     }
 
     cmd!(incr, "incr", "INCR", NotSubscriber, key: "key");
@@ -676,13 +676,13 @@ impl JSValkeyClient {
         // Convert seconds to a string
         let mut int_buf = bun_core::fmt::ItoaBuf::new();
         let seconds_slice = bun_core::fmt::itoa(&mut int_buf, seconds);
-        Ok(self.send(
+        self.send(
             this,
             global,
             b"EXPIRE",
             &[key.slice(), seconds_slice],
             Reply::Value,
-        ))
+        )
     }
 
     cmd!(ttl, "ttl", "TTL", NotSubscriber, key: "key");
@@ -751,7 +751,7 @@ impl JSValkeyClient {
             }
         }
 
-        Ok(self.send(this, global, b"HMGET", &args, reply))
+        self.send(this, global, b"HMGET", &args, reply)
     }
 
     cmd_hincrby!(hincrby, "hincrby", "HINCRBY", NotSubscriber);
@@ -855,7 +855,7 @@ impl JSValkeyClient {
             return Err(global.throw(format_args!("HSET requires at least one field-value pair")));
         }
 
-        Ok(self.send(this, global, command.as_bytes(), &args, Reply::Value))
+        self.send(this, global, command.as_bytes(), &args, Reply::Value)
     }
 
     pub(crate) fn hset(
@@ -926,7 +926,7 @@ impl JSValkeyClient {
             Some(m) => core::slice::from_ref(m),
             None => &[],
         };
-        Ok(self.send(this, global, b"PING", args_slice, reply))
+        self.send(this, global, b"PING", args_slice, reply)
     }
 
     cmd!(bitcount, "bitcount", "BITCOUNT", NotSubscriber, key: "key");
@@ -1177,7 +1177,7 @@ impl JSValkeyClient {
                 "string or buffer",
             ));
         };
-        Ok(self.send(this, global, b"PUBLISH", &[channel, message], Reply::Value))
+        self.send(this, global, b"PUBLISH", &[channel, message], Reply::Value)
     }
 
     pub(crate) fn subscribe(
@@ -1188,6 +1188,8 @@ impl JSValkeyClient {
         listener: JsLocal<'_>,
     ) -> JsResult<JSValue> {
         let global = cx.global();
+        self.require_not_transaction("subscribe")?;
+
         let (channel_or_many, handler_callback) = (channel.to_js(), listener.to_js());
         let mut redis_channels: Vec<JSArgument> = Vec::with_capacity(1);
 
@@ -1253,7 +1255,7 @@ impl JSValkeyClient {
             self.upsert_receive_handler(this.into(), global, channel_or_many, handler_callback)?;
         }
 
-        Ok(self.send(this, global, b"SUBSCRIBE", &redis_channels, Reply::Value))
+        self.send(this, global, b"SUBSCRIBE", &redis_channels, Reply::Value)
     }
 
     pub(crate) fn unsubscribe(
@@ -1263,6 +1265,8 @@ impl JSValkeyClient {
         args: &[JsLocal<'_>],
     ) -> JsResult<JSValue> {
         let global = cx.global();
+        self.require_not_transaction("unsubscribe")?;
+
         // Check if we're in subscription mode
         require_subscriber(self, "unsubscribe")?;
         let object = Object::from(this);
@@ -1275,7 +1279,7 @@ impl JSValkeyClient {
         let Some(&channel_or_many) = args_view.first() else {
             // If no arguments, unsubscribe from all channels
             object.clear_all_receive_handlers(global)?;
-            return Ok(self.send(this, global, b"UNSUBSCRIBE", &redis_channels, Reply::Value));
+            return self.send(this, global, b"UNSUBSCRIBE", &redis_channels, Reply::Value);
         };
 
         // Two arguments means .unsubscribe(channel, listener) is invoked.
@@ -1322,7 +1326,7 @@ impl JSValkeyClient {
             // In this case, we only want to send the unsubscribe command to redis if there are no more listeners for this
             // channel.
             if remaining_listeners == 0 {
-                return Ok(self.send(this, global, b"UNSUBSCRIBE", &redis_channels, Reply::Value));
+                return self.send(this, global, b"UNSUBSCRIBE", &redis_channels, Reply::Value);
             }
 
             // Otherwise, in order to keep the API consistent, we need to return a resolved promise.
@@ -1373,7 +1377,60 @@ impl JSValkeyClient {
         }
 
         // Now send the unsubscribe command and clean up if necessary
-        Ok(self.send(this, global, b"UNSUBSCRIBE", &redis_channels, Reply::Value))
+        self.send(this, global, b"UNSUBSCRIBE", &redis_channels, Reply::Value)
+    }
+
+    /// `multi()`: an object with the client's command methods that keeps the commands until `exec()`.
+    pub(crate) fn multi(
+        &self,
+        this: JsWrapper<'_, Self>,
+        cx: &mut JsScope<'_>,
+        args: &[JsLocal<'_>],
+    ) -> JsResult<JSValue> {
+        let cx = cx.js_thread();
+        let global = cx.global();
+        self.require_not_transaction("multi")?;
+        require_not_subscriber(self, "multi")?;
+        // ioredis takes an array of commands here; it must not become an empty transaction.
+        if !args.is_empty() {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "multi() takes no arguments. Queue the commands with the methods of the transaction it returns."
+            )));
+        }
+
+        let transaction = js::to_js(Self::new_transaction(&cx), global);
+        // `exec()` sends through the client, so a reachable transaction keeps the client's object.
+        js::transaction_parent_set_cached(transaction, global, this.to_js());
+        Ok(transaction)
+    }
+
+    /// `exec()`: MULTI, the commands and EXEC go to the client as one command.
+    pub(crate) fn exec(
+        &self,
+        this: JsWrapper<'_, Self>,
+        cx: &mut JsScope<'_>,
+    ) -> JsResult<JSValue> {
+        let global = cx.global();
+        let parent = js::transaction_parent_get_cached(this.to_js());
+        let parent = parent
+            .as_ref()
+            .and_then(|value| Some((js::from_js(value)?, js::ref_from_js(*value)?)));
+        let Some((wrapper, parent)) = parent else {
+            return Err(global
+                .err(
+                    ErrorCode::REDIS_INVALID_STATE,
+                    format_args!(
+                        "RedisClient.prototype.exec can only be called on a transaction. multi() starts one."
+                    ),
+                )
+                .throw());
+        };
+        require_not_subscriber(&parent, "exec")?;
+
+        let Some(transaction) = self.take_transaction() else {
+            return Err(Self::transaction_sent_error(global));
+        };
+        Ok(parent.send_transaction((&wrapper).into(), global, *transaction))
     }
 
     pub(crate) fn duplicate(
@@ -1383,6 +1440,7 @@ impl JSValkeyClient {
     ) -> JsResult<JSValue> {
         let cx = cx.js_thread();
         let global = cx.global();
+        self.require_not_transaction("duplicate")?;
         // The duplicate is the calling script's, whoever made the original.
         let new_client = self.clone_without_connecting(&cx);
         let wrapper = js::wrap(new_client.clone(), global);
