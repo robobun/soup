@@ -561,6 +561,79 @@ describe("Bun.build", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("alias: an in-memory file takes the place of a package", async () => {
+    const build = await Bun.build({
+      entrypoints: ["/virtual/entry.ts"],
+      files: {
+        "/virtual/entry.ts": `import { value } from "config";\nimport { sub } from "config/sub";\nimport { relative } from "relative";\nconsole.log(value, sub, relative);\n`,
+        "/virtual/config.production.ts": `export const value = "production";\n`,
+        "/virtual/sub.ts": `export const sub = "the sub path";\n`,
+        // A file that is named like the import is not what the import is.
+        config: `export const value = "not this one";\n`,
+        // A relative path is relative to the working directory.
+        [join(process.cwd(), "alias-virtual", "relative.ts")]: `export const relative = "relative to cwd";\n`,
+      },
+      alias: {
+        config: "/virtual/config.production.ts",
+        "config/sub": "/virtual/sub.ts",
+        relative: "./alias-virtual/relative.ts",
+      },
+      plugins: [
+        {
+          name: "has no answer",
+          setup(build) {
+            build.onResolve({ filter: /^relative$/ }, () => undefined);
+          },
+        },
+      ],
+    });
+    expect(build.success).toBe(true);
+    const output = await build.outputs[0].text();
+    expect(output).toContain(`"production"`);
+    expect(output).toContain(`"the sub path"`);
+    expect(output).toContain(`"relative to cwd"`);
+    expect(output).not.toContain("not this one");
+  });
+
+  test("alias: a plugin can set it", async () => {
+    using dir = tempDir("bun-build-api-alias-plugin", {
+      "entry.js": `import value from "pkg";\nconsole.log(value);\n`,
+      "substitute.js": `export default "set by a plugin";\n`,
+    });
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "entry.js")],
+      plugins: [
+        {
+          name: "sets alias",
+          setup(build) {
+            build.config.alias = { pkg: join(String(dir), "substitute.js") };
+          },
+        },
+      ],
+    });
+    expect(await build.outputs[0].text()).toContain("set by a plugin");
+  });
+
+  test("alias: invalid values", () => {
+    const entrypoints = ["./entry.js"];
+    for (const name of [
+      "./local",
+      "../up",
+      "/absolute",
+      ".hidden",
+      "pkg/",
+      "pkg//sub",
+      "pkg/../other",
+      "C:\\pkg",
+      "",
+    ]) {
+      expect(() => Bun.build({ entrypoints, alias: { [name]: "other" } })).toThrow(`Invalid alias name: "${name}"`);
+    }
+    expect(() => Bun.build({ entrypoints, alias: { pkg: "" } })).toThrow('Invalid alias substitution for "pkg"');
+    expect(() => Bun.build({ entrypoints, alias: { pkg: 1 as any } })).toThrow('alias "pkg" must be a string');
+    expect(() => Bun.build({ entrypoints, alias: "pkg=other" as any })).toThrow("alias must be an object");
+  });
+
   test("invalid options throws", async () => {
     expect(() => Bun.build({} as any)).toThrow();
     expect(() =>
