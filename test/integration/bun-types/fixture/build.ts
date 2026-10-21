@@ -5,6 +5,17 @@ Bun.build({
   splitting: false,
 });
 
+Bun.build({
+  entrypoints: ["hey"],
+  alias: { react: "preact/compat", "@app/config": "./src/config.production.ts" },
+});
+
+Bun.build({
+  entrypoints: ["hey"],
+  // @ts-expect-error
+  alias: ["react=preact/compat"],
+});
+
 // Build.CompileTarget should accept SIMD variants (issue #26247)
 expectAssignable<Bun.Build.CompileTarget>("bun-linux-x64-modern");
 expectAssignable<Bun.Build.CompileTarget>("bun-linux-x64-baseline");

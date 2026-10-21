@@ -511,6 +511,7 @@ function expectBundled(
     entryPointsRaw,
     env,
     external,
+    alias,
     allowUnresolved,
     packages,
     drop = [],
@@ -573,7 +574,6 @@ function expectBundled(
     throw: _throw = false,
     timeoutScale: _timeoutScale, // consumed by itBundled when registering the test
     // esbuild test-suite options with no bun build equivalent (yet)
-    alias,
     entryPointsAdvanced,
     extensionOrder,
     mangleProps,
@@ -647,7 +647,6 @@ function expectBundled(
   }
 
   for (const [name, value] of Object.entries({
-    alias,
     entryPointsAdvanced,
     extensionOrder,
     mangleProps,
@@ -749,6 +748,12 @@ function expectBundled(
     if (external) {
       external = external.map(x =>
         typeof x !== "string" ? x : x.replaceAll("{{root}}", root.replaceAll("\\", "\\\\")),
+      );
+    }
+    if (alias) {
+      // As in `files`, a path that starts with "/" is in the root of the test.
+      alias = Object.fromEntries(
+        Object.entries(alias).map(([name, to]) => [name, to.startsWith("/") ? path.join(root, to) : to]),
       );
     }
 
@@ -886,6 +891,7 @@ function expectBundled(
               `--target=${target}`,
               `--format=${format}`,
               external && external.map(x => ["--external", x]),
+              alias && Object.entries(alias).map(([name, to]) => ["--alias", `${name}=${to}`]),
               allowUnresolved !== undefined &&
                 (allowUnresolved.length === 0
                   ? "--reject-unresolved"
@@ -944,6 +950,7 @@ function expectBundled(
               minifyWhitespace && `--minify-whitespace`,
               globalName && `--global-name=${globalName}`,
               external && external.map(x => `--external:${x}`),
+              alias && Object.entries(alias).map(([name, to]) => `--alias:${name}=${to}`),
               packages && ["--packages", packages],
               conditions && `--conditions=${conditions.join(",")}`,
               inject && inject.map(x => `--inject:${path.join(root, x)}`),
@@ -1260,6 +1267,7 @@ function expectBundled(
         const buildConfig: BuildConfig = {
           entrypoints: [...entryPaths, ...(entryPointsRaw ?? [])],
           external,
+          alias,
           allowUnresolved,
           banner,
           format,

@@ -1727,6 +1727,35 @@ pub mod bv2_impl {
         false
     }
 
+    /// The error for an import whose alias does not resolve. It names both, because the file
+    /// has one name and the other was looked up.
+    #[cold]
+    pub(crate) fn log_aliased_resolve_error(
+        log: &mut bun_ast::Log,
+        source: Option<&bun_ast::Source>,
+        range: bun_ast::Range,
+        original: &[u8],
+        substitute: &[u8],
+        kind: ImportKind,
+    ) {
+        log.add_resolve_error_with_note(
+            source,
+            range,
+            format_args!(
+                "Could not resolve: \"{}\" (originally \"{}\")",
+                bstr::BStr::new(substitute),
+                bstr::BStr::new(original)
+            ),
+            substitute,
+            kind,
+            format_args!(
+                "\"{}\" was replaced with \"{}\" by the \"alias\" option. An alias is resolved from the current working directory, not from the importing file.",
+                bstr::BStr::new(original),
+                bstr::BStr::new(substitute)
+            ),
+        );
+    }
+
     // Unified with the canonical definitions at the parent module level (this
     // avoids two distinct nominal `BundleV2`/`BakeOptions` types
     // that previously caused widespread "expected `BundleV2`, found `BundleV2`"
@@ -2816,6 +2845,32 @@ pub mod bv2_impl {
 
         pub(crate) fn arena(&self) -> &'a bun_alloc::Arena {
             self.graph.heap
+        }
+
+        /// `alias`: what an import of `specifier` is looked up as, if it has an alias. The
+        /// text lives as long as the build does.
+        fn alias_substitute(&self, specifier: &[u8]) -> Option<&'a [u8]> {
+            let (substitute, rest) = self.transpiler.options.alias.find(specifier)?;
+            Some(self.arena_concat(substitute, rest))
+        }
+
+        /// Where an alias is looked up from: the working directory, and a file in it for the
+        /// rules that ask for the file that has the import.
+        fn alias_base(&self) -> (&'static [u8], &'a [u8]) {
+            let top_level_dir = Fs::FileSystem::get().top_level_dir();
+            let file: &[u8] = match top_level_dir.last() {
+                Some(&last) if bun_paths::is_sep(last) => b"alias",
+                _ if cfg!(windows) => b"\\alias",
+                _ => b"/alias",
+            };
+            (top_level_dir, self.arena_concat(top_level_dir, file))
+        }
+
+        fn arena_concat(&self, a: &[u8], b: &[u8]) -> &'a [u8] {
+            let text = self.arena().alloc_slice_fill_copy(a.len() + b.len(), 0u8);
+            text[..a.len()].copy_from_slice(a);
+            text[a.len()..].copy_from_slice(b);
+            text
         }
 
         pub(crate) fn increment_scan_counter(&mut self) {
@@ -5647,6 +5702,9 @@ pub mod bv2_impl {
             let source_dir = source.path.source_dir();
             let only_records = ctx.only_records;
             debug_assert!(only_records.is_none_or(<[u32]>::is_sorted));
+            // The runtime imports `node:module` for `require`. That import is the bundler's.
+            let has_alias =
+                !self.transpiler.options.alias.is_empty() && source.index.0 != Index::RUNTIME.get();
             let mut estimated_resolve_queue_count: usize = 0;
             for import_record in ctx.import_records.iter_mut() {
                 if import_record
@@ -5747,9 +5805,36 @@ pub mod bv2_impl {
                     continue;
                 }
 
+                // `alias`: the plugins are asked about the name as the file has it. What they leave
+                // is looked up as the substitute, from the working directory, by every rule below.
+                // A `type: "sqlite"` import stays in the output for the runtime to open, which
+                // reads its path from the output file and not from the working directory.
+                let aliased = if has_alias
+                    && import_record.loader != Some(Loader::Sqlite)
+                    // The module that a plugin named is the answer, whatever its name.
+                    && !matches!(ctx.plugin_answer, PluginAnswer::Path(_))
+                {
+                    self.alias_substitute(import_record.original_path)
+                } else {
+                    None
+                };
+                if aliased.is_some()
+                    && self.enqueue_on_resolve_plugin_if_needed(
+                        source.index.0,
+                        import_record,
+                        source.path.text,
+                        i as u32,
+                        ctx.target,
+                        &ctx.plugin_answer,
+                    )
+                {
+                    continue;
+                }
+                let specifier: &'a [u8] = aliased.unwrap_or(import_record.path.text);
+
                 if ctx.target.is_bun() {
                     if let Some(replacement) = bun_resolve_builtins::HardcodedModule::Alias::get(
-                        import_record.path.text,
+                        specifier,
                         Target::Bun,
                         bun_resolve_builtins::HardcodedModule::Cfg {
                             rewrite_jest_for_tests: self.transpiler.options.rewrite_jest_for_tests,
@@ -5773,13 +5858,15 @@ pub mod bv2_impl {
                         continue;
                     }
 
-                    if import_record.path.text.starts_with(b"bun:") {
+                    if specifier.starts_with(b"bun:") {
                         if let Some(builtin) =
                             bun_resolve_builtins::HardcodedModule::Alias::bun_prefixed_builtin(
-                                import_record.path.text,
+                                specifier,
                             )
                         {
                             import_record.path = bun_paths::fs::Path::init(builtin);
+                        } else if aliased.is_some() {
+                            import_record.path = bun_paths::fs::Path::init(specifier);
                         }
                         import_record.source_index = Index::INVALID;
                         import_record
@@ -5805,16 +5892,22 @@ pub mod bv2_impl {
                         .insert(bun_ast::ImportRecordFlags::IS_EXTERNAL_WITHOUT_SIDE_EFFECTS);
                 }
 
-                if self.enqueue_on_resolve_plugin_if_needed(
-                    source.index.0,
-                    import_record,
-                    source.path.text,
-                    i as u32,
-                    ctx.target,
-                    &ctx.plugin_answer,
-                ) {
+                if aliased.is_none()
+                    && self.enqueue_on_resolve_plugin_if_needed(
+                        source.index.0,
+                        import_record,
+                        source.path.text,
+                        i as u32,
+                        ctx.target,
+                        &ctx.plugin_answer,
+                    )
+                {
                     continue;
                 }
+                let (source_dir, importer): (&[u8], &[u8]) = match aliased {
+                    Some(_) => self.alias_base(),
+                    None => (source_dir, source.path.text),
+                };
 
                 // `bake_graph` is the imported file's graph. Resolution failures are logged under the importer's graph.
                 let (bake_graph, target) = if import_record.tag
@@ -5856,12 +5949,9 @@ pub mod bv2_impl {
                 if let Some(file_map) = self.file_map
                     && !matches!(ctx.plugin_answer, PluginAnswer::Path(_))
                 {
-                    if let Some(_file_map_result) = file_map.resolve(
-                        heap,
-                        source.path.text,
-                        import_record.path.text,
-                        import_record.kind,
-                    ) {
+                    if let Some(_file_map_result) =
+                        file_map.resolve(heap, importer, specifier, import_record.kind)
+                    {
                         let mut file_map_result = _file_map_result;
                         let mut path_primary = file_map_result.path_pair.primary;
                         let path_loader = Fs::Path::init(path_primary.text)
@@ -5881,6 +5971,10 @@ pub mod bv2_impl {
                             .get_keyed(&path_primary, key_loader)
                         {
                             import_record.source_index = Index::init(id);
+                            if aliased.is_some() {
+                                import_record.path =
+                                    self.graph.input_files.items_source()[id as usize].path;
+                            }
                             continue;
                         }
 
@@ -5966,11 +6060,7 @@ pub mod bv2_impl {
                         _ => self
                             .transpiler_for_target(target)
                             .resolver
-                            .resolve_with_framework(
-                                source_dir,
-                                import_record.path.text,
-                                import_record.kind,
-                            ),
+                            .resolve_with_framework(source_dir, specifier, import_record.kind),
                     };
                     match resolved {
                         Ok(r) => break r,
@@ -5997,16 +6087,16 @@ pub mod bv2_impl {
                                         bun_core::scoped_log!(
                                             watcher,
                                             "busting dir cache {} -> {}",
-                                            bstr::BStr::new(&source.path.text),
-                                            bstr::BStr::new(&import_record.path.text)
+                                            bstr::BStr::new(importer),
+                                            bstr::BStr::new(specifier)
                                         );
                                         // Only re-query if we previously had something cached.
                                         if self
                                             .transpiler_for_target(target)
                                             .resolver
                                             .bust_dir_cache_from_specifier(
-                                                source.path.text,
-                                                import_record.path.text,
+                                                importer,
+                                                specifier,
                                                 import_record.kind,
                                             )
                                         {
@@ -6017,9 +6107,9 @@ pub mod bv2_impl {
                                     if let Some(dev) = self.dev_server {
                                         // Tell DevServer about the resolution failure.
                                         dev.track_resolution_failure(
-                                            source.path.text,
+                                            importer,
                                             &_resolver::path_of_specifier(
-                                                import_record.path.text,
+                                                specifier,
                                                 import_record.kind,
                                             ),
                                             ctx.target.bake_graph(), // use the source file target not the altered one
@@ -6048,7 +6138,16 @@ pub mod bv2_impl {
                                     && !self.transpiler.options.ignore_module_resolution_errors
                                 {
                                     last_error = Some(err.into());
-                                    if is_package_path(import_record.path.text) {
+                                    if let Some(substitute) = aliased {
+                                        log_aliased_resolve_error(
+                                            log,
+                                            Some(source),
+                                            import_record.range,
+                                            import_record.original_path,
+                                            substitute,
+                                            import_record.kind,
+                                        );
+                                    } else if is_package_path(import_record.path.text) {
                                         if ctx.target == Target::Browser
                                             && options::is_node_builtin(import_record.path.text)
                                         {
@@ -6138,7 +6237,7 @@ pub mod bv2_impl {
                                     Some(source),
                                     import_record.range,
                                     err,
-                                    import_record.path.text,
+                                    specifier,
                                     import_record.kind,
                                     report,
                                 );
@@ -6162,6 +6261,9 @@ pub mod bv2_impl {
                 };
 
                 if resolve_result.flags.is_external() {
+                    if let Some(substitute) = aliased {
+                        import_record.path = Fs::Path::init(substitute);
+                    }
                     if resolve_result.flags.external_kind()
                         == bun_resolver::ExternalKind::ExternalRewritePath
                         && !strings::eql_long(
@@ -6316,6 +6418,12 @@ pub mod bv2_impl {
                             self.graph.input_files.items_source()[id as usize].path;
                     } else {
                         import_record.source_index = Index::init(id);
+                        // `patch_import_record_source_indices` looks a record up by its path. The
+                        // name in the file can be the path of a module from a plugin.
+                        if aliased.is_some() {
+                            import_record.path =
+                                self.graph.input_files.items_source()[id as usize].path;
+                        }
                     }
                     continue;
                 }
