@@ -4483,10 +4483,322 @@ describe("bundler", () => {
       run: { file: "/out/entry.js", stdout: "true 1 true later" },
     });
   }
+  itBundled("edgecase/AliasBuiltinModule", {
+    files: {
+      "/entry.js": /* js */ `
+        import { readFileSync } from "node:fs";
+        import fs from "fs";
+        import { Database } from "bun:sqlite";
+        import path from "node:path";
+        import { existsSync } from "the-real-fs";
+        console.log(readFileSync(), fs.name, Database, typeof path.join, typeof existsSync);
+      `,
+      "/fake-fs.js": /* js */ `
+        export function readFileSync() {
+          return "fake read";
+        }
+        export default { name: "fake fs" };
+      `,
+      "/fake-sqlite.js": `export const Database = "fake database";`,
+    },
+    target: "bun",
+    alias: {
+      "node:fs": "./fake-fs.js",
+      fs: "./fake-fs.js",
+      "bun:sqlite": "./fake-sqlite.js",
+      // The substitute is not looked up as the name of another alias.
+      "the-real-fs": "node:fs",
+    },
+    run: { stdout: "fake read fake fs fake database function function" },
+  });
+  for (const target of ["browser", "node"] as const) {
+    itBundled(`edgecase/AliasBuiltinModule/${target}`, {
+      files: {
+        "/entry.js": /* js */ `
+          import { join } from "path";
+          console.log(join("a", "b"));
+        `,
+        "/my-path.js": `export const join = (...parts) => "joined:" + parts.join("+");`,
+      },
+      target,
+      alias: { path: "./my-path.js" },
+      run: { stdout: "joined:a+b" },
+    });
+  }
+  itBundled("edgecase/AliasThatDoesNotResolve", {
+    files: {
+      "/entry.js": /* js */ `
+        import "pkg";
+        import "@app/missing";
+      `,
+    },
+    alias: { pkg: "not-installed", "@app/missing": "./nope.js" },
+    bundleErrors: {
+      "/entry.js": [
+        'Could not resolve: "not-installed" (originally "pkg")',
+        'Could not resolve: "./nope.js" (originally "@app/missing")',
+      ],
+    },
+  });
+  // An import that may fail keeps its name when the alias does not resolve.
+  itBundled("edgecase/AliasThatDoesNotResolveInTryCatch", {
+    files: {
+      "/entry.js": /* js */ `
+        let found = "not found";
+        try {
+          found = require("optional-dep");
+        } catch {}
+        console.log(found, require("present-dep"));
+      `,
+      "/present.js": `module.exports = "present";`,
+    },
+    target: "bun",
+    alias: { "optional-dep": "not-installed", "present-dep": "./present.js" },
+    onAfterBundle(api) {
+      const out = api.readFile("/out.js");
+      expect(out).toContain("optional-dep");
+      expect(out).not.toContain("not-installed");
+    },
+    run: { stdout: "not found present" },
+  });
+  itBundled("edgecase/AliasToExternalPackage", {
+    files: {
+      "/entry.js": /* js */ `
+        import "./entry.css";
+        import { h } from "react";
+        import { jsx } from "react/jsx-runtime";
+        import { other } from "other";
+        console.log(h, jsx, other);
+      `,
+      "/entry.css": `@import "tokens/base.css";\n.a { background: url("tokens/bg.png") }`,
+    },
+    outdir: "/out",
+    alias: { react: "preact/compat", tokens: "@acme/tokens" },
+    packages: "external",
+    onAfterBundle(api) {
+      expect(api.readFile("/out/entry.js").match(/(?<=from ?")[^"]+/g)).toEqual([
+        "preact/compat",
+        "preact/compat/jsx-runtime",
+        "other",
+      ]);
+      const css = api.readFile("/out/entry.css");
+      expect(css).toContain(`@import "@acme/tokens/base.css";`);
+      expect(css).toContain(`url("@acme/tokens/bg.png")`);
+    },
+  });
+  // `external` is asked about the substitute, not about the name in the file.
+  itBundled("edgecase/AliasBeforeExternal", {
+    files: {
+      "/entry.js": /* js */ `
+        import { name } from "react";
+        import { join } from "lodash/join";
+        console.log(name, join);
+      `,
+      "/node_modules/preact/index.js": `export const name = "bundled preact";`,
+    },
+    alias: { react: "preact", lodash: "lodash-es" },
+    external: ["react", "lodash-es"],
+    onAfterBundle(api) {
+      const out = api.readFile("/out.js");
+      expect(out).toContain("bundled preact");
+      expect(out.match(/(?<=from ?")[^"]+/g)).toEqual(["lodash-es/join"]);
+    },
+  });
+  itBundled("edgecase/AliasIsAppliedOnce", {
+    files: {
+      "/entry.js": /* js */ `
+        import a from "a";
+        import b from "b";
+        console.log(a, b);
+      `,
+      "/node_modules/b/index.js": `export default "the package b";`,
+      "/c.js": `export default "the file c";`,
+    },
+    alias: { a: "b", b: "./c.js" },
+    run: { stdout: "the package b the file c" },
+  });
+  itBundled("edgecase/AliasJSXRuntimeAndCSS", {
+    files: {
+      "/entry.jsx": /* jsx */ `
+        import "tokens/colors.css";
+        console.log(<div />);
+      `,
+      "/node_modules/preact/jsx-runtime.js": /* js */ `
+        export const jsx = type => "preact " + type;
+        export const jsxs = jsx;
+        export const Fragment = "fragment";
+      `,
+      "/node_modules/preact/jsx-dev-runtime.js": /* js */ `
+        export const jsxDEV = type => "preact " + type;
+        export const Fragment = "fragment";
+      `,
+      "/design/colors.css": `@import "tokens/base.css";\n.color { color: red }`,
+      "/design/base.css": `.base { margin: 0 }`,
+    },
+    outdir: "/out",
+    alias: { react: "preact", tokens: "./design" },
+    onAfterBundle(api) {
+      const css = api.readFile("/out/entry.css");
+      expect(css).toContain(".base");
+      expect(css).toContain(".color");
+    },
+    run: { file: "/out/entry.js", stdout: "preact div" },
+  });
+  // A plugin is asked before the alias, with the name as the file has it, and is not asked
+  // about the substitute.
+  itBundled("edgecase/AliasAfterPlugins", {
+    files: {
+      "/entry.js": /* js */ `
+        import a from "pkg-a";
+        import b from "pkg-b";
+        import { c } from "pkg-c";
+        import { d } from "pkg-d/sub";
+        console.log(a, b, c, d);
+      `,
+      "/a-from-alias.js": `export default "a from alias";`,
+      "/b-from-alias.js": `export default "b from alias";`,
+      "/b-from-plugin.js": `export default "b from plugin";`,
+      "/node_modules/c-from-alias/index.js": `export const c = "c from alias";`,
+    },
+    alias: {
+      "pkg-a": "./a-from-alias.js",
+      "pkg-b": "./b-from-alias.js",
+      "pkg-c": "c-from-alias",
+      "pkg-d": "d-from-alias",
+    },
+    external: ["d-from-alias"],
+    plugins(builder) {
+      builder.onResolve({ filter: /^pkg-|alias/ }, args => {
+        if (args.path === "pkg-b") return { path: join(args.importer, "..", "b-from-plugin.js") };
+        if (args.path.includes("alias")) throw new Error("the plugin was asked for " + args.path);
+      });
+    },
+    onAfterBundle(api) {
+      expect(api.readFile("/out.js").match(/(?<=from ?")[^"]+/g)).toEqual(["d-from-alias/sub"]);
+    },
+    // "d-from-alias" is external: it is there when the bundle runs.
+    runtimeFiles: {
+      "/node_modules/d-from-alias/sub.js": `export const d = "d from alias";`,
+    },
+    run: { stdout: "a from alias b from plugin c from alias d from alias" },
+  });
+  // A module from a plugin can have the name of the package as its path, which is how a
+  // plugin wraps a package: the import in it that the plugin has no answer for is the alias.
+  itBundled("edgecase/AliasAfterPluginThatWrapsThePackage", {
+    files: {
+      "/entry.js": /* js */ `
+        import { value } from "lib-x";
+        import { again } from "./again.js";
+        console.log(value, again);
+      `,
+      "/again.js": `export { value as again } from "lib-y";`,
+      "/node_modules/lib-x/index.js": `export const value = "lib-x";`,
+      "/node_modules/lib-y/index.js": `export const value = "lib-y";`,
+    },
+    alias: { "lib-x": "lib-y" },
+    plugins(builder) {
+      builder.onResolve({ filter: /^lib-x$/ }, args =>
+        args.importer === "lib-x" ? undefined : { path: args.path, namespace: "wrap" },
+      );
+      builder.onLoad({ filter: /.*/, namespace: "wrap" }, () => ({
+        contents: `import { value as inner } from "lib-x"; export const value = "wrapped(" + inner + ")";`,
+        loader: "js",
+      }));
+    },
+    run: { stdout: "wrapped(lib-y) lib-y" },
+  });
+  itBundled("edgecase/AliasAfterPluginsThatDoesNotResolve", {
+    files: {
+      "/entry.js": `import "pkg";`,
+    },
+    alias: { pkg: "not-installed" },
+    plugins(builder) {
+      builder.onResolve({ filter: /^pkg$/ }, () => undefined);
+    },
+    bundleErrors: {
+      "/entry.js": ['Could not resolve: "not-installed" (originally "pkg")'],
+    },
+  });
+  itBundled("edgecase/AliasAfterPluginsToBuiltinModule", {
+    files: {
+      "/entry.js": /* js */ `
+        import { existsSync } from "the-real-fs";
+        console.log(typeof existsSync);
+      `,
+    },
+    target: "bun",
+    alias: { "the-real-fs": "node:fs" },
+    plugins(builder) {
+      builder.onResolve({ filter: /fs/ }, args => {
+        if (args.path !== "the-real-fs") throw new Error("the plugin was asked for " + args.path);
+      });
+    },
+    run: { stdout: "function" },
+  });
+  // The runtime imports "node:module" for require(). That import is not the user's.
+  itBundled("edgecase/AliasNodeModule", {
+    files: {
+      "/entry.js": /* js */ `
+        import { builtinModules } from "node:module";
+        const load = name => require(name);
+        console.log(builtinModules, typeof load("node:os").platform);
+      `,
+      "/module-shim.js": `export const builtinModules = "the shim";`,
+    },
+    target: "node",
+    alias: { "node:module": "./module-shim.js" },
+    run: { stdout: "the shim function" },
+  });
+  // A `type: "sqlite"` import is opened by the runtime, from where the output file is.
+  itBundled("edgecase/AliasIsNotForSqliteImports", {
+    files: {
+      "/entry.js": /* js */ `
+        import db from "app-db" with { type: "sqlite" };
+        import value from "app-value";
+        console.log(value, db);
+      `,
+      "/value.js": `export default "aliased";`,
+    },
+    target: "bun",
+    alias: { "app-db": "./other.sqlite", "app-value": "./value.js" },
+    onAfterBundle(api) {
+      const out = api.readFile("/out.js");
+      expect(out).toContain(`"app-db"`);
+      expect(out).not.toContain("other.sqlite");
+      expect(out).toContain(`"aliased"`);
+    },
+  });
 });
 
 for (const backend of ["api", "cli"] as const) {
   describe(`bundler_edgecase/${backend}`, () => {
+    itBundled("edgecase/Alias", {
+      files: {
+        "/entry.js": /* js */ `
+          import { name } from "react";
+          import { jsx } from "react/jsx-runtime";
+          import config from "@app/config";
+          import { reactOfDep } from "dep";
+          import { name as dom } from "react-dom";
+          console.log([name, jsx, config.env, reactOfDep, dom].join(", "));
+        `,
+        "/node_modules/react/index.js": `export const name = "react";`,
+        "/node_modules/react/jsx-runtime.js": `export const jsx = "react jsx";`,
+        "/node_modules/react-dom/index.js": `export const name = "react-dom";`,
+        "/node_modules/preact/compat/index.js": `export const name = "preact";`,
+        "/node_modules/preact/compat/jsx-runtime.js": `export const jsx = "preact jsx";`,
+        "/config.production.js": `export default { env: "production" };`,
+        // The alias is looked up from the working directory: "dep" has another preact next to it.
+        "/node_modules/dep/index.js": `export { name as reactOfDep } from "react";`,
+        "/node_modules/dep/node_modules/preact/compat/index.js": `export const name = "the preact of dep";`,
+      },
+      backend,
+      alias: {
+        react: "preact/compat",
+        "@app/config": "./config.production.js",
+      },
+      run: { stdout: "preact, preact jsx, production, preact, react-dom" },
+    });
     itBundled("edgecase/ProcessEnvArbitrary", {
       files: {
         "/entry.js": /* js */ `

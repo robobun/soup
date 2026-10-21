@@ -11,10 +11,12 @@ pub mod error;
 pub mod global_cache;
 pub mod jsx;
 pub mod offline_mode;
+pub mod package_aliases;
 pub mod schema;
 pub mod trim;
 
 pub use error::{Error, Result};
+pub use package_aliases::{InvalidAlias, PackageAliases};
 
 pub use jsx as JSX;
 

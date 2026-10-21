@@ -6396,6 +6396,9 @@ describe.concurrent("bundler", () => {
       "prefix": "alias10",
       "@scope/prefix": "alias11",
     },
+    run: {
+      stdout: "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11",
+    },
   });
   itBundled("default/PackageAliasMatchLongest", {
     files: {
@@ -6406,12 +6409,27 @@ describe.concurrent("bundler", () => {
         import "pkg/foo/bar/baz"
         import "pkg/bar/baz"
         import "pkg/baz"
+        import "pkg/foo/"
       `,
     },
+    // Not in the order of their length: the longest one is the alias, whichever comes first.
     alias: {
+      "pkg/foo/bar": "alias/pkg_foo_bar",
       pkg: "alias/pkg",
       "pkg/foo": "alias/pkg_foo",
-      "pkg/foo/bar": "alias/pkg_foo_bar",
+    },
+    external: ["alias/*"],
+    onAfterBundle(api) {
+      expect(api.readFile("/out.js").match(/(?<=^import ?")[^"]+/gm)).toEqual([
+        "alias/pkg",
+        "alias/pkg_foo",
+        "alias/pkg_foo_bar",
+        "alias/pkg_foo_bar/baz",
+        "alias/pkg/bar/baz",
+        "alias/pkg/baz",
+        // A lone "/" after the name is not a path in the package.
+        "alias/pkg_foo",
+      ]);
     },
   });
   // itBundled("default/ErrorsForAssertTypeJSON", {

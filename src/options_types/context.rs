@@ -256,6 +256,8 @@ pub struct BundlerOptions {
     pub trim: crate::trim::TrimRequest,
     pub windows: bundle_enums::WindowsOptions,
     pub allow_unresolved: Option<Vec<Box<[u8]>>>,
+    /// `--alias <name>=<substitute>`
+    pub alias: crate::PackageAliases,
 }
 
 impl Default for BundlerOptions {
@@ -322,6 +324,7 @@ impl Default for BundlerOptions {
             trim: Default::default(),
             windows: bundle_enums::WindowsOptions::default(),
             allow_unresolved: None,
+            alias: crate::PackageAliases::default(),
         }
     }
 }
