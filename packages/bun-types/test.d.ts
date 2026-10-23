@@ -98,12 +98,80 @@ declare module "bun:test" {
     function fn<T extends (...args: any[]) => any>(func?: T): Mock<T>;
     function setSystemTime(now?: number | Date): void;
     function setTimeout(milliseconds: number): void;
-    function useFakeTimers(options?: { now?: number | Date } | "modern" | "legacy"): typeof vi;
+    function useFakeTimers(
+      options?:
+        | {
+            now?: number | Date;
+            /**
+             * The maximum number of timers that one `runAllTimers()` or
+             * `runAllTimersAsync()` call runs. If timers remain after that,
+             * `runAllTimers()` throws an "assuming an infinite loop" error, and
+             * the promise of `runAllTimersAsync()` rejects with it.
+             *
+             * `0` means the default.
+             *
+             * @default 100_000
+             */
+            timerLimit?: number;
+            /**
+             * The name that Vitest has for `timerLimit`.
+             */
+            loopLimit?: number;
+          }
+        | "modern"
+        | "legacy",
+    ): typeof vi;
     function useRealTimers(): typeof vi;
     function advanceTimersByTime(milliseconds: number): typeof vi;
+    /**
+     * Like `advanceTimersByTime()`, for code that awaits between timers.
+     *
+     * It waits one turn of the event loop before the first timer and after each
+     * timer it runs, so the promise callbacks of one timer have run before the
+     * next timer runs. A real operation between two timers (a `fetch()`, a file
+     * read) can need more turns than that: call the function again for the
+     * timers that the code schedules afterwards.
+     *
+     * If a timer callback throws, the promise rejects with the first error once
+     * the other timers of the span have run.
+     *
+     * @example
+     * ```ts
+     * jest.useFakeTimers();
+     * const request = jest.fn().mockRejectedValueOnce(new Error("503")).mockResolvedValue("ok");
+     * const result = retryWithBackoff(request); // awaits setTimeout() between attempts
+     * await jest.advanceTimersByTimeAsync(10_000);
+     * expect(await result).toBe("ok");
+     * ```
+     */
+    function advanceTimersByTimeAsync(milliseconds: number): Promise<void>;
     function advanceTimersToNextTimer(): typeof vi;
+    /**
+     * Runs the next timer and the other timers that are due at the same time,
+     * `steps` times. It waits for the event loop before and after each timer,
+     * like `advanceTimersByTimeAsync()`.
+     *
+     * @param steps How many times to advance to the next timer. Defaults to 1.
+     */
+    function advanceTimersToNextTimerAsync(steps?: number): Promise<void>;
     function runAllTimers(): typeof vi;
+    /**
+     * Runs timers until none is left, including the ones that timer callbacks
+     * and their promise callbacks schedule. It waits for the event loop before
+     * and after each timer, like `advanceTimersByTimeAsync()`.
+     *
+     * The promise rejects after `timerLimit` timers (see `useFakeTimers()`) if
+     * more are pending, which is what a `setInterval` leads to.
+     */
+    function runAllTimersAsync(): Promise<void>;
     function runOnlyPendingTimers(): typeof vi;
+    /**
+     * Runs the timers that are pending now, up to the time of the last one.
+     * Timers that are scheduled meanwhile run if they are due before that time.
+     * It waits for the event loop before and after each timer, like
+     * `advanceTimersByTimeAsync()`.
+     */
+    function runOnlyPendingTimersAsync(): Promise<void>;
     function getTimerCount(): number;
     function clearAllTimers(): void;
     function isFakeTimers(): boolean;
@@ -194,9 +262,25 @@ declare module "bun:test" {
     useFakeTimers: typeof jest.useFakeTimers;
     useRealTimers: typeof jest.useRealTimers;
     advanceTimersByTime: typeof jest.advanceTimersByTime;
+    /**
+     * `jest.advanceTimersByTimeAsync()`, with a promise that resolves with `vi`.
+     */
+    advanceTimersByTimeAsync(milliseconds: number): Promise<typeof vi>;
     advanceTimersToNextTimer: typeof jest.advanceTimersToNextTimer;
+    /**
+     * `jest.advanceTimersToNextTimerAsync()`, with a promise that resolves with `vi`.
+     */
+    advanceTimersToNextTimerAsync(steps?: number): Promise<typeof vi>;
     runAllTimers: typeof jest.runAllTimers;
+    /**
+     * `jest.runAllTimersAsync()`, with a promise that resolves with `vi`.
+     */
+    runAllTimersAsync(): Promise<typeof vi>;
     runOnlyPendingTimers: typeof jest.runOnlyPendingTimers;
+    /**
+     * `jest.runOnlyPendingTimersAsync()`, with a promise that resolves with `vi`.
+     */
+    runOnlyPendingTimersAsync(): Promise<typeof vi>;
     getTimerCount: typeof jest.getTimerCount;
     clearAllTimers: typeof jest.clearAllTimers;
     isFakeTimers: typeof jest.isFakeTimers;

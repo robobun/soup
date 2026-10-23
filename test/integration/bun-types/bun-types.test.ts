@@ -327,6 +327,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "DevServer.bind.ts": null,
   "FFIObject.bind.ts": null,
   "FakeTimers.bind.ts": 'typeof import("bun:test").jest',
+  "FakeTimersInternals.bind.ts": null,
   "FetchSession.bind.ts": "typeof Bun",
   "FetchTasklet.bind.ts": null,
   "FileSink.bind.ts": null,

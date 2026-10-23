@@ -3218,6 +3218,8 @@ impl TestCommand {
                 unsafe { (*bun_test_root_ptr).exit_file(); }
                 // A mock.module() patch still pending must not hold up the next file.
                 bun_jsc::cpp::JSMock__forgetPendingModulePatches(global);
+                // An async fake timer advance still in flight must not fire the next file's timers.
+                crate::test_runner::timers::fake_timers::end_test_file();
             }
 
             // Recompute on every repeat because the reporters overwrite `relative`'s buffer while the file runs.

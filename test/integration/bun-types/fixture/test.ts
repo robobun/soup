@@ -13,6 +13,7 @@ import {
   type SnapshotSerializer,
   spyOn,
   test,
+  vi,
   xdescribe,
   xit,
   xtest,
@@ -397,6 +398,26 @@ expectType(expect(spy).toHaveBeenCalledOnce()).is<void>();
 
 jest.spyOn(console, "log");
 jest.fn(() => 123 as const);
+
+jest.useFakeTimers({ now: new Date(0), timerLimit: 1000 });
+vi.useFakeTimers({ loopLimit: 1000 });
+// @ts-expect-error
+jest.useFakeTimers({ timerLimit: "1000" });
+// @ts-expect-error
+vi.useFakeTimers({ loopLimit: "1000" });
+expectType(jest.advanceTimersByTimeAsync(1000)).is<Promise<void>>();
+expectType(jest.advanceTimersToNextTimerAsync(2)).is<Promise<void>>();
+expectType(jest.runAllTimersAsync()).is<Promise<void>>();
+expectType(jest.runOnlyPendingTimersAsync()).is<Promise<void>>();
+expectType(vi.advanceTimersByTimeAsync(1000)).is<Promise<typeof vi>>();
+expectType(vi.advanceTimersToNextTimerAsync()).is<Promise<typeof vi>>();
+expectType(vi.advanceTimersToNextTimerAsync(2)).is<Promise<typeof vi>>();
+expectType(vi.runAllTimersAsync()).is<Promise<typeof vi>>();
+expectType(vi.runOnlyPendingTimersAsync()).is<Promise<typeof vi>>();
+// @ts-expect-error
+vi.advanceTimersByTimeAsync();
+// @ts-expect-error
+vi.advanceTimersToNextTimerAsync("2");
 
 xtest("", () => {});
 xdescribe("", () => {});

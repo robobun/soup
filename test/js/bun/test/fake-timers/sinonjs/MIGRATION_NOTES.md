@@ -53,18 +53,6 @@ All tests in this file require features not yet implemented:
     - **Issue**: No support for negative initial time + access to clock state
     - **Needed**: Negative timestamp support and clock state inspection
 
-### issue-347.test.ts (2 tests)
-
-1. **"setTimeout"**
-   - **Issue**: No async timer advancement API
-   - **Original**: `clock.tickAsync(100)`
-   - **Current**: `vi.advanceTimersByTime(100)` is synchronous
-   - **Needed**: `vi.advanceTimersByTimeAsync()` or similar for promise-based timers
-
-2. **"setImmediate"**
-   - **Issue**: Same as above - no async timer advancement
-   - **Needed**: Async advancement API to properly test promisified timers
-
 ### issue-2449.test.ts (1 test)
 
 - **Test**: "should not fake faked timers"
@@ -83,11 +71,6 @@ All tests in this file require features not yet implemented:
 - **Test**: "should throw on using `config.target`"
 - **Reason**: Test is specific to `FakeTimers.install({ target: {} })` API
 - **Note**: `vi.useFakeTimers()` has a different API design
-
-### issue-516.test.ts
-- **Test**: "should successfully install the timer"
-- **Reason**: Uses `FakeTimers.createClock()` which is a standalone clock API
-- **Note**: `vi` doesn't expose a standalone clock creation API
 
 ### issue-1852.test.ts
 - **Test**: "throws when creating a clock and global has no Date"
@@ -110,11 +93,28 @@ All tests in this file require features not yet implemented:
 
 ### Missing Features Required:
 1. **Initial time setting**: `vi.useFakeTimers({ now: timestamp })`
-2. **Async timer advancement**: `vi.advanceTimersByTimeAsync()`
-3. **hrtime mocking**: Mock `process.hrtime()` with fake timers
-4. **Clock state inspection**: Access to current fake time value
-5. **Negative timestamp support**: Allow negative values in `now` option
-6. **Double install protection**: Throw error when calling `vi.useFakeTimers()` twice
+2. **hrtime mocking**: Mock `process.hrtime()` with fake timers
+3. **Clock state inspection**: Access to current fake time value
+4. **Negative timestamp support**: Allow negative values in `now` option
+5. **Double install protection**: Throw error when calling `vi.useFakeTimers()` twice
+
+### Async advancement
+
+`tickAsync`, `nextAsync`, `runAllAsync` and `runToLastAsync` of the helper call `vi.advanceTimersByTimeAsync()`, `vi.advanceTimersToNextTimerAsync()`, `vi.runAllTimersAsync()` and `vi.runOnlyPendingTimersAsync()`.
+
+The four blocks with those names in fake-timers.test.ts run: 90 tests, and 77 of them pass as @sinonjs/fake-timers wrote them. The other blocks of `describe("FakeTimers")` are `describe.todo`. The helper gives the tests what they use of sinon and mocha: `sinon.spy()`, `sinon.stub()` and `sinon.fake()` over `jest.fn()`, `createClock()` as `install()`, `loopLimit`, and one `this` for a test and its hooks.
+
+13 of the 90 are `it.failing`, each with its reason in a comment above it:
+
+- 4 expect the promise to resolve with the time of the clock. Jest and Vitest drop that value.
+- 3 pass a time string such as `"01:00"` to `tickAsync()`. `advanceTimersByTimeAsync()` takes a number of milliseconds.
+- 1 calls `tickAsync()` without an argument. `advanceTimersByTimeAsync()` rejects without one.
+- 3 expect `nextAsync()` to fire one timer. `advanceTimersToNextTimerAsync()` is Jest's function, which also fires the other timers that are due at the same time.
+- 2 expect a timer callback to get the global object or `null` as `this`. Bun calls it with its Timeout object, as Node.js does.
+
+The 8 tests of `setTickMode > nextAsync` need `vi.setTimerTickMode()` and are still todo.
+
+With `createClock()` and the spies of the helper, "should successfully install the timer" of issue-516.test.ts and the two overflow tests of issue-67.test.ts pass and are no longer `it.failing`.
 
 ### API Differences (Expected):
 - No `withGlobal()` for custom contexts (architectural difference)
@@ -123,6 +123,6 @@ All tests in this file require features not yet implemented:
 
 ## Test Coverage
 - **Total tests migrated**: 31
-- **Passing**: 11 (35%)
+- **Passing**: 13 (42%)
 - **Skipped**: 6 (19%)
-- **TODO**: 14 (45%)
+- **TODO**: 12 (39%)

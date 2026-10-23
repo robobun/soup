@@ -1,6 +1,6 @@
 ---
 title: "Dates and times"
-description: "Learn how to manipulate time and dates in your Bun tests using setSystemTime and Jest compatibility functions"
+description: "Learn how to manipulate time, dates and timers in your Bun tests using setSystemTime, fake timers and Jest compatibility functions"
 ---
 
 `bun:test` lets you change what time it is in your tests.
@@ -92,6 +92,150 @@ test("get the current mocked time", () => {
 ```
 
 Use it to read the mocked time without creating a new `Date` object.
+
+## Fake timers
+
+`jest.useFakeTimers()` also takes timers off the real clock: `setTimeout`, `setInterval`, `Bun.sleep()`, `AbortSignal.timeout()` and in-process [`Bun.cron()`](/runtime/cron#fake-timers) jobs. Their callbacks run when the test moves the clock. `setImmediate` and `process.nextTick` are not faked.
+
+| Function                          | Runs                                                            |
+| --------------------------------- | --------------------------------------------------------------- |
+| `jest.advanceTimersByTime(ms)`    | the timers that are due in the next `ms` milliseconds           |
+| `jest.advanceTimersToNextTimer()` | the next timer                                                  |
+| `jest.runOnlyPendingTimers()`     | the timers that are pending now, up to the time of the last one |
+| `jest.runAllTimers()`             | every timer, until none is left                                 |
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect, jest } from "bun:test";
+
+test("an interval of one second", () => {
+  jest.useFakeTimers();
+  const tick = jest.fn();
+  setInterval(tick, 1000);
+
+  jest.advanceTimersByTime(3500);
+  expect(tick).toHaveBeenCalledTimes(3);
+
+  jest.useRealTimers();
+});
+```
+
+`jest.getTimerCount()` returns the number of pending timers and `jest.clearAllTimers()` drops them. `vi` has the same timer functions. `setSystemTime()` is on `jest` and on the `bun:test` module, not on `vi`.
+
+`jest.runAllTimers()` throws `Aborting after running 100000 timers, assuming an infinite loop!` when timers are still pending after it ran that many. A `setInterval` or a `Bun.cron()` job that nothing stops leads to that error. `jest.useFakeTimers({ timerLimit: 1000 })` sets the limit. `loopLimit`, the name Vitest uses, sets the same limit.
+
+<Note>
+  Timers that Bun's own modules arm while the clock is fake are fake too. For example, a `node:http` server that starts
+  to listen arms a 30 second interval to check its connections, so `runAllTimers()` ends at the limit. Start the server
+  before `jest.useFakeTimers()`, or use `advanceTimersByTime()`.
+</Note>
+
+### Code that awaits between timers
+
+Some code awaits between its timers: a loop around `await sleep(100)`, a retry with a growing delay, a timer callback that is an `async` function. Use the async functions for that code. They wait one turn of the event loop before the first timer and after each timer they run, so the promise callbacks of one timer run before the next timer does.
+
+| Function                                     | Runs                                                              |
+| -------------------------------------------- | ----------------------------------------------------------------- |
+| `jest.advanceTimersByTimeAsync(ms)`          | the timers that are due in the next `ms` milliseconds             |
+| `jest.advanceTimersToNextTimerAsync(steps?)` | the next timer and the others due at the same time, `steps` times |
+| `jest.runOnlyPendingTimersAsync()`           | the timers that are pending now, up to the time of the last one   |
+| `jest.runAllTimersAsync()`                   | every timer, until none is left or `timerLimit` timers have run   |
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect, jest } from "bun:test";
+
+test("retries with a growing delay", async () => {
+  jest.useFakeTimers();
+  const request = jest
+    .fn()
+    .mockRejectedValueOnce(new Error("503"))
+    .mockRejectedValueOnce(new Error("503"))
+    .mockResolvedValue("ok");
+
+  async function retry() {
+    for (let delay = 1000; ; delay *= 2) {
+      try {
+        return await request();
+      } catch {
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  const result = retry();
+  await jest.advanceTimersByTimeAsync(3000); // 1000 ms, then 2000 ms
+  expect(await result).toBe("ok");
+  expect(request).toHaveBeenCalledTimes(3);
+
+  jest.useRealTimers();
+});
+```
+
+A sync function does not work for this test. `jest.advanceTimersByTime(3000)` runs no timer here: `retry()` schedules its first timer in a promise callback, and that callback has not run when the sync function looks for timers. Do not rely on a sync function to run promise callbacks between two timers.
+
+Each async function returns a promise:
+
+- On `vi` the promise resolves with `vi`, as in Vitest. On `jest` it resolves with `undefined`, as in Jest.
+- If the callback of a `setTimeout` or a `setInterval` throws, the promise rejects with that error. `advanceTimersByTimeAsync()` and `runOnlyPendingTimersAsync()` run the other timers of their span first, and reject with the first error. `runAllTimersAsync()` and `advanceTimersToNextTimerAsync()` stop at that timer.
+- `runAllTimersAsync()` rejects with the `assuming an infinite loop` error of `runAllTimers()` at the same limit.
+- `advanceTimersByTimeAsync(0)` runs the callback of `setTimeout(fn, 0)`, as `advanceTimersByTime(0)` does.
+
+Await the promise before the test ends. An advance that is still in flight goes on in the next tests of the file. It stops when the file ends, and its promise then stays pending.
+
+#### Real work between timers
+
+An async function waits one turn of the event loop for each timer. Promise callbacks and `process.nextTick` callbacks run in that turn. A real operation can need more turns: a `fetch()`, a file read, a subprocess, a `setImmediate`. The function can then end before the code schedules its next timer, and that timer stays pending. The `request` in the test above is a mock for this reason.
+
+For code that does real work between its timers, advance in a loop until the work is done:
+
+```ts
+let settled = false;
+result.then(
+  () => (settled = true),
+  () => (settled = true),
+);
+while (!settled) await jest.advanceTimersToNextTimerAsync();
+```
+
+#### Assert on a promise that settles after a timer
+
+In `bun:test`, `expect(promise).resolves` and `expect(promise).rejects` wait inside the call until the promise settles. Start the advance before the assertion, or take the rejection before the advance:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect, jest } from "bun:test";
+
+async function giveUpAfter(ms: number) {
+  await new Promise(resolve => setTimeout(resolve, ms));
+  throw new Error("timed out");
+}
+
+test("start the advance, then assert", async () => {
+  jest.useFakeTimers();
+  const result = giveUpAfter(3000);
+  const advance = jest.advanceTimersByTimeAsync(3000);
+  await expect(result).rejects.toThrow("timed out");
+  await advance;
+  jest.useRealTimers();
+});
+
+test("take the rejection, advance, then assert", async () => {
+  jest.useFakeTimers();
+  const error = giveUpAfter(3000).catch(error => error);
+  await jest.advanceTimersByTimeAsync(3000);
+  expect(await error).toEqual(new Error("timed out"));
+  jest.useRealTimers();
+});
+```
+
+Vitest also allows `const assertion = expect(result).rejects.toThrow("timed out")` before the advance. In `bun:test` that line does not return: no timer runs while the matcher waits.
+
+#### Differences from Jest and Vitest
+
+- A sync function does not throw the error of a timer callback. Bun reports the error as uncaught, the test fails, and the function runs the other timers.
+- With the sync and the async functions, Bun reports what an `AbortSignal.timeout()` listener or a `Bun.cron()` callback throws as an uncaught error. The promise of an async function does not reject with it.
+- `advanceTimersByTime(0)` and `advanceTimersByTimeAsync(0)` move the clock by 1 ms. A `setTimeout(fn, 0)` is due 1 ms after the call that schedules it.
+- `advanceTimersToNextTimer()` runs one timer. `advanceTimersToNextTimerAsync()` also runs the other timers that are due at the same time.
+- `expect.poll()` throws while timers are fake.
+- `vi.useFakeTimers()` has the default limit of Jest (100000 timers), not the default of Vitest (10000).
 
 ## Set the time zone
 

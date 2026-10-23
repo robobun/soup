@@ -21,8 +21,34 @@ import {
   utilPromisifyAvailable,
 } from "./helpers/setup-tests";
 
+import { afterEach as bunAfterEach, beforeEach as bunBeforeEach, it as bunIt, describe, vi } from "bun:test";
 import * as timersModule from "timers";
 import * as timersPromisesModule from "timers/promises";
+
+// The tests are written for mocha, where a test and its hooks share one `this`.
+let context: any = {};
+bunBeforeEach(() => {
+  context = { skip() {} };
+});
+bunAfterEach(() => {
+  vi.useRealTimers();
+});
+const withContext = (fn: any) =>
+  typeof fn !== "function"
+    ? fn
+    : fn.length > 0
+      ? function (done: any) {
+          return fn.call(context, done);
+        }
+      : function () {
+          return fn.call(context);
+        };
+const it: any = (name: string, fn: any, ...rest: any[]) => bunIt(name, withContext(fn), ...rest);
+it.failing = (name: string, fn: any, ...rest: any[]) => bunIt.failing(name, withContext(fn), ...rest);
+it.skip = bunIt.skip;
+it.todo = bunIt.todo;
+const beforeEach = (fn: any) => bunBeforeEach(withContext(fn));
+const afterEach = (fn: any) => bunAfterEach(withContext(fn));
 
 const before = beforeEach;
 const after = afterEach;
@@ -40,8 +66,8 @@ try {
 
 const isRunningInWatchMode = ++globalObject.__runs > 1;
 
-describe.todo("FakeTimers", function () {
-  describe("setTimeout", function () {
+describe("FakeTimers", function () {
+  describe.todo("setTimeout", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
       FakeTimers.evalCalled = false;
@@ -336,7 +362,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("setImmediate", function () {
+  describe.todo("setImmediate", function () {
     beforeEach(function () {
       if (!setImmediatePresent) {
         this.skip();
@@ -448,7 +474,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("clearImmediate", function () {
+  describe.todo("clearImmediate", function () {
     beforeEach(function () {
       if (!setImmediatePresent) {
         this.skip();
@@ -502,7 +528,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("countTimers", function () {
+  describe.todo("countTimers", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -525,7 +551,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("tick", function () {
+  describe.todo("tick", function () {
     beforeEach(function () {
       this.clock = FakeTimers.install({ now: 0 });
     });
@@ -1127,7 +1153,8 @@ describe.todo("FakeTimers", function () {
         });
     });
 
-    it("calls function with global object or null (strict mode) as this", function () {
+    // Bun calls a timer callback with its Timeout object as `this`, as Node.js does.
+    it.failing("calls function with global object or null (strict mode) as this", function () {
       const clock = this.clock;
       const stub = sinon.stub().throws();
       const catchSpy = sinon.spy();
@@ -1305,7 +1332,8 @@ describe.todo("FakeTimers", function () {
       });
     });
 
-    it("passes 8 seconds", function () {
+    // `advanceTimersByTimeAsync()` takes a number of milliseconds, as in Jest and Vitest, and no time string.
+    it.failing("passes 8 seconds", function () {
       const spy = sinon.spy();
       this.clock.setInterval(spy, 4000);
 
@@ -1314,7 +1342,8 @@ describe.todo("FakeTimers", function () {
       });
     });
 
-    it("passes 1 minute", function () {
+    // `advanceTimersByTimeAsync()` takes a number of milliseconds, as in Jest and Vitest, and no time string.
+    it.failing("passes 1 minute", function () {
       const spy = sinon.spy();
       this.clock.setInterval(spy, 6000);
 
@@ -1323,7 +1352,8 @@ describe.todo("FakeTimers", function () {
       });
     });
 
-    it("passes 2 hours, 34 minutes and 10 seconds", function () {
+    // `advanceTimersByTimeAsync()` takes a number of milliseconds, as in Jest and Vitest, and no time string.
+    it.failing("passes 2 hours, 34 minutes and 10 seconds", function () {
       const spy = sinon.spy();
       this.clock.setInterval(spy, 100000);
 
@@ -1377,7 +1407,8 @@ describe.todo("FakeTimers", function () {
         });
     });
 
-    it("treats missing argument as 0", function () {
+    // `advanceTimersByTimeAsync()` rejects without its argument, as `advanceTimersByTime()` throws.
+    it.failing("treats missing argument as 0", function () {
       const clock = this.clock;
       return this.clock.tickAsync().then(function () {
         assert.equals(clock.now, 0);
@@ -1440,7 +1471,8 @@ describe.todo("FakeTimers", function () {
         });
     });
 
-    it("returns the current now value", function () {
+    // The promise does not resolve with the time of the clock: Jest and Vitest drop that value.
+    it.failing("returns the current now value", function () {
       const clock = this.clock;
       return clock.tickAsync(200).then(function (value) {
         assert.equals(clock.now, value);
@@ -1627,7 +1659,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("next", function () {
+  describe.todo("next", function () {
     beforeEach(function () {
       this.clock = FakeTimers.install({ now: 0 });
     });
@@ -1849,7 +1881,8 @@ describe.todo("FakeTimers", function () {
       });
     });
 
-    it("does not trigger simultaneous timers", function () {
+    // `advanceTimersToNextTimerAsync()` is Jest's: it also fires the other timers that are due at the same time.
+    it.failing("does not trigger simultaneous timers", function () {
       const spies = [sinon.spy(), sinon.spy()];
       this.clock.setTimeout(spies[0], 100);
       this.clock.setTimeout(spies[1], 100);
@@ -1860,7 +1893,8 @@ describe.todo("FakeTimers", function () {
       });
     });
 
-    it("subsequent calls trigger simultaneous timers", function () {
+    // `advanceTimersToNextTimerAsync()` is Jest's: it also fires the other timers that are due at the same time.
+    it.failing("subsequent calls trigger simultaneous timers", function () {
       const spies = [sinon.spy(), sinon.spy(), sinon.spy(), sinon.spy()];
       const clock = this.clock;
       this.clock.setTimeout(spies[0], 100);
@@ -1978,7 +2012,8 @@ describe.todo("FakeTimers", function () {
         });
     });
 
-    it("calls function with global object or null (strict mode) as this", function () {
+    // Bun calls a timer callback with its Timeout object as `this`, as Node.js does.
+    it.failing("calls function with global object or null (strict mode) as this", function () {
       const clock = this.clock;
       const stub = sinon.stub().throws();
       const catchSpy = sinon.spy();
@@ -2080,7 +2115,8 @@ describe.todo("FakeTimers", function () {
         });
     });
 
-    it("subsequent calls trigger timeouts and intervals in the order scheduled", function () {
+    // `advanceTimersToNextTimerAsync()` is Jest's: it also fires the other timers that are due at the same time.
+    it.failing("subsequent calls trigger timeouts and intervals in the order scheduled", function () {
       const clock = this.clock;
       const spies = [sinon.spy(), sinon.spy()];
       this.clock.setInterval(spies[0], 10);
@@ -2154,7 +2190,8 @@ describe.todo("FakeTimers", function () {
       });
     });
 
-    it("returns the current now value", function () {
+    // The promise does not resolve with the time of the clock: Jest and Vitest drop that value.
+    it.failing("returns the current now value", function () {
       const clock = this.clock;
       clock.setTimeout(sinon.spy(), 55);
       return clock.nextAsync().then(function (value) {
@@ -2203,7 +2240,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("runAll", function () {
+  describe.todo("runAll", function () {
     it("if there are no timers just return", function () {
       this.clock = FakeTimers.createClock();
       this.clock.runAll();
@@ -2512,7 +2549,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("runToLast", function () {
+  describe.todo("runToLast", function () {
     it("returns current time when there are no timers", function () {
       this.clock = FakeTimers.createClock();
 
@@ -2636,7 +2673,8 @@ describe.todo("FakeTimers", function () {
       }
     });
 
-    it("returns current time when there are no timers", function () {
+    // The promise does not resolve with the time of the clock: Jest and Vitest drop that value.
+    it.failing("returns current time when there are no timers", function () {
       this.clock = FakeTimers.createClock();
 
       return this.clock.runToLastAsync().then(function (time) {
@@ -2656,7 +2694,8 @@ describe.todo("FakeTimers", function () {
       });
     });
 
-    it("returns time of the last timer", function () {
+    // The promise does not resolve with the time of the clock: Jest and Vitest drop that value.
+    it.failing("returns time of the last timer", function () {
       this.clock = FakeTimers.createClock();
       const spies = [sinon.spy(), sinon.spy()];
       this.clock.setTimeout(spies[0], 10);
@@ -2894,7 +2933,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("clearTimeout", function () {
+  describe.todo("clearTimeout", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -2952,7 +2991,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("reset", function () {
+  describe.todo("reset", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -2989,7 +3028,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("setInterval", function () {
+  describe.todo("setInterval", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -3079,7 +3118,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("clearInterval", function () {
+  describe.todo("clearInterval", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -3137,7 +3176,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("Date", function () {
+  describe.todo("Date", function () {
     beforeEach(function () {
       this.now = new GlobalDate().getTime() - 3000;
       this.clock = FakeTimers.createClock(this.now);
@@ -3363,7 +3402,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("stubTimers", function () {
+  describe.todo("stubTimers", function () {
     beforeEach(function () {
       this.dateNow = global.Date.now;
     });
@@ -3806,7 +3845,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("shouldAdvanceTime", function () {
+  describe.todo("shouldAdvanceTime", function () {
     it("should create an auto advancing timer", function (done) {
       const testDelay = 29;
       const date = new Date("2015-09-25");
@@ -3930,7 +3969,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("setTickMode", function () {
+  describe.todo("setTickMode", function () {
     const originalSetTimeout = setTimeout;
     let clock;
     const date = new Date("2015-09-25");
@@ -4104,7 +4143,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("shouldClearNativeTimers", function () {
+  describe.todo("shouldClearNativeTimers", function () {
     function createCallback(done, succeed) {
       return function () {
         if (succeed) {
@@ -4191,7 +4230,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("requestAnimationFrame", function () {
+  describe.todo("requestAnimationFrame", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -4308,7 +4347,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("cancelAnimationFrame", function () {
+  describe.todo("cancelAnimationFrame", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -4380,7 +4419,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("runToFrame", function () {
+  describe.todo("runToFrame", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -4397,7 +4436,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("jump", function () {
+  describe.todo("jump", function () {
     beforeEach(function () {
       this.clock = FakeTimers.install({ now: 0 });
     });
@@ -4456,7 +4495,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("performance.now()", function () {
+  describe.todo("performance.now()", function () {
     before(function () {
       if (!performanceNowPresent) {
         this.skip();
@@ -4495,7 +4534,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("process.hrtime()", function () {
+  describe.todo("process.hrtime()", function () {
     before(function () {
       if (!hrtimePresent) {
         this.skip();
@@ -4567,7 +4606,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("process.hrtime.bigint()", function () {
+  describe.todo("process.hrtime.bigint()", function () {
     before(function () {
       if (!hrtimeBigintPresent) {
         this.skip();
@@ -4620,7 +4659,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("queueMicrotask semantics", function () {
+  describe.todo("queueMicrotask semantics", function () {
     // adapted from Node's tests
     let clock, called;
 
@@ -4666,7 +4705,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("nextTick semantics", function () {
+  describe.todo("nextTick semantics", function () {
     before(function () {
       if (!nextTickPresent) {
         this.skip();
@@ -4873,7 +4912,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("requestIdleCallback", function () {
+  describe.todo("requestIdleCallback", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -4936,7 +4975,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("cancelIdleCallback", function () {
+  describe.todo("cancelIdleCallback", function () {
     beforeEach(function () {
       this.clock = FakeTimers.createClock();
     });
@@ -4951,7 +4990,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("Node timers module", function () {
+  describe.todo("Node timers module", function () {
     before(function () {
       if (!timersModule) {
         this.skip();
@@ -5083,7 +5122,7 @@ describe.todo("FakeTimers", function () {
     });
   });
 
-  describe("Node timers/promises module", function () {
+  describe.todo("Node timers/promises module", function () {
     let clock;
 
     before(function () {
