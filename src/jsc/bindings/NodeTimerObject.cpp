@@ -14,6 +14,10 @@
 #include "JavaScriptCore/JSCJSValue.h"
 #include "AsyncContextFrame.h"
 
+// FakeTimers.rs: an async timer control of bun:test that is firing `timerObject` rejects with
+// what its callback threw.
+extern "C" bool Bun__FakeTimers__captureThrow(JSC::EncodedJSValue timerObject, JSC::EncodedJSValue thrown);
+
 namespace Bun {
 using namespace JSC;
 
@@ -65,7 +69,7 @@ static bool call(JSGlobalObject* globalObject, JSValue timerObject, JSValue call
         (void)scope.tryClearException();
         if (vm.isTerminationException(exception))
             Bun__VM__takeTerminationOutsideScript(globalObject);
-        else
+        else if (!Bun__FakeTimers__captureThrow(JSValue::encode(timerObject), JSValue::encode(exception->value())))
             Bun__reportUnhandledError(globalObject, JSValue::encode(exception));
         hadException = true;
     }

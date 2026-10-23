@@ -1665,6 +1665,9 @@ unsafe fn cancel_timers(vm: *mut VirtualMachine, only: Option<bun_jsc::ContextId
         }
     }
     if let Some(context) = only {
+        // SAFETY: `state` is the live boxed per-thread `RuntimeState`; `end_drives_of` doesn't
+        // re-enter it.
+        unsafe { (*state).timer.fake_timers.end_drives_of(context) };
         // A graph's context keeps the set of its own live timers.
         // SAFETY: `vm` per fn contract.
         let Some(timers) = (unsafe { (*vm).timer_context(context) }).map(|c| c.take_timers())

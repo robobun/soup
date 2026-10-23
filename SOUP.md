@@ -6896,6 +6896,423 @@ Files: `src/options_types/package_aliases.rs` (new), `src/options_types/lib.rs`,
 `test/bundler/bun-build-api.test.ts`, `test/bundler/cli.test.ts`,
 `test/integration/bun-types/fixture/build.ts`.
 
+### 2026-10-23: async fake timers for `bun test`, `advanceTimersByTimeAsync()` and the other three
+
+With `jest.useFakeTimers()` a test moves the clock itself. The four functions that do it,
+`advanceTimersByTime()`, `advanceTimersToNextTimer()`, `runOnlyPendingTimers()` and
+`runAllTimers()`, fire the timers back to back inside one call. Code that awaits between timers
+does not come along: the loop around `await sleep(100)`, the retry with a backoff, the timer
+callback that is an `async` function all continue in promise callbacks, and those run after the
+call. Jest and Vitest have an async variant of each function for that. Bun had none, so a ported
+suite ended in `TypeError: jest.advanceTimersByTimeAsync is not a function`. oven-sh/bun#40990
+lists them among the missing parts of the Vitest API that hurt most, and the port of sinon's
+suite in `test/js/bun/test/fake-timers/sinonjs/` had two tests waiting for them. Now:
+
+```ts
+import { test, expect, jest } from "bun:test";
+
+test("retries with a growing delay", async () => {
+  jest.useFakeTimers();
+  const request = jest
+    .fn()
+    .mockRejectedValueOnce(new Error("503"))
+    .mockRejectedValueOnce(new Error("503"))
+    .mockResolvedValue("ok");
+
+  async function retry() {
+    for (let delay = 1000; ; delay *= 2) {
+      try {
+        return await request();
+      } catch {
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  const result = retry();
+  await jest.advanceTimersByTimeAsync(3000); // 1000 ms, then 2000 ms
+  expect(await result).toBe("ok");
+  expect(request).toHaveBeenCalledTimes(3);
+});
+
+await vi.advanceTimersToNextTimerAsync(steps);
+await vi.runOnlyPendingTimersAsync();
+await vi.runAllTimersAsync();
+
+// The most timers that runAllTimers() and runAllTimersAsync() run. `timerLimit` is Jest's name.
+vi.useFakeTimers({ loopLimit: 1000 });
+```
+
+The sync functions are not a substitute. In the test above, `jest.advanceTimersByTime(3000)`
+runs no timer at all: `retry()` schedules its first timer in a promise callback, and that
+callback has not run when the sync function looks for timers. Code that schedules its first
+timer at once gets further, but only by where the test is in the event loop. The first test of
+a file has the promise callbacks of a timer run before the next timer. A test body that has
+awaited one real operation does not, because it then runs inside a promise callback itself.
+Jest and Vitest never run them there.
+
+The four functions follow `tickAsync`, `nextAsync`, `runAllAsync` and `runToLastAsync` of
+@sinonjs/fake-timers, which Jest and Vitest call, turn for turn:
+
+- Each waits a turn of the real event loop before the first timer and after every timer it
+  fires. An advance over N timers takes N + 1 turns. A turn is a real `setImmediate`, which
+  `useFakeTimers()` does not fake in Bun, so the immediates of the program and the turns of an
+  advance run in the order they were queued, as they do with sinon on Node.js.
+- `advanceTimersByTimeAsync(ms)` fires the timers of the next `ms` milliseconds and then moves the
+  clock to the end of that window. The window is a span and not an instant: when something else
+  moves the clock (a second advance in flight, a sync advance in a timer callback), the end of
+  the window moves with it. `advanceTimersByTimeAsync(30)` and `advanceTimersByTimeAsync(10)`
+  started together advance the clock by 40. `ms` is read like the sync function reads it, 0
+  included (it fires `setTimeout(fn, 0)`).
+- `runOnlyPendingTimersAsync()` looks for the last timer that is pending in its first turn, and
+  advances to it. Timers that are scheduled meanwhile fire if they are due before it.
+- `runAllTimersAsync()` fires timers until none is left. After 100,000 timers with more pending
+  it rejects with Jest's `Aborting after running 100000 timers, assuming an infinite loop!`.
+  The sync `runAllTimers()` has the same limit now and throws that error, where it used to spin
+  on a `setInterval` with no test timeout able to stop it. That half is oven-sh/bun#42744 (open),
+  taken whole with its tests. `useFakeTimers({ timerLimit })` sets the number. `loopLimit`,
+  Vitest's name, sets it too, and 0 means the default. The option is read the way
+  oven-sh/bun#44833 reads it, with its error messages.
+- `advanceTimersToNextTimerAsync(steps = 1)` is Jest's: per step the next timer, then the other
+  timers that are due at that instant, and it stops when no timer is left.
+- While an advance is inside its window, a zero-delay timer is due 1 ms later, as it is inside a
+  timer callback. So `while (!done) await Bun.sleep(0)` moves the clock on and ends.
+- If the callback of a `setTimeout` or a `setInterval` throws, the promise rejects with what was
+  thrown, and the error is not reported a second time. `advanceTimersByTimeAsync()` and
+  `runOnlyPendingTimersAsync()` fire the rest of their window first and reject with the first
+  error. What a later timer of the same call throws is dropped, which is sinon's
+  `firstException = firstException || e`. `runAllTimersAsync()` and
+  `advanceTimersToNextTimerAsync()` stop at the timer that threw. The throw of an
+  `AbortSignal.timeout()` listener or a `Bun.cron()` callback is reported as an uncaught error,
+  as before, and the promise resolves.
+- Nothing is thrown at the call. Fake timers that are not active and an argument the sync
+  function refuses reject the promise, with the wording of the sync function.
+- On `vi` the promise resolves with `vi`, as in Vitest. On `jest` it resolves with `undefined`,
+  as in Jest. One function object serves both, so the receiver decides, and a call without a
+  receiver resolves with `undefined` (`const { advanceTimersByTimeAsync } = vi`, which is how
+  @testing-library/user-event takes its `advanceTimers` option).
+- An advance ends with its clock. After `useRealTimers()` or another `useFakeTimers()`, its next
+  turn fires nothing, moves no clock and settles the promise. `clearAllTimers()` leaves it its
+  window.
+- An advance ends with its test file. One that nothing awaited, or whose test timed out, is
+  still in flight when the file is over. Without `--isolate` the next file runs on the same
+  thread and the same clock, and the advance went on there: it fired the timers of tests that
+  never touched a timer function. Now the runner ends the advances in flight when a file is
+  over, in every isolation mode. Their promises stay pending, so the code that awaits them does
+  not go on in the next file. The clock itself stays as the file left it, as before.
+- `Bun.ModuleGraph.dispose()` cancels the immediates of the graph, and with them the next turn of
+  an advance that code of the graph started. The advance ends there as well.
+- `expect(promise).rejects` and `.resolves` run the event loop inside the call. On the promise of
+  an advance they return in the turn that settles it: that turn wakes the loop. Without the
+  wake the loop waited for I/O, with a fake timer pending and nothing real due, until the idle
+  timer of the garbage collector fired a second later, or until the test timeout.
+
+Where it lives was decided by a design review before the code was written (5.8 hours), and the
+first draft lost. That draft was an internal JS module behind four builtins, with small native
+steps, the way `expect.poll()` is built. The review put it next to four other designs:
+
+- Four more rows in the table of the sync functions, each a resolved promise around its sync
+  twin (the shape of oven-sh/bun#40997). It only makes the names exist: the test above still
+  times out, because the sync function inside runs no timer, and `runAllTimersAsync()` with a
+  `setInterval` never returns.
+- The JS module. It takes the same turns, but every process would carry four more builtins, one
+  more internal module and a few more entries in the table of native functions that JavaScript
+  can reach, and the state of an advance would be spread over Rust, TypeScript and C++.
+- One rebuilt core for the sync and the async functions. The sync half fixes nothing and moves
+  eight working functions onto new code.
+- The native drive of oven-sh/bun#44833 (open, "bun test: Vitest compatibility"), which has the
+  same four functions and takes its turns as event loop tasks of its own
+  (`Bun__FakeTimers__postStep`) and not as immediates.
+- No change.
+
+What was built is the native drive with an immediate as its turn, all of it in `FakeTimers.rs`:
+
+- Four rows in `FAKE_TIMERS_FNS`. A call validates, makes the promise, adds a `Drive` (plain
+  data: an id, the context of the caller, which control, where it is, what is left of its
+  window) and queues the first turn.
+- A turn is a native function that `setImmediate` calls. It fires at most one fake timer through
+  the `FakeTimers::fire` the sync functions use, and queues the next turn or settles. Of the
+  sync drivers only `execute_all_timers` changes, for the limit: the async functions have a
+  bounded pop of their own (`pop_due`, 8 lines).
+- What outlives a turn (the promise, what it resolves with, the first error) is a JS array in
+  the arguments of the pending immediate. Nothing on the thread roots a JS value, and an
+  immediate that `--isolate` drops takes its advance with it.
+- The list of drives is the one owner of the "inside a tick" rule: `min_delay_ms()` is 1 while a
+  drive is in its window. Every way a turn can stop coming ends the drive: the turn itself, a
+  change of clock, `cancel_timers` for a stopped context (`jsc_hooks.rs`), and the end of the
+  file (`fake_timers::end_test_file()`, called from the guard in `TestCommand::run` that already
+  forgets pending module mocks). The end of a file also sets a mark: the turn of an advance that
+  started before it does nothing.
+- Turns are queued through `Bun__Timer__setImmediate`, the exported function that `setImmediate`
+  itself goes through, so `All::set_immediate` keeps its one call site.
+- `Bun__JSTimeout__call` (`NodeTimerObject.cpp`) asks `Bun__FakeTimers__captureThrow` before it
+  reports what a timer callback threw. The answer is yes only for the timer object that an async
+  control is firing at that moment. That is one call in the branch of a callback that threw. An
+  immediate that throws while that callback runs the event loop is still reported.
+
+The shape of the drive (one entry per call, a step per event loop task, `Tick` / `All` / `Next`)
+is the one oven-sh/bun#44833 has. That pull request is 112,000 lines, pins a preview build of
+WebKit and is not merged. When it lands, this commit is dropped. Two more open pull requests
+overlap: oven-sh/bun#42744 (the limit of `runAllTimers()`, which this commit now contains
+whole) and oven-sh/bun#40997 (four rows that resolve at once around the sync functions, which
+this commit replaces). If #42744 lands first, its hunks are upstream's and the rest stays.
+Three more open pull requests change lines that this commit also changes: oven-sh/bun#46165 (a
+zero-delay `setTimeout` is due at once), #41571 (the `steps` of `advanceTimersToNextTimer()`)
+and #42000 (docs of the fake timer functions, in the same page).
+
+Measured, on debug builds of the stack without and with this commit:
+
+|                                                 | without  | with       |
+| ----------------------------------------------- | -------- | ---------- |
+| `Bun.jest()`: `Function` cells                  | 168      | 172        |
+| `Bun.jest()`: `NativeExecutable` cells          | 161      | 165        |
+| `Bun.jest()`: `Structure` cells                 | 215      | 223        |
+| `Bun.jest()`: `FunctionExecutable` cells        | 1        | 1          |
+| `Bun.jest()`: heap size (`heapStats()`, 3 runs) | 64,721 B | 66,193 B   |
+| `size_of::<FakeTimers>()`, once per JS thread   | 48 B     | 96 B       |
+| turns of an advance over 0, 3 and 1000 timers   |          | 1, 4, 1001 |
+| `write` calls of 1,000 async advances           |          | 1,000      |
+| `write` calls of 1,000 sync advances            | 0        | 0          |
+
+So a test file that never calls them pays 16 cells (1,472 B) for the four functions on `jest`
+and `vi`, like it pays for the nine sync ones, and a thread pays 48 bytes. A timer that is not
+fake pays nothing: `min_delay_ms()` looks at the list of drives only after `is_active()`, and
+the call in `Bun__JSTimeout__call` is behind `scope.exception()`. That is by reading the code
+and by the debug build. The end of a test file is one call that clears an empty list.
+`useFakeTimers()` with an options object reads two more properties, and `runAllTimers()` counts
+its timers. An async advance reads one property more than it needs for its work (`vi` of the
+module, to know what to resolve with), and the turn that settles it makes one `write` to wake
+the event loop. The `write` calls are the `syscw` of `/proc/self/io`, read in the test process.
+Not measured: instruction counts and the size of a release binary. valgrind, perf, strace and
+bloaty are not in the build container, and no release build was made.
+
+Against the reference: the copy of @sinonjs/fake-timers that Vitest 4.1.9 bundles ran 3,000
+seeded scenarios on Node.js 26, and this build ran the same 3,000. A scenario arms up to 30
+timers that re-arm from their callbacks, from promise callbacks, from `async` functions and from
+immediates, call `process.nextTick`, nest a sync advance or throw (up to four timers of a
+scenario throw, and 1,671 scenarios have a rejection), and then runs one to three of the four
+controls, alone, two at once, or next to a sync advance. All 3,000 give the same log of events
+with their fake times, the same final clock and the same number of pending timers. The two
+orders that the design review wrote down are tests in the repository. The scenarios are not:
+they need Node.js and sinon.
+
+Not done, and what differs:
+
+- A sync function still reports what a timer callback throws as an uncaught error, returns, and
+  goes on with the other timers. Jest and Vitest throw it from the call, and oven-sh/bun#44833
+  does. So the eight functions have two error contracts for now. The worst case is a sync
+  advance inside a callback that an async advance fired: Jest 29.7 and Vitest 4.1.9 reject the
+  async promise (16 of 16 combinations), and here the error is reported and the promise
+  resolves. The capture slot of this commit is what the sync half needs, as its own commit. A
+  `test.todo` holds the reference outcome.
+- The sync functions are otherwise as they were: their flush still depends on the position in
+  the event loop, and `advanceTimersToNextTimer()` fires one timer and ignores `steps`
+  (oven-sh/bun#41571), where the async one fires every timer of the instant.
+- Timers that Bun's own modules arm under the fake clock are fake. A `node:http` server that
+  starts to listen arms a 30 second interval, so `getTimerCount()` goes from 0 to 1, and
+  `runAllTimers()` and `runAllTimersAsync()` end at the limit. On Node.js, Jest and Vitest leave
+  those timers real. The fix is in `All::insert` and is its own change (oven-sh/bun#37987, open).
+  The docs say it, with the two ways around it, and a `test.todo` holds the reference outcome.
+- An advance ends with its file, not with its test. One that nothing awaited, or whose test
+  timed out, goes on firing timers in the later tests of the same file. That is what Jest and
+  Vitest do on one clock, and a bound at the end of a test or at its timeout is a follow-up.
+- `expect(promise).rejects` and `.resolves` wait inside the call. The order that Vitest allows,
+  `const assertion = expect(result).rejects.toThrow()` before the advance, never returns, not
+  even at the test timeout (Bun 1.4.3 does the same with a sync advance). The docs show the two
+  orders that work, and two tests pin them. The repair is in the matchers and the runner:
+  oven-sh/bun#33289, #46545 and #44833 carry it, and oven-sh/bun#14950 and #23420 ask for it.
+- `expect.poll()` throws while timers are fake. `vi.waitFor()` and `vi.waitUntil()` are missing
+  (oven-sh/bun#24715, #44328): they poll on a real timer and do not build on the drive.
+- An advance waits one turn of the event loop for each timer, as sinon does. Code that does real
+  I/O between two timers (a `fetch()`, a file read) has not scheduled its next timer by then, so
+  one advance does not carry it through. The docs say so and show the loop that does.
+- `setImmediate` cannot be faked. Code that awaits a real `setImmediate` between fake timers
+  behaves as with sinon's `toFake` without `setImmediate`, which is not Jest's default.
+- `useRealTimers()` in the middle of an advance drops the timers of the old clock, so the advance
+  settles without firing them.
+- Still missing on `vi`: `setSystemTime()` (on `jest` and the module only: a one-line alias that
+  #40997 and #44833 both carry), `getMockedSystemTime()`, `getRealSystemTime()`, `runAllTicks()`,
+  `advanceTimersToNextFrame()` and `setTimerTickMode()`. Of the 12 timer members that
+  oven-sh/bun#40990 lists on `vi`, this commit adds 4.
+- What flips on the day oven-sh/bun#44833 replaces this commit, by its code and its tests:
+  - `vi.useFakeTimers()` gets Vitest's default limit of 10,000. Here `jest` and `vi` share one
+    function and one default, Jest's 100,000.
+  - `advanceTimersByTime(0)` and its async twin stop moving the clock by 1 ms, and
+    `setTimeout(fn, 0)` is due at once (also oven-sh/bun#46165).
+  - The end of a test file puts the real clock back there (unless a preload installed the fake
+    one). Here it only ends the advances in flight.
+  - The sync functions throw what a timer callback throws, and run no promise callback before
+    they return.
+  - `setImmediate`, `process.nextTick` and `queueMicrotask` can be faked there.
+  - A turn is an event loop task of its own there and an immediate here. There an advance also
+    sees a timer that the code arms after one real `setImmediate`. Here it does not, as with
+    sinon on Node.js.
+  - A second `useFakeTimers()` starts without the timers of the first there. Here they stay
+    pending, as on upstream main.
+
+  The 48 tests that #44833 has for the four async functions ran on this build: 44 pass, and the
+  4 that fail are the last two points, once for `jest` and once for `vi`.
+
+- In `sinonjs/fake-timers.test.ts` the `tickAsync`, `nextAsync`, `runAllAsync` and
+  `runToLastAsync` blocks run now: 90 tests, 77 as sinon wrote them. 13 are `it.failing`, each
+  with its reason in a comment: sinon resolves with the time of the clock (4), takes a time
+  string (3) or no argument (1), fires one timer per `nextAsync()` where Jest's function fires
+  the instant (3), and calls a timer callback with the global object as `this` (2). The helper
+  got what the blocks use of sinon and mocha (spies over `jest.fn()`, `createClock()`,
+  `loopLimit`, one `this` for a test and its hooks). With it three older tests of the
+  directory pass that were `it.failing`.
+
+Before the push a review read the finished commit, ran it against Jest 29.7, Vitest 4.1.9 and
+the tests of oven-sh/bun#44833, and mutated it. Self-reviewed: 36 concerns raised, 36 addressed,
+28 by code or tests and 8 by text. What changed because of it:
+
+- `jest.*Async()` resolves with `undefined`. It resolved with `jest`, which no reference does.
+- A second throw in one advance is dropped. It was reported, which failed tests that pass on
+  Jest, on Vitest and on #44833.
+- The limit option is whole: it bounds `runAllTimers()` too, `loopLimit` is read, and 0 is the
+  default. It bounded the async function only and refused 0.
+- An advance ends with its test file, and with a `Bun.ModuleGraph` that is disposed. A counter of
+  the advances inside a window went away with that: the list of drives is read instead, so the
+  count cannot go stale when a turn never comes.
+- The turn that settles an advance wakes the event loop, so `expect().rejects` on its promise
+  returns.
+- A comment that gave a false reason for an `unsafe` block, and a block that had none (a
+  deny-level clippy lint), became one helper with the real invariant.
+- 48 more tests in `fake-timers.test.ts`, and sinon's own: a test for each mutation that
+  survived the first suite, the identity check of the throw capture (a two-byte patch of the
+  binary that removes the check now fails a test), garbage collection between the turns, a
+  control inside the callback of another, `Bun.cron()` under three controls, the end of a file.
+- The docs lost a sentence that was false for its own example, and say what the review found
+  users will meet next (the list above).
+
+Parts of it that were not taken: a Worker test (3 to 5 seconds on a debug build for a path the
+other tests cover), mordant in the lint workflow of the fork, and splitting the two meanings of
+`Drive::count`. The changes that the review itself put into later commits are in the list
+above.
+
+Tests: `test/js/bun/test/fake-timers/fake-timers.test.ts` has 112 new tests (191 in all,
+with one that needs a release build and two `test.todo`). 105 of the new ones fail on
+Bun 1.4.3, and the rest pin behaviour that the commit must keep (a limit that is not reached,
+0 as the default). `describe("async timer controls")` covers each function on `jest` and `vi`,
+in the first test of a file (a subprocess) and after a real `await`, the two orders above, the
+window (first turn, two advances in flight, a nested sync advance, an overdue timer), the
+zero-delay rule inside and after a window, every error path per function, the first error
+of several, the limit at 50 timers (at it and past it), what `useRealTimers()`,
+`useFakeTimers()` and `clearAllTimers()` do to an advance in flight, the end of a file, a
+disposed `Bun.ModuleGraph`, garbage collection between turns, a call without a receiver,
+`AbortSignal.timeout()`, `Bun.cron()`, the iterator of `timers/promises`, and real turns
+between timers. `describe("runAllTimers")` has the tests of oven-sh/bun#42744 for the limit and
+the option. With the commit the whole directory passes on the debug build (309 tests, and
+350 are todo), as do `test-timers.test.ts`, `expect-poll.test.ts`,
+`in-process-cron.test.ts`, `node-timers.test.ts`, the `setImmediate` and `microtask` files of
+`test/js/web/timers/`, the `callbacks`, `gc` and `io` files of `test/js/bun/module-graph/`,
+`rerun-each.test.ts`, `isolation.test.ts` and `test-timeout-behavior.test.ts` of
+`test/cli/test/`, the type tests and the source lints. The new tests pass with
+`BUN_JSC_validateExceptionChecks=1`, and `cargo clippy -p bun_runtime` is clean.
+
+What failed, and why it is not the commit:
+
+- Four leak tests fail on this debug build with and without the commit. The three of
+  `setTimeout.test.js` allow an ASAN build 192 MB and take only a binary named `bun-asan` for
+  one, so `bun-debug` gets the 10 MB limit. The one of `setInterval.test.js` runs out of its 30
+  seconds.
+- Tests that need more time than they have on a debug build: four `dynamicImport` tests of
+  `module-graph.test.ts` (they pass with a longer limit) and two of `timer-gc-roots.test.ts`,
+  which do not use fake timers. One test of `module-graph.test.ts` that compares timings failed
+  in a run of the whole file and passes alone.
+
+`fake-timers.test.ts` takes about 25 seconds on the debug build and took about 12 before, so it
+is further over the 10 second budget of a test file there. Its time on a release build was not
+measured.
+
+Built and run on Linux x64 only, as a debug build with ASAN. `cargo check -p bun_runtime`
+passes for `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`, and nothing was run there.
+
+Rebase notes: upstream moved by 37 commits to 5c6d4e24cd. One of them, oven-sh/bun#46329, moved
+the last 61 classes to schemas of the bindings generator and deleted `generate-classes.ts` with
+every `.classes.ts` file, the `#[bun_jsc::JsClass]` macro and the `host_fn(method)` thunks. 20 of
+the 59 patches needed a hand merge, and nothing was dropped. The rebased stack was pushed on its
+own first (aaf380e985), and the three workflows of the fork passed on it.
+
+- Four patches had edited a `.classes.ts` file:
+  - `.lines()` (2026-08-18): `lines: { builtin: true, length: 0 }` in `Blob.bind.ts`.
+  - `expect.poll()` (2026-09-08): `poll: { builtin: true, length: 2 }` in the `static` table of
+    `expect.bind.ts`. The generator refused a builtin there and has a test for the refusal. It
+    takes one now: three lines in `bindgen-lib-internal.ts` and `bindgen-emit.ts`, with the test
+    and the table in `docs/project/bindgen.mdx` changed to match.
+  - `.kill()`, `.signal()` and `.timeout()` for `$` (2026-09-15): `kill` and `setKillSignal` are
+    members of `ParsedShellScript.bind.ts` and `interpreter.bind.ts`. Upstream also replaced the
+    counter of pending activity with a reference to the wrapper that is strong while the script
+    runs, so "is running" in `Interpreter::kill` reads that reference, and a script that was
+    killed before it ran upgrades it before it finishes.
+  - `redis.multi()` (2026-10-20): `multi` and `exec` are two rows of the command table in
+    `valkey.bind.ts`, and `transactionParent` is an internal field there. A schema file can only
+    export what it generates, so the list of what a transaction does not queue moved to
+    `test/js/valkey/transaction-not-queueable.ts`, where the lint and `valkey.test.ts` read it.
+    Upstream's new test that compares every schema with the published types lists `exec` as a
+    member that `class RedisClient` does not declare.
+- Classes whose methods upstream re-signed for the generator, with this stack's code inside them:
+  `Bun.Archive` (2026-09-02: the constructor and `Archive.write` parse `format`), the `append`
+  option (2026-08-29: `Bun.s3.write` moved to `S3Client::static_write`), S3 metadata
+  (2026-09-27), `expect.addSnapshotSerializer()` (2026-09-22: upstream's stub in
+  `expect.bind.ts` takes the serializer now) and `bun test --reporter=json` (2026-08-24).
+- Response compression for `Bun.serve` (2026-09-04) merged and did not compile: the server's
+  config is in a `JsCell` now, so `reload()` sets `compress` through `with_mut`.
+- "Did you mean" (2026-08-28): upstream shows `bun lint` on canary builds only
+  (`lint_command::IS_ENABLED`). The table of root commands has that arm, and a build without the
+  command does not suggest it.
+- `publishConfig` (2026-09-11) and `jsr:` (2026-10-18): upstream split `add_own_package` out of
+  `add_bundled_dep` in `pack_command.rs`. The check for what makes a package.json need an edit
+  is in the new function.
+- `alias` (2026-10-21): upstream prints a `bun:` specifier that names no builtin as it is
+  written. The branch reads the alias value there as before.
+- Lines next to lines: `Bun.INI.parse()` (two lists), `import.meta.glob()` (the transpiler cache
+  is at version 44), Web Storage (`ZigGlobalObject.lut.txt`), `Bun.unescapeHTML()` (the table in
+  `BunObject.cpp`), `while` and `until` (`Parser::new` returns the parser), `node:sea`
+  (`ErrorCode.ts`) and the `jsr:` line in `docs/pm/overrides.mdx`.
+
+After the rebase 80 test files of the stack were run on the debug build, every file that a patch
+adds or changes except the registry suite of `bun outdated --json`. Against a local Redis 8.0.2
+with the ports and users of the test image: `valkey.test.ts` (1084), `connection-failures`
+(90) and `valkey-gc` (26). What failed, and why it is not the stack:
+
+- Tests that need more than their 5 seconds on a debug build and pass alone or with a longer
+  limit: 39 of `module-graph-isolation.test.ts`, the six recursive scans of `glob/scan.test.ts`,
+  three `bun pm ls` tests, one each in `bun-test.test.ts` and `bun-write.test.js`, the two
+  high-volume pub/sub tests of `valkey.test.ts` and two of `valkey-gc.test.ts`.
+- Tests that assume a timing the debug build does not have: the worker ids of `parallel.test.ts`
+  (one pass in three runs), "run in parallel" of `filter-workspace.test.ts`, and one `--hot` test
+  that saw two reloads for one write.
+- The sandbox: the connection timeout test of `connection-failures.test.ts` gets `Connection
+closed` at once for 192.0.2.1 (so does Bun 1.4.3), the MySQL half of `sql-debug.test.ts` is
+  refused as `root@localhost`, and one upstream snapshot test expects colors.
+
+After this sync upstream moved by three more commits, to a8b5e920c4, and this run did not rebase
+the stack over them. One is oven-sh/bun#46540, which moved every Rust function that takes a
+`CallFrame` to a schema of the bindings generator and deleted `#[bun_jsc::host_fn]`, `$rust` and
+`$newRustFunction`. Seven patches use what it deleted, so the next sync moves them by hand:
+`expect.poll()` (2026-09-08), `expect.addSnapshotSerializer()` (2026-09-22), `--watch-path`
+(2026-09-24), watch mode for `Bun.build` (2026-10-09), `Bun.unescapeHTML()` and
+`performance.eventLoopUtilization()` (2026-10-15), and this one. For this one the four async
+functions, the function of a turn and the two limit options go into upstream's new
+`FakeTimers.bind.ts`, whose options dictionary has only `now`. The async functions take their
+arguments as `b.any`: they reject where a schema would throw.
+
+Files: `src/runtime/test_runner/timers/FakeTimers.rs` (`Drive`, `FakeTimers::turn`, `pop_due`,
+`fire_capturing`, `async_control_turn`, `start_async_control`, `async_control_value`,
+`advance_ms`, `end_test_file`, `end_drives_of`, `timer_limit`, the limit in
+`execute_all_timers`), `src/runtime/cli/test_command.rs` (the call at the end of a file),
+`src/runtime/jsc_hooks.rs` (`cancel_timers`), `src/jsc/bindings/NodeTimerObject.cpp`,
+`packages/bun-types/test.d.ts`, `docs/test/dates-times.mdx`, `docs/runtime/cron.mdx`,
+`test/js/bun/test/fake-timers/fake-timers.test.ts`,
+`test/js/bun/test/fake-timers/sinonjs/fake-timers.test.ts`,
+`test/js/bun/test/fake-timers/sinonjs/helpers/setup-tests.ts`,
+`test/js/bun/test/fake-timers/sinonjs/issue-347.test.ts`,
+`test/js/bun/test/fake-timers/sinonjs/issue-516.test.ts`,
+`test/js/bun/test/fake-timers/sinonjs/issue-67.test.ts`,
+`test/js/bun/test/fake-timers/sinonjs/MIGRATION_NOTES.md`,
+`test/integration/bun-types/fixture/test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
