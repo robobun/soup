@@ -614,6 +614,7 @@ const dir = String(
         const writer = file.writer({ partSize: 5 << 20 });
         writer.write(new Uint8Array(6 << 20));
         writer.end().catch?.(() => {});
+        file.copyTo("copied").catch(() => {});
       });
     `,
     "s3-after-it-was-disposed.mjs": `

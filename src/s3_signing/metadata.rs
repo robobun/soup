@@ -1,15 +1,15 @@
 //! User-defined object metadata: the `x-amz-meta-*` headers of PutObject and
 //! CreateMultipartUpload.
 
-/// One `x-amz-meta-*` header of an upload.
+/// One header of an [`AmzHeaders`] list.
 #[derive(Clone)]
-pub struct MetadataEntry {
+pub struct AmzHeader {
     name: Box<[u8]>,
     value: Box<[u8]>,
 }
 
-impl MetadataEntry {
-    /// The header name: lowercase, with the `x-amz-meta-` prefix.
+impl AmzHeader {
+    /// The header name, in lowercase.
     #[inline]
     pub fn name(&self) -> &[u8] {
         &self.name
@@ -23,7 +23,7 @@ impl MetadataEntry {
 
     /// The value as Signature Version 4 signs it: without the spaces around
     /// it, and with one space for each run of spaces inside it. (A value has
-    /// no other whitespace: [`Metadata::insert`] takes printable ASCII.)
+    /// no other whitespace: a list takes printable ASCII.)
     pub(crate) fn canonical_value(&self) -> impl Iterator<Item = u8> + '_ {
         let value = bun_core::strings::trim(&self.value, b" ");
         let mut previous = 0u8;
@@ -55,7 +55,7 @@ pub enum MetadataError {
 /// no two have the same name.
 #[derive(Clone, Default)]
 pub struct Metadata {
-    entries: Vec<MetadataEntry>,
+    headers: AmzHeaders,
 }
 
 impl Metadata {
@@ -72,16 +72,39 @@ impl Metadata {
         let mut name = Vec::with_capacity(Self::PREFIX.len() + key.len());
         name.extend_from_slice(Self::PREFIX);
         name.extend(key.iter().map(u8::to_ascii_lowercase));
-        match self
-            .entries
-            .binary_search_by(|entry| (*entry.name).cmp(&name[..]))
-        {
+        self.headers.insert_entry(name.into_boxed_slice(), value)
+    }
+
+    pub(crate) fn into_headers(self) -> AmzHeaders {
+        self.headers
+    }
+}
+
+impl core::ops::Deref for Metadata {
+    type Target = AmzHeaders;
+
+    #[inline]
+    fn deref(&self) -> &AmzHeaders {
+        &self.headers
+    }
+}
+
+/// The headers that `sign_request` signs between `x-amz-content-sha256` and `x-amz-request-payer`, sorted by name.
+#[derive(Clone, Default)]
+pub struct AmzHeaders {
+    entries: Vec<AmzHeader>,
+}
+
+impl AmzHeaders {
+    /// Keeps the entries sorted by name.
+    fn insert_entry(&mut self, name: Box<[u8]>, value: &[u8]) -> Result<(), MetadataError> {
+        match self.entries.binary_search_by(|entry| entry.name.cmp(&name)) {
             Ok(_) => Err(MetadataError::DuplicateKey),
             Err(index) => {
                 self.entries.insert(
                     index,
-                    MetadataEntry {
-                        name: name.into_boxed_slice(),
+                    AmzHeader {
+                        name,
                         value: Box::from(value),
                     },
                 );
@@ -90,9 +113,37 @@ impl Metadata {
         }
     }
 
+    /// The fixed signed headers on each side of the entries.
+    pub(crate) const BEFORE_ENTRIES: &'static [u8] = b"x-amz-content-sha256";
+    pub(crate) const AFTER_ENTRIES: &'static [u8] = b"x-amz-request-payer";
+
+    /// Adds one of [`crate::copy::CopyHeaders`].
+    pub(crate) fn insert(
+        &mut self,
+        name: &'static [u8],
+        value: &[u8],
+    ) -> Result<(), MetadataError> {
+        debug_assert!(Self::BEFORE_ENTRIES < name && name < Self::AFTER_ENTRIES);
+        if !value.iter().all(|&c| c == b' ' || c.is_ascii_graphic()) {
+            return Err(MetadataError::InvalidValue);
+        }
+        self.insert_entry(Box::from(name), value)
+    }
+
     #[inline]
-    pub fn entries(&self) -> &[MetadataEntry] {
+    pub fn entries(&self) -> &[AmzHeader] {
         &self.entries
+    }
+
+    /// The entries that sort before `x-amz-date`, and the rest, which has all user-defined metadata.
+    pub(crate) fn split_at_date(&self) -> (&[AmzHeader], &[AmzHeader]) {
+        const DATE: &[u8] = b"x-amz-date";
+        match self.entries.first() {
+            Some(first) if &*first.name < DATE => self
+                .entries
+                .split_at(self.entries.partition_point(|entry| &*entry.name < DATE)),
+            _ => (&[], &self.entries),
+        }
     }
 
     #[inline]
@@ -103,7 +154,7 @@ impl Metadata {
     pub fn estimated_size(&self) -> usize {
         self.entries
             .iter()
-            .map(|entry| size_of::<MetadataEntry>() + entry.name.len() + entry.value.len())
+            .map(|entry| size_of::<AmzHeader>() + entry.name.len() + entry.value.len())
             .sum()
     }
 

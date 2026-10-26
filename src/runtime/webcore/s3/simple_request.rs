@@ -15,7 +15,7 @@ use bun_picohttp as picohttp;
 use bun_s3_signing::acl::ACL;
 use bun_s3_signing::credentials::{S3Credentials, SignOptions, SignResult};
 use bun_s3_signing::error::{S3Error, get_sign_error_code_and_message};
-use bun_s3_signing::metadata::Metadata;
+use bun_s3_signing::metadata::AmzHeaders;
 use bun_s3_signing::storage_class::StorageClass;
 use bun_threading::thread_pool;
 use bun_url::URL;
@@ -90,6 +90,20 @@ pub(crate) enum S3DeleteResult<'a> {
 pub(crate) enum S3ListObjectsResult<'a> {
     Success(Box<list_objects::S3ListObjectsV2Result>),
     NotFound(S3Error<'a>),
+    /// failure error is not owned and need to be copied if used after this callback
+    Failure(S3Error<'a>),
+}
+
+pub(crate) struct S3CopySuccess<'a> {
+    /// The entity tag of the new object, in its quotes. Not owned.
+    pub(crate) etag: &'a [u8],
+    /// ISO 8601, as in `2026-10-25T16:57:38.000Z`. Not owned.
+    pub(crate) last_modified: &'a [u8],
+}
+
+// a copy also fails if status 200 but with body containing an Error
+pub(crate) enum S3CopyResult<'a> {
+    Success(S3CopySuccess<'a>),
     /// failure error is not owned and need to be copied if used after this callback
     Failure(S3Error<'a>),
 }
@@ -176,6 +190,7 @@ pub(crate) enum Callback {
     ListObjects(fn(S3ListObjectsResult<'_>, *mut c_void) -> bun_jsc::JsResult<()>),
     Commit(fn(S3CommitResult<'_>, *mut c_void) -> bun_jsc::JsResult<()>),
     Part(fn(S3PartResult<'_>, *mut c_void) -> bun_jsc::JsResult<()>),
+    Copy(fn(S3CopyResult<'_>, *mut c_void) -> bun_jsc::JsResult<()>),
 }
 
 impl Callback {
@@ -191,6 +206,7 @@ impl Callback {
             }
             Callback::Commit(callback) => callback(S3CommitResult::Failure(err), context)?,
             Callback::Part(callback) => callback(S3PartResult::Failure(err), context)?,
+            Callback::Copy(callback) => callback(S3CopyResult::Failure(err), context)?,
         }
         Ok(())
     }
@@ -403,6 +419,26 @@ impl S3HttpSimpleTask {
                     }
                 }
             }
+            Callback::Copy(callback) => {
+                // a copy can fail with status 200
+                let status = response.status_code;
+                if !this.fail_if_contains_error(status)? {
+                    let copied = xml_response::parse_copy_object_result(
+                        this.response_buffer.list.as_slice(),
+                    );
+                    let result = match &copied {
+                        Some(copied) => S3CopyResult::Success(S3CopySuccess {
+                            etag: &copied.etag,
+                            last_modified: &copied.last_modified,
+                        }),
+                        None => S3CopyResult::Failure(S3Error {
+                            code: b"InvalidResponse",
+                            message: b"CopyObject response is not a <CopyObjectResult> document",
+                        }),
+                    };
+                    callback(result, this.callback_context)?;
+                }
+            }
         }
         Ok(())
     }
@@ -537,8 +573,8 @@ pub(crate) struct S3SimpleRequestOptions<'a> {
     pub(crate) acl: Option<ACL>,
     pub(crate) storage_class: Option<StorageClass>,
     pub(crate) request_payer: bool,
-    /// For the request that creates the object: PutObject or CreateMultipartUpload.
-    pub(crate) metadata: Option<&'a Metadata>,
+    /// For the request that creates the object: PutObject, CreateMultipartUpload or CopyObject.
+    pub(crate) metadata: Option<&'a AmzHeaders>,
 }
 
 impl<'a> Default for S3SimpleRequestOptions<'a> {
