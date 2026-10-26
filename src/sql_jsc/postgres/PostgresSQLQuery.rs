@@ -84,7 +84,7 @@ pub struct Flags {
     pub(crate) result_mode: PostgresSQLQueryResultMode,
 }
 
-/// The stream that `readable()` or `writable()` made for the request. See CopyStream.rs.
+/// The stream that `readable()` or `writable()` made for the request (CopyStream.rs), or what it is to a cursor (Cursor.rs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CopyStream {
     None,
@@ -94,6 +94,27 @@ pub enum CopyStream {
     Writable,
     /// Between CopyInResponse and the CopyDone or CopyFail that the stream ends with.
     WritableOpen,
+    /// The statement of a cursor: its Bind names the portal and its Execute has the row limit.
+    CursorOpen,
+    /// An Execute for the next rows of the portal.
+    CursorFetch,
+    /// The row limit ended the last Execute: at its ReadyForQuery the request leaves the queue, until `fetch()`.
+    CursorSuspended,
+    /// A Close of the portal.
+    CursorClose,
+}
+
+impl CopyStream {
+    #[inline]
+    pub(crate) fn is_cursor(self) -> bool {
+        matches!(
+            self,
+            CopyStream::CursorOpen
+                | CopyStream::CursorFetch
+                | CopyStream::CursorSuspended
+                | CopyStream::CursorClose
+        )
+    }
 }
 
 /// Of a request that is written.
@@ -174,6 +195,23 @@ impl PostgresSQLQuery {
     pub(crate) fn leave_queue(&self) {
         self.statement.set(None);
         self.connection.set(None);
+    }
+
+    /// `leave_queue` for a request that `fetch()` queues again: its statement has the columns and formats of the portal.
+    #[inline]
+    pub(crate) fn leave_queue_suspended(&self) {
+        self.connection.set(None);
+        self.status.set(Status::Cursor);
+    }
+
+    /// `Status::Pending` of a request that `dispatch_next` writes as what `Flags::copy` says.
+    #[inline]
+    pub(crate) fn unwritten_status(&self) -> Status {
+        if self.flags.get().copy.is_cursor() {
+            Status::Cursor
+        } else {
+            Status::Pending
+        }
     }
 
     pub(crate) fn get_target(
@@ -450,18 +488,56 @@ impl PostgresSQLQuery {
         connection: &PostgresSQLConnection,
         query: JsLocal<'_>,
     ) -> JsResult<()> {
-        let global_object = cx.global();
-        let query = query.to_js();
+        self.queue(this_value.to_js(), cx.global(), connection, query.to_js())
+    }
 
-        if !query.is_object() {
-            return Err(global_object.throw_invalid_argument_type("run", "query", "Query"));
+    /// Queues the request behind what `connection` has, and writes what can be written now. Only a request that `fetch()` queues again has no `target`.
+    pub(crate) fn queue(
+        &self,
+        this_value: JSValue,
+        global_object: &JSGlobalObject,
+        connection: &PostgresSQLConnection,
+        target: JSValue,
+    ) -> JsResult<()> {
+        if !target.is_object() {
+            self.queue_again(global_object, connection, target)?;
+        } else {
+            self.row_type
+                .set(RowDecoder::expected_row_type(global_object, target));
+            self.set_statement(this_value, global_object, connection)?;
+            js::target_set_cached(this_value, global_object, target);
         }
-        self.row_type
-            .set(RowDecoder::expected_row_type(global_object, query));
 
-        let this_value = this_value.to_js();
+        connection
+            .requests
+            .with_mut(|q| q.push_back(self.ref_guard()));
+        connection.count(self, RequestCounter::Pending);
+        self.connection.set(Some(connection.ref_guard()));
+        // Request is enqueued: keep the event loop alive until the server responds.
+        connection.poll_ref.with_mut(|r| {
+            r.ref_(bun_io::posix_event_loop::get_vm_ctx(
+                bun_io::AllocatorType::Js,
+            ))
+        });
+        self.this_value.with_mut(|r| r.upgrade(global_object));
+
+        connection.advance();
+        connection.flush_data_and_reset_timeout();
+        // advance() can reject this request with nothing sent: no reply releases the ref then.
+        connection.update_poll_ref();
+        Ok(())
+    }
+
+    /// For `queue`, of a request that runs for the first time.
+    #[inline(always)]
+    fn set_statement(
+        &self,
+        this_value: JSValue,
+        global_object: &JSGlobalObject,
+        connection: &PostgresSQLConnection,
+    ) -> JsResult<()> {
         let binding_value = js::binding_get_cached(this_value).unwrap_or_default();
-        let unnamed = connection
+        let mut unnamed = connection
             .flags
             .get()
             .contains(ConnectionFlags::USE_UNNAMED_PREPARED_STATEMENTS);
@@ -487,8 +563,13 @@ impl PostgresSQLQuery {
             )));
         }
         // That code can have called `cancel()`.
-        if self.status.get() != Status::Pending {
-            return Err(global_object.throw_value(connection.cancelled_error(None)));
+        match self.status.get() {
+            Status::Pending => {}
+            Status::Cursor => {
+                self.set_cursor_statement(global_object)?;
+                unnamed = true;
+            }
+            _ => return Err(global_object.throw_value(connection.cancelled_error(None))),
         }
 
         // A connection that failed or closed answers nothing: a query queued on it would hold the
@@ -522,24 +603,6 @@ impl PostgresSQLQuery {
             })
         }));
 
-        connection
-            .requests
-            .with_mut(|q| q.push_back(self.ref_guard()));
-        connection.count(self, RequestCounter::Pending);
-        self.connection.set(Some(connection.ref_guard()));
-        // Request is enqueued: keep the event loop alive until the server responds.
-        connection.poll_ref.with_mut(|r| {
-            r.ref_(bun_io::posix_event_loop::get_vm_ctx(
-                bun_io::AllocatorType::Js,
-            ))
-        });
-        self.this_value.with_mut(|r| r.upgrade(global_object));
-        js::target_set_cached(this_value, global_object, query);
-
-        connection.advance();
-        connection.flush_data_and_reset_timeout();
-        // advance() can reject this request with nothing sent: no reply releases the ref then.
-        connection.update_poll_ref();
         Ok(())
     }
 
@@ -548,6 +611,12 @@ impl PostgresSQLQuery {
             Some(connection) => connection.cancel(self),
             // `run` has not queued it: it refuses a query that is not `Pending`.
             None if self.status.get() == Status::Pending => self.status.set(Status::Fail),
+            // The same for a request of a cursor. One that waits for `fetch()` can still close its portal.
+            None if self.status.get() == Status::Cursor
+                && self.flags.get().copy != CopyStream::CursorSuspended =>
+            {
+                self.status.set(Status::Fail)
+            }
             None => {}
         }
     }

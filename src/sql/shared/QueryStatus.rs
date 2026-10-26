@@ -5,6 +5,8 @@ pub enum Status {
     Pending,
     /// Only the request that prepares the statement is written, the one that runs it is not
     Preparing,
+    /// PostgreSQL: a request of a cursor with nothing on the wire. Next to the two others that have no reply to read.
+    Cursor,
     /// The query is being bound to the statement
     Binding,
     /// The query is running

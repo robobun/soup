@@ -144,6 +144,8 @@ pub mod postgres {
         pub mod authentication;
         #[path = "BackendKeyData.rs"]
         pub mod backend_key_data;
+        #[path = "Close.rs"]
+        pub mod close;
         #[path = "CommandComplete.rs"]
         pub mod command_complete;
         #[path = "CopyData.rs"]

@@ -69,6 +69,8 @@ use crate::generated_bindgen::postgres_sql_connection::js_PostgresSQLConnection 
 
 #[path = "CopyStream.rs"]
 mod copy_stream;
+#[path = "Cursor.rs"]
+mod cursor;
 
 use crate::jsc::verify_error_to_js;
 
@@ -1366,7 +1368,7 @@ impl PostgresSQLConnection {
     fn executed(&self) -> Result<ParentRef<PostgresSQLQuery>, AnyPostgresError> {
         let head = self.current().ok_or(AnyPostgresError::ExpectedRequest)?;
         match head.status.get() {
-            QueryStatus::Pending | QueryStatus::Preparing => {
+            QueryStatus::Pending | QueryStatus::Preparing | QueryStatus::Cursor => {
                 Err(AnyPostgresError::UnexpectedMessage)
             }
             _ => Ok(head),
@@ -1398,7 +1400,10 @@ impl PostgresSQLConnection {
             .is_some_and(|head| core::ptr::eq(&raw const *head, request))
             && !matches!(
                 request.status.get(),
-                QueryStatus::Pending | QueryStatus::Success | QueryStatus::Fail
+                QueryStatus::Pending
+                    | QueryStatus::Cursor
+                    | QueryStatus::Success
+                    | QueryStatus::Fail
             )
     }
 
@@ -1423,7 +1428,7 @@ impl PostgresSQLConnection {
         let status = request.status.get();
         match status {
             QueryStatus::Success | QueryStatus::Fail => {}
-            QueryStatus::Pending => {
+            QueryStatus::Pending | QueryStatus::Cursor => {
                 self.reject_unwritten(request, self.cancelled_error(None));
                 // What waited behind it may not have to wait any more.
                 self.advance();
@@ -1857,10 +1862,11 @@ impl PostgresSQLConnection {
         let Some(req) = self.first_unwritten() else {
             return false;
         };
-        if req.status.get() == QueryStatus::Preparing {
-            return false;
+        match req.status.get() {
+            QueryStatus::Pending => {}
+            QueryStatus::Preparing => return false,
+            _ => return self.dispatch_cursor(&req),
         }
-        debug_assert!(req.status.get() == QueryStatus::Pending);
 
         if req.flags.get().simple {
             if self.has_request_in_flight() {
@@ -1877,13 +1883,23 @@ impl PostgresSQLConnection {
             return true;
         }
 
+        self.dispatch_extended(&req, PostgresRequest::Unnamed)
+    }
+
+    /// The Parse, Bind and Execute of `req`, as far as they can be written now.
+    #[inline(always)]
+    fn dispatch_extended<P: PostgresRequest::Portal>(
+        &self,
+        req: &PostgresSQLQuery,
+        portal: P,
+    ) -> bool {
         // User code can end the request while its parameters are converted.
         let _statement_ref = req.statement.get().clone();
         let (Some(statement), Some(this_value)) =
             (req.statement_mut(), req.this_value.get().try_get())
         else {
             debug_assert!(false, "a queued request has a statement and a wrapper");
-            return self.remove_unwritten(&req);
+            return self.remove_unwritten(req);
         };
         let values = postgres_sql_query::js::binding_get_cached(this_value).unwrap_or_default();
         let unnamed = self
@@ -1900,7 +1916,7 @@ impl PostgresSQLConnection {
                         .unwrap_or_else(|err| self.global().take_error(err)),
                     None => JSValue::UNDEFINED,
                 };
-                self.reject_unwritten(&req, error);
+                self.reject_unwritten(req, error);
             }
             // Replies go to the requests in queue order: nothing is written past this one.
             StatementStatus::Parsing => return false,
@@ -1908,7 +1924,7 @@ impl PostgresSQLConnection {
                 if self.has_request_in_flight() && !self.can_pipeline() {
                     return false;
                 }
-                if !self.stage(&req, values, statement.parameter_types()) {
+                if !self.stage(req, values, statement.parameter_types()) {
                     return true;
                 }
                 // Whether an unnamed statement is described before its Bind depends on the values.
@@ -1929,6 +1945,7 @@ impl PostgresSQLConnection {
                         values,
                         formats,
                         false,
+                        portal,
                         self.writer(),
                     )
                 } else {
@@ -1937,20 +1954,21 @@ impl PostgresSQLConnection {
                         statement,
                         values,
                         formats,
+                        portal,
                         self.writer(),
                     )
                 } {
                     return self.fail_write(err);
                 }
-                self.note_request_bound(&req);
+                self.note_request_bound(req);
             }
             StatementStatus::Pending => {
                 if self.has_request_in_flight() {
                     return false;
                 }
-                let describe_first =
-                    req.flags.get().describe_first && !statement.signature.fields.is_empty();
-                if !describe_first && !self.stage(&req, values, statement.parameter_types()) {
+                let describe_first = req.flags.get().describe_first
+                    && (P::DESCRIBED || !statement.signature.fields.is_empty());
+                if !describe_first && !self.stage(req, values, statement.parameter_types()) {
                     return true;
                 }
                 self.close_evicted_statements();
@@ -1969,6 +1987,7 @@ impl PostgresSQLConnection {
                         values,
                         ResultFormats::Text,
                         true,
+                        portal,
                         self.writer(),
                     )
                 } {
@@ -1979,7 +1998,7 @@ impl PostgresSQLConnection {
                 if describe_first {
                     req.status.set(QueryStatus::Preparing);
                 } else {
-                    self.note_request_bound(&req);
+                    self.note_request_bound(req);
                 }
             }
         }
@@ -2160,7 +2179,9 @@ impl PostgresSQLConnection {
                         request.on_result(b"", self.global(), true);
                         self.discard_request(&request);
                     } else if request.status.get() == QueryStatus::Preparing {
-                        request.status.set(QueryStatus::Pending);
+                        request.status.set(request.unwritten_status());
+                    } else if request.flags.get().copy.is_cursor() {
+                        self.ready_cursor(&request);
                     }
                 }
                 self.advance();
@@ -2748,7 +2769,7 @@ impl PostgresSQLConnection {
             }
             MessageType::PortalSuspended => {
                 reader.skip_message()?;
-                debug!("TODO PortalSuspended");
+                self.on_portal_suspended();
             }
             MessageType::CloseComplete => {
                 // The answer to `close_evicted_statements`.

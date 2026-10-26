@@ -246,6 +246,38 @@ const queryA = sql`SELECT 1`;
 expectType(queryA).is<Bun.SQL.Query<any>>();
 expectType(await queryA).is<any>();
 
+for await (const batch of sql<{ id: number }[]>`SELECT id FROM users`.cursor(100)) {
+  expectType(batch).is<{ id: number }[] & Bun.SQL.ResultMetadata>();
+}
+const cursorIterator = sql<{ id: number }[]>`SELECT id FROM users`.cursor();
+expectType(cursorIterator).is<Bun.SQL.CursorIterator<{ id: number }[] & Bun.SQL.ResultMetadata>>();
+expectType(cursorIterator.next()).is<
+  Promise<IteratorResult<{ id: number }[] & Bun.SQL.ResultMetadata, undefined>>
+>();
+expectType(cursorIterator.return()).is<
+  Promise<IteratorResult<{ id: number }[] & Bun.SQL.ResultMetadata, undefined>>
+>();
+expectType(cursorIterator[Symbol.asyncDispose]()).is<PromiseLike<void>>();
+{
+  await using disposedCursor = sql<{ id: number }[]>`SELECT id FROM users`.cursor(100);
+  expectType(disposedCursor).is<Bun.SQL.CursorIterator<{ id: number }[] & Bun.SQL.ResultMetadata>>();
+}
+const cursorQuery = sql<{ id: number }[]>`SELECT id FROM users`.cursor(100, async rows => {
+  expectType(rows).is<{ id: number }[] & Bun.SQL.ResultMetadata>();
+  return rows.length === 0 ? sql.CLOSE : undefined;
+});
+expectType(cursorQuery).is<Bun.SQL.Query<[]>>();
+expectType(await cursorQuery).is<[] & Bun.SQL.ResultMetadata>();
+// @ts-expect-error
+(await cursorQuery)[0].id;
+expectType(sql<{ id: number }[]>`SELECT id FROM users`.cursor(rows => rows.length)).is<Bun.SQL.Query<[]>>();
+expectType(sql.CLOSE).is<Bun.SQL.CursorClose>();
+expectType(sql.END).is<Bun.SQL.CursorClose>();
+// @ts-expect-error
+sql`SELECT 1`.cursor("100");
+// @ts-expect-error
+sql`SELECT 1`.cursor(100, "not a function");
+
 const queryB = sql({ foo: "bar" });
 expectType(queryB).is<Bun.SQL.Helper<{ foo: string }>>();
 

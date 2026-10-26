@@ -178,8 +178,36 @@ fn array_literal(global: &JSGlobalObject, list: JSValue, tag: types::Tag) -> JsR
     Ok(literal)
 }
 
+/// The portal that a Bind makes and its Execute runs. A type, so that a plain query writes constants.
+pub(crate) trait Portal: Copy {
+    /// Its statement is described before the Bind also when it has no parameters: the rows come in the formats of their columns.
+    const DESCRIBED: bool;
+    fn name(&self) -> &[u8];
+    /// Of its Execute. 0 is no limit.
+    fn max_rows(&self) -> Int4;
+}
+
+/// The portal of a plain query: the next Bind replaces it, and its Execute returns every row.
+#[derive(Clone, Copy)]
+pub(crate) struct Unnamed;
+
+impl Portal for Unnamed {
+    const DESCRIBED: bool = false;
+
+    #[inline(always)]
+    fn name(&self) -> &[u8] {
+        b""
+    }
+
+    #[inline(always)]
+    fn max_rows(&self) -> Int4 {
+        0
+    }
+}
+
 /// Runs no JS once `stage_parameters` has seen `values_array`.
 fn write_bind<Context: WriterContext>(
+    portal: impl Portal,
     name: &[u8],
     global: &JSGlobalObject,
     values_array: JSValue,
@@ -194,8 +222,7 @@ fn write_bind<Context: WriterContext>(
     writer.write(b"B")?;
     let length = writer.length()?;
 
-    // The unnamed portal.
-    writer.string(b"")?;
+    writer.string(portal.name())?;
     writer.string(name)?;
 
     writer.short(len)?;
@@ -318,11 +345,12 @@ pub(crate) fn bind_and_execute<Context: WriterContext>(
     statement: &PostgresSQLStatement,
     values: JSValue,
     formats: types::ResultFormats,
-    mut writer: protocol::NewWriter<Context>,
+    portal: impl Portal,
+    writer: protocol::NewWriter<Context>,
 ) -> Result<(), AnyPostgresError> {
-    let name = &statement.signature.prepared_statement_name;
     write_bind(
-        name,
+        portal,
+        &statement.signature.prepared_statement_name,
         global,
         values,
         statement.parameter_types(),
@@ -330,11 +358,31 @@ pub(crate) fn bind_and_execute<Context: WriterContext>(
         formats,
         writer,
     )?;
+    execute_portal(portal, writer)
+}
+
+/// The next rows of a portal. Alone, it is the request for a portal that an earlier request has bound by name.
+pub(crate) fn execute_portal<Context: WriterContext>(
+    portal: impl Portal,
+    mut writer: protocol::NewWriter<Context>,
+) -> Result<(), AnyPostgresError> {
     protocol::Execute {
-        p: protocol::PortalOrPreparedStatement::PreparedStatement(name),
-        ..Default::default()
+        portal: portal.name(),
+        max_rows: portal.max_rows(),
     }
     .write_internal(&mut writer)?;
+    writer.write(&protocol::SYNC)
+}
+
+/// The server answers CloseComplete also when it has no portal of that name.
+pub(crate) fn close_portal<Context: WriterContext>(
+    portal: &[u8],
+    writer: protocol::NewWriter<Context>,
+) -> Result<(), AnyPostgresError> {
+    protocol::Close {
+        p: protocol::PortalOrPreparedStatement::Portal(portal),
+    }
+    .write_internal(writer)?;
     writer.write(&protocol::SYNC)
 }
 
@@ -347,24 +395,24 @@ pub(crate) fn parse_and_bind_and_execute<Context: WriterContext>(
     values: JSValue,
     formats: types::ResultFormats,
     include_describe: bool,
+    portal: impl Portal,
     writer: protocol::NewWriter<Context>,
 ) -> Result<(), AnyPostgresError> {
     write_parse(query, &statement.signature, writer)?;
     if include_describe {
         write_describe(&statement.signature, writer)?;
     }
-    bind_and_execute(global, statement, values, formats, writer)
+    bind_and_execute(global, statement, values, formats, portal, writer)
 }
 
 pub(crate) fn write_close_statement<Context: WriterContext>(
     name: &[u8],
     writer: protocol::NewWriter<Context>,
 ) -> Result<(), AnyPostgresError> {
-    writer.write(b"C")?;
-    let length = writer.length()?;
-    writer.write(b"S")?;
-    writer.string(name)?;
-    length.write()
+    protocol::Close {
+        p: protocol::PortalOrPreparedStatement::PreparedStatement(name),
+    }
+    .write_internal(writer)
 }
 
 pub(crate) fn write_copy_fail<Context: WriterContext>(

@@ -172,6 +172,7 @@ impl PostgresSQLStatement {
     }
 
     /// `result.statement` of the results of a named statement.
+    #[inline(always)]
     pub(crate) fn description(
         &mut self,
         global_object: &JSGlobalObject,

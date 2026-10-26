@@ -7647,6 +7647,327 @@ Files: `src/s3_signing/copy.rs` (new), `src/s3_signing/metadata.rs` (`AmzHeaders
 `test/packages/s3-server/src/signature.ts`, `test/packages/s3-server/test/auth.test.ts`,
 `test/integration/bun-types/fixture/s3.ts`.
 
+### 2026-10-26: cursors for `Bun.SQL`, `query.cursor()`
+
+`await sql`...`` builds one array with every row of the result. `Bun.SQL` had no API to read a
+large result in pieces at the pace of the consumer. oven-sh/bun#17181 ("Cursor support for sql",
+open since February 2025, 14 upvotes) asks for it, oven-sh/bun#25307 (12 upvotes) was closed into
+it in August with the words "neither shape is implemented yet", and the tracking issue
+oven-sh/bun#15088 still has "Support async iterators" unchecked. Upstream main has
+`debug!("TODO PortalSuspended")` where the server says that a row limit was reached. No pull
+request, open or closed, has a cursor. kysely-postgres-js 5.0.1 throws `streaming queries is not
+supported in Bun.SQL` at the line before its `reserved.unsafe(text, values).cursor(chunkSize)`.
+
+A program can write `DECLARE` and `FETCH` in `sql.begin()` today, and for a `SELECT` that bounds
+memory. PostgreSQL refuses `DECLARE` for `INSERT`, `UPDATE`, `DELETE` and `MERGE ... RETURNING`,
+for `SHOW` and for `EXPLAIN` (42601), and the caller has the transaction, the cursor name and the
+`CLOSE` to manage. The postgres package, which `Bun.SQL` takes its API from, reads all of them
+through `cursor()`. Now, on PostgreSQL:
+
+```ts
+import { sql } from "bun";
+
+// batches of at most 1,000 rows, asked for one at a time
+for await (const rows of sql`SELECT * FROM events ORDER BY id`.cursor(1000)) {
+  await send(rows);
+}
+
+// or a callback: the next batch is asked for when its promise has resolved
+await sql`SELECT * FROM events ORDER BY id`.cursor(1000, async rows => {
+  await send(rows);
+});
+
+// stop early: leave the loop, or return sql.CLOSE (sql.END is the same value)
+for await (const [event] of sql`SELECT * FROM events ORDER BY id`.cursor()) {
+  if (isTheOne(event)) break;
+}
+
+// in a transaction, the other statements run between two batches
+await sql.begin(async tx => {
+  const users = tx<{ id: number }[]>`SELECT id FROM users WHERE NOT notified ORDER BY id`;
+  for await (const rows of users.cursor(500)) {
+    await tx`UPDATE users SET notified = true WHERE id IN ${tx(rows.map(row => row.id))}`;
+  }
+});
+```
+
+The two forms and the token are those of the postgres package: `cursor(rows = 1)` is an async
+iterator of batches, `cursor(rows = 1, fn)` returns the query and calls `fn` with each batch. The
+iterator has `return()` and `Symbol.asyncDispose`, so `await using` ends it. The 15 cursor tests of
+that package and its two tests of concurrent cursors were in `test/js/sql/sql.test.ts` as comments.
+They are tests now, without their delays, and pass. MySQL and SQLite throw
+`cursor() is not supported by this adapter (PostgreSQL only)` in the call, as `readable()` and
+`writable()` do.
+
+What the consumer gets:
+
+- A batch is an array of 1 to `rows` rows, like the result of a query. Its `count` is its number of
+  rows, `columns` and `statement` describe it, and `command` is `null` except on the batch that the
+  statement ended with. A statement that returns no rows gives no batch.
+- The query resolves when the cursor has ended, to an array without rows. `count` is the number of
+  rows of all the batches, or the count of the command tag for a statement that returns none.
+  `command` is `null` when the cursor stopped before the statement ended, and `affectedRows` is
+  then `0`. The count is of the rows that Bun delivered, not of the tag, because the tag of an
+  `Execute` counts differently before PostgreSQL 13.
+- `.values()`, `.raw()`, `bigint` and a column transform apply to every batch. The values are those
+  of `await query` once its statement is prepared: `int4[]` is an `Int32Array` in the first cursor
+  as in the tenth. A query that runs with the simple protocol when it is awaited (`sql.unsafe()` and
+  `sql.file()` without values, `.simple()`) gives the text values that it gives when awaited.
+- A query has one cursor: the first `cursor()` with a callback, or the first iterator that is read.
+  Another one throws `ERR_INVALID_STATE`, or rejects so at its first `next()`.
+
+How it reads. The Bind of the statement names a portal (`C1`, `C2`, the lowest number that is free
+on the connection), and its Execute has the row limit. Each later batch is one more Execute of that
+portal, and it is the same native request, queued again. Every one of these requests ends with its
+own Sync and its own ReadyForQuery, so between two batches the connection is where it is between
+two statements of a transaction: `idle in transaction`, with the server's `statement_timeout`
+counting one batch and not the time of the consumer. No `Flush` is sent. The statement of a cursor
+is the unnamed one, parsed for each cursor and cached nowhere, so a cursor cannot fail because a
+cached statement went stale: `DEALLOCATE ALL`, `DISCARD ALL` and `ALTER TABLE ... ADD COLUMN`
+are tested. A query with the extended protocol is described first (Parse, Describe, Sync), so that
+its rows come in binary from the first batch. A cursor on `sql` that reads 7 rows by 3 is 6 round
+trips and 12 frontend messages: `BEGIN`, the describe, the Bind with the first Execute, two more
+Executes, `COMMIT`.
+
+Who owns the transaction. A portal lives only inside a transaction block, and the server ends it
+with the block. One place in Bun sends `BEGIN`, `COMMIT` and `ROLLBACK` for a caller, the `Scope`
+code of `src/js/bun/sql.ts`, and a cursor uses that place:
+
+- On `sql`, the cursor takes one connection of the pool and runs in a private transaction scope, as
+  the callback of `sql.begin()` does. The end of the loop, `break`, `return()`, `sql.CLOSE` and a
+  throw of the loop body or of the callback commit. An error of the server, `cancel()`, a lost
+  connection and an iterator that is dropped and collected roll back. When the statement ends, Bun
+  sends `COMMIT` before it hands out the last batch, so a batch with a `command` is of a statement
+  that is committed, and a `COMMIT` that fails (a deferred constraint) rejects the loop and the
+  query with nothing written.
+- On the handle of `sql.begin()` or of a savepoint, the cursor reads in that transaction and ends
+  with a Close of its portal. It never ends the transaction. A cursor that is open when the
+  callback returns fails the transaction, as an open COPY stream does.
+- On a reserved connection, the cursor reads in the transaction that is open there (`BEGIN` by
+  hand, or `reserved.begin()`), and never ends it. With no transaction open it rejects with
+  `ERR_POSTGRES_INVALID_TRANSACTION_STATE` and nothing is written.
+
+The last rule is enforced where the request is written, not in JavaScript. The native connection
+writes the statement of a cursor only when no request waits for an answer and the last
+ReadyForQuery said that a transaction is open. Until then the request waits, and in no transaction
+it is rejected unwritten. So a cursor never runs in autocommit, where its portal would be gone at
+the first Sync with the writes of the statement committed. That holds for every order of statements
+that a caller sends by hand, and for a `BEGIN` that the server refuses.
+
+`cancel()` between two batches ends the cursor with `ERR_POSTGRES_QUERY_CANCELLED` and leaves the
+caller's transaction as it is. With a request on its way the server is asked to stop, and the
+cursor rejects with what the server answers (`57014`), as any cancelled query does. A savepoint
+that is rolled back ends the cursors that were opened inside it, also those whose query was made
+on another handle of the transaction. The `COMMIT` or `ROLLBACK` of `reserved.begin()` ends the
+cursors that were opened on the reserved handle meanwhile. Without this, the next request for
+their rows would be answered with 34000 and abort the caller's transaction.
+
+What a program that never calls `cursor()` pays. Measured on release builds of the stack without
+this commit and with it. `perf`, `valgrind`, `strace` and `bloaty` are not in the container. The
+instruction counts are from gdb, one step at a time, which is exact, and from `perf_event_open`
+for the whole process. Syscalls are from `qemu-x86_64 -strace`.
+
+| Per                                              | Without the commit      | With it                 |
+| ------------------------------------------------ | ----------------------- | ----------------------- |
+| query: bytes of the native request               | 96                      | 96                      |
+| query: bytes of its JS wrapper                   | 64                      | 64                      |
+| query: GC cells allocated (cached, awaited)      | 32.06                   | 32.06                   |
+| query: instructions of native `run()`, cached    | 2,715                   | 2,666                   |
+| query: the same with `prepare: false`            | 3,019                   | 3,008                   |
+| query: the same for `.simple()`                  | 780                     | 772                     |
+| query: instructions of the dispatch that writes  | 1,457                   | 1,457                   |
+| query: instructions per message read             | 1,733 / 53 / 2,900      | 1,733 / 53 / 2,900      |
+| query: instructions of the whole process         | 29,179 (28,914-29,391)  | 29,215 (28,518-29,655)  |
+| query: the same with a result of 100 rows        | 137,322                 | 137,432                 |
+| query: sendto (42 bytes), recvfrom, epoll_pwait  | 1, 1, 1                 | 1, 1, 1                 |
+| `sql.begin()` with one statement: GC cells       | 124.01                  | 124.01                  |
+| `reserve()` and `release()`: GC cells            | 34.57                   | 34.57                   |
+| savepoint, released / rolled back: GC cells      | 214.07 / 226.07         | 214.01 / 226.08         |
+| `new SQL()` on PostgreSQL: GC cells, bytes held  | 55.07, 2,893            | 55.07, 2,952            |
+| process: host functions of the query prototype   | 10                      | 12                      |
+| process: text of the binary                      | 108,629,396             | 108,653,497 (+24.1 KB)  |
+
+The "whole process" rows are the slope between 20,000 and 40,000 awaited queries, the median of
+five interleaved runs, and the difference is inside the spread. The lower counts of `run()` are
+not an optimization: the function was split, and the compiler inlines it differently. What is
+written for a plain query is byte for byte what it was, and the pinned wire tests of upstream pass
+unmodified.
+
+The first release build of this work was not free, with no new branch in the source: `run()` took 48
+instructions more, 30 of them in the dispatch that it calls, and the result 31 more, because the
+compiler had stopped inlining three things that got a second caller. Three changes took that back,
+and they are in the commit. The writers of Bind and Execute are generic over a `Portal` type, and a
+plain query passes `Unnamed`, a type without data, so it writes constants. `run()` and `fetch()`
+share one tail in `queue()`. `PostgresSQLStatement::description` is `#[inline(always)]`. The request
+of a cursor is found by `dispatch_next` on the status byte, through the compare that was there: the
+shared `QueryStatus` has one more value, `Cursor`, and the kind of the request (open, fetch,
+suspended, close) is in the one-byte `CopyStream` enum that a request had. The portal id and the row
+limit are one number in the `copy` slot of the JS wrapper. A client has three more fields on its
+adapter (59 bytes), a `Scope` has one.
+
+What a cursor costs. One round trip for each batch, plus `BEGIN`, the describe and `COMMIT` on
+`sql`. On loopback, 1,000,000 rows of three columns take 0.37 to 0.61 s as one array, 0.93 to 0.98 s
+with `cursor(1000)` and 0.57 to 0.61 s with `cursor(10000)`. Reading 5,000,000 rows by 1,000 grows
+the resident set by 25 MiB, and the same rows as one array by 486 MiB. No native request is
+allocated for a batch: a test reads cursors that end in every way and counts the requests that
+are alive afterwards. The consumer holds one batch: while the next one is on its way, the one
+before it is collected (tested with a weak reference, in both forms).
+
+Limits, each in the docs:
+
+- A cursor on a reserved connection needs an open transaction. `reserved.begin()` gives one.
+- With as many cursors, transactions and reservations open as the pool has connections, a query on
+  `sql` inside the loop waits, and if each of them waits for such a query, none ends.
+- What an `INSERT ... RETURNING` cursor on `sql` wrote is not committed until the cursor ends. The
+  rows of an `UPDATE ... RETURNING` or `SELECT ... FOR UPDATE` cursor stay locked until then.
+- With `max: 1`, a cursor on `sql` inside a `BEGIN` by hand ends that transaction with its own
+  `COMMIT`, as `sql.begin()` does in the same place.
+- PostgreSQL plans the statement for the whole result. A plan that streams stops where the consumer
+  stops (tested with `nextval`). A sort, an aggregate and every `RETURNING` statement do their work
+  before the first batch. PostgreSQL uses no parallel query under a row limit.
+- `idle_in_transaction_session_timeout` and, from PostgreSQL 17, `transaction_timeout` count the
+  time of the consumer and end the connection (25P03, 25P04).
+- On `sql`, an iterator that is dropped without `return()` holds its connection until the garbage
+  collector finds it. Then the cursor is rolled back.
+- A statement that refuses a transaction block, such as `VACUUM`, has no cursor (25001).
+- A reserved handle that is dropped without `release()` while a cursor of it is read ends that
+  cursor when the handle is collected. An open COPY stream has the same rule.
+
+Self-reviewed before the push, twice. The first review (6.6 hours) said: keep the API and the
+wire, and change who owns the transaction. The first version had a second transaction manager for
+cursors beside `Scope`: a conditional `BEGIN` request and a `COMMIT` that the cursors of a reserved
+connection shared. The review reproduced four cases where the result and the database disagreed.
+A cursor resolved `INSERT` with count 5 and 0 rows stored after a sibling cursor was cancelled. An
+awaited `INSERT` on a reserved connection was rolled back by the `cancel()` of a cursor. The end
+of a cursor committed a transaction that the caller began. After `DEALLOCATE ALL`, a cursor on
+`sql` gave one batch, rejected with 34000 and left its rows committed, because its `BEGIN` was a
+cached statement. All of that is gone with the design above, and each case is a test. Of the 59
+points of that review, these changed the behaviour: the transaction of a cursor on `sql` belongs
+to `Scope`, the statement waits for a transaction on the wire, no transaction is begun or ended on
+a reserved connection, the statement of a cursor is the unnamed one, the cursor ends when the
+statement ends and not one `next()` later, a batch is never empty, counts are of delivered rows,
+the first `cursor()` has the query, portal names are per connection and do not wrap, `cancel()`
+reports what the server answered, and only a cursor on `sql` is watched by the collector (inside
+`sql.begin()` a collection could turn a rollback into a commit).
+
+A second, short check looked at the rework (eight reviewers, 40 minutes) and found 26 things, of
+which 23 are changed. The ones with an effect: an iterator whose `next()` was awaited with no
+other reference to it could be collected while it waited, and then held its connection for ever
+(a pending call keeps the iterator now). A Close that was written behind a running request kept
+a cancel of that request from the server. The `COMMIT` of `reserved.begin()` was aborted by
+Bun's own cancel of a cursor on the reserved handle. A savepoint rollback missed the cursors of
+a sibling handle. The rest were five sentences of the docs and the types, ten points of the
+tests (tests near the time limit, assertions that could not fail, a failed assertion that showed
+as a timeout, five branches that no test noticed), and four costs (a walk of the running queries
+at every savepoint, an out-of-line call while a statement is prepared, a bound function for each
+client, a call for each evicted statement).
+
+Not taken, and why:
+
+- A transaction of its own for a cursor on a reserved connection that is in none. The review's
+  reviewers disagreed: refuse, or begin one and refuse the caller's other statements until the
+  cursor ends. Refusing can become the other later without a break. kysely-postgres-js calls
+  `cursor()` on reserved connections, and its `stream()` outside a transaction needs the second.
+- A new name for the `CopyStream` enum, which holds the kind of a cursor request now. It would
+  touch about 30 lines of upstream's COPY code. `is_cursor()` is an exhaustive match.
+- Routing on `Flags.copy` in place of `Status::Cursor`, and a flag test in `dispatchToPool` in
+  place of the handler that `cursor()` swaps in. Both add a compare or a branch to every plain
+  query. The numbers above are with neither.
+- Plain fields for the portal id and the row limit: the request would be 104 bytes, in the
+  112-byte bin of the allocator, for every query.
+- `affectedRows: null` for a cursor that stopped early. `ResultMetadata.affectedRows` is a number,
+  and the summary would need a type of its own. It is `0`, `command` is `null`, and the docs say
+  why.
+- The cursor code in a module of its own that loads on the first `cursor()`.
+- A rule of its own for a reserved handle that is dropped while a cursor is read (above).
+
+Open for a maintainer, if this goes upstream: the rule for a reserved connection (above), both
+forms and the token or the iterator alone, a row-less summary and not the last batch as the
+result of the query, `COMMIT` on `break` and on a throw, and what `cursor()` on `sql` does with
+`max: 1` inside a `BEGIN` by hand (as `sql.begin()` today).
+
+Tests: `test/js/sql/postgres-cursor.test.ts` (new, 106 tests). Two check that MySQL and SQLite
+throw. 93 run against a real server:
+both forms, row counts around the limit, `prepare: false`, `sql.unsafe()`, `sql.file()`,
+`.simple()`, values against the awaited query, `pg_prepared_statements` after a cursor, every
+end on `sql`, in a transaction, in savepoints and on a reserved connection with `BEGIN` by hand
+in five orders, the refusal without a transaction, the four cases of the first review, a
+`COMMIT` that fails, `cancel()` before the start, while it waits for a connection, between two
+batches, after the last batch and with the first or a later batch on its way, a session that the
+server ends in three places, the two timeouts of the server, the pool with its connections in
+cursors, and the collector (a dropped iterator, an iterator with a call that waits, requests
+that are freed). 11 run against a scripted server that records every frontend message: the
+frames on a pool, in a transaction, with `prepare: false` and for a query of the simple
+protocol, a `BEGIN` that is refused, a statement that waits for the ReadyForQuery of a `BEGIN`
+by hand, `cancel()` while `BEGIN` is on its way, and tags that count as PostgreSQL 12 does. All
+106 fail on Bun 1.4.3 and on the release build of the stack without this commit. The file takes
+3 to 4 seconds on the release build and 18 to 22 on the debug build. The 17 tests in `sql.test.ts`,
+one in `sql-debug.test.ts` (`debug` reports `BEGIN`, the statement once, and `COMMIT`, each in the
+async context of the code that ran the query) and the byte tests of two new frame helpers in
+`wire-frames.test.ts` pass.
+
+Also run on the debug build: `postgres-bind-wire` (61), `postgres-dispatch` (26),
+`postgres-simple-query-pipeline` (3), `postgres-prepared-pipeline-reorder` (28),
+`postgres-split-prepare-reorder` (2), `postgres-copy` (75), `postgres-connection` (91),
+`sql-handles` (258), `sql-pool-transaction-isolation` (18), `sql-reserve-abort` (9),
+`sql-prepare-false` (8), none of them modified. Every snippet of the docs and every sentence of
+the cursor section that can be tested was run, the type tests pass (24), and so do the source
+lints (187, with the release build). `cargo fmt`, `bun fmt` and clippy are clean, and so is the
+rule of upstream's comment-cop workflow: no comment of two lines or more in `src/`.
+`cargo check -p bun_sql_jsc` passes for Windows, macOS, musl and FreeBSD.
+
+What failed, and why it is not the commit. The MySQL blocks of `sql-debug`, `sql-pool`,
+`sql-errors` and `sql-result-columns` fail in this container with "Access denied for user
+'root'". Ten tests of `sql.test.ts` and one of `sql-pool.test.ts` fail with and without the
+commit, because of how the server of the container is set up: `SQL_ASCII` as its encoding, no
+prepared transactions, no role `bun_sql_test_md5`. The subprocess tests of `postgres-listen-notify`
+run out of 5 seconds on the debug build when the file runs whole, and pass alone (9) and on both
+release builds (61). A test of upstream, `test/internal/prestart-map.test.ts`, failed on the
+stack before this commit: the `debug` patch of 2026-09-20 had no entry for its test file. That
+patch has the entry now, and this commit has its own.
+
+Built and run on Linux x64 only. Nothing in the commit is specific to a platform.
+
+Relation to open pull requests of upstream. The commit applies to oven-sh/bun 449877f3e0 with
+two conflicts, both next to the `debug` patch of 2026-09-20: three lines in the constructor of
+`Client` in `src/js/bun/sql.ts`, and the sentence about cursors in the "Logging queries" section
+of the docs, which upstream does not have. `test/js/sql/sql-debug.test.ts` is a file of that patch
+too. It was not built there. None of these has a review of a maintainer:
+
+- oven-sh/bun#46811 (pipelined `BEGIN`) and oven-sh/bun#45628 (`query.describe()`) each take
+  `1 << 10` of `SQLQueryFlags`. The cursor has `1 << 12`. Both add a field to the flags of the
+  native request, which is 96 bytes with no byte to spare. After #46811 the statement of a cursor
+  still waits for the answer to its `BEGIN`: that wait is what keeps it out of autocommit when a
+  `BEGIN` is refused.
+- oven-sh/bun#44924 changes the shared `QueryStatus` too.
+- oven-sh/bun#40944 and oven-sh/bun#40250 change `PostgresRequest.rs`.
+- oven-sh/bun#46529 asks for streaming on the MySQL adapter. This commit is PostgreSQL only, so
+  it is the PostgreSQL part of #17181 and does not close it.
+
+Rebase notes: the 61 patches went onto oven-sh/bun 449877f3e0 with no conflict and nothing
+dropped, and the three workflows of the fork were green on the last push. The `debug` patch of
+2026-09-20 was amended with its line in `test/docker/prestart-map.mjs`, so the 28 patches
+between it and this one have new hashes and the same content. Four commits landed upstream
+during the work (1341090411 is the last). They touch no file of this commit and wait for the
+next sync.
+
+Files: `src/sql_jsc/postgres/Cursor.rs` (new), `src/sql_jsc/postgres/PostgresSQLQuery.rs`
+(`queue`, `set_statement`, the cursor kinds of `CopyStream`),
+`src/sql_jsc/postgres/PostgresSQLConnection.rs` (`dispatch_next`, `dispatch_extended`, the
+ReadyForQuery and PortalSuspended arms), `src/sql_jsc/postgres/PostgresRequest.rs` (`Portal`,
+`Unnamed`, `execute_portal`, `close_portal`), `src/sql_jsc/postgres/PostgresSQLStatement.rs`,
+`src/sql_jsc/postgres/PostgresSQLQuery.bind.ts` (`fetch`, `setCursor`),
+`src/sql/postgres/protocol/Close.rs` (new), `src/sql/postgres/protocol/Execute.rs`,
+`src/sql/postgres/PostgresProtocol.rs`, `src/sql/lib.rs`, `src/sql/shared/QueryStatus.rs`,
+`src/sql_jsc/mysql/MySQLQuery.rs`, `src/js/internal/sql/query.ts` (`cursor()`, `Cursor`,
+`CursorIterator`), `src/js/internal/sql/postgres.ts` (`PortalCursor`),
+`src/js/internal/sql/shared.ts`, `src/js/bun/sql.ts` (the transaction of a cursor on a pool,
+`abandonCursorsAround`, `CLOSE` and `END`), `packages/bun-types/sql.d.ts`,
+`docs/runtime/sql.mdx`, `test/js/sql/postgres-cursor.test.ts` (new), `test/js/sql/sql.test.ts`,
+`test/js/sql/sql-debug.test.ts`, `test/js/sql/wire-frames.ts`,
+`test/js/sql/wire-frames.test.ts`, `test/integration/bun-types/fixture/sql.ts`,
+`test/docker/prestart-map.mjs`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

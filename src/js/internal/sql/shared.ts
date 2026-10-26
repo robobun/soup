@@ -620,6 +620,13 @@ export interface DatabaseAdapter<Connection, ConnectionHandle, QueryHandle> exte
   detachConnectionCloseHandler(connection: Connection, handler: (err: Error) => void): void;
   isInTransaction?(connection: Connection): boolean;
   copyStream?(query: QueryType<any, any>, writable: boolean): ReadableStream<Uint8Array> | WritableStream<unknown>;
+  /** What reads `query` in batches of at most `rows` rows. Without it, query.cursor() throws. */
+  cursor?(query: QueryType<any, any>, rows: number): import("./query").CursorSource<QueryHandle>;
+  /** With `cursor`, from the client of the pool: it dispatches a query that cursor() was called on to a connection of its own. */
+  cursorHandler?: (query: QueryType<any, any>, handle: QueryHandle) => void;
+  cursorClient?: unknown;
+  /** With `cursor`: how many cursors are open. */
+  cursors?: number;
 
   array(values: any[], typeNameOrID?: number | string): SQLArrayParameter;
   /** The parameter that stores `value` as JSON, where that is not its JSON text. */
