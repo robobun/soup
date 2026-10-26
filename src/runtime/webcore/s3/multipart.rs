@@ -472,7 +472,7 @@ impl MultiPartUpload {
                             acl: self_.acl,
                             storage_class: self_.storage_class,
                             request_payer: self_.request_payer,
-                            metadata: self_.metadata.as_ref(),
+                            metadata: self_.metadata.as_deref(),
                             ..Default::default()
                         },
                         s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
@@ -955,7 +955,7 @@ impl MultiPartUpload {
                     acl: self.acl,
                     storage_class: self.storage_class,
                     request_payer: self.request_payer,
-                    metadata: self.metadata.as_ref(),
+                    metadata: self.metadata.as_deref(),
                     ..Default::default()
                 },
                 s3_simple_request::S3Callback::Download(Self::start_multi_part_request_result),
@@ -1081,7 +1081,7 @@ impl MultiPartUpload {
                     acl: self.acl,
                     storage_class: self.storage_class,
                     request_payer: self.request_payer,
-                    metadata: self.metadata.as_ref(),
+                    metadata: self.metadata.as_deref(),
                     ..Default::default()
                 },
                 s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),

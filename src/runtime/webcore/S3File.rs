@@ -519,7 +519,7 @@ pub(crate) fn get_presign_url_from(
             // Headers the request has to send, and only an upload has them.
             metadata: credentials_with_options
                 .metadata
-                .as_ref()
+                .as_deref()
                 .filter(|_| matches!(method, Method::PUT | Method::POST)),
         },
         Some(bun_s3_signing::SignQueryOptions { expires }),
@@ -558,6 +558,28 @@ fn get_bucket_name(this: &Blob) -> Option<&[u8]> {
     Some(bucket)
 }
 
+/// `file.copyTo(destination, options)`: a destination key is at the endpoint and in the bucket of this file.
+fn copy_to(
+    this: &Blob,
+    global: &JSGlobalObject,
+    destination: JSValue,
+    options: JSValue,
+) -> JsResult<JSValue> {
+    use crate::webcore::s3::copy;
+
+    let store = s3_store(this, global, "copyTo")?;
+    let source = copy::Object::File(Box::new(this.borrowed_view()));
+    let destination =
+        copy::Object::from_js(global, destination, "Expected a S3 or path to copy to")?;
+    copy::copy(
+        &global.js_thread_of_caller(),
+        source,
+        destination,
+        copy::Defaults::of_credentials(store.data.as_s3().get_credentials()),
+        (!options.is_undefined_or_null()).then_some(options),
+    )
+}
+
 // Exported as `JSS3File__*` (see the `exports` block below).
 fn get_bucket(this: &Blob, global: &JSGlobalObject) -> JsResult<JSValue> {
     if let Some(name) = get_bucket_name(this) {
@@ -585,6 +607,7 @@ pub(crate) fn to_js_unchecked(global: &JSGlobalObject, this: *mut Blob) -> JSVal
 // JSS3File__presign     -> raw shim wrapping get_presign_url_from (method-with-context)
 // JSS3File__bucket      -> get_bucket
 // JSS3File__stat        -> raw shim wrapping S3BlobStatTask::stat (method-with-context)
+// JSS3File__copyTo      -> raw shim wrapping copy_to (method-with-context)
 
 pub(crate) mod exports {
     use super::*;
@@ -621,6 +644,21 @@ pub(crate) mod exports {
         let (this, global) = unsafe { (&*this, &*global) };
         bun_jsc::to_js_host_call(global, || {
             S3BlobStatTask::stat(&global.js_thread_of_caller(), this)
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    #[bun_jsc::host_call]
+    fn JSS3File__copyTo(
+        this: *mut Blob,
+        global: *mut JSGlobalObject,
+        destination: JSValue,
+        options: JSValue,
+    ) -> JSValue {
+        // SAFETY: JSC method shim passes the wrapper's live Blob and global.
+        let (this, global) = unsafe { (&*this, &*global) };
+        bun_jsc::to_js_host_call(global, || {
+            super::copy_to(this, global, destination, options)
         })
     }
 }

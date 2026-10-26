@@ -7237,6 +7237,416 @@ Files: `src/runtime/test_runner/timers/FakeTimers.rs` (`Drive`, `FakeTimers::tur
 `test/js/bun/test/fake-timers/sinonjs/MIGRATION_NOTES.md`,
 `test/integration/bun-types/fixture/test.ts`.
 
+### 2026-10-25: server-side copy for S3, `copy()` and `copyTo()`
+
+Bun's S3 client could not copy an object inside the service. `write()` with an S3 file as its
+data downloads the object and uploads it again, and there was no other way: no request of the
+client could carry `x-amz-copy-source`. oven-sh/bun#29595 (open since April, 8 upvotes) asks for
+"a first-class server-side copy operation" as the second of its four items, and one comment there
+describes the pipeline that needs it: an upload goes to a quarantine key, is scanned, and is then
+promoted to its final key with CopyObject and `x-amz-copy-source-if-match`, so that the bytes that
+passed the scan are the bytes that are promoted. That team keeps `@aws-sdk/client-s3` installed
+for this one call, because a download and an upload do not fit in a 256 MB pod and lose the
+condition. No pull request, open or closed, has the header. Now:
+
+```ts
+import { s3, S3Client } from "bun";
+
+// two keys in the bucket of the client
+await s3.copy("uploads/photo.jpg", "archive/photo.jpg");
+
+// from a file: to a key next to it, or to another bucket
+const photo = s3.file("uploads/photo.jpg");
+await photo.copyTo("archive/photo.jpg");
+await photo.copyTo("photo.jpg", { bucket: "backups" });
+await S3Client.copy(photo, backups.file("photo.jpg"));
+
+// promote the object that the scanner read, and no other
+const upload = await fetch(s3.presign("quarantine/upload.bin"));
+const etag = upload.headers.get("etag");
+if (!upload.ok || !etag) throw new Error("cannot read the upload");
+await scan(upload.body);
+await s3.copy("quarantine/upload.bin", "files/upload.bin", { copySourceIfMatch: etag });
+
+// a new object with its own type and metadata, or the same object in another storage class
+await s3.copy("uploads/scan-0001.bin", "reports/january.pdf", {
+  metadataDirective: "REPLACE",
+  type: "application/pdf",
+  metadata: { reviewed: "yes" },
+});
+await s3.copy("logs/2025.tar", "logs/2025.tar", { storageClass: "GLACIER_IR" });
+
+const { etag: copied, lastModified } = await s3.copy("a.txt", "b.txt");
+```
+
+A copy is one CopyObject request: a `PUT` of the destination that has no body and names the
+source in a header. It is signed with the credentials of the destination and goes to the endpoint
+of the destination. The promise resolves with `{ etag, lastModified }` from the answer, the entity
+tag in its quotes as `stat()` has it. Against the S3 server of the tests, a copy of 1 MiB is
+one request with no body, where `write(key, s3.file(source))` is two requests and 1 MiB in each
+direction.
+
+There are three ways to call it, and they are one function underneath. Each has one rule for
+where a key is:
+
+- `client.copy(source, destination, options?)`, and so `Bun.s3.copy()`: two keys in the bucket of
+  the client, or in the `bucket` of the options. As every other method of a client, it takes no
+  `S3File`.
+- `file.copyTo(destination, options?)`: the destination is an `S3File`, or a key at the endpoint
+  and in the bucket of the file, with the credentials of the file. Nothing else of the file goes
+  to the new object: not its `acl`, its storage class, its type or its metadata.
+- `S3Client.copy(source, destination, options?)`: each is a key or an `S3File`. A destination key
+  is read with the environment and the options, as in the other static methods, also next to a
+  source `S3File`. A source key is read with the credentials of the destination.
+
+A key is a path as in each other method: with credentials that have no `bucket`, its first part is
+the bucket.
+
+The options are those of the destination, as the options of `write()` are those of the object it
+makes: its credentials, its `bucket`, its `acl` and `storageClass`. A source that is a key is in
+the bucket of the destination, so `client.copy("a", "b", { bucket: "other" })` copies inside
+`other`. A source in another bucket is an `S3File`, which knows its bucket. The AWS SDK has the
+same two parts: its request is addressed to the destination, and the source is a path that has
+its own bucket in it. `requestPayer` is the one option that is for the request and not for the
+object: the request reads the bucket of the source too. So Bun sends it when the destination has
+it, or the `S3File` of the source, and a call can still say `false`.
+
+What the new object is made of follows CopyObject:
+
+- Without `metadataDirective` it has the `type`, the `contentDisposition`, the `contentEncoding`
+  and the metadata of the source, and each other header that the service keeps. The request sends
+  none of them. `metadataDirective: "COPY"` is the same copy, and the request says so in
+  `x-amz-metadata-directive`, for a bucket policy that asks for the header.
+- With `metadataDirective: "REPLACE"` the copy stores what an upload to the destination stores:
+  the four of the call, then the metadata of the file or of the client and the type of the file,
+  then the type that the extension of the key gives. One test compares the headers of a copy
+  with the headers of `write()` to the same destination, for settings on the client, on the file
+  and on the call.
+- `"REPLACE"` is all or nothing on the service. The new object has only what the request sends,
+  so the `Cache-Control`, `Content-Language` and `Expires` of the source are gone too, and Bun
+  has no option that sets them. That is why Bun does not turn it on for the caller: a call that
+  has one of the four options without `"REPLACE"` throws. The other choices were weighed.
+  To ignore the option (the REST API, the SDK) is a copy that did not do what the call said. To
+  replace without a word (aws-cli v1 with `--metadata`) loses the headers that the call did not
+  name. To read the source first and give everything again (aws-cli v2, rclone) is a second
+  request, and needs three options that Bun does not have.
+- The `acl` and the `storageClass` are never those of the source. The service takes them from the
+  request, so they are the ones of the call, of the file or of the client, as for an upload. That
+  is also how an object changes its storage class: a copy onto itself with `storageClass`.
+
+Four options are conditions on the source: `copySourceIfMatch`, `copySourceIfNoneMatch`,
+`copySourceIfModifiedSince` and `copySourceIfUnmodifiedSince`, named after the fields of the AWS
+SDK. A time is a `Date`, as in the SDK, and goes out as an HTTP date. The first build took a
+string too and sent it as it was. The self-review showed that a service does not apply a time
+that it cannot read, so `"garbage"` made a copy without a condition. Only `undefined` is no
+condition: `null` throws, because `headers.get("etag")` is `null` for a response that has no
+entity tag, and an entity tag of spaces throws as an empty one does. `new Date(0)` is a date. A
+date after the year 3000 throws: the writer of HTTP dates that Bun has does not check the result
+of `gmtime_s`, which on Windows has no later year (read in the source, not run on Windows).
+
+An error of a copy is an `S3Error` with the source in `path` and the destination in `dest`, which
+is what `fs.copyFile()` gives its errors. `dest` is set where the copy fails, as a property that
+a program can delete. The struct that the other eleven S3 callbacks share with C++ is as it was.
+Two answers need care. CopyObject can answer 200 and carry an `<Error>` document, which is an
+error here, through the check that CompleteMultipartUpload already had. And a 200 that is neither
+that nor a `<CopyObjectResult>` (the page of a proxy) is the error `InvalidResponse`, not a
+success with an empty entity tag. The arm of CompleteMultipartUpload still resolves for such a
+page. That is upstream's behaviour, oven-sh/bun#34044 and oven-sh/bun#45701 are about it, and
+this commit does not change it.
+
+What rejects without a request, as in each other method: credentials without a key pair
+(`ERR_S3_MISSING_CREDENTIALS`, and before the keys are looked at), and a source or a destination
+that has no key or no bucket (`ERR_S3_INVALID_PATH`). Both are an `S3Error` with `path` and
+`dest`. What throws before a promise exists:
+
+- an argument that is not a key or an S3 file;
+- a `slice()` for the source or the destination: CopyObject has no range;
+- a source `S3File` at another service than the destination. The request goes to the
+  destination, and a service answers 200 for a key of its own that has the same name. The design
+  review saw exactly that against two servers: the copy of a stale object, and no error. Amazon
+  S3 is one service in each of its three partitions, whatever the region, and a host of Amazon is
+  Amazon S3 only with an `s3` label: MinIO on the host name of an EC2 instance is not. R2 is one
+  service in each account and jurisdiction. Another service is one host and one path of the
+  endpoint, without the bucket of a virtual hosted-style host name. The scheme is not a part of
+  it;
+- a `bucket` that is not the bucket of a virtual hosted-style host name. Each other method of
+  such a client sends its request to the host and does not read `bucket`. A copy has to name its
+  source as a bucket and a key, so the first build read `bucket` there, and one `S3File` was one
+  object for `text()` and another for `copyTo()`. Now Bun reads the bucket from a host name of
+  Amazon S3 or of R2, which say where it is, and needs `bucket` to be the first part of another
+  host name. An access point, a PrivateLink host and a proxy whose host name does not start with
+  its bucket cannot be the source of a copy;
+- an option of the four without the directive, as above;
+- a condition of the wrong type or value, as above;
+- more than 232 metadata keys with `REPLACE`, from the call, the file or the client: an upload
+  takes 238, and a copy can add six headers of its own to the 250 that the HTTP client sends.
+
+Where it lives was decided by a design review before the code was written (4.5 hours). It traced
+the request through 16 frames and found four places that have to change in any design: the
+surface, one request function, the signer, and the reader of the answer. It compared six
+designs:
+
+- Sign the copy as a presigned URL, which already signs extra headers (the smallest patch). A
+  bucket policy that requires `s3:authType=REST-HEADER` answers 403 to it, the signature and the
+  session token are in the URL and in the verbose log, and a session token of 2,000 bytes is
+  refused where header signing takes it.
+- One flag per header in `SignedHeadersKey`, as the other signed headers have. The list of a full
+  copy is 320 bytes and the buffer for it has 256, and `SignResult` would grow by 96 bytes in
+  every S3 request.
+- An open sorted list of extra headers that is merged into the canonical request after it is
+  written. It reads the canonical request back on every copy, nothing can test its order, and the
+  rewrite of oven-sh/bun#45440 leaves it nothing to read.
+- A signer around one ordered header list for every request. That is the shape of botocore and of
+  oven-sh/bun#39210 (open), and oven-sh/bun#46746 calls a generic sorted list "the right end
+  state". Nothing in a copy needs it, and a new abstraction across the signer is for the
+  maintainers to agree to first.
+- CopyObject with a second path through UploadPartCopy for a slice or for more than 5 GB: a
+  second multipart state machine that nobody asked for.
+- No change.
+
+It also ruled on `Bun.write(s3File, otherS3File)`: that stays a download and an upload. For an
+object that is stored with `Content-Encoding: gzip`, the download decodes, so `write()` stores
+4,096 decoded bytes where a copy stores the 40 bytes of the source, and oven-sh/bun#46863 (open)
+pins the two requests of `write()` with a test. The docs of a copy say what `write()` stores.
+
+What was built is the design it picked. The six copy headers are a closed set, named in one new
+file of the signing crate (`src/s3_signing/copy.rs`), and they travel in the sorted list of signed
+headers that the metadata patch of 2026-09-27 gave the signer:
+
+- The list has a type of its own now, `AmzHeaders`. `Metadata` was that list, and six headers
+  that are not metadata do not belong in a type of that name. `Metadata` keeps `insert()` for an
+  `x-amz-meta-*` key and derefs to the list. The signer and the request options take the list.
+  This is a name and not the generic list of the fourth design: the list is for the headers that
+  sort between `x-amz-content-sha256` and `x-amz-request-payer`, and a constant assertion checks
+  at compile time that each of the six names does.
+- `CopyHeaders` takes the credentials and the path of the source, the four conditions and the
+  directive, and gives back the list: the copy headers and, for `REPLACE`, the metadata, sorted
+  by name.
+- The value of `x-amz-copy-source` is `bucket/key` by the rule the signer has for the path of a
+  request (one leading slash off, the bucket of the credentials or the first part of the path,
+  slashes trimmed, `\` read as `/`, percent-encoded), so that a copy reads the object that
+  `stat()` of the same key describes. The first build had a copy of that rule. Now the rule is
+  one macro, `bucket_and_key!`, that `sign_request` and the copy both expand. A macro and not a
+  function, because the macro leaves the machine code of `sign_request` as it was and a function
+  does not (the self-review built both: 0 and 3,671 lines of disassembly differ).
+- An endpoint can have a path, and `sign_request` puts it before the bucket and the key. Amazon S3
+  and R2 have the S3 API at the root of a host, so there the path is a part of where an object is
+  and the source has it. In another host the path is where the S3 API is, as the docs have it for
+  Supabase, and the source does not have it.
+- The two functions that write the signed headers, `SignedHeaders::write` and
+  `CanonicalRequest::format`, test for the list before they write `x-amz-content-sha256` and
+  `x-amz-date`, where they tested after. A request without a list writes the two names as one
+  literal, as before. A request with a list writes `x-amz-content-sha256`, the entries that sort
+  before `x-amz-date`, `x-amz-date`, and the rest. Metadata is all in the rest, and one compare of
+  the first name says so.
+- `SignResult`, `SignedHeadersKey` and the presign branch are as they were.
+  `execute_simple_s3_request` is too: it already adds each entry of the list to the request after
+  it is signed.
+- The answer has its own arm, `Callback::Copy`. The request is `s3::client::copy`, a wrapper as
+  `stat` and `delete` have one. The arguments, the options and the promise are in
+  `src/runtime/webcore/s3/copy.rs`.
+
+The window of the list is what it can carry later without a change of the signer:
+`x-amz-copy-source-range`, the headers of a source that is encrypted with a key of the customer,
+grants, object lock and `x-amz-expected-bucket-owner` sort inside it. `x-amz-checksum-algorithm`
+sorts before `x-amz-content-sha256`. `x-amz-tagging` and `x-amz-tagging-directive`, the
+encryption of the destination, the website redirect and `x-amz-source-expected-bucket-owner` sort
+after `x-amz-request-payer`. None of those fits. The first of them needs the writers to split at
+the fixed names around the window as they now split at `x-amz-date`, or the generic list.
+
+What it costs a program that never copies, on two release builds (the stack without this commit
+and with it, same toolchain):
+
+|                                                                        | without                                      | with                    |
+| ---------------------------------------------------------------------- | -------------------------------------------- | ----------------------- |
+| `sign_request::<false>` (disassembly)                                  | 3,416 instructions, 299 conditional jumps    | the same, none differs  |
+| `SignedHeaders::get`, `execute_simple_s3_request`, the `stat()` thunk  | 68, 756 and 145 instructions                 | the same, none differs  |
+| `CanonicalRequest::format` for a `stat()`, callees included            | 2,780 instructions, 494 conditional branches | 2,779, 494              |
+| the same for an upload without metadata                                | 2,776, 494                                   | 2,775, 494              |
+| the same for an upload with 1, 3 and 10 metadata keys                  | 3,414, 4,678 and 9,232 instructions          | 3,529, 4,795 and 9,356  |
+| `SignedHeaders::with_metadata` for an upload with 3 keys               | 241 instructions, 42 conditional branches    | 312, 47                 |
+| `S3HttpSimpleTask::on_response` for a `stat()`, its own body           | 190 instructions, 24 conditional branches    | 190, 24                 |
+| `SignResult`, `SignOptions`, the request options, the task, `Metadata` | 488, 128, 144, 3,176 and 24 bytes            | the same                |
+| 21 requests and 4 presigned URLs, recorded with a fixed clock          |                                              | 0 of 25 lines differ    |
+| host functions of `S3Client` and `S3File`                              | 20                                           | 23                      |
+| binary (`size`, text)                                                  | 108,623,540 bytes                            | 108,656,564 bytes       |
+
+The disassembly is `objdump` of the two binaries without addresses. In `sign_request` the only
+lines that differ are two calls of `encode_uri_component`, which has the same body under another
+mangled name, because the signing crate now instantiates it itself. The instruction
+counts are one call that was single-stepped in gdb, the third of its kind, with the clock fixed
+by a preload shim. They repeat exactly for these functions. The count of a whole `stat()` or
+`write()` call does not (29,191 to 29,203 for `stat()` on one binary), so it is not in the table:
+the two binaries are inside each other's range.
+
+So a request without metadata runs the instructions it ran. An upload with metadata pays about
+190 instructions more for its signature, 115 to 124 in `format` and 71 in `with_metadata`, with
+12 more conditional branches and no allocation: `split_at_date` is 61 instructions in each of the two writers, and the loop over the
+entries is now a function of its own. A whole `write()` with three metadata keys is about 66,500
+instructions.
+
+The binary is 33,024 bytes larger for three host functions (`client.copy`, `S3Client.copy`,
+`copyTo`), three table rows and the code behind them: 28,613 bytes in 27 new functions, 148 bytes
+in seven functions that were there (`on_response` with its new arm, the two writers,
+`Metadata::insert`), and tables, strings and alignment for the rest. The first build was 34,304
+bytes larger. Of those, 7,644 were in the eleven S3 callbacks that never copy: a fourth field in
+the error struct had changed what the compiler inlines there. With `dest` set where a copy
+fails, no function outside the seven changed its size.
+
+What a copy itself costs, on the debug build: 40 calls of the allocator from the call to the
+return of the promise (64 with four conditions, `REPLACE` and three metadata keys), where
+`stat()` makes 28. The 12 more are the two keys, each of which becomes a file of its own with a
+copy of the credentials. In the release build the call is about 35,800 instructions, where
+`stat()` is about 29,200.
+
+Not done, and what differs:
+
+- One request copies at most 5 GB on Amazon S3. For more, the service answers `InvalidRequest`
+  and Bun passes it on. This is the lasting limit of `copy()`, not a first step: a copy in parts
+  (UploadPartCopy) carries nothing of the source over, so it would need a read of the headers and
+  the tags of the source and options that Bun does not have, and it would answer 200 for a copy
+  that lost them above 5 GB and kept them below. `write()` with the `S3File` is the route above
+  5 GB, and the docs say what it stores.
+- No `versionId` for the source. It is a suffix of the value of `x-amz-copy-source`, so the
+  signer does not change for it.
+- No `x-amz-tagging-directive`, see the window above. It belongs with the `tagging` option of
+  oven-sh/bun#46746. Once `S3Options` has `tagging`, `S3CopyOptions` inherits an option that a
+  copy does not send, and a copy has to throw for it as it does for `type` without `REPLACE`.
+- `stat()` does not return the `contentDisposition` and the `contentEncoding` of an object, so a
+  `REPLACE` in place reads them with a `HEAD` through a presigned URL, as the docs show. The
+  self-review asked for the two fields on `S3Stats` in this commit. They are a feature of their
+  own, with `cacheControl` and the others of oven-sh/bun#29595.
+- A `<CopyObjectResult>` without an entity tag or without a time resolves, with an empty string
+  or an invalid `Date`. The service made the copy, so the promise does not reject.
+- A copy is not retried by the S3 client, like `stat()` and `delete()`. The HTTP client under it
+  sends a request again when a connection that it used before closes before the answer, and the
+  service checks the conditions again. The docs say so, and one test pins it.
+- With `REPLACE`, the `contentDisposition` and `contentEncoding` that were given to `file()` or
+  to `new S3Client()` are not sent, because `write()` does not send them either
+  (oven-sh/bun#46863 repairs that for uploads, and the test that compares a copy with an upload
+  fails on the day the two differ).
+- `fetch()` with `PUT` to an `s3://` URL still drops the headers of its caller, so a copy that
+  is made by hand there stores an empty object and answers 200. That is older than this commit
+  and is reported upstream.
+- A program that added its own `copy` to `S3Client.prototype` or `copyTo` to an `S3File` now
+  shadows or is shadowed by these.
+- Nothing here ran against Amazon S3, R2 or MinIO. Each statement about a service is from the
+  in-repo server, which follows the documentation of Amazon S3, and the docs name Amazon S3 where
+  they state its limit and its error codes.
+
+Self-reviewed before the push (5.3 hours): 39 concerns raised, 37 addressed, none against
+the design. The ones that changed behaviour are above: one rule for the bucket and the key of a
+source, the bucket of a virtual hosted-style host, the scheme, `Date` only, `null`, an explicit
+`"COPY"`, `requestPayer` of the source, `copyTo(key)` without the settings of the file, errors
+that reject where they threw, `dest` outside the shared struct, and the type of the list. It
+also found that the test server accepted signed headers in any order, so a header that both
+writers misplace the same way got 200. `verify()` in `test/packages/s3-server` now sorts the
+names as the service does, a request that lists them in another order gets
+`SignatureDoesNotMatch`, and the 2,057 tests of that package pass. Not taken: the two fields on
+`S3Stats` (above); a change of the HTTP client so that a conditional copy is not sent twice (the
+docs and a test state it); one function for the defaults of a file and of a client, named as
+oven-sh/bun#46746 names them (that pull request rewrites those lines, and the test that compares
+a copy with an upload guards them until then); a test under a bucket policy for the explicit
+`"COPY"` (the header and its signature are tested).
+
+A second, short check looked only at what the first one had changed (four reviewers, half an
+hour) and found 18 more things, of which 17 are fixed. Four were copies of another object than
+the one that `stat()` of the same file reads: an endpoint of Amazon S3 or of R2 with a path, a
+bucket whose name ends in `.s3`, a `bucket` option that is the first label of a longer bucket
+name in a `s3-fips` host, and two MinIO servers on EC2 host names, which the first fix took for
+Amazon S3. The others: two endpoints of one host with different paths were one service, the
+range of a date (above), a `Buffer` key that a getter of the options could change, an error
+that named the wrong argument, three checks in the tests that could not fail, a worker test
+close to its time limit, and five statements in the docs. The one not taken is the empty
+`<CopyObjectResult>` (above).
+
+Open for a maintainer, if this goes upstream: that `client.copy()` takes keys only, the option
+names of the AWS SDK (`copySourceIfMatch`) or shorter ones, `{ etag, lastModified }` as the
+result, and the window of the list or a generic list in the signer.
+
+Tests: `test/js/bun/s3/s3-copy.test.ts` (new, 41 tests) runs against `test/packages/s3-server`,
+which verifies the signature of every request and refuses an `x-amz-*` header that is not
+signed. It covers the ways to call it with keys and with files, the one request without a body,
+what the new object stores with and without the directive (read from the store of the server),
+the stored bytes of a gzip object, the headers that `REPLACE` drops, a copy against an upload,
+the whole list of signed headers of a copy that has every header, each condition and which of two
+decides, the dates at both ends of the range, nine odd keys in both directions
+(`sp ace+plus?.txt`, `100%.txt`, `dir/sub/`, `a\b.txt` and others), sources in other buckets, a
+Requester Pays bucket of another account, virtual hosted-style endpoints with and without
+`bucket`, eight forms of host names of Amazon S3 and of R2 and endpoints with a path (through an
+HTTP proxy in the test, in a child process), the hosts that are not one service, credentials
+from the `S3_*` and the `AWS_*` variables with a session token, two key
+pairs in one copy, the errors with `path` and `dest`, the error for more than 5 GB, a 200 with an
+`<Error>`, white space before the result and a page that is neither, what rejects and what throws
+before a request, a connection that closes, a request that goes out again, four workers that stop
+with 24 copies in flight each, the metadata limit at 232 and at 233 keys (the request at the
+limit is read from a raw socket, because `Bun.serve` takes 200 header fields), and 24 copies at
+once with a garbage collection on each side. All 41 fail on Bun 1.4.3 and on the
+release build of the stack without this commit. The file takes 1.2 seconds on the release build
+and 10 on the debug build.
+
+Rows for a copy are also in `s3-moved-store.test.ts` (five: a getter of the options moves and
+frees the store of the source, of the destination, or of both), in the missing-credentials block
+of `s3.test.ts`, in `s3-argument-validation.test.ts` and in the S3 fixture of
+`module-graph-isolation.test.ts` (a copy after the graph is disposed sends nothing).
+`test/packages/s3-server/test/auth.test.ts` has the row for the order of the signed headers,
+which fails without the change of the server.
+
+Also run on the debug build: the 24 files of `test/js/bun/s3` (553 pass, and 278 need the
+credentials of a real service), the new file with `BUN_JSC_validateExceptionChecks=1`, every
+snippet of the docs and of the JSDoc (26 copies, in a child process that has the credentials in
+its environment), the type tests and the source lints. `cargo fmt`, `clang-format` and `bun fmt`
+are clean, and so is the rule of upstream's comment-cop workflow: no comment of two lines or more
+in `src/`.
+
+What failed, and why it is not the commit. `s3-list-objects.test.ts` has one test that runs out
+of its 5 seconds when the whole directory runs on the debug build, next to a test that parses a
+large listing for 12 seconds. It passes when the file runs alone (40 of 40). Two source lints of
+the type checker's parser run out of 5 seconds on the debug build and pass with the released
+binary, which is how the workflow of the fork runs them (187 of 187).
+
+Built and run on Linux x64 only. Nothing in the commit is specific to a platform.
+
+Relation to open pull requests of upstream. This commit needs the metadata patch of 2026-09-27
+(a0b5974ef8) under it, so a cherry-pick onto upstream is the two commits. It reuses the sorted
+list of that patch, its heap path for a long canonical request and its loop that adds the entries
+to the request. That design is oven-sh/bun#26154 by Ciro Spaciari, closed unmerged. The pair
+applies to oven-sh/bun 179664ea89 with a conflict in SOUP.md only. That holds until one of these
+merges, and none has a review of a maintainer:
+
+- oven-sh/bun#46746 (`tagging`, and one carrier for the headers of an upload) and
+  oven-sh/bun#46863 (defaults for the content headers) rewrite the two writers and the arguments
+  of an upload. After them, `s3::client::copy` passes a `PutHeaders` where it passes six
+  arguments, `copy::Defaults` is their `S3Defaults`, and the limits of 238 and 232 keys are 237
+  and 231. A copy becomes a `CopyHeaders` next to `PutHeaders`.
+- oven-sh/bun#45440 streams the canonical request into a hash, so `CanonicalRequest::format` and
+  its loop over the entries are written again.
+- oven-sh/bun#39210 rewrites `sign_request` and `simple_request.rs`. It has had conflicts since
+  August.
+- oven-sh/bun#44818 has a parser for the bucket of a host name. The one here reads the two host
+  names that the docs show and nothing else.
+
+Rebase notes: upstream did not move since the sync of 2026-10-24, so the 60 patches are on
+oven-sh/bun 179664ea89 as they were, with no conflict and nothing dropped. The debug build of the
+stack was made from scratch before the work, and the three workflows of the fork were green on
+the last push. One commit landed upstream during the work (449877f3e0, `console.groupCollapsed`).
+It touches no file of this commit and waits for the next sync.
+
+Files: `src/s3_signing/copy.rs` (new), `src/s3_signing/metadata.rs` (`AmzHeaders`,
+`split_at_date`), `src/s3_signing/credentials.rs` (`bucket_and_key!`, `SignedHeaders::write`,
+`CanonicalRequest::format`), `src/s3_signing/lib.rs`, `src/runtime/webcore/s3/copy.rs` (new),
+`src/runtime/webcore/s3/client.rs` (`copy`), `src/runtime/webcore/s3/simple_request.rs`
+(`Callback::Copy`), `src/runtime/webcore/s3/xml_response.rs` (`parse_copy_object_result`),
+`src/runtime/webcore/s3/credentials_jsc.rs`, `src/runtime/webcore/s3/multipart.rs`,
+`src/runtime/webcore/fetch.rs`, `src/runtime/webcore/S3Client.bind.ts`,
+`src/runtime/webcore/S3Client.rs`, `src/runtime/webcore/S3File.rs`,
+`src/jsc/bindings/JSS3File.cpp`, `src/runtime/webcore.rs`, `packages/bun-types/s3.d.ts`,
+`docs/runtime/s3.mdx`, `test/js/bun/s3/s3-copy.test.ts` (new),
+`test/js/bun/s3/s3-argument-validation.test.ts`, `test/js/bun/s3/s3-moved-store.test.ts`,
+`test/js/bun/s3/s3.test.ts`, `test/js/bun/module-graph/module-graph-isolation.test.ts`,
+`test/packages/s3-server/src/signature.ts`, `test/packages/s3-server/test/auth.test.ts`,
+`test/integration/bun-types/fixture/s3.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

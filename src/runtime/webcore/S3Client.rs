@@ -106,6 +106,28 @@ fn path_from_js(global: &JSGlobalObject, path: JSValue) -> JsResult<Option<PathL
     PathLike::from_js(global, &mut args)
 }
 
+/// A key of `client.copy()`. `verb` completes the "Expected a path to {verb}" error message.
+fn copy_key(global: &JSGlobalObject, path: JSValue, verb: &str) -> JsResult<PathLike<'static>> {
+    if let Some(path) = path_from_js(global, path)? {
+        // The clone owns a copy of a buffer's bytes, which a getter of the options can change.
+        return Ok(path.clone());
+    }
+    if path.is_undefined() {
+        return Err(global
+            .err(
+                ErrorCode::MISSING_ARGS,
+                format_args!("Expected a path to {verb}"),
+            )
+            .throw());
+    }
+    if path.as_class_ref::<crate::webcore::blob::Blob>().is_some() {
+        return Err(global.throw_invalid_arguments(format_args!(
+            "Expected a path to {verb}. client.copy() takes two keys of the client. For an S3File, use copyTo() of the source file"
+        )));
+    }
+    Err(global.throw_invalid_arguments(format_args!("Expected a path to {verb}")))
+}
+
 /// `presign(path, undefined)` signs with the `acl` and `storageClass` of the store, `presign(path)` without.
 fn presign_args(args: &[JsLocal<'_>]) -> (JSValue, Option<JSValue>) {
     (
@@ -585,7 +607,70 @@ impl S3Client {
         store.data.as_s3().unlink(store.clone(), &cx, options)
     }
 
+    pub(crate) fn copy(
+        &self,
+        cx: &mut JsScope<'_>,
+        source: JsLocal<'_>,
+        destination: JsLocal<'_>,
+        options: JsLocal<'_>,
+    ) -> JsResult<JSValue> {
+        use crate::webcore::s3::copy as s3_copy;
+
+        let cx = cx.js_thread();
+        let global = cx.global();
+        let source = copy_key(global, source.to_js(), "copy")?;
+        let destination = copy_key(global, destination.to_js(), "copy to")?;
+        s3_copy::copy(
+            &cx,
+            s3_copy::Object::Key(source),
+            s3_copy::Object::Key(destination),
+            s3_copy::Defaults {
+                credentials: &self.credentials,
+                options: self.options,
+                acl: self.acl,
+                storage_class: self.storage_class,
+                request_payer: self.request_payer,
+                metadata: self.metadata.as_ref(),
+            },
+            opt_js(options.to_js()),
+        )
+    }
+
     // ── Static methods ────────────────────────────────────────────────────
+
+    pub(crate) fn static_copy(
+        cx: &mut JsScope<'_>,
+        source: JsLocal<'_>,
+        destination: JsLocal<'_>,
+        options: JsLocal<'_>,
+    ) -> JsResult<JSValue> {
+        use crate::webcore::s3::copy as s3_copy;
+
+        let cx = cx.js_thread();
+        let global = cx.global();
+        let source =
+            s3_copy::Object::from_js(global, source.to_js(), "Expected a S3 or path to copy")?;
+        let destination = s3_copy::Object::from_js(
+            global,
+            destination.to_js(),
+            "Expected a S3 or path to copy to",
+        )?;
+        let env_credentials = crate::webcore::fetch::s3_credentials_from_env(
+            global
+                .bun_vm()
+                .as_mut()
+                .transpiler
+                .env_mut()
+                .get_s3_credentials(),
+        );
+        s3_copy::copy(
+            &cx,
+            source,
+            destination,
+            s3_copy::Defaults::of_credentials(&env_credentials),
+            opt_js(options.to_js()),
+        )
+    }
 
     pub(crate) fn static_write(
         cx: &mut JsScope<'_>,

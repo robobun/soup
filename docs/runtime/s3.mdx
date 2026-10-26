@@ -192,7 +192,7 @@ metadata.customer; // "1042"
 metadata["reviewed-by"]; // "ana"
 ```
 
-`write()`, `writer()` and `S3Client.write()` take `metadata`, and a multipart upload sends it once, with the request that creates the upload. `fetch()` with `method: "PUT"` to an `s3://` URL takes it in its `s3` option. Requests that do not upload ignore it.
+`write()`, `writer()` and `S3Client.write()` take `metadata`, and a multipart upload sends it once, with the request that creates the upload. `fetch()` with `method: "PUT"` to an `s3://` URL takes it in its `s3` option. Requests that do not upload ignore it. A [copy](#copying-files) sends it only with `metadataDirective: "REPLACE"`.
 
 The metadata given to `file()` or to `new S3Client()` is the default of the uploads of that file or client, `Bun.write()` to the file and [presigned uploads](#presigning-an-upload-with-metadata) included. The `metadata` of a call replaces the default and does not merge with it, so `{}` or `null` uploads without metadata.
 
@@ -207,11 +207,132 @@ await invoice.write(pdfData, { metadata: {} }); // no metadata
 - Keys are case-insensitive. S3 stores them in lowercase, and `stat()` returns them in lowercase. Two keys that differ only in case, such as `Color` and `color`, are an error.
 - A key has to be a valid HTTP header name (letters, digits and ``!#$%&'*+-.^_`|~``), and a value has to be a string of printable ASCII characters. Encode other text, for example with `encodeURIComponent()`.
 - The spaces at the start and at the end of a value are not part of it: `" draft "` is stored as `"draft"`.
-- One object can have 238 keys.
+- One object can have 238 keys. A copy with `metadataDirective: "REPLACE"` has room for 232.
 - Bun throws for what these rules do not allow before it sends a request.
 - Amazon S3 accepts up to 2 KB of keys and values for one object and answers `MetadataTooLarge` for more. Other services have other limits, so Bun does not check the size.
 - An upload replaces the object and its metadata. The metadata of an earlier upload does not stay.
 - `stat()` returns a value as the service sent it. Amazon S3 sends a value that another client stored with other characters than ASCII as an [RFC 2047](https://datatracker.ietf.org/doc/html/rfc2047) encoded word, such as `=?UTF-8?B?Y2Fmw6k=?=`.
+
+### Copying files
+
+To copy an object inside S3, call `copy()` on a client or `copyTo()` on an `S3File`. The service makes the copy: Bun sends one request without a body, and no byte of the object comes to your process.
+
+```ts s3.ts icon="/icons/typescript.svg"
+// Two keys in the bucket of the client
+await s3.copy("uploads/photo.jpg", "archive/photo.jpg");
+
+// From a file, to a key next to it
+const photo = s3.file("uploads/photo.jpg");
+await photo.copyTo("archive/photo.jpg");
+
+// The promise resolves with the entity tag and the time of the new object
+const { etag, lastModified } = await photo.copyTo("archive/photo-2.jpg");
+
+// A rename is a copy and a delete
+await photo.copyTo("uploads/portrait.jpg");
+await photo.delete();
+```
+
+To copy to another bucket, name the bucket in the options or pass an `S3File` of it. The request is signed with the credentials of the destination and goes to the endpoint of the destination, so those credentials need read access to the source.
+
+```ts s3.ts icon="/icons/typescript.svg"
+const photo = s3.file("uploads/photo.jpg");
+const backups = new S3Client({ bucket: "backups" });
+
+await photo.copyTo("photo.jpg", { bucket: "backups" });
+await photo.copyTo(backups.file("photo.jpg"));
+await S3Client.copy(photo, backups.file("photo.jpg"));
+```
+
+A key is a place in a bucket, and each method has one rule for the bucket of a key:
+
+- `client.copy(source, destination)`: both keys are in the bucket of the client, or in the `bucket` of the options.
+- `file.copyTo(key)`: the key is read with the credentials of the file, so it is at the endpoint and in the bucket of the file. Nothing else of the file goes to the new object.
+- `S3Client.copy(source, destination, options)`: a destination key is read with the credentials of the environment and the options, as in the other static methods, also when the source is an `S3File`. A source key is read with the credentials of the destination.
+
+A key is a path as in the other methods: if the credentials have no `bucket`, the first part of the path is the bucket.
+
+`write()` with an `S3File` for its data is not a copy. It downloads the object and uploads it again, so it also works between two services, for a `slice()` and for an object over 5 GB. The new object has the bytes that Bun reads, which are the decoded bytes for an object with a `contentEncoding`. It has the type and the metadata of an upload, and none of the headers and the metadata of its source.
+
+#### Conditional copies
+
+A condition makes the service copy only the object that you mean. If the condition does not hold, the service does not make the copy and the promise rejects with an `S3Error`. Amazon S3 sends the code `PreconditionFailed`.
+
+```ts s3.ts icon="/icons/typescript.svg" highlight={8}
+// Promote an upload only if it is still the object that the scanner read
+const upload = await fetch(s3.presign("quarantine/upload.bin"));
+const etag = upload.headers.get("etag");
+if (!upload.ok || !etag) throw new Error("cannot read the upload");
+await scan(upload.body);
+
+await s3.copy("quarantine/upload.bin", "files/upload.bin", {
+  copySourceIfMatch: etag,
+});
+```
+
+Take the entity tag from the response that the scanner reads. An object can change between a `stat()` and the read, and then the tag of the `stat()` is the tag of bytes that the scanner did not see.
+
+| Option                        | The service copies the source only if        |
+| ----------------------------- | -------------------------------------------- |
+| `copySourceIfMatch`           | its entity tag is this one                   |
+| `copySourceIfNoneMatch`       | its entity tag is not this one               |
+| `copySourceIfModifiedSince`   | it changed after this time (a `Date`)        |
+| `copySourceIfUnmodifiedSince` | it did not change after this time (a `Date`) |
+
+Only `undefined` is no condition. Bun throws for `null` and for an empty string, so a tag that a response did not have cannot become a copy without a condition. When a request has `copySourceIfMatch` and `copySourceIfUnmodifiedSince`, Amazon S3 copies if the entity tag matches, whatever the time is. Other services can check each condition by itself.
+
+#### The type and the metadata of a copy
+
+By default the new object has the `type`, the `contentDisposition`, the `contentEncoding` and the [metadata](#metadata) of its source, and each other header that the service keeps for an object. To set them, pass `metadataDirective: "REPLACE"`. Then the copy stores what an upload to the destination stores.
+
+```ts s3.ts icon="/icons/typescript.svg" highlight={3}
+// The new object has this type and this metadata, and nothing of its source
+await s3.copy("uploads/scan-0001.bin", "reports/january.pdf", {
+  metadataDirective: "REPLACE",
+  type: "application/pdf",
+  contentDisposition: 'attachment; filename="january.pdf"',
+  metadata: { reviewed: "yes" },
+});
+```
+
+`"REPLACE"` is all or nothing: the new object has only what the request sends. The `Cache-Control`, `Content-Language` and `Expires` headers of the source are gone too, and Bun has no option that sets them. To change the metadata of an object in place, read what the object has and give each value again that it keeps:
+
+```ts s3.ts icon="/icons/typescript.svg"
+const key = "reports/january.pdf";
+const { type, metadata } = await s3.stat(key);
+// The headers that stat() does not return. This copy cannot keep a Cache-Control, a Content-Language or an Expires.
+const { headers } = await fetch(s3.presign(key, { method: "HEAD" }), { method: "HEAD" });
+
+await s3.copy(key, key, {
+  metadataDirective: "REPLACE",
+  type,
+  contentDisposition: headers.get("content-disposition") ?? undefined,
+  contentEncoding: headers.get("content-encoding") ?? undefined,
+  metadata: { ...metadata, reviewed: "yes" },
+});
+```
+
+Bun sends a `type` as an upload sends it: in lowercase, and in its usual form if Bun knows the type. So a `text/html` from `stat()` goes out as `text/html;charset=utf-8`.
+
+Bun does not turn `"REPLACE"` on for you, because of what it drops. Without it, Bun throws if the call has `type`, `contentDisposition`, `contentEncoding` or `metadata`. The `type` and the `metadata` that the client or the file of the destination was made with do not throw, and are not sent. `metadataDirective: "COPY"` is what the service does without the option. With it the request says so, for a bucket policy that asks for the header.
+
+The `acl` and the `storageClass` are never copied. They are those of the destination, as for an upload: the ones of the call, of the file or of the client, and the defaults of the service if there are none. `requestPayer` is for the request, which reads the bucket of the source too. Bun sends it when the destination has it, or the `S3File` of the source.
+
+```ts s3.ts icon="/icons/typescript.svg"
+// Move an object to another storage class
+await s3.copy("logs/2025.tar", "logs/2025.tar", { storageClass: "GLACIER_IR" });
+```
+
+- Amazon S3 copies up to 5 GB in one request and answers `InvalidRequest` for more. Other services have other limits, so Bun does not check the size. For a larger object, use `write()` with the `S3File` as its data, which uploads in parts.
+- A copy takes the whole object: a `slice()` throws, for the source and for the destination.
+- A source that is a key is read with the credentials of the destination, so it is in the bucket of the destination. Pass an `S3File` to copy from another bucket.
+- The source and the destination have to be in one service. Bun throws for two hosts, for two endpoints of one host that have different paths, and for Amazon S3 and another host. The regions of Amazon S3 are one service, except the ones in China and in AWS GovCloud, which are services of their own.
+- A copy names its source to the service as a bucket and a key. With a [virtual hosted-style endpoint](#using-buns-s3client-with-s3-virtual-hosted-style-endpoints), Bun reads the bucket from a host name of Amazon S3 or of R2. It cannot read it from an access point or a PrivateLink host, or from the host of another service. For those, set `bucket` to the first part of the host name. Bun throws if the host name does not start with `bucket`, and if a host name of Amazon S3 or of R2 has another bucket.
+- On Amazon S3, a copy of an object onto itself has to change something, such as the storage class or the metadata.
+- With `metadataDirective: "REPLACE"`, a copy has room for 232 metadata keys, six fewer than an upload.
+- If a connection that Bun used before closes before the answer, Bun sends the copy again, as it does for each request that is safe to repeat. The service checks the conditions again. So a copy with a condition can reject after the service made the copy, if the copy changed what the condition looks at. An example is a copy of an object onto itself with `copySourceIfUnmodifiedSince`. After such an error, look at the destination with `stat()`.
+- If a copy fails, the error has the source in `path` and the destination in `dest`.
+- Bun throws for arguments and options that are not valid before it sends a request. For a key or for credentials that it cannot sign a request with, the promise rejects, as in the other methods.
 
 ---
 
@@ -493,6 +614,8 @@ const r2WithEndpoint = new S3Client({
 });
 ```
 
+A [copy](#copying-files) names its source to the service as a bucket and a key. Bun reads the bucket from a host name of these two services. For a virtual hosted-style endpoint of another service, set `bucket` to the first part of the host name.
+
 ---
 
 ## Credentials
@@ -608,6 +731,22 @@ const exists = await client.exists("my-file.txt");
 // const exists = await client.file("my-file.txt").exists();
 ```
 
+### `S3Client.prototype.copy`
+
+To copy a file to another key without a download, call `copy` on the `S3Client` instance. See [Copying files](#copying-files) for the options.
+
+```ts s3.ts icon="/icons/typescript.svg" highlight={7}
+const client = new Bun.S3Client({
+  accessKeyId: "your-access-key",
+  secretAccessKey: "your-secret-key",
+  bucket: "my-bucket",
+});
+
+const { etag, lastModified } = await client.copy("my-file.txt", "my-copy.txt");
+// The same copy from a file. The new object does not get the `acl` and the `storageClass` of the client.
+// await client.file("my-file.txt").copyTo("my-copy.txt");
+```
+
 ## `S3File`
 
 Calling `file()` on an `S3Client` instance, or `s3.file()`, returns an `S3File`. Like `Bun.file()`, `S3File` instances are lazy: they don't refer to something that necessarily exists at the time of creation. That's why all the methods that don't involve network requests are fully synchronous.
@@ -634,6 +773,7 @@ interface S3File extends Blob {
   presign(options?: S3Options): string;
 
   stat(options?: S3Options): Promise<S3Stat>;
+  copyTo(destination: string | S3File, options?: S3CopyOptions): Promise<{ etag: string; lastModified: Date }>;
   /**
    * Size is not synchronously available because it requires a network request.
    *
@@ -695,7 +835,7 @@ When Bun's S3 API throws an error, the error has a `code` property with one of t
 - `ERR_S3_INVALID_SIGNATURE`
 - `ERR_S3_INVALID_SESSION_TOKEN`
 
-When the S3 service itself returns an error (that is, not Bun), the error is an `S3Error` instance: an `Error` instance with the name `"S3Error"`.
+When the S3 service itself returns an error (that is, not Bun), the error is an `S3Error` instance: an `Error` instance with the name `"S3Error"`. The `S3Error` of a [copy](#copying-files) has the source in `path` and the destination in `dest`.
 
 ## `S3Client` static methods
 
@@ -909,6 +1049,29 @@ await S3Client.delete("my-file.txt", credentials);
 
 // S3Client.unlink is alias of S3Client.delete
 await S3Client.unlink("my-file.txt", credentials);
+```
+
+### `S3Client.copy` (static)
+
+To copy an S3 file to another key without a download, use the `S3Client.copy` static method. The source and the destination are each a path or an `S3File`. A destination path is read with the credentials of the environment and the options, also when the source is an `S3File`. A source path is read with the credentials of the destination. See [Copying files](#copying-files) for the options.
+
+```ts s3.ts icon="/icons/typescript.svg" highlight={10, 16}
+import { S3Client } from "bun";
+
+const credentials = {
+  accessKeyId: "your-access-key",
+  secretAccessKey: "your-secret-key",
+  bucket: "my-bucket",
+  // endpoint: "https://s3.us-east-1.amazonaws.com",
+};
+
+await S3Client.copy("my-file.txt", "my-copy.txt", credentials);
+// equivalent to
+// await new S3Client(credentials).copy("my-file.txt", "my-copy.txt");
+
+// Between two buckets: the source is an S3File
+const source = S3Client.file("my-file.txt", credentials);
+await S3Client.copy(source, "my-file.txt", { ...credentials, bucket: "my-backups" });
 ```
 
 ## `s3://` protocol

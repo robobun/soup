@@ -133,7 +133,7 @@ export function canonicalRequest(parts: {
   method: string;
   canonicalUri: string;
   canonicalQueryString: string;
-  /** Lowercase names with their values, in the order of `signedHeaders`. */
+  /** Lowercase names with their values, in the order of the names. */
   headers: [name: string, value: string][];
   payloadHash: string;
 }): string {
@@ -517,7 +517,9 @@ function verify(
   input: AuthenticationInput,
   request: Omit<SignedRequest, "signingKey"> & { date: string; query: QueryParameter[] },
 ): SignedRequest {
-  const headers = request.signedHeaders.map((name): [string, string] => [name, input.headers.get(name) ?? ""]);
+  // A canonical request has the headers in the order of their names, whatever the order of `SignedHeaders` is.
+  const names = request.signedHeaders.toSorted(compare);
+  const headers = names.map((name): [string, string] => [name, input.headers.get(name) ?? ""]);
   const canonical = canonicalRequest({
     method: input.method,
     canonicalUri: canonicalUri(percentDecodeToString(input.path) ?? percentDecode(input.path)),

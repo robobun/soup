@@ -1554,6 +1554,17 @@ describe.concurrent("s3 missing credentials", () => {
       await Bun.s3.presign("test");
     });
   });
+  it("copy", async () => {
+    await assertMissingCredentials(async () => {
+      await Bun.s3.copy("test", "test2");
+    });
+    await assertMissingCredentials(async () => {
+      await S3Client.copy("test", "test2");
+    });
+    await assertMissingCredentials(async () => {
+      await Bun.s3.file("test").copyTo("test2");
+    });
+  });
   it("file", async () => {
     assertMissingCredentials(async () => {
       await Bun.s3.file("test").text();

@@ -12,6 +12,7 @@ describe("S3Client static method argument validation", () => {
     ["presign", "Expected a S3 or path to presign", []],
     ["unlink", "Expected a S3 or path to delete", []],
     ["write", "Expected a S3 or path to upload", ["data"]],
+    ["copy", "Expected a S3 or path to copy", ["destination"]],
     ["size", "Expected a S3 or path to get size", []],
     ["exists", "Expected a S3 or path to check if it exists", []],
     // stat reuses the size wording
@@ -40,7 +41,7 @@ describe("S3Client static method argument validation", () => {
 test("S3File.prototype inherits from Blob.prototype", () => {
   const prototype = Object.getPrototypeOf(Bun.s3.file("key"));
   expect(Object.getPrototypeOf(prototype)).toBe(Blob.prototype);
-  expect(Object.getOwnPropertyNames(prototype).sort()).toEqual(["bucket", "presign", "stat"]);
+  expect(Object.getOwnPropertyNames(prototype).sort()).toEqual(["bucket", "copyTo", "presign", "stat"]);
 });
 
 test("S3File.prototype[Symbol.toStringTag] is read-only and not enumerable", () => {
@@ -63,6 +64,7 @@ describe("S3Client instance method argument validation", () => {
 
   const instanceCases = [
     ["presign", "Expected a path to presign"],
+    ["copy", "Expected a path to copy"],
     ["exists", "Expected a path to check if it exists"],
     ["size", "Expected a path to check the size of"],
     ["stat", "Expected a path to check the stat of"],

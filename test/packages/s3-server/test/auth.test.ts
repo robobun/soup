@@ -72,11 +72,12 @@ const authorization = (pattern: string | RegExp, replacement: string): Edit => {
 const body = (change: (body: Buffer) => Uint8Array): Edit => {
   return request => void (request.body = change(Buffer.from(request.body!)));
 };
-/** Signs the request again, after a change of its headers. */
-const resign: Edit = request => {
+/** Signs the request again, after a change of its headers. `reversed` is a client that does not sort the signed headers. */
+const resign = (request: SignedRequest, reversed = false): void => {
   const { authorization, ...headers } = request.headers;
   const { pathname, search } = new URL(request.url);
   const names = Object.keys(headers).sort();
+  if (reversed) names.reverse();
   const canonical = v4.canonicalRequest({
     method: request.method,
     canonicalUri: pathname,
@@ -258,6 +259,7 @@ describe("the Authorization header", () => {
     ["an x-amz-date in another format", header("x-amz-date", "2013-05-24T00:00:00Z"), noDate],
     ["an x-amz-* header that is not signed", header("x-amz-meta-color", "red"), notSigned("x-amz-meta-color")],
     ["host not signed", authorization("SignedHeaders=host;", "SignedHeaders="), notSigned("host")],
+    ["the signed headers in another order than that of their names", request => resign(request, true), MISMATCH],
     ["an unknown access key", authorization(KEY, "AKIAUNKNOWN"), unknownKey()],
   ];
   test.each(cases)("with %s", async (_name, edit, expected) => {

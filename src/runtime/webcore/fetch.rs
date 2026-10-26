@@ -1808,7 +1808,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
         // Only an upload has metadata to send.
         let metadata = credentials_with_options
             .metadata
-            .as_ref()
+            .as_deref()
             .filter(|_| method == Method::PUT);
         let mut result = match credentials_with_options.credentials.sign_request::<false>(
             &SignOptions {

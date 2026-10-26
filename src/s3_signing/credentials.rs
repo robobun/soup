@@ -9,7 +9,7 @@ use bun_picohttp::Header as PicoHeader;
 use bun_ptr::{RefCount, RefPtr};
 
 use super::acl::ACL;
-use super::metadata::Metadata;
+use super::metadata::{AmzHeader, AmzHeaders, Metadata};
 use super::storage_class::StorageClass;
 
 bun_core::declare_scope!(AWS, visible);
@@ -150,6 +150,39 @@ fn aws_cache_get(day: u64, key: &[u8]) -> Option<[u8; DIGESTED_HMAC_256_LEN]> {
 fn aws_cache_set(day: u64, key: &[u8], digest: [u8; DIGESTED_HMAC_256_LEN]) {
     AWS_SIGNATURE_CACHE.set(day, key, digest)
 }
+
+/// Declares `$bucket` and `$key`: what `$path` names with `$credentials`, not yet URL-encoded. Returns `Err($invalid)` for no bucket.
+macro_rules! bucket_and_key {
+    ($credentials:expr, $path:expr, $bucket:ident, $key:ident, $invalid:expr) => {
+        let mut full_path = $path;
+        // handle \\ on bucket name
+        if strings::starts_with(full_path, b"/") || strings::starts_with(full_path, b"\\") {
+            full_path = &full_path[1..];
+        }
+
+        let mut $key: &[u8] = full_path;
+        let mut $bucket: &[u8] = &$credentials.bucket;
+
+        if !$credentials.virtual_hosted_style {
+            if $bucket.is_empty() {
+                // guess bucket using path
+                if let Some(end) = strings::index_of(full_path, b"/") {
+                    $bucket = &full_path[..end];
+                    $key = &full_path[end + 1..];
+                } else if let Some(backslash_index) = strings::index_of(full_path, b"\\") {
+                    $bucket = &full_path[..backslash_index];
+                    $key = &full_path[backslash_index + 1..];
+                } else {
+                    return Err($invalid);
+                }
+            }
+        }
+
+        let $key = normalize_name($key);
+        let $bucket = normalize_name($bucket);
+    };
+}
+pub(crate) use bucket_and_key;
 
 // ──────────────────────────────────────────────────────────────────────────
 // S3Credentials
@@ -322,32 +355,7 @@ impl S3Credentials {
         } else {
             guess_region(&self.endpoint)
         };
-        let mut full_path = request_path;
-        // handle \\ on bucket name
-        if strings::starts_with(full_path, b"/") || strings::starts_with(full_path, b"\\") {
-            full_path = &full_path[1..];
-        }
-
-        let mut path: &[u8] = full_path;
-        let mut bucket: &[u8] = &self.bucket;
-
-        if !self.virtual_hosted_style {
-            if bucket.is_empty() {
-                // guess bucket using path
-                if let Some(end) = strings::index_of(full_path, b"/") {
-                    bucket = &full_path[..end];
-                    path = &full_path[end + 1..];
-                } else if let Some(backslash_index) = strings::index_of(full_path, b"\\") {
-                    bucket = &full_path[..backslash_index];
-                    path = &full_path[backslash_index + 1..];
-                } else {
-                    return Err(SignError::InvalidPath);
-                }
-            }
-        }
-
-        let path = normalize_name(path);
-        let bucket = normalize_name(bucket);
+        bucket_and_key!(self, request_path, bucket, path, SignError::InvalidPath);
 
         // if we allow path.len == 0 it will list the bucket for now we disallow
         if !ALLOW_EMPTY_PATH && path.is_empty() {
@@ -1115,7 +1123,7 @@ pub struct SignOptions<'a> {
     pub request_payer: bool,
     /// Signed as headers, in a presigned URL too: the request has to carry
     /// each entry. [`SignResult::headers`] does not list them.
-    pub metadata: Option<&'a Metadata>,
+    pub metadata: Option<&'a AmzHeaders>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1228,7 +1236,7 @@ pub fn encode_uri_component<'b, const ENCODE_SLASH: bool>(
     Ok(&buffer[..written])
 }
 
-fn normalize_name(name: &[u8]) -> &[u8] {
+pub(crate) fn normalize_name(name: &[u8]) -> &[u8] {
     if name.is_empty() {
         return name;
     }
@@ -1331,7 +1339,7 @@ impl SignedHeaders {
     }
 
     /// A presigned URL signs `host` and the metadata.
-    fn with_metadata(key: SignedHeadersKey, sign_query: bool, metadata: &Metadata) -> Vec<u8> {
+    fn with_metadata(key: SignedHeadersKey, sign_query: bool, metadata: &AmzHeaders) -> Vec<u8> {
         let mut list = Vec::with_capacity(256 + metadata.signed_len());
         if sign_query {
             list.extend_from_slice(b"host");
@@ -1342,7 +1350,7 @@ impl SignedHeaders {
         list
     }
 
-    fn write(key: SignedHeadersKey, metadata: Option<&Metadata>, mut push: impl FnMut(&[u8])) {
+    fn write(key: SignedHeadersKey, metadata: Option<&AmzHeaders>, mut push: impl FnMut(&[u8])) {
         if key.content_disposition {
             push(b"content-disposition;");
         }
@@ -1356,9 +1364,20 @@ impl SignedHeaders {
         if key.acl {
             push(b"x-amz-acl;");
         }
-        push(b"x-amz-content-sha256;x-amz-date");
-        if let Some(metadata) = metadata {
-            Self::write_metadata(metadata, &mut push);
+        const SHA256_AND_DATE: &[u8] = b"x-amz-content-sha256;x-amz-date";
+        match metadata {
+            None => push(SHA256_AND_DATE),
+            Some(metadata) => {
+                let (before_date, after_date) = metadata.split_at_date();
+                if before_date.is_empty() {
+                    push(SHA256_AND_DATE);
+                } else {
+                    push(b"x-amz-content-sha256");
+                    Self::write_entries(before_date, &mut push);
+                    push(b";x-amz-date");
+                }
+                Self::write_entries(after_date, &mut push);
+            }
         }
         if key.request_payer {
             push(b";x-amz-request-payer");
@@ -1371,8 +1390,12 @@ impl SignedHeaders {
         }
     }
 
-    fn write_metadata(metadata: &Metadata, mut push: impl FnMut(&[u8])) {
-        for entry in metadata.entries() {
+    fn write_metadata(metadata: &AmzHeaders, push: impl FnMut(&[u8])) {
+        Self::write_entries(metadata.entries(), push);
+    }
+
+    fn write_entries(entries: &[AmzHeader], mut push: impl FnMut(&[u8])) {
+        for entry in entries {
             push(b";");
             push(entry.name());
         }
@@ -1400,7 +1423,7 @@ impl CanonicalRequest {
         acl: Option<&[u8]>,
         hash: &[u8],
         date: &[u8],
-        metadata: Option<&Metadata>,
+        metadata: Option<&AmzHeaders>,
         session_token: Option<&[u8]>,
         storage_class: Option<&[u8]>,
         signed_headers: &[u8],
@@ -1435,19 +1458,27 @@ impl CanonicalRequest {
         if key.acl {
             w!("x-amz-acl:{}\n", BStr::new(acl.unwrap()));
         }
-        w!(
-            "x-amz-content-sha256:{}\nx-amz-date:{}\n",
-            BStr::new(hash),
-            BStr::new(date)
-        );
-        if let Some(metadata) = metadata {
-            for entry in metadata.entries() {
-                w!("{}:", BStr::new(entry.name()));
-                for byte in entry.canonical_value() {
-                    *c.buf.get_mut(c.at).ok_or(core::fmt::Error)? = byte;
-                    c.at += 1;
+        macro_rules! sha256_and_date {
+            () => {
+                w!(
+                    "x-amz-content-sha256:{}\nx-amz-date:{}\n",
+                    BStr::new(hash),
+                    BStr::new(date)
+                )
+            };
+        }
+        match metadata {
+            None => sha256_and_date!(),
+            Some(metadata) => {
+                let (before_date, after_date) = metadata.split_at_date();
+                if before_date.is_empty() {
+                    sha256_and_date!();
+                } else {
+                    w!("x-amz-content-sha256:{}\n", BStr::new(hash));
+                    Self::write_entries(&mut c, before_date)?;
+                    w!("x-amz-date:{}\n", BStr::new(date));
                 }
-                w!("\n");
+                Self::write_entries(&mut c, after_date)?;
             }
         }
         if key.request_payer {
@@ -1470,6 +1501,21 @@ impl CanonicalRequest {
 
         let len = c.at;
         Ok(&c.buf[..len])
+    }
+
+    fn write_entries(
+        c: &mut bun_core::fmt::SliceCursor<'_>,
+        entries: &[AmzHeader],
+    ) -> core::fmt::Result {
+        for entry in entries {
+            core::fmt::Write::write_fmt(c, format_args!("{}:", BStr::new(entry.name())))?;
+            for byte in entry.canonical_value() {
+                *c.buf.get_mut(c.at).ok_or(core::fmt::Error)? = byte;
+                c.at += 1;
+            }
+            core::fmt::Write::write_str(c, "\n")?;
+        }
+        Ok(())
     }
 }
 

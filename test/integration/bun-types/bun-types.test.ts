@@ -638,7 +638,7 @@ describe("@types/bun integration test", () => {
       // `undefined` for a Blob without a store or with bytes. What is published is a BunFile.
       "Blob.bind.ts: file().stat() is Promise<unknown> | undefined, not Promise<Stats>",
       // An S3File is a Blob with more members, which C++ adds and no schema describes.
-      "S3Client.bind.ts: new S3Client().file() has no readable, bucket, presign",
+      "S3Client.bind.ts: new S3Client().file() has no readable, bucket, presign, copyTo",
       "S3Client.bind.ts: new S3Client().file().stat() is Promise<unknown> | undefined, not Promise<S3Stats>",
       "S3Client.bind.ts: new S3Client().file().lastModified is not published",
       // bun.d.ts and s3.d.ts do not declare these.
