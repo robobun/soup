@@ -307,8 +307,12 @@ mod requests {
         ParseBind,
         CloseParse,
         CloseParseBind,
+        Execute,
+        ClosePortal,
         /// It is rejected in the place of being written.
         Never,
+        /// And `Pipeline::refuses` says why.
+        Refused,
     }
 
     const DESCRIBED: &[Read] = &[ParseComplete, Parameters, Columns];
@@ -335,9 +339,12 @@ mod requests {
         while let Some((next, step)) = pipeline.next(0) {
             let (name, request) = (next.request, next.turn());
             let wrote = match step {
+                None if pipeline.refuses(next) => Refused,
                 None => Never,
                 Some(Step::Query) => Query,
                 Some(Step::Bind) => Bind,
+                Some(Step::Execute) => Execute,
+                Some(Step::Close) => ClosePortal,
                 Some(Step::Parse { close, bind }) => match (close, bind) {
                     (false, false) => Parse,
                     (false, true) => ParseBind,
@@ -598,6 +605,95 @@ mod requests {
         let _ = push_simple(&mut pipeline, 'b');
         error(&mut pipeline, Canceled);
         assert_eq!(advance(&mut pipeline), [('b', Never)]);
+    }
+
+    fn unnamed() -> Statement {
+        pipeline::Statement::new(None, Box::default(), ())
+    }
+
+    fn push_cursor(pipeline: &mut Pipeline, name: char, describe_first: bool) -> Turn {
+        let protocol = Protocol::Cursor { describe_first };
+        pipeline.push(name, unnamed(), protocol)
+    }
+
+    /// The request that a ReadyForQuery in a transaction block takes out of the queue, and whether its portal has more rows.
+    fn ready_in_block(pipeline: &mut Pipeline) -> Option<(char, bool)> {
+        let entry = pipeline.on_ready_for_query(b'T')?;
+        Some((entry.request, entry.is_suspended()))
+    }
+
+    #[test]
+    fn a_cursor_is_suspended_at_its_row_limit_and_queued_again() {
+        let pipeline = &mut Pipeline::new(true);
+        assert_eq!(ready_in_block(pipeline), None);
+        let _ = push_cursor(pipeline, 'a', true);
+        assert_eq!(advance(pipeline), [('a', Parse)]);
+        read(pipeline, DESCRIBED);
+        assert_eq!(ready_in_block(pipeline), None);
+        assert_eq!(advance(pipeline), [('a', Bind)]);
+        read(pipeline, &[BindComplete]);
+        pipeline.on_portal_suspended();
+        assert_eq!(ready_in_block(pipeline), Some(('a', true)));
+        assert!(!pipeline.is_busy());
+
+        let _ = pipeline.push('a', unnamed(), Protocol::Fetch);
+        assert_eq!(advance(pipeline), [('a', Execute)]);
+        pipeline.on_portal_suspended();
+        assert_eq!(ready_in_block(pipeline), Some(('a', true)));
+
+        let _ = pipeline.push('a', unnamed(), Protocol::Fetch);
+        assert_eq!(advance(pipeline), [('a', Execute)]);
+        read(pipeline, &[CommandComplete]);
+        assert_eq!(ready_in_block(pipeline), Some(('a', false)));
+
+        let _ = pipeline.push('a', unnamed(), Protocol::Close);
+        assert_eq!(advance(pipeline), [('a', ClosePortal)]);
+        assert_eq!(ready_in_block(pipeline), Some(('a', false)));
+    }
+
+    #[test]
+    fn the_statement_of_a_cursor_waits_for_a_transaction_block() {
+        let pipeline = &mut Pipeline::new(true);
+        let _ = push_simple(pipeline, 'a');
+        let _ = push_cursor(pipeline, 'b', false);
+        let _ = push_cursor(pipeline, 'c', false);
+        assert_eq!(advance(pipeline), [('a', Query)]);
+        read(pipeline, &[CommandComplete]);
+        assert_eq!(advance(pipeline), [], "only a ReadyForQuery says so");
+        assert_eq!(ready_in_block(pipeline), Some(('a', false)));
+        assert_eq!(advance(pipeline), [('b', ParseBind)]);
+        read(pipeline, &[DESCRIBED, EXECUTED].concat());
+        assert_eq!(ready(pipeline), Some('b'));
+        assert_eq!(advance(pipeline), [('c', Refused)]);
+        assert!(!pipeline.is_busy());
+    }
+
+    #[test]
+    fn an_execute_of_a_portal_is_pipelined_and_its_close_waits() {
+        let (mut pipeline, statement) = prepared(true);
+        let _ = push(&mut pipeline, 'a', &statement);
+        let _ = pipeline.push('b', unnamed(), Protocol::Fetch);
+        let _ = pipeline.push('c', unnamed(), Protocol::Close);
+        assert_eq!(advance(&mut pipeline), [('a', Bind), ('b', Execute)]);
+        read(&mut pipeline, EXECUTED);
+        assert_eq!(ready(&mut pipeline), Some('a'));
+        assert_eq!(advance(&mut pipeline), []);
+        read(&mut pipeline, &[CommandComplete]);
+        assert_eq!(ready(&mut pipeline), Some('b'));
+        assert_eq!(advance(&mut pipeline), [('c', ClosePortal)]);
+    }
+
+    #[test]
+    fn a_rejected_request_ends_at_its_row_limit() {
+        let pipeline = &mut Pipeline::new(true);
+        assert_eq!(ready_in_block(pipeline), None);
+        let request = push_cursor(pipeline, 'a', false);
+        assert_eq!(advance(pipeline), [('a', ParseBind)]);
+        read(pipeline, DESCRIBED);
+        read(pipeline, &[BindComplete]);
+        assert!(pipeline.reject(request).is_some());
+        pipeline.on_portal_suspended();
+        assert_eq!(ready_in_block(pipeline), Some(('a', false)));
     }
 
     #[test]

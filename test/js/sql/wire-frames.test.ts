@@ -20,6 +20,7 @@ import {
   pgBind,
   type PgBindFrame,
   pgCancelRequest,
+  pgClose,
   pgCloseComplete,
   pgCopyBothResponse,
   pgCopyInResponse,
@@ -33,6 +34,7 @@ import {
   pgParse,
   pgParseSASLInitialResponse,
   pgParseStartupMessage,
+  pgPortalSuspended,
   pgReadyForQuery,
   pgScramServer,
   pgSync,
@@ -80,7 +82,9 @@ test("frontend message builders encode per §55.7", () => {
     ),
   );
   expect(pgExecute()).toEqual(Buffer.from("E\x00\x00\x00\x09\x00\x00\x00\x00\x00", "binary"));
+  expect(pgExecute("C1", 3)).toEqual(Buffer.from("E\x00\x00\x00\x0bC1\x00\x00\x00\x00\x03", "binary"));
   expect(pgSync()).toEqual(Buffer.from("S\x00\x00\x00\x04", "binary"));
+  expect(pgClose("P", "C1")).toEqual(Buffer.from("C\x00\x00\x00\x08PC1\x00", "binary"));
   expect(pgCancelRequest(1, 2)).toEqual(
     Buffer.from("\x00\x00\x00\x10\x04\xd2\x16\x2e\x00\x00\x00\x01\x00\x00\x00\x02", "binary"),
   );
@@ -92,6 +96,7 @@ test("backend message builders encode per §55.7", () => {
   expect(pgBackendKeyData(1, 2)).toEqual(Buffer.from("K\x00\x00\x00\x0c\x00\x00\x00\x01\x00\x00\x00\x02", "binary"));
   expect(pgCloseComplete()).toEqual(Buffer.from("3\x00\x00\x00\x04", "binary"));
   expect(pgNoData()).toEqual(Buffer.from("n\x00\x00\x00\x04", "binary"));
+  expect(pgPortalSuspended()).toEqual(Buffer.from("s\x00\x00\x00\x04", "binary"));
   const copyBody = "\x00\x00\x00\x0b\x01\x00\x02\x00\x01\x00\x01";
   expect(pgCopyInResponse([1, 1], 1)).toEqual(Buffer.from("G" + copyBody, "binary"));
   expect(pgCopyOutResponse([1, 1], 1)).toEqual(Buffer.from("H" + copyBody, "binary"));

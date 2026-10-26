@@ -80,6 +80,16 @@ pub fn close_statement(out: &mut Vec<u8>, name: &[u8]) -> Result {
     message(out, b'C', &[b"S", name, b"\0"])
 }
 
+/// The next rows of a portal that a Bind has named. `max_rows`: 0 is no limit.
+pub fn execute(out: &mut Vec<u8>, portal: &[u8], max_rows: u32) -> Result {
+    message(out, b'E', &[portal, b"\0", &max_rows.to_be_bytes()])
+}
+
+/// The server answers CloseComplete also when it has no portal of that name.
+pub fn close_portal(out: &mut Vec<u8>, name: &[u8]) -> Result {
+    message(out, b'C', &[b"P", name, b"\0"])
+}
+
 pub fn copy_data(out: &mut Vec<u8>, data: &[u8]) -> Result {
     message(out, b'd', &[data])
 }

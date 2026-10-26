@@ -45,7 +45,8 @@ impl Columns {
             .build_from_columns(global_object, owner, names);
     }
 
-    /// `result.statement` of the results of a named statement.
+    /// `result.statement` of the results of a named statement, and of the batches of a cursor.
+    #[inline(always)]
     pub(crate) fn description(
         &mut self,
         global_object: &JSGlobalObject,
