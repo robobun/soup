@@ -6,6 +6,12 @@ const pathMethod = { ...method, args: { path: b.any, options: b.any } } as const
 /** `S3Client.write(..)` uses the credentials of the environment, `client.write(..)` those of the client. */
 const members = (prefix: "" | "static_") =>
   ({
+    copy: {
+      ...method,
+      args: { source: b.any, destination: b.any, options: b.any },
+      length: 2,
+      rustName: `${prefix}copy`,
+    },
     delete: { ...pathMethod, rustName: `${prefix}unlink` },
     exists: { ...pathMethod, rustName: `${prefix}exists` },
     file: { ...pathMethod, returns: b.any.returning("Blob"), rustName: `${prefix}file` },

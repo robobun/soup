@@ -24,11 +24,13 @@ extern "C" {
 SYSV_ABI EncodedJSValue JSS3File__presign(void* ptr, JSC::JSGlobalObject*, EncodedJSValue options);
 SYSV_ABI EncodedJSValue JSS3File__stat(void* ptr, JSC::JSGlobalObject*);
 SYSV_ABI EncodedJSValue JSS3File__bucket(void* ptr, JSC::JSGlobalObject*);
+SYSV_ABI EncodedJSValue JSS3File__copyTo(void* ptr, JSC::JSGlobalObject*, EncodedJSValue destination, EncodedJSValue options);
 }
 
 // Forward declarations
 JSC_DECLARE_HOST_FUNCTION(functionS3File_presign);
 JSC_DECLARE_HOST_FUNCTION(functionS3File_stat);
+JSC_DECLARE_HOST_FUNCTION(functionS3File_copyTo);
 static JSC_DECLARE_CUSTOM_GETTER(getterS3File_bucket);
 static JSC_DEFINE_CUSTOM_GETTER(getterS3File_bucket, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
@@ -44,6 +46,7 @@ static JSC_DEFINE_CUSTOM_GETTER(getterS3File_bucket, (JSC::JSGlobalObject * glob
     return JSS3File__bucket(thisObject->wrapped(), globalObject);
 }
 static const HashTableValue JSS3FilePrototypeTableValues[] = {
+    { "copyTo"_s, static_cast<unsigned>(PropertyAttribute::Function | PropertyAttribute::ReadOnly), NoIntrinsic, { HashTableValue::NativeFunctionType, functionS3File_copyTo, 1 } },
     { "presign"_s, static_cast<unsigned>(PropertyAttribute::Function | PropertyAttribute::ReadOnly), NoIntrinsic, { HashTableValue::NativeFunctionType, functionS3File_presign, 1 } },
     { "stat"_s, static_cast<unsigned>(PropertyAttribute::Function | PropertyAttribute::ReadOnly), NoIntrinsic, { HashTableValue::NativeFunctionType, functionS3File_stat, 1 } },
     { "bucket"_s, static_cast<unsigned>(PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, getterS3File_bucket, 0 } },
@@ -105,6 +108,18 @@ JSC_DEFINE_HOST_FUNCTION(functionS3File_stat, (JSGlobalObject * globalObject, Ca
         return {};
     }
     return JSS3File__stat(thisObject->wrapped(), globalObject);
+}
+
+JSC_DEFINE_HOST_FUNCTION(functionS3File_copyTo, (JSGlobalObject * globalObject, CallFrame* callframe))
+{
+    auto* thisObject = dynamicDowncast<JSS3File>(callframe->thisValue());
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!thisObject) {
+        Bun::throwError(globalObject, scope, Bun::ErrorCode::ERR_INVALID_THIS, "Expected a S3File instance"_s);
+        return {};
+    }
+    RELEASE_AND_RETURN(scope, JSS3File__copyTo(thisObject->wrapped(), globalObject, JSValue::encode(callframe->argument(0)), JSValue::encode(callframe->argument(1))));
 }
 
 const JSC::ClassInfo JSS3File::s_info = { "S3File"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSS3File) };

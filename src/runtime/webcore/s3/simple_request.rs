@@ -13,7 +13,7 @@ use bun_ptr::RefPtr;
 use bun_s3_signing::acl::ACL;
 use bun_s3_signing::credentials::{S3Credentials, SignOptions, SignResult};
 use bun_s3_signing::error::{ErrorCodeAndMessage, S3Error, get_sign_error_code_and_message};
-use bun_s3_signing::metadata::Metadata;
+use bun_s3_signing::metadata::AmzHeaders;
 use bun_s3_signing::storage_class::StorageClass;
 use bun_s3_signing::upload::{NO_UPLOAD_ID, Request};
 use bun_url::URL;
@@ -77,6 +77,20 @@ pub(crate) enum S3ListObjectsResult<'a> {
     Failure(S3Error<'a>),
 }
 
+pub(crate) struct S3CopySuccess<'a> {
+    /// The entity tag of the new object, in its quotes. Not owned.
+    pub(crate) etag: &'a [u8],
+    /// ISO 8601, as in `2026-10-25T16:57:38.000Z`. Not owned.
+    pub(crate) last_modified: &'a [u8],
+}
+
+// a copy also fails if status 200 but with body containing an Error
+pub(crate) enum S3CopyResult<'a> {
+    Success(S3CopySuccess<'a>),
+    /// failure error is not owned and need to be copied if used after this callback
+    Failure(S3Error<'a>),
+}
+
 pub(crate) struct S3HttpSimpleTask {
     pub(crate) async_http_id: u32,
     /// Held while the request is out on the HTTP thread: how it delivers the
@@ -132,6 +146,7 @@ pub(crate) type OnDownload = Box<dyn FnOnce(S3DownloadResult<'_>) -> bun_jsc::Js
 pub(crate) type OnUpload = Box<dyn FnOnce(S3UploadResult<'_>) -> bun_jsc::JsResult<()>>;
 pub(crate) type OnDelete = Box<dyn FnOnce(S3DeleteResult<'_>) -> bun_jsc::JsResult<()>>;
 pub(crate) type OnListObjects = Box<dyn FnOnce(S3ListObjectsResult<'_>) -> bun_jsc::JsResult<()>>;
+pub(crate) type OnCopy = Box<dyn FnOnce(S3CopyResult<'_>) -> bun_jsc::JsResult<()>>;
 
 pub(crate) enum Callback {
     Stat(OnStat),
@@ -139,6 +154,7 @@ pub(crate) enum Callback {
     Upload(OnUpload),
     Delete(OnDelete),
     ListObjects(OnListObjects),
+    Copy(OnCopy),
     /// `Request` has the body.
     Sink(RefPtr<NetworkSink>, Request),
 }
@@ -195,7 +211,8 @@ impl Callback {
             | Callback::Download(_)
             | Callback::Upload(_)
             | Callback::Delete(_)
-            | Callback::ListObjects(_) => self.fail(error.code, error.message),
+            | Callback::ListObjects(_)
+            | Callback::Copy(_) => self.fail(error.code, error.message),
         }
     }
 
@@ -207,6 +224,7 @@ impl Callback {
             Callback::Stat(callback) => callback(S3StatResult::Failure(err)),
             Callback::Delete(callback) => callback(S3DeleteResult::Failure(err)),
             Callback::ListObjects(callback) => callback(S3ListObjectsResult::Failure(err)),
+            Callback::Copy(callback) => callback(S3CopyResult::Failure(err)),
             Callback::Sink(sink, request) => NetworkSink::on_reply(&sink, request, Err(err)),
         }
     }
@@ -382,6 +400,28 @@ impl S3HttpSimpleTask {
                     }
                 }
             }
+            (Callback::Copy(callback), status) => {
+                // a copy can fail with status 200
+                let parsed = xml_response::parse_error(&this.response_buffer.list);
+                if let Some(err) = this.response_error(status, parsed.as_ref()) {
+                    callback(S3CopyResult::Failure(err))
+                } else {
+                    let copied = xml_response::parse_copy_object_result(
+                        this.response_buffer.list.as_slice(),
+                    );
+                    let result = match &copied {
+                        Some(copied) => S3CopyResult::Success(S3CopySuccess {
+                            etag: &copied.etag,
+                            last_modified: &copied.last_modified,
+                        }),
+                        None => S3CopyResult::Failure(S3Error {
+                            code: b"InvalidResponse",
+                            message: b"CopyObject response is not a <CopyObjectResult> document",
+                        }),
+                    };
+                    callback(result)
+                }
+            }
             (callback @ (Callback::Upload(_) | Callback::Sink(..)), _) => {
                 this.error_with_body(callback, ErrorType::Failure)
             }
@@ -471,8 +511,8 @@ pub(crate) struct Options<'a> {
     pub(crate) acl: Option<ACL>,
     pub(crate) storage_class: Option<StorageClass>,
     pub(crate) request_payer: bool,
-    /// For the request that creates the object: PutObject or CreateMultipartUpload.
-    pub(crate) metadata: Option<&'a Metadata>,
+    /// For the request that creates the object: PutObject, CreateMultipartUpload or CopyObject.
+    pub(crate) metadata: Option<&'a AmzHeaders>,
 }
 
 impl<'a> Default for Options<'a> {
