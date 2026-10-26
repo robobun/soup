@@ -20,9 +20,10 @@ interface PooledConnection {
 
 const {
   Query,
+  CLOSE,
   SQLQueryFlags,
   onQuerySettled,
-  symbols: { _flags, _strings, _values, _waiter, _copy },
+  symbols: { _adapter, _flags, _strings, _values, _waiter, _copy },
 } = require("internal/sql/query");
 const { PostgresAdapter } = require("internal/sql/postgres");
 const { MySQLAdapter } = require("internal/sql/mysql");
@@ -82,6 +83,10 @@ class Client implements Target {
     this.pool = pool;
     this.options = options;
     this.flags = options.bigint ? SQLQueryFlags.bigint : SQLQueryFlags.none;
+    if (pool.cursor !== undefined) {
+      pool.cursorClient = this;
+      pool.cursorHandler = dispatchCursorToPool;
+    }
     const debug = options.debug;
     this.debug = debug === true ? printQuery : debug || undefined;
   }
@@ -118,6 +123,8 @@ class Scope implements Target {
   statements: TransactionCommands | null = null;
   distributed = false;
   savepoints = 0;
+  /// Of a savepoint: the cursors that were open around it when it began. Its ROLLBACK leaves their portals.
+  cursorsBefore: Query[] | null = null;
   /// of a transaction that waits for the one before it on the reservation
   start: (() => void) | null = null;
   resolve: ((value: unknown) => void) | null = null;
@@ -183,7 +190,10 @@ function rejectQuery(this: Query, err: Error) {
 function onFileRead(this: Target, query: Query, text: string) {
   const handle = query.setText(text);
   if (handle !== null) {
-    this.handler(query, handle);
+    // cursor() left the handler of a query that had its file to read.
+    const handler =
+      query[_flags] & SQLQueryFlags.cursor && this === this.client ? this.pool.cursorHandler! : this.handler;
+    handler(query, handle);
   }
 }
 
@@ -266,6 +276,67 @@ function dispatchToPool(this: Client, query: Query, handle: QueryHandle) {
     return query.reject(pool.connectionClosedError());
   }
   pool.connect((query[_waiter] = onQueryConnected.bind(this, query, handle, debugFrameOf(this))));
+}
+
+/// A cursor reads on one connection, in a transaction. On a pool it gets both for itself, as the callback of begin() does.
+function dispatchCursorToPool(query: Query, handle: QueryHandle) {
+  const pool: Pool = query[_adapter];
+  const client = pool.cursorClient as Client;
+  if (pool.closed) {
+    return query.reject(pool.connectionClosedError());
+  }
+  const connected = onCursorConnected.bind(client, query, handle);
+  // Whoever gives up the connection calls it. `debug` runs as the code that ran the query.
+  query[_waiter] =
+    client.debug === undefined
+      ? connected
+      : AsyncContextFrame.run.bind(undefined, AsyncContextFrame.current(), connected, undefined);
+  pool.connect(query[_waiter], true);
+}
+
+function onCursorConnected(
+  this: Client,
+  query: Query,
+  handle: QueryHandle,
+  err: Error | null,
+  pooledConnection: PooledConnection | null,
+) {
+  query[_waiter] = null;
+  const pool = this.pool;
+  if (err) {
+    // as in onQueryConnected()
+    if (pool.closedAtOnce) {
+      $pokePromiseAsHandled(query);
+    }
+    return query.reject(err);
+  }
+  const scope = new Scope(this, Kind.transaction, null, pooledConnection);
+  scope.statements = pool.getTransactionCommands();
+  ownConnection(scope);
+  query[_copy].ended = endCursorTransaction.bind(scope);
+  beginCursorTransaction(scope, query, handle);
+}
+
+async function beginCursorTransaction(scope: Scope, query: Query, handle: QueryHandle) {
+  try {
+    await send(scope, scope.statements!.BEGIN, dispatchOwn.bind(scope));
+  } catch (err) {
+    leave(scope);
+    return query.reject(err as Error);
+  }
+  // A cursor that ended while BEGIN was on its way has shut the scope: the statement is refused.
+  dispatch.$call(scope, query, handle);
+}
+
+/// The end of a cursor on a pool is the end of its transaction.
+async function endCursorTransaction(this: Scope, failed: boolean) {
+  try {
+    await finish(this, !failed, undefined);
+  } catch (err) {
+    if (err !== nothingToEnd) {
+      throw err;
+    }
+  }
 }
 
 function refusal(scope: Scope): Error {
@@ -380,11 +451,15 @@ function cancelRunning(scope: Scope, reason?: Error) {
 
 const kindNames = ["reservation", "transaction", "savepoint"];
 
-/// A COPY stream that is open when its scope ends would hold the connection for ever. Returns the queries it told so.
+const copyOrCursor = SQLQueryFlags.copy | SQLQueryFlags.cursor;
+
+/// A COPY stream or a cursor that is open when its scope ends would hold the connection for ever. Returns the queries it told so.
 function abandonCopies(scope: Scope, ended: Scope, copies: Query[] = []) {
   for (const query of scope.running) {
-    if (query[_flags] & SQLQueryFlags.copy) {
-      query[_copy].abandon(`the ${kindNames[ended.kind]} ended before the COPY stream did`);
+    const open = query[_flags] & copyOrCursor;
+    if (open) {
+      const what = open & SQLQueryFlags.copy ? "COPY stream" : "cursor";
+      query[_copy].abandon(`the ${kindNames[ended.kind]} ended before the ${what} did`);
       copies.push(query);
     }
   }
@@ -395,6 +470,51 @@ function abandonCopies(scope: Scope, ended: Scope, copies: Query[] = []) {
     }
   }
   return copies;
+}
+
+/// The cursors of the handles that `from` and the scopes in it are, but for `scope` and the scopes in it.
+function cursorsOutside(scope: Scope, from: Scope, open: Query[] | null): Query[] | null {
+  if (from === scope) {
+    return open;
+  }
+  for (const query of from.running) {
+    if (query[_flags] & SQLQueryFlags.cursor) {
+      (open ??= []).push(query);
+    }
+  }
+  for (const child of from.children) {
+    open = cursorsOutside(scope, child, open);
+  }
+  return open;
+}
+
+/// The cursors that are open on the other handles of the connection of `scope`.
+function cursorsAround(scope: Scope) {
+  if (!scope.pool.cursors) {
+    return null;
+  }
+  let root = scope;
+  while (root.parent !== null) {
+    root = root.parent;
+  }
+  return cursorsOutside(scope, root, null);
+}
+
+/// The server ends a portal with the transaction or savepoint that was open at its Bind, whichever handle made the query. A request for its rows would then fail the transaction.
+function abandonCursorsAround(scope: Scope) {
+  const open = cursorsAround(scope);
+  if (open === null) {
+    return;
+  }
+  const before = scope.cursorsBefore;
+  // COMMIT and ROLLBACK take every portal. A cursor that started in the turn of savepoint() can be ahead of SAVEPOINT: its portal gets a Close.
+  const ending = scope.kind === Kind.transaction;
+  for (let i = 0; i < open.length; i++) {
+    const query = open[i];
+    if (before === null || !before.includes(query)) {
+      query[_copy].abandon(`the ${kindNames[scope.kind]} that it was opened in ended`, ending);
+    }
+  }
 }
 
 /// The transactions of a reservation run one at a time, so the oldest that is left has not started.
@@ -539,6 +659,10 @@ async function end(scope: Scope, commit: boolean, grace: number | undefined) {
     }
     const { BEFORE_COMMIT_OR_ROLLBACK, COMMIT, ROLLBACK } = scope.statements!;
     const last = commit ? COMMIT : ROLLBACK;
+    // RELEASE SAVEPOINT hands the portals of the savepoint to the scope around it.
+    if (!commit || scope.kind === Kind.transaction) {
+      abandonCursorsAround(scope);
+    }
     if (BEFORE_COMMIT_OR_ROLLBACK) {
       await send(scope, BEFORE_COMMIT_OR_ROLLBACK, dispatchEnd.bind(scope, false));
       const answer = await send(scope, last, dispatchOwn.bind(scope));
@@ -550,6 +674,7 @@ async function end(scope: Scope, commit: boolean, grace: number | undefined) {
     } catch (err) {
       // A savepoint whose RELEASE failed is still there.
       if (commit && scope.kind === Kind.savepoint && scope.connection !== null) {
+        abandonCursorsAround(scope);
         await send(scope, ROLLBACK, dispatchOwn.bind(scope)).then(undefined, noop);
       }
       throw err;
@@ -775,6 +900,7 @@ function savepoint(this: Scope, nameOrFn: unknown, fnOrName?: unknown) {
   scope.resolve = resolve;
   scope.reject = reject;
   this.children.add(scope);
+  scope.cursorsBefore = cursorsAround(scope);
   run(scope, callback as TransactionCallback);
   return promise;
 }
@@ -1085,6 +1211,9 @@ function SQL(
 // A builtin function has no `prototype`, and `instanceof` throws without one. A client is a function.
 const SQLPrototype = Object.create(Function.prototype, {
   constructor: { value: SQL, writable: true, configurable: true },
+  // What the callback of query.cursor() returns to stop, under the two names the postgres package has for it.
+  CLOSE: { value: CLOSE },
+  END: { value: CLOSE },
 });
 defineProperty(SQL, "prototype", { value: SQLPrototype });
 

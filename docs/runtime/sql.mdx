@@ -45,6 +45,7 @@ const sqliteResults = await sqlite`
 - Automatic configuration with environment variables
 - PostgreSQL `LISTEN` / `NOTIFY`
 - PostgreSQL `COPY` as web streams
+- PostgreSQL cursors, to read a large result in batches
 
 ---
 
@@ -1142,7 +1143,7 @@ const sql = new SQL({
 - The function is called in the async context of the code that ran the query, so an `AsyncLocalStorage` store (a request id, for example) is there, also when the query had to wait for a connection.
 - The function only observes. If it throws, the error is reported as an uncaught exception and the query is sent anyway.
 
-`debug: false` turns logging off for one instance while `BUN_CONFIG_VERBOSE_SQL` is set. Parameters can hold passwords and personal data, so think twice before logging them in production. `sql.listen()` keeps a connection of its own, and the `LISTEN` and `UNLISTEN` statements it sends there are not reported.
+`debug: false` turns logging off for one instance while `BUN_CONFIG_VERBOSE_SQL` is set. Parameters can hold passwords and personal data, so think twice before logging them in production. `sql.listen()` keeps a connection of its own, and the `LISTEN` and `UNLISTEN` statements it sends there are not reported. The statement of a [cursor](#cursors-postgresql) is reported once, and the requests for its later batches are not. The `BEGIN` and the `COMMIT` or `ROLLBACK` that Bun sends around a cursor on `sql` are reported, as those of `sql.begin()` are.
 
 ---
 
@@ -1644,6 +1645,122 @@ const { count } = await query; // 2
 - Bun aborts a stream that is still open when its transaction, savepoint or reservation ends. Nothing of the `COPY` is stored, and `sql.begin` rolls back and rejects with the error of the `COPY`. Await `writer.close()` or `pipeTo()`, or read the stream to its end, before the callback returns or you call `release()`.
 - `query.cancel()`, `reader.cancel()` and leaving a `for await` loop end the `COPY`.
 - For Node.js streams, wrap them with `Readable.fromWeb()` and `Writable.fromWeb()`.
+
+---
+
+## Cursors (PostgreSQL)
+
+`await query` resolves to one array with every row. `query.cursor(rows)` reads the same result in batches of at most `rows` rows, through a cursor of the server. Bun asks the server for a batch when your code asks for it, so your program holds one batch at a time, however large the result is.
+
+```ts
+// An async iterator of batches
+for await (const rows of sql`SELECT * FROM events ORDER BY id`.cursor(1000)) {
+  await send(rows); // an array of at most 1,000 rows
+}
+
+// A callback. Bun waits for its promise before it asks for the next batch
+await sql`SELECT * FROM events ORDER BY id`.cursor(1000, async rows => {
+  await send(rows);
+});
+
+// One row in a batch is the default
+for await (const [event] of sql`SELECT * FROM events ORDER BY id`.cursor()) {
+  console.log(event.id);
+}
+```
+
+To stop before the last batch, leave the loop, or return `sql.CLOSE` from the callback. `sql.END` is the same value.
+
+```ts
+for await (const rows of sql`SELECT * FROM events ORDER BY id`.cursor(100)) {
+  if (rows.some(isTheOne)) break; // ends the cursor
+}
+
+await sql`SELECT * FROM events ORDER BY id`.cursor(100, rows => {
+  if (rows.some(isTheOne)) return sql.CLOSE;
+});
+```
+
+- A batch is an array of 1 to `rows` rows, like the result of a query. Its `count` is its number of rows, and `columns` describes them. A statement that returns no rows gives no batch.
+- The `command` of a batch is `null`, except on a batch that the statement ended with. After a number of rows that is a multiple of `rows`, no batch has it. Read `command` from the query.
+- The iterator starts the query at its first `next()`. Its `return()` ends the cursor, and `await using` calls that at the end of a block. An iterator that you never read leaves the query as it was: `await query` then resolves to every row.
+- The callback form returns the query, which starts when you await it. A callback that throws stops the cursor, and the query rejects with what the callback threw.
+- In both forms the query resolves when the cursor has ended, to an array without rows. Its `count` is the number of rows of all the batches, or the number of rows that a statement without `RETURNING` wrote. Its `command` is `null` when the cursor stopped before the statement ended. Then `affectedRows` is `0`, because the server says what a statement wrote only at its end.
+- `rows` is an integer from 1 to 2,147,483,647. The default is 1.
+- `.values()`, `.raw()` and the `bigint` option apply to every batch. Call `values()` and `raw()` before `cursor()`.
+- `sql.unsafe()` and `sql.file()` queries have `cursor()` too. A cursor reads one statement: PostgreSQL answers a text of several statements with `errno` `"42601"`.
+- A query has one cursor: the first `cursor()` that has a callback, or whose iterator is read. After that, `cursor()` throws `ERR_INVALID_STATE`, and so does the first `next()` of an iterator that was made earlier.
+- `cursor()` is PostgreSQL-only. On MySQL and SQLite it throws.
+
+### Cursors and transactions
+
+The server keeps a cursor only inside a transaction. Where you call `cursor()` decides which transaction that is.
+
+**On `sql`**, the cursor takes one connection of the pool for itself and puts `BEGIN` and `COMMIT` around the statement, as `sql.begin()` does. The connection goes back to the pool when the cursor ends. How the cursor ends decides how its transaction ends:
+
+| The cursor ends with                                                                       | The transaction of the cursor            |
+| ------------------------------------------------------------------------------------------ | ---------------------------------------- |
+| The last batch, `break`, `return()`, `sql.CLOSE`, a callback or a loop body that throws    | `COMMIT`: what the statement wrote stays |
+| An error from the server, `query.cancel()`, a lost connection, `sql.close({ timeout: 0 })` | `ROLLBACK`                               |
+
+When the statement ends, Bun sends `COMMIT` before it gives you the last batch. A batch that has a `command` is the end of a statement that is committed. If that `COMMIT` fails, for example on a deferred constraint, the last batch does not come: the loop and the query reject with the error.
+
+An `INSERT`, `UPDATE` or `DELETE ... RETURNING` writes every row before the first batch arrives. The batches only return the rows. Until the cursor ends, what the statement wrote is not committed. No other connection sees it, and that includes a query on `sql` inside the loop. The rows that an `UPDATE ... RETURNING` or a `SELECT ... FOR UPDATE` cursor returns stay locked until then. A statement on `sql` inside the loop that changes one of them waits for the cursor while the cursor waits for the loop, and PostgreSQL reports no deadlock. Use `sql.begin()` and run the cursor and those statements on `tx`.
+
+A query on `sql` inside the loop needs a second connection. When as many cursors, transactions and reserved connections are open as the pool has connections (`max`, 10 by default), that query waits until one of them ends. If each of them waits for such a query, none of them ends. Use `sql.begin()` and run the cursor and the query on `tx`, or keep fewer cursors open than `max`.
+
+With `max: 1`, do not run a cursor on `sql` while a transaction is open that you began with `BEGIN` by hand. As with `sql.begin()` in the same place, the `COMMIT` of the cursor ends your transaction.
+
+**In `sql.begin()` or a savepoint**, the cursor reads in your transaction and does not end it. The other statements of the transaction run between two batches:
+
+```ts
+await sql.begin(async tx => {
+  const users = tx<{ id: number; email: string }[]>`SELECT id, email FROM users WHERE NOT notified ORDER BY id`;
+  for await (const rows of users.cursor(500)) {
+    await notify(rows);
+    await tx`UPDATE users SET notified = true WHERE id IN ${tx(rows.map(row => row.id))}`;
+  }
+});
+```
+
+End the cursor before the callback returns. As with an open [`COPY`](#copy-postgresql) stream, Bun closes a cursor that is still open when its transaction, savepoint or reservation ends, and `sql.begin` rolls back and rejects.
+
+A cursor belongs to the transaction or the savepoint that is open when its first batch is read. The `ROLLBACK` of that savepoint ends the cursor, also when its query was made on `tx`.
+
+`query.cancel()` between two batches closes the cursor and leaves your transaction as it is. While the server works on a batch, `cancel()` asks the server to stop, as for any query. The cursor then rejects with the answer of the server (`errno` `"57014"`), and your transaction is aborted, as after any statement that fails.
+
+**On a reserved connection**, the cursor reads in the transaction that is open on that connection, and does not end it. When no transaction is open, the cursor rejects with `ERR_POSTGRES_INVALID_TRANSACTION_STATE` and sends nothing. Use `reserved.begin()`:
+
+```ts
+using reserved = await sql.reserve();
+
+await reserved.begin(async tx => {
+  for await (const rows of tx`SELECT * FROM events ORDER BY id`.cursor(1000)) {
+    await send(rows);
+  }
+});
+```
+
+### What to know about cursors
+
+- A cursor parses its statement each time and does not cache it, as `prepare: false` does for every query. So a cursor does not fail because a cached statement went stale (`errno` `"0A000"` or `"26000"`), also after `DISCARD ALL`.
+- A batch has the values that `await query` gives once its statement is prepared. With `prepare: false`, and for a query that runs with the simple protocol when you await it (`sql.unsafe()` and `sql.file()` without values, `.simple()`), it has the values that `await query` gives.
+- Each batch is a request of its own, and between two batches the connection is `idle in transaction`. The server's `statement_timeout` applies to each batch, not to the time your code takes. Its `idle_in_transaction_session_timeout` and, from PostgreSQL 17, its `transaction_timeout` count the time of your code. When one of them runs out, the server ends the connection, and the cursor rejects with `errno` `"25P03"` or `"25P04"`.
+- PostgreSQL plans the statement of a cursor for the whole result, as it plans a plain query. A plan that streams, such as a table scan or an index scan, computes only the rows that you ask for. A sort, an aggregate or a hash does its work before the first batch, and so does every `RETURNING` statement. For the first rows of a sorted result, use `LIMIT`.
+- PostgreSQL does not use [parallel query](https://www.postgresql.org/docs/current/when-can-parallel-query-be-used.html) for a statement that is read with a row limit.
+- Your own `COMMIT` or `ROLLBACK`, and a statement that fails in the same transaction, end the cursors of that transaction. The next batch rejects with `errno` `"34000"` or `"25P02"`.
+- On `sql`, an iterator that you drop without finishing holds its connection and its transaction until the garbage collector finds it. That can take long. Finish the loop, `break`, call `return()`, or use `await using`.
+- An open cursor does not keep the process alive: a script that stops asking for batches can exit.
+- A statement that cannot run in a transaction block, such as `VACUUM`, has no cursor (`errno` `"25001"`).
+- A cursor on a table keeps that table from `ALTER TABLE` in the same transaction until the cursor ends.
+
+A cursor rejects with the error of the server, as any query does, or with one of these:
+
+| Error of a cursor                        | Description                                                                                                   |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `ERR_POSTGRES_QUERY_CANCELLED`           | `query.cancel()` with no request on its way, or the transaction, savepoint or reservation of the cursor ended |
+| `ERR_POSTGRES_INVALID_TRANSACTION_STATE` | `cursor()` on a connection that is in no transaction: a reserved connection, or a `tx` that you ended by hand |
+| `ERR_POSTGRES_COPY_NOT_SUPPORTED`        | `cursor()` on a `COPY` statement. Use `readable()` or `writable()`                                            |
 
 ---
 
