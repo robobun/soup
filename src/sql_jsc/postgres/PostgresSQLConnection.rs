@@ -66,6 +66,8 @@ use crate::generated_bindgen::postgres_sql_connection::js_PostgresSQLConnection 
 
 #[path = "CopyStream.rs"]
 mod copy_stream;
+#[path = "Cursor.rs"]
+mod cursor;
 
 use crate::jsc::verify_error_to_js;
 
@@ -1321,7 +1323,8 @@ impl PostgresSQLConnection {
         }
         // That code can wait for the reply to a request that is still in the write buffer.
         self.register_auto_flusher();
-        match PostgresRequest::stage_parameters(self.global(), values, statement) {
+        let prepared = self.names_statements();
+        match PostgresRequest::stage_parameters(self.global(), values, statement, prepared) {
             Ok(replaced) => !replaced,
             Err(err) => {
                 let error = self.global().take_exception(err);
@@ -1358,6 +1361,10 @@ impl PostgresSQLConnection {
         let (Some(step), Some(this_value)) = (step, request.this_value.get().try_get()) else {
             debug_assert!(step.is_none(), "a live request has a wrapper");
             let failure = statement.failure().map(|it| it.to_js(self.global()));
+            let failure = failure.or_else(|| {
+                let refused = self.pipeline.get().refuses(next);
+                refused.then(|| self.needs_transaction_error())
+            });
             self.reject_unwritten(turn, failure);
             return true;
         };
@@ -1415,6 +1422,19 @@ impl PostgresSQLConnection {
             Step::Query => {
                 return self.write(|out| frontend::query(out, request.query.to_utf8().slice()));
             }
+            // Each with its own Sync: between two batches the session is where it is between two statements.
+            Step::Execute | Step::Close => {
+                let portal = request.portal().ok_or(AnyPostgresError::ExpectedRequest)?;
+                return self.write(|out| {
+                    if let Step::Close = step {
+                        frontend::close_portal(out, portal.name())?;
+                    } else {
+                        frontend::execute(out, portal.name(), portal.max_rows)?;
+                    }
+                    out.extend_from_slice(&frontend::SYNC);
+                    Ok(())
+                });
+            }
             Step::Parse { close, bind } => {
                 self.write(|out| {
                     if close {
@@ -1430,7 +1450,7 @@ impl PostgresSQLConnection {
                 ResultFormats::Text
             }
             // PgBouncer in transaction mode may give this batch to another backend.
-            Step::Bind if !statement.is_named() => {
+            Step::Bind if !self.names_statements() => {
                 self.write(parse)?;
                 ResultFormats::Text
             }
@@ -1442,7 +1462,15 @@ impl PostgresSQLConnection {
             },
         };
         request.formats.set(formats);
-        PostgresRequest::bind_and_execute(self, self.global(), statement, values, formats)
+        let portal = request.portal();
+        PostgresRequest::bind_and_execute(
+            self,
+            self.global(),
+            statement,
+            values,
+            formats,
+            portal.as_ref(),
+        )
     }
 
     /// Stops after a notification: a listener can run the event loop, which reuses the receive buffer.
@@ -1536,6 +1564,10 @@ impl PostgresSQLConnection {
                 self.pipeline.with_mut(Pipeline::on_bind_complete)?;
             }
             b'3' => reader.eat_message(&protocol::CLOSE_COMPLETE)?,
+            b's' => {
+                reader.skip_message()?;
+                self.pipeline.with_mut(Pipeline::on_portal_suspended);
+            }
             b't' => {
                 let types = protocol::ParameterDescription::decode_internal(reader)?.parameters;
                 self.pipeline
@@ -1693,6 +1725,7 @@ impl PostgresSQLConnection {
         }
         match self.pipeline.with_mut(|it| it.on_ready_for_query(status)) {
             Some(entry) if entry.is_rejected() => self.end_rejected(entry, None),
+            Some(entry) if entry.is_suspended() => self.park(&entry),
             Some(entry) => {
                 let request = &entry.request;
                 request.leave_queue();

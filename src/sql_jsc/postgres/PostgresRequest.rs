@@ -66,18 +66,20 @@ pub(crate) fn needs_parameter_types(global: &JSGlobalObject, values: JSValue) ->
 
 /// Replaces each value by the text that `bind_and_execute` sends for it, unless it can encode the value
 /// itself without running JS. Once per request: it would take that text for a string.
+/// `prepared`: the connection names its statements. A cursor has an unnamed one there too.
 /// `true`: it replaced one, so user code may have run.
 pub(crate) fn stage_parameters(
     global: &JSGlobalObject,
     values: JSValue,
     statement: &PostgresSQLStatement,
+    prepared: bool,
 ) -> JsResult<bool> {
     let mut iter = JSArrayIterator::init(values, global)?;
     let mut index: u32 = 0;
     let mut replaced = false;
     while let Some(value) = iter.next()? {
         let tag = parameter_tag(statement, index as usize);
-        if let Some(text) = parameter_text(global, value, tag, index, statement.is_named())? {
+        if let Some(text) = parameter_text(global, value, tag, index, prepared)? {
             values.put_index(global, index, text)?;
             replaced = true;
         }
@@ -161,13 +163,63 @@ fn array_literal(global: &JSGlobalObject, list: JSValue, tag: types::Tag) -> JsR
     Ok(literal)
 }
 
+/// The portal of a cursor and the row limit of its Executes. The wrapper of the request keeps them as one number in its `copy` slot.
+pub(crate) struct NamedPortal {
+    name: [u8; Self::NAME_LENGTH],
+    name_length: usize,
+    /// 0 is no limit.
+    pub(crate) max_rows: Int4,
+}
+
+impl NamedPortal {
+    const MAX_ROWS_BITS: u32 = 31;
+    /// What is left of the 53 bits that a number keeps exactly.
+    const ID_BITS: u32 = 22;
+    /// `C` and the digits of an id.
+    const NAME_LENGTH: usize = 8;
+
+    pub(crate) fn pack(id: u32, max_rows: u32) -> Option<JSValue> {
+        if id >> Self::ID_BITS != 0 || max_rows >> Self::MAX_ROWS_BITS != 0 {
+            return None;
+        }
+        Some(JSValue::js_number_from_uint64(
+            (u64::from(id) << Self::MAX_ROWS_BITS) | u64::from(max_rows),
+        ))
+    }
+
+    pub(crate) fn unpack(packed: JSValue) -> Option<NamedPortal> {
+        if !packed.is_number() {
+            return None;
+        }
+        let packed = packed.as_number() as u64;
+        let mut name = [0u8; Self::NAME_LENGTH];
+        let name_length = {
+            use std::io::Write as _;
+            let mut unwritten = &mut name[..];
+            write!(unwritten, "C{}", packed >> Self::MAX_ROWS_BITS).ok()?;
+            Self::NAME_LENGTH - unwritten.len()
+        };
+        Some(NamedPortal {
+            name,
+            name_length,
+            max_rows: (packed & ((1 << Self::MAX_ROWS_BITS) - 1)) as Int4,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &[u8] {
+        &self.name[..self.name_length]
+    }
+}
+
 /// An accessor of `values` still runs user code, and so does the `toString()` of bytes that a retry sends as text.
+/// `portal`: of a cursor. Without one the Bind makes the unnamed portal, and its Execute has no row limit.
 pub(crate) fn bind_and_execute(
     connection: &PostgresSQLConnection,
     global: &JSGlobalObject,
     statement: &PostgresSQLStatement,
     values: JSValue,
     formats: types::ResultFormats,
+    portal: Option<&NamedPortal>,
 ) -> Result<(), AnyPostgresError> {
     let len = statement.parameter_types().len();
     let name = &statement.name;
@@ -175,7 +227,7 @@ pub(crate) fn bind_and_execute(
 
     let (length, format_codes) = connection.encode_more(|out| {
         let length = frontend::begin(out, b'B');
-        // The unnamed portal.
+        out.extend_from_slice(portal.map_or(&b""[..], NamedPortal::name));
         out.push(0);
         out.extend_from_slice(name);
         out.push(0);
@@ -235,7 +287,13 @@ pub(crate) fn bind_and_execute(
         }
 
         length.end_message(out)?;
-        out.extend_from_slice(&frontend::EXECUTE_AND_SYNC);
+        match portal {
+            None => out.extend_from_slice(&frontend::EXECUTE_AND_SYNC),
+            Some(portal) => {
+                frontend::execute(out, portal.name(), portal.max_rows)?;
+                out.extend_from_slice(&frontend::SYNC);
+            }
+        }
         Ok(())
     })
 }

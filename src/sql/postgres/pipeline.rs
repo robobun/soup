@@ -103,6 +103,14 @@ pub enum Protocol {
         /// Parse and Describe go out first, and Bind waits for the server's parameter types.
         describe_first: bool,
     },
+    /// The statement of a cursor: its Bind names a portal, and its Execute has a row limit.
+    Cursor {
+        describe_first: bool,
+    },
+    /// An Execute for the next rows of the portal of a cursor.
+    Fetch,
+    /// The Close of such a portal.
+    Close,
 }
 
 /// `describing`: the batch has a Describe that is not answered yet.
@@ -118,8 +126,10 @@ enum Stage {
         describing: bool,
     },
     Running,
-    /// It has a result, and the next ReadyForQuery ends it.
+    /// It has a result, or it is a Close, which has none: the next ReadyForQuery ends it.
     Answered,
+    /// The row limit ended its Execute: the next ReadyForQuery takes it out of the queue, and the host has its rows.
+    Suspended,
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +180,11 @@ impl<R, E, C> Entry<R, E, C> {
         matches!(self.protocol, Protocol::Simple)
     }
 
+    /// Its portal has more rows: the host queues a `Protocol::Fetch` for them with the same statement.
+    pub fn is_suspended(&self) -> bool {
+        matches!(self.stage, Stage::Suspended)
+    }
+
     /// Its response is skipped until ReadyForQuery.
     pub fn is_rejected(&self) -> bool {
         use Reply::*;
@@ -198,6 +213,10 @@ pub enum Step {
         bind: bool,
     },
     Bind,
+    /// Of a portal that an earlier request has bound.
+    Execute,
+    /// Of that portal.
+    Close,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -355,15 +374,30 @@ impl<R, E, C> Pipeline<R, E, C> {
             _ if next.is_rejected() => return Some((next, None)),
             (_, State::Failed(_)) => return Some((next, None)),
             (Protocol::Simple, _) => idle.then_some(Step::Query)?,
+            // Written behind a request that is on its way, it would keep a CancelRequest for that one back.
+            (Protocol::Close, _) => idle.then_some(Step::Close)?,
+            (Protocol::Fetch, _) => (idle || self.has_room(buffered)).then_some(Step::Execute)?,
+            // Only with nothing on its way has the server said whether a transaction is open by now.
+            (Protocol::Cursor { .. }, _) if !idle => return None,
+            _ if self.refuses(next) => return Some((next, None)),
             (_, State::Parsing { .. }) => return None,
             (_, State::Prepared) => (idle || self.has_room(buffered)).then_some(Step::Bind)?,
-            (Protocol::Extended { describe_first }, &State::Unparsed { stored }) => idle
-                .then_some(Step::Parse {
-                    close: stored,
-                    bind: !describe_first,
-                })?,
+            (
+                Protocol::Extended { describe_first } | Protocol::Cursor { describe_first },
+                &State::Unparsed { stored },
+            ) => idle.then_some(Step::Parse {
+                close: stored,
+                bind: !describe_first,
+            })?,
         };
         Some((next, Some(step)))
+    }
+
+    /// `next` never writes the statement of a cursor in no transaction block: its portal would be gone at its first Sync, with what the statement wrote committed.
+    pub fn refuses(&self, entry: &Entry<R, E, C>) -> bool {
+        matches!(entry.protocol, Protocol::Cursor { .. })
+            && self.written == 0
+            && self.transaction_status == b'I'
     }
 
     fn has_room(&self, buffered: usize) -> bool {
@@ -384,7 +418,8 @@ impl<R, E, C> Pipeline<R, E, C> {
             self.parsing = true;
         }
         entry.stage = match step {
-            Step::Query => Stage::Running,
+            Step::Query | Step::Execute => Stage::Running,
+            Step::Close => Stage::Answered,
             Step::Bind => Stage::Binding { describing: false },
             Step::Parse { bind: true, .. } => Stage::Binding { describing: true },
             Step::Parse { bind: false, .. } => Stage::Preparing { describing: true },
@@ -466,14 +501,25 @@ impl<R, E, C> Pipeline<R, E, C> {
         Ok(())
     }
 
-    /// The request that it ends.
+    /// The row limit ended the Execute of the head.
+    pub fn on_portal_suspended(&mut self) {
+        if let Some(head) = self.queue.front_mut()
+            && matches!(head.protocol, Protocol::Cursor { .. } | Protocol::Fetch)
+            && matches!(head.stage, Stage::Binding { .. } | Stage::Running)
+            && !head.is_rejected()
+        {
+            head.stage = Stage::Suspended;
+        }
+    }
+
+    /// The request that it ends or suspends.
     pub fn on_ready_for_query(&mut self, transaction_status: u8) -> Option<Entry<R, E, C>> {
         self.transaction_status = transaction_status;
         self.parsing = false;
         let head = self.queue.front_mut()?;
         match head.stage {
             _ if head.is_rejected() => self.pop(),
-            Stage::Answered => self.pop(),
+            Stage::Answered | Stage::Suspended => self.pop(),
             Stage::Preparing { .. } => {
                 head.stage = Stage::Queued;
                 None

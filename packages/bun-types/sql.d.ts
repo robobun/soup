@@ -933,6 +933,25 @@ declare module "bun" {
     }
 
     /**
+     * The batches of {@link Query.cursor}. A `for await` loop reads it, and
+     * `await using` ends the cursor at the end of the block.
+     */
+    interface CursorIterator<T> extends AsyncIterableIterator<T>, AsyncDisposable {
+      /**
+       * The next batch. `done` is `true` after the last one. The promise
+       * rejects when the cursor fails.
+       */
+      next(): Promise<IteratorResult<T, undefined>>;
+
+      /**
+       * Ends the cursor before its last batch. On `sql`, that commits what
+       * the statement wrote. A `for await` loop calls it when it is left with
+       * `break`, `return` or an error.
+       */
+      return(): Promise<IteratorResult<T, undefined>>;
+    }
+
+    /**
      * A pending SQL query. Extends `Promise`, so it can be awaited, and adds
      * methods to control how it runs. The array it resolves to also has
      * {@link ResultMetadata}.
@@ -1031,6 +1050,92 @@ declare module "bun" {
       writable(): WritableStream<string | NodeJS.TypedArray | DataView | ArrayBufferLike>;
 
       /**
+       * PostgreSQL only. Reads the result in batches of at most `rows` rows,
+       * through a cursor of the server. Your program holds one batch at a
+       * time, and Bun asks the server for a batch only when the loop asks for
+       * it.
+       *
+       * It returns an async iterator of the batches. The query starts at the
+       * first `next()`. A `break`, a `return` or a `throw` in a `for await`
+       * loop ends the cursor, and so does `return()` of the iterator.
+       *
+       * A batch is an array of 1 to `rows` rows, like the one a query
+       * resolves to. Its `count` is its number of rows. Its `command` is
+       * `null`, except when the statement ended with that batch. A statement
+       * that returns no rows gives no batch. Call `values()` and `raw()`
+       * before `cursor()`.
+       *
+       * A cursor reads inside a transaction:
+       *
+       * - On a `sql.begin()` or `savepoint()` handle it reads in that
+       *   transaction. Other statements of the transaction can run between
+       *   two batches. The cursor must end before the callback returns.
+       * - On `sql` it takes one connection of the pool for itself and puts
+       *   `BEGIN` and `COMMIT` around the statement, as `sql.begin()` does.
+       *   The end of the loop commits, also a `break` or a `throw`. An error
+       *   of the server, `cancel()` and a lost connection roll back.
+       * - On a reserved connection it reads in the transaction that is open
+       *   there, and rejects with `ERR_POSTGRES_INVALID_TRANSACTION_STATE`
+       *   when none is. Use `reserved.begin()`.
+       *
+       * The query resolves when the cursor has ended, to an array without
+       * rows: see `cursor(rows, fn)`.
+       *
+       * @param rows The most rows in a batch: an integer from 1 to 2147483647.
+       * The default is 1.
+       *
+       * @example
+       * ```ts
+       * for await (const rows of sql`SELECT * FROM events ORDER BY id`.cursor(1000)) {
+       *   await send(rows);
+       * }
+       * ```
+       */
+      cursor(rows?: number): CursorIterator<T & ResultMetadata>;
+
+      /**
+       * PostgreSQL only. Reads the result one row at a time, as
+       * `cursor(1, fn)` does.
+       *
+       * @example
+       * ```ts
+       * await sql`SELECT * FROM events ORDER BY id`.cursor(async ([event]) => {
+       *   await send(event);
+       * });
+       * ```
+       */
+      cursor(fn: (rows: T & ResultMetadata) => unknown): Query<[]>;
+
+      /**
+       * PostgreSQL only. Reads the result in batches, as `cursor(rows)` does,
+       * and calls `fn` with each batch. It waits for the promise that `fn`
+       * returns before it asks the server for the next batch.
+       *
+       * It returns the query, which starts like any other query. `fn` stops
+       * the cursor when it returns `sql.CLOSE`. When `fn` throws, the cursor
+       * stops and the query rejects with what `fn` threw.
+       *
+       * The query resolves when the cursor has ended, to an array without
+       * rows. Its `count` is the number of rows of all the batches, or the
+       * number of rows that a statement without `RETURNING` wrote. Its
+       * `command` is `null` when the cursor stopped before the statement
+       * ended. Then `affectedRows` is `0`, because the server says what a
+       * statement wrote only at its end.
+       *
+       * @param rows The most rows in a batch: an integer from 1 to 2147483647
+       * @param fn Called with each batch. Bun waits for what it returns
+       *
+       * @example
+       * ```ts
+       * await sql`SELECT * FROM events ORDER BY id`.cursor(1000, async rows => {
+       *   await send(rows);
+       *   if (rows.at(-1).id > lastWanted) return sql.CLOSE;
+       * });
+       * ```
+       */
+      cursor(rows: number, fn: (rows: T & ResultMetadata) => unknown): Query<[]>;
+
+      /**
        * Starts executing the query. Queries are lazy: they only run when
        * awaited or executed with this method.
        */
@@ -1060,6 +1165,12 @@ declare module "bun" {
        */
       values(): Query<T>;
     }
+
+    /**
+     * The value of `sql.CLOSE` and `sql.END`: what the callback of
+     * {@link Query.cursor} returns to stop the cursor.
+     */
+    interface CursorClose {}
 
     /**
      * Callback function type for transaction contexts
@@ -1672,6 +1783,23 @@ declare module "bun" {
      * ```
      */
     notify(channel: string, payload?: string): Promise<void>;
+
+    /**
+     * What the callback of {@link SQL.Query.cursor} returns to close the
+     * cursor before the last batch. Every client, reserved connection and
+     * transaction has the same value.
+     *
+     * @example
+     * ```ts
+     * await sql`SELECT * FROM events`.cursor(100, rows => (found(rows) ? sql.CLOSE : undefined));
+     * ```
+     */
+    readonly CLOSE: SQL.CursorClose;
+
+    /**
+     * Another name for {@link SQL.CLOSE}
+     */
+    readonly END: SQL.CursorClose;
   }
 
   /**

@@ -23,6 +23,7 @@ use bun_sql::shared::SQLQueryResultMode as PostgresSQLQueryResultMode;
 
 bun_core::declare_scope!(Postgres, visible);
 
+use crate::generated_bindgen::postgres_sql_query::CursorRequest;
 pub(crate) use crate::generated_bindgen::postgres_sql_query::js_PostgresSQLQuery as js;
 
 // JS can re-enter any method, so they all take `&self` and the fields are cells.
@@ -49,10 +50,12 @@ pub struct PostgresSQLQuery {
 enum Place {
     New,
     Queued(Seat),
+    /// Of a cursor, between two batches. `fetch()` queues it again, and the statement has the columns of its portal.
+    Suspended(RefPtr<PostgresSQLStatement>),
     Ended,
 }
 
-/// The stream that `readable()` or `writable()` made for the request. See CopyStream.rs.
+/// The stream that `readable()` or `writable()` made for the request (CopyStream.rs), or what it is to a cursor (Cursor.rs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CopyStream {
     None,
@@ -62,6 +65,10 @@ pub enum CopyStream {
     Writable,
     /// Between CopyInResponse and the CopyDone or CopyFail that the stream ends with.
     WritableOpen,
+    /// The request of a cursor: its statement, whose Bind names a portal, and then an Execute for each batch of that portal.
+    Cursor,
+    /// The Close of a portal.
+    CursorClose,
 }
 
 impl PostgresSQLQuery {
@@ -76,13 +83,19 @@ impl PostgresSQLQuery {
     pub(crate) fn seat(&self) -> Option<Seat> {
         match self.place.get() {
             Place::Queued(seat) => Some(seat.clone()),
-            Place::New | Place::Ended => None,
+            Place::New | Place::Suspended(_) | Place::Ended => None,
         }
     }
 
     #[inline]
     pub(crate) fn leave_queue(&self) {
         self.place.set(Place::Ended);
+    }
+
+    /// `leave_queue` for a cursor whose portal has more rows.
+    #[inline]
+    pub(crate) fn suspend(&self, statement: RefPtr<PostgresSQLStatement>) {
+        self.place.set(Place::Suspended(statement));
     }
 
     pub(crate) fn get_target(
@@ -306,6 +319,35 @@ impl PostgresSQLQuery {
         Ok(())
     }
 
+    /// Before `run()`: the statement of a cursor. Before `fetch()`: the Close of a portal.
+    pub fn set_cursor(
+        &self,
+        this_value: JsWrapper<'_, Self>,
+        cx: &mut JsScope<'_>,
+        request: CursorRequest,
+        portal: u32,
+        rows: u32,
+    ) -> JsResult<()> {
+        let global_object = cx.global();
+        let copy = self.copy.get();
+        let fresh = matches!(self.place.get(), Place::New) && copy == CopyStream::None;
+        let waits = matches!(self.place.get(), Place::Suspended(_)) && copy == CopyStream::Cursor;
+        let (Some(packed), true) = (
+            PostgresRequest::NamedPortal::pack(portal, rows),
+            fresh || (waits && request == CursorRequest::Close),
+        ) else {
+            return Err(global_object.throw_invalid_arguments(format_args!(
+                "setCursor: the query has started, or the portal or the row limit is out of range"
+            )));
+        };
+        js::copy_set_cached(this_value.to_js(), global_object, packed);
+        self.copy.set(match request {
+            CursorRequest::Open => CopyStream::Cursor,
+            CursorRequest::Close => CopyStream::CursorClose,
+        });
+        Ok(())
+    }
+
     pub fn run(
         &self,
         this_value: JsWrapper<'_, Self>,
@@ -324,10 +366,11 @@ impl PostgresSQLQuery {
         let binding_value = js::binding_get_cached(this_value).unwrap_or_default();
         // Reading the values can run user code, so it comes before any look at the connection's state.
         let mut declared = Vec::new();
+        let mut describe_first = false;
         let mut protocol = Protocol::Simple;
         if !self.simple {
             declared = PostgresRequest::declared_types(global_object, binding_value)?;
-            let describe_first = connection.names_statements()
+            describe_first = connection.names_statements()
                 || PostgresRequest::needs_parameter_types(global_object, binding_value)?;
             // What is written behind a COPY FROM STDIN is its data, and nothing is written behind a simple query.
             if self.is_copy_statement() {
@@ -349,6 +392,20 @@ impl PostgresSQLQuery {
         if !matches!(self.place.get(), Place::New) {
             return Err(global_object.throw_value(connection.cancelled_error(None)));
         }
+        if self.copy.get() == CopyStream::Cursor {
+            // A COPY has no portal to suspend, and no Sync ends a COPY FROM STDIN.
+            if self.is_copy_statement() {
+                return Err(global_object.throw_value(postgres_error_to_js(
+                    global_object,
+                    Some(
+                        b"A COPY statement has no cursor: use query.readable() or query.writable()",
+                    ),
+                    AnyPostgresError::CopyNotSupported,
+                )));
+            }
+            // Not set for a simple query: its rows stay text, and one request parses it and binds its portal.
+            protocol = Protocol::Cursor { describe_first };
+        }
 
         // A connection that failed or closed answers nothing: a query queued on it would hold the
         // event loop for ever. The pool hears of a close through `onclose` and stops handing the
@@ -362,22 +419,63 @@ impl PostgresSQLQuery {
         }
 
         let seat = connection.enqueue(self, &declared, protocol);
+        js::target_set_cached(this_value, global_object, query);
+        self.queued(global_object, connection, seat);
+        Ok(())
+    }
+
+    /// Queues the request of a cursor again: for the next rows of its portal, or for the Close that `set_cursor` asked for.
+    pub fn fetch(&self, cx: &mut JsScope<'_>, connection: &PostgresSQLConnection) -> JsResult<()> {
+        let global_object = cx.global();
+        let statement = match (self.place.get(), self.copy.get()) {
+            (Place::Suspended(statement), CopyStream::Cursor) => Some(statement.clone()),
+            (Place::New | Place::Suspended(_), CopyStream::CursorClose) => None,
+            _ => {
+                return Err(global_object.throw_invalid_arguments(format_args!(
+                    "fetch: the query does not wait for the next rows of a cursor"
+                )));
+            }
+        };
+        if connection.is_closed() {
+            return Err(global_object.throw_value(postgres_error_to_js(
+                global_object,
+                Some(b"Connection closed"),
+                AnyPostgresError::ConnectionClosed,
+            )));
+        }
+
+        let seat = match statement {
+            Some(statement) => connection.enqueue_fetch(self, statement),
+            // Nothing of a Close is read through its statement.
+            None => connection.enqueue(self, &[], Protocol::Close),
+        };
+        self.queued(global_object, connection, seat);
+        Ok(())
+    }
+
+    /// The request has `seat` in the queue of `connection`: what can be written of it now is written.
+    fn queued(
+        &self,
+        global_object: &JSGlobalObject,
+        connection: &PostgresSQLConnection,
+        seat: Seat,
+    ) {
         self.place.set(Place::Queued(seat));
         // Request is enqueued: keep the event loop alive until the server responds.
         connection.poll_ref.ref_(bun_io::js_vm_ctx());
         self.this_value.with_mut(|r| r.upgrade(global_object));
-        js::target_set_cached(this_value, global_object, query);
 
         connection.advance();
         connection.flush_data_and_reset_timeout();
         // advance() can reject this request with nothing sent: no reply releases the ref then.
         connection.update_poll_ref();
-        Ok(())
     }
 
     pub fn cancel(&self, _: &mut JsScope<'_>) {
         match self.seat() {
             Some(seat) => seat.cancel(),
+            // A cursor between two batches can still close its portal.
+            None if matches!(self.place.get(), Place::Suspended(_)) => {}
             // `run` refuses it from here on.
             None => self.place.set(Place::Ended),
         }
