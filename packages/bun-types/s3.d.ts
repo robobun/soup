@@ -234,7 +234,8 @@ declare module "bun" {
     /**
      * Use a virtual hosted-style endpoint, where the bucket name is part of the
      * hostname. Defaults to `false`. When `true`, if `endpoint` is provided, the
-     * `bucket` option is ignored.
+     * `bucket` option is ignored. A copy is the exception: see
+     * {@link S3CopyOptions}.
      *
      * @example
      * ```ts
@@ -418,7 +419,8 @@ declare module "bun" {
      *
      * The metadata of a file or of a client is the default of its uploads
      * and of its presigned uploads. The `metadata` of a call replaces it,
-     * and `{}` or `null` uploads with none. Only an upload uses it.
+     * and `{}` or `null` uploads with none. An upload uses it, and so does a
+     * copy with `metadataDirective: "REPLACE"`, which has room for 232 keys.
      *
      * In a presigned URL the metadata is signed as headers: a `PUT` or a
      * `POST` to that URL has to send the same `x-amz-meta-*` headers.
@@ -526,6 +528,126 @@ declare module "bun" {
      * ```
      */
     metadata: Record<string, string>;
+  }
+
+  /**
+   * Options for a server-side copy: {@link S3Client.copy} and
+   * {@link S3File.copyTo}.
+   *
+   * The credentials, the `endpoint` and the `bucket` are those of the
+   * destination: the request is signed with them and goes there. The `acl`
+   * and the `storageClass` are those of the new object, as for an upload. A
+   * copy does not take them from its source.
+   *
+   * `requestPayer` is for the request, which reads the bucket of the source
+   * and writes to the bucket of the destination. Bun sends it when the
+   * destination has it, or the S3 file of the source.
+   *
+   * A copy names its source to the service as a bucket and a key. So with
+   * `virtualHostedStyle` and an `endpoint`, Bun has to know the bucket of the
+   * host name. It reads it from a host name of Amazon S3 or of R2, but not
+   * from an access point or a PrivateLink host. For those and for another
+   * service, set `bucket` to the first part of the host name. Bun throws if
+   * the host name does not start with `bucket`, and if a host name of Amazon
+   * S3 or of R2 has another bucket.
+   */
+  interface S3CopyOptions extends S3Options {
+    /**
+     * Where the new object gets its `type`, `contentDisposition`,
+     * `contentEncoding` and `metadata` from.
+     *
+     * - Not set: from the source. The service copies each header and all
+     *   metadata of the source.
+     * - `"COPY"`: the same, and the request says so in
+     *   `x-amz-metadata-directive`, for a bucket policy that asks for the
+     *   header.
+     * - `"REPLACE"`: from this request, as an upload to the destination sets
+     *   them: the options of the call, then the defaults of the file and of
+     *   the client, then the type that the extension of the key gives.
+     *
+     * `"REPLACE"` is all or nothing. The new object has only what the
+     * request sends, so a call has to give each value again that it keeps.
+     * The `Cache-Control`, `Content-Language` and `Expires` of the source
+     * are gone too, and Bun has no option that sets them. That is why Bun
+     * does not replace for you: without `"REPLACE"`, Bun throws if the call
+     * has `type`, `contentDisposition`, `contentEncoding` or `metadata`.
+     * The `type` and the `metadata` that the client or the file of the
+     * destination was made with do not throw, and are not sent.
+     *
+     * With `"REPLACE"`, `metadata` has room for 232 keys.
+     *
+     * @example
+     * ```ts
+     * // The new object has this type and this metadata, and nothing of its source
+     * await s3.copy("uploads/scan-0001.bin", "reports/january.pdf", {
+     *   metadataDirective: "REPLACE",
+     *   type: "application/pdf",
+     *   metadata: { reviewed: "yes" },
+     * });
+     * ```
+     */
+    metadataDirective?: "COPY" | "REPLACE" | undefined;
+
+    /**
+     * Copy only if the entity tag of the source is this one. Otherwise the
+     * service does not make the copy and the promise rejects with an
+     * `S3Error`. Amazon S3 sends the code `PreconditionFailed`.
+     *
+     * Only `undefined` is no condition. Bun throws for `null`, which
+     * `headers.get("etag")` returns for a response without an entity tag.
+     *
+     * @example
+     * ```ts
+     * // Take the entity tag from the response that the scanner reads, not from a `stat()` before it
+     * const upload = await fetch(s3.presign("quarantine/upload.bin"));
+     * const etag = upload.headers.get("etag");
+     * if (!upload.ok || !etag) throw new Error("cannot read the upload");
+     * await scan(upload.body);
+     * // Promote the object that the scanner read
+     * await s3.copy("quarantine/upload.bin", "files/upload.bin", {
+     *   copySourceIfMatch: etag,
+     * });
+     * ```
+     */
+    copySourceIfMatch?: string | undefined;
+
+    /**
+     * Copy only if the entity tag of the source is not this one. Only
+     * `undefined` is no condition.
+     */
+    copySourceIfNoneMatch?: string | undefined;
+
+    /**
+     * Copy only if the source changed after this time. Bun sends the `Date`
+     * as an HTTP date, which has no parts of a second, and throws for a date
+     * before 1970 or after the year 3000. Only `undefined` is no condition.
+     */
+    copySourceIfModifiedSince?: Date | undefined;
+
+    /**
+     * Copy only if the source did not change after this time. Bun sends the
+     * `Date` as an HTTP date, which has no parts of a second, and throws for
+     * a date before 1970 or after the year 3000. Only `undefined` is no
+     * condition.
+     */
+    copySourceIfUnmodifiedSince?: Date | undefined;
+  }
+
+  /**
+   * What a server-side copy resolves with: {@link S3Client.copy} and
+   * {@link S3File.copyTo}.
+   */
+  interface S3CopyResult {
+    /**
+     * The entity tag of the new object, in its quotes as {@link S3Stats.etag}
+     * has it. It is an empty string if the answer of the service has none.
+     */
+    etag: string;
+    /**
+     * When the service made the new object. It is an invalid `Date` if the
+     * answer of the service has no time.
+     */
+    lastModified: Date;
   }
 
   /**
@@ -865,6 +987,59 @@ declare module "bun" {
      * @returns Promise resolving to {@link S3Stats}
      */
     stat(): Promise<S3Stats>;
+
+    /**
+     * Copies the object to another key with one request. The service copies
+     * it: no byte of the object comes to this process.
+     *
+     * The new object has the type, the other headers and the metadata of
+     * this one, unless the options say `metadataDirective: "REPLACE"`. It
+     * does not get the `acl` and the storage class of this one: those are
+     * the ones of the destination.
+     *
+     * Amazon S3 copies up to 5 GB in one request. For a larger object, or
+     * for a `slice()`, use `write()` with the S3 file as its data. That
+     * downloads and uploads: the new object has the bytes that Bun reads,
+     * which are the decoded ones for an object with a `contentEncoding`,
+     * and none of the headers and the metadata of its source.
+     *
+     * If the copy fails, the `S3Error` has the key of this file in `path`
+     * and the key of the destination in `dest`.
+     *
+     * @param destination A key, or an S3 file. A key is read with the
+     * credentials of this file and with nothing else of it, so it is at the
+     * endpoint and in the bucket of this file. If the credentials have no
+     * `bucket`, the first part of the key is its bucket, as in the other
+     * methods. An S3 file gives the copy its credentials,
+     * endpoint, bucket, `acl`, `storageClass` and `requestPayer`, and with
+     * `metadataDirective: "REPLACE"` its `type` and `metadata`. The request
+     * is signed with the credentials of the destination and goes to its
+     * endpoint, which has to be the service that stores this file. Bun
+     * throws for a `slice()`, here and for this file.
+     * @param options Options for the destination and for the copy
+     * @returns A promise that resolves with the entity tag and the time of the new object
+     *
+     * @example
+     * ```ts
+     * const file = s3.file("uploads/photo.jpg");
+     * await file.copyTo("archive/photo.jpg");
+     * ```
+     *
+     * @example
+     * ```ts
+     * // To another bucket
+     * await file.copyTo("photo.jpg", { bucket: "backups" });
+     * await file.copyTo(backups.file("photo.jpg"));
+     * ```
+     *
+     * @example
+     * ```ts
+     * // Rename
+     * await file.copyTo("uploads/portrait.jpg");
+     * await file.delete();
+     * ```
+     */
+    copyTo(destination: string | S3File, options?: S3CopyOptions): Promise<S3CopyResult>;
   }
 
   interface S3ListObjectsOptions {
@@ -1458,6 +1633,86 @@ declare module "bun" {
      * ```
      */
     static stat(path: string, options?: S3Options): Promise<S3Stats>;
+
+    /**
+     * Copies an object to another key with one request. The service copies
+     * it: no byte of the object comes to this process.
+     *
+     * The new object has the type, the other headers and the metadata of the
+     * source, unless the options say `metadataDirective: "REPLACE"`. It does
+     * not get the `acl` and the storage class of the source: those are the
+     * ones of the destination.
+     *
+     * Amazon S3 copies up to 5 GB in one request. For a larger object, use
+     * `write()` with the S3 file as its data. That downloads and uploads:
+     * the new object has the bytes that Bun reads, which are the decoded
+     * ones for an object with a `contentEncoding`, and none of the headers
+     * and the metadata of its source.
+     *
+     * Both keys are in the bucket of the client, or in the `bucket` of the
+     * options. If there is no `bucket`, the first part of each key is its
+     * bucket. To copy between two buckets, use {@link S3File.copyTo}:
+     * `client.file(key).copyTo(other.file(key))`.
+     *
+     * If the copy fails, the `S3Error` has the key of the source in `path`
+     * and the key of the destination in `dest`.
+     *
+     * @param source The key of the object to copy
+     * @param destination The key of the new object
+     * @param options Options for the destination and for the copy
+     * @returns A promise that resolves with the entity tag and the time of the new object
+     *
+     * @example
+     * ```ts
+     * await bucket.copy("uploads/photo.jpg", "archive/photo.jpg");
+     * ```
+     *
+     * @example
+     * ```ts
+     * // Change the storage class of an object in place
+     * await bucket.copy("logs/2025.tar", "logs/2025.tar", {
+     *   storageClass: "GLACIER_IR",
+     * });
+     * ```
+     */
+    copy(source: string, destination: string, options?: S3CopyOptions): Promise<S3CopyResult>;
+
+    /**
+     * Copies an object to another key with one request. The service copies
+     * it: no byte of the object comes to this process.
+     *
+     * The new object has the type, the other headers and the metadata of the
+     * source, unless the options say `metadataDirective: "REPLACE"`. The
+     * `acl` and the storage class are the ones of the destination. Amazon S3
+     * copies up to 5 GB in one request. If the copy fails, the `S3Error` has
+     * the key of the source in `path` and the key of the destination in
+     * `dest`.
+     *
+     * @param source The key of the object to copy, or an S3 file. A key is
+     * read with the credentials of the destination, so it is in the bucket
+     * of the destination. Bun throws for a `slice()` of a file: a copy takes
+     * the whole object.
+     * @param destination The key of the new object, or an S3 file. A key is
+     * read with the credentials of the environment and the options, as in
+     * the other static methods, and never with the S3 file of the source:
+     * for a key next to a file, use {@link S3File.copyTo}. The request is
+     * signed with the credentials of the destination and goes to its
+     * endpoint, which has to be the service that stores the source.
+     * @param options S3 credentials and options for the destination and for the copy
+     * @returns A promise that resolves with the entity tag and the time of the new object
+     *
+     * @example
+     * ```ts
+     * await S3Client.copy("uploads/photo.jpg", "archive/photo.jpg", credentials);
+     * ```
+     *
+     * @example
+     * ```ts
+     * // Between two buckets
+     * await S3Client.copy(uploads.file("photo.jpg"), backups.file("photo.jpg"));
+     * ```
+     */
+    static copy(source: string | S3File, destination: string | S3File, options?: S3CopyOptions): Promise<S3CopyResult>;
 
     /**
      * Returns some or all (up to 1,000) of the objects in a bucket with each request.

@@ -11,7 +11,7 @@ use bun_ptr::{AliasableBox, RefPtr};
 pub(crate) use crate::webcore::s3::download_stream::S3HttpDownloadStreamingTask;
 pub(crate) use bun_s3_signing::MultiPartUploadOptions;
 pub(crate) use bun_s3_signing::acl::ACL;
-pub(crate) use bun_s3_signing::metadata::Metadata;
+pub(crate) use bun_s3_signing::metadata::{AmzHeaders, Metadata};
 pub(crate) use bun_s3_signing::storage_class::StorageClass;
 
 pub(crate) use bun_s3_signing::error as Error;
@@ -32,6 +32,7 @@ use bun_s3_signing::credentials::encode_uri_component;
 
 pub(crate) use crate::webcore::s3::list_objects::S3ListObjectsOptions;
 pub(crate) use crate::webcore::s3::list_objects::get_list_objects_options_from_js;
+pub(crate) use crate::webcore::s3::simple_request::S3CopyResult;
 pub(crate) use crate::webcore::s3::simple_request::S3DeleteResult;
 pub(crate) use crate::webcore::s3::simple_request::S3HttpSimpleTask;
 pub(crate) use crate::webcore::s3::simple_request::S3ListObjectsResult;
@@ -379,10 +380,44 @@ pub(crate) fn upload(
             acl,
             storage_class,
             request_payer,
-            metadata,
+            metadata: metadata.map(|metadata| &**metadata),
             ..Default::default()
         },
         s3_simple_request::Callback::Upload(callback),
+    )
+}
+
+/// CopyObject: a `PUT` of `path` without a body. `headers` are those of [`bun_s3_signing::CopyHeaders`].
+pub(crate) fn copy(
+    this: &S3Credentials,
+    context: &bun_jsc::ScriptExecutionContext,
+    path: &[u8],
+    headers: &AmzHeaders,
+    content_type: Option<&[u8]>,
+    content_disposition: Option<&[u8]>,
+    content_encoding: Option<&[u8]>,
+    acl: Option<ACL>,
+    storage_class: Option<StorageClass>,
+    request_payer: bool,
+    callback: s3_simple_request::OnCopy,
+) -> JsResult<()> {
+    s3_simple_request::execute_simple_s3_request(
+        this,
+        context,
+        s3_simple_request::Options {
+            path,
+            method: bun_http::Method::PUT,
+            body: b"",
+            content_type,
+            content_disposition,
+            content_encoding,
+            acl,
+            storage_class,
+            request_payer,
+            metadata: Some(headers),
+            ..Default::default()
+        },
+        s3_simple_request::Callback::Copy(callback),
     )
 }
 

@@ -164,7 +164,7 @@ impl NetworkSink {
             options.content_encoding = target.content_encoding.as_deref();
             options.acl = target.acl;
             options.storage_class = target.storage_class;
-            options.metadata = target.metadata.as_ref();
+            options.metadata = target.metadata.as_deref();
         }
         let context = match request {
             // The store bills the parts, so this goes out for a context that stopped too.
