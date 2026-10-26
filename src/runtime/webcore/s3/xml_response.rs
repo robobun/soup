@@ -135,3 +135,19 @@ pub(crate) fn parse_error(body: &[u8]) -> Option<ErrorBody> {
     })
     .flatten()
 }
+
+/// The `<ETag>` and `<LastModified>` of a `<CopyObjectResult>` document, each empty if absent.
+pub(crate) struct CopyObjectResult {
+    pub etag: Box<[u8]>,
+    pub last_modified: Box<[u8]>,
+}
+
+pub(crate) fn parse_copy_object_result(body: &[u8]) -> Option<CopyObjectResult> {
+    parse(body, |root| {
+        (root.name == b"CopyObjectResult").then(|| CopyObjectResult {
+            etag: root.child_text(b"ETag").unwrap_or_default(),
+            last_modified: root.child_text(b"LastModified").unwrap_or_default(),
+        })
+    })
+    .flatten()
+}

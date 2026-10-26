@@ -276,7 +276,8 @@ pub(crate) fn get_credentials_with_options(
 /// The HTTP client drops the headers of a request that it has no room for,
 /// and the signature of an upload counts on each `x-amz-meta-*` one. An
 /// upload has the headers `sign_request` makes and its `Content-Type`.
-const MAX_METADATA_ENTRIES: usize = bun_http::MAX_USER_HEADERS - (SignResult::MAX_HEADERS + 1);
+pub(crate) const MAX_METADATA_ENTRIES: usize =
+    bun_http::MAX_USER_HEADERS - (SignResult::MAX_HEADERS + 1);
 
 /// `opts.metadata`: the `x-amz-meta-*` headers of an upload. `None` when the
 /// property is not there or `undefined`, and none of them for `null`.

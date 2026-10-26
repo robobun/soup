@@ -283,6 +283,9 @@ pub(crate) mod multipart_options_impl {
 #[path = "webcore/s3/client.rs"]
 pub(crate) mod __s3_client;
 #[doc(hidden)]
+#[path = "webcore/s3/copy.rs"]
+pub(crate) mod __s3_copy;
+#[doc(hidden)]
 #[path = "webcore/s3/credentials_jsc.rs"]
 pub(crate) mod __s3_credentials_jsc;
 #[doc(hidden)]
@@ -307,6 +310,7 @@ pub(crate) mod s3 {
     // Note: `client` is the umbrella re-export hub. It pulls in `simple_request`
     // / `download_stream` / `list_objects` / `multipart` transitively.
     pub(crate) use super::__s3_client as client;
+    pub(crate) use super::__s3_copy as copy;
     pub(crate) use super::__s3_credentials_jsc as credentials_jsc;
     pub(crate) use super::__s3_download_stream as download_stream;
     pub(crate) use super::__s3_list_objects as list_objects;

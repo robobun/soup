@@ -51,3 +51,44 @@ async function doMetadata(file: Bun.S3File) {
 }
 
 doMetadata(s3.file("invoice.pdf"));
+
+async function doCopy(file: Bun.S3File) {
+  expectType(await s3.copy("a.txt", "b.txt")).is<Bun.S3CopyResult>();
+  const credentials = { accessKeyId: "key", secretAccessKey: "secret", bucket: "backups" };
+  expectType(await Bun.S3Client.copy(file, "b.txt", credentials)).is<Bun.S3CopyResult>();
+  expectType(await Bun.S3Client.copy("s3://uploads/a.txt", file)).is<Bun.S3CopyResult>();
+  expectType(await file.copyTo("b.txt")).is<Bun.S3CopyResult>();
+
+  const { etag, lastModified } = await file.copyTo(s3.file("b.txt"), {
+    metadataDirective: "REPLACE",
+    type: "text/plain",
+    metadata: { reviewed: "yes" },
+    storageClass: "STANDARD_IA",
+  });
+  expectType(etag).is<string>();
+  expectType(lastModified).is<Date>();
+
+  const options: Bun.S3CopyOptions = {
+    copySourceIfMatch: etag,
+    copySourceIfNoneMatch: '"0"',
+    copySourceIfModifiedSince: new Date(0),
+    copySourceIfUnmodifiedSince: lastModified,
+  };
+  await s3.copy("a.txt", "b.txt", options);
+  await s3.copy("a.txt", "b.txt", { metadataDirective: "COPY", copySourceIfMatch: undefined });
+
+  // @ts-expect-error
+  await s3.copy(file, "b.txt");
+  // @ts-expect-error
+  await s3.copy("a.txt", "b.txt", { metadataDirective: "replace" });
+  // @ts-expect-error
+  await s3.copy("a.txt", "b.txt", { copySourceIfMatch: new Date() });
+  // @ts-expect-error
+  await s3.copy("a.txt", "b.txt", { copySourceIfMatch: new Headers().get("etag") });
+  // @ts-expect-error
+  await s3.copy("a.txt", "b.txt", { copySourceIfUnmodifiedSince: "Sun, 25 Oct 2026 12:00:00 GMT" });
+  // @ts-expect-error
+  await file.copyTo();
+}
+
+doCopy(s3.file("a.txt"));
