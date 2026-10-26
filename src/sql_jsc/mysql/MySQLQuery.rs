@@ -293,7 +293,11 @@ impl MySQLQuery {
     pub(crate) fn cancel(&mut self) -> bool {
         match self.status {
             Status::Pending | Status::Binding | Status::Preparing => self.discard_response(),
-            Status::Running | Status::PartialResponse | Status::Success | Status::Fail => false,
+            Status::Running
+            | Status::PartialResponse
+            | Status::Success
+            | Status::Fail
+            | Status::Cursor => false,
         }
     }
 
@@ -312,7 +316,7 @@ impl MySQLQuery {
     pub(crate) fn is_in_flight(&self) -> bool {
         match self.status {
             Status::Preparing | Status::Binding | Status::Running | Status::PartialResponse => true,
-            Status::Success | Status::Fail | Status::Pending => false,
+            Status::Success | Status::Fail | Status::Pending | Status::Cursor => false,
         }
     }
 

@@ -474,5 +474,45 @@ for (const [adapter, image, url] of [
       // listen() has a connection of its own, which is not the pool's
       expect(squeeze(calls)).toEqual([["SELECT pg_notify($1, $2)", [channel, "hello"]]]);
     });
+
+    test("debug reports the statement of a cursor once, between the BEGIN and the COMMIT of the cursor", async () => {
+      await container.ready;
+      const requests = new AsyncLocalStorage<string>();
+      const seen: [store: string | undefined, query: string, parameters: unknown[]][] = [];
+      await using sql = new SQL(url(container.host, container.port), {
+        max: 1,
+        debug: (_connection, query, parameters) => void seen.push([requests.getStore(), query, parameters]),
+      });
+      const series = (from: typeof sql) => from`SELECT x FROM generate_series(1, ${5}) AS x`;
+      const text = "SELECT x FROM generate_series(1, $1 ) AS x";
+
+      // The cursor waits for the connection that the reservation has. Whoever releases it is not who ran the query.
+      const reserved = await sql.reserve();
+      const reading = requests.run("iterator", async () => {
+        const batches: number[] = [];
+        for await (const rows of series(sql).cursor(2)) batches.push(rows.length);
+        return batches;
+      });
+      const called = requests.run("callback", () =>
+        series(sql)
+          .cursor(2, () => sql.CLOSE)
+          .execute(),
+      );
+      requests.run("release", () => reserved.release());
+      expect([await reading, (await called).count]).toEqual([[2, 2, 1], 2]);
+      await requests.run("transaction", () => sql.begin(tx => series(tx).cursor(2, () => {})));
+
+      expect(seen).toEqual([
+        ["iterator", "BEGIN", []],
+        ["iterator", text, [5]],
+        ["iterator", "COMMIT", []],
+        ["callback", "BEGIN", []],
+        ["callback", text, [5]],
+        ["callback", "COMMIT", []],
+        ["transaction", "BEGIN", []],
+        ["transaction", text, [5]],
+        ["transaction", "COMMIT", []],
+      ]);
+    });
   });
 }

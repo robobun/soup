@@ -294,6 +294,11 @@ export function pgNoData(): Buffer {
   return pgRaw("n", Buffer.alloc(0));
 }
 
+// PostgreSQL FE/BE protocol §55.7 PortalSuspended: Byte1('s') Int32(4)
+export function pgPortalSuspended(): Buffer {
+  return pgRaw("s", Buffer.alloc(0));
+}
+
 // PostgreSQL FE/BE protocol §55.7 ParameterDescription: Byte1('t') Int32(len) Int16(nparams) Int32[nparams](typeOid)
 export function pgParameterDescription(typeOids: number[]): Buffer {
   const body = Buffer.alloc(2 + 4 * typeOids.length);
@@ -415,6 +420,11 @@ export function pgExecute(portal: string = "", maxRows: number = 0): Buffer {
 // PostgreSQL FE/BE protocol §55.7 Sync: Byte1('S') Int32(4)
 export function pgSync(): Buffer {
   return pgRaw("S", Buffer.alloc(0));
+}
+
+// PostgreSQL FE/BE protocol §55.7 Close: Byte1('C') Int32(len) Byte1('S' = statement | 'P' = portal) String(name)
+export function pgClose(kind: "S" | "P", name: string): Buffer {
+  return pgRaw("C", Buffer.concat([Buffer.from(kind, "latin1"), pgCString(name)]));
 }
 
 // PostgreSQL FE/BE protocol §55.7 DataRow: Byte1('D') Int32(len) Int16(ncols) per col: Int32(byteLen | -1) Byte[len]

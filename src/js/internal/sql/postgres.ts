@@ -27,7 +27,7 @@ const {
   init: initPostgres,
 } = $bindgen("postgres.bind.ts", "binding") as PostgresDotZig;
 
-// 1 to 4 are the commands whose tag counts the rows written.
+// 1 to 4 are the commands whose tag counts the rows written. 0 is no command: the row limit of a cursor ended the Execute.
 const cmds = ["", "INSERT", "DELETE", "UPDATE", "MERGE", "SELECT", "MOVE", "FETCH", "COPY"];
 
 const POSTGRES_ARRAY_TYPES = {
@@ -270,6 +270,13 @@ class PostgresAdapter extends BaseSQLAdapter<$Bindgen.PostgresSQLConnection, $Bi
       ? new WritableStream(new CopySink(query))
       : new ReadableStream(new CopySource(query), new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 }));
   }
+
+  cursor(_query: Query<any, any>, rows: number) {
+    return new PortalCursor(rows);
+  }
+  cursorHandler: ((query: Query<any, any>, handle: $Bindgen.PostgresSQLQuery) => void) | undefined = undefined;
+  cursorClient: unknown = undefined;
+  cursors = 0;
 
   #listener: ListenConnection | null = null;
 
@@ -677,6 +684,230 @@ class ListenConnection {
       this.#conn = null;
       conn.close();
     }
+  }
+}
+
+// Cursors. A portal with a name and a row limit lives as long as its transaction, and each batch is a request with its own Sync.
+
+type CursorConnection = $Bindgen.PostgresSQLConnection;
+type CursorHandle = $Bindgen.PostgresSQLQuery;
+
+/// The ids of the portals that Bun has open on a connection. A portal is named after its id.
+const openPortals = new WeakMap<CursorConnection, Set<number>>();
+
+function takePortalId(connection: CursorConnection) {
+  let open = openPortals.get(connection);
+  if (open === undefined) {
+    openPortals.set(connection, (open = new Set()));
+  }
+  let id = 1;
+  while (open.has(id)) {
+    id++;
+  }
+  open.add(id);
+  return id;
+}
+
+const enum PortalState {
+  /// run() has not given it a connection
+  unsent,
+  /// a request for rows is queued or on its way
+  fetching,
+  /// the row limit ended the last Execute: the native request waits for fetch()
+  suspended,
+  /// the statement ran to its end. The server has the portal until something closes it.
+  complete,
+  /// a request failed, and its transaction with it
+  failed,
+  closed,
+}
+
+/// The CursorSource of PostgreSQL, and the target of its native request.
+class PortalCursor {
+  // The members onResolvePostgresQuery and onRejectQuery read off a query.
+  [_results]: SQLResultArray<unknown> | null = null;
+  [_handle]!: CursorHandle;
+
+  rows: number;
+  id = 0;
+  state = PortalState.unsent;
+  connection: CursorConnection | null = null;
+  /// of the fetch() that waits for the request
+  waiting: Promise<SQLResultArray<unknown>> | null = null;
+  /// what a request failed with that no fetch() waited for
+  failure: { error: unknown } | null = null;
+  /// The rows of all the batches, and what the statement ended with.
+  delivered = 0;
+  command: string | null = null;
+  commandCount = 0;
+  statement: SQLStatementDescription | null = null;
+
+  constructor(rows: number) {
+    this.rows = rows;
+  }
+
+  attach(handle: CursorHandle) {
+    this[_handle] = handle;
+    return this;
+  }
+
+  setMode(mode: number) {
+    this[_handle].setMode(mode);
+  }
+
+  get started() {
+    return this.state !== PortalState.unsent;
+  }
+
+  get more() {
+    return this.state < PortalState.complete;
+  }
+
+  /// From the dispatcher of the query, with a connection that is in a transaction.
+  run(connection: CursorConnection, query: Query<any, any>) {
+    if (this.state !== PortalState.unsent) {
+      return;
+    }
+    this.state = PortalState.fetching;
+    // cancel() found nothing to stop while the query waited for its turn.
+    if (query.cancelled) {
+      return this.reject(new PostgresError("Query cancelled", { code: "ERR_POSTGRES_QUERY_CANCELLED" }));
+    }
+    this.connection = connection;
+    try {
+      const handle = this[_handle];
+      handle.setCursor("open", (this.id = takePortalId(connection)), this.rows);
+      handle.run(connection, this as any);
+    } catch (err) {
+      this.reject(err);
+    }
+  }
+
+  fetch(): Promise<SQLResultArray<unknown>> {
+    const failure = this.failure;
+    if (failure !== null) {
+      this.failure = null;
+      return Promise.$reject(failure.error);
+    }
+    switch (this.state) {
+      case PortalState.suspended:
+        this.state = PortalState.fetching;
+        try {
+          this[_handle].fetch(this.connection!);
+        } catch (err) {
+          this.state = PortalState.failed;
+          return Promise.$reject(err);
+        }
+      // fallthrough
+      case PortalState.unsent:
+      case PortalState.fetching:
+        return (this.waiting = $newPromise<SQLResultArray<unknown>>());
+      default:
+        return Promise.$reject(new PostgresError("Cursor closed", { code: "ERR_POSTGRES_QUERY_CANCELLED" }));
+    }
+  }
+
+  /// The native request ended. Command 0: at its row limit, and the request waits for fetch().
+  resolve() {
+    const batch = this[_results];
+    this[_results] = null;
+    const waiting = this.waiting;
+    if (this.state !== PortalState.fetching || batch == null || waiting === null) {
+      return;
+    }
+    if (batch.command === "") {
+      this.state = PortalState.suspended;
+      batch.command = null;
+    } else {
+      this.state = PortalState.complete;
+      this.command = batch.command;
+      // The tag of an Execute counts the rows of that Execute: of a statement that returns rows, only `delivered` is all of them.
+      this.commandCount = batch.count ?? 0;
+    }
+    this.statement = batch.statement;
+    // A batch is rows. What the statement wrote is for the result of the query to say, when the statement has ended.
+    this.delivered += batch.count = batch.length;
+    batch.affectedRows = 0;
+    this.waiting = null;
+    $resolvePromise(waiting, batch);
+  }
+
+  reject(err: unknown) {
+    this[_results] = null;
+    if (this.state === PortalState.closed) {
+      return;
+    }
+    // The connection wrote nothing for a cursor that it found in no transaction: there is no portal to close.
+    if ((err as { code?: unknown } | null)?.code === "ERR_POSTGRES_INVALID_TRANSACTION_STATE") {
+      openPortals.get(this.connection!)?.delete(this.id);
+      this.connection = null;
+    }
+    this.state = PortalState.failed;
+    const waiting = this.waiting;
+    if (waiting !== null) {
+      this.waiting = null;
+      $rejectPromise(waiting, err);
+    } else {
+      this.failure = { error: err };
+    }
+  }
+
+  interrupt(err: unknown) {
+    const waiting = this.waiting;
+    if (waiting !== null) {
+      this.waiting = null;
+      $rejectPromise(waiting, err);
+    }
+  }
+
+  stop() {
+    if (this.state !== PortalState.fetching) {
+      return false;
+    }
+    this[_handle].cancel();
+    return true;
+  }
+
+  close(ending: boolean) {
+    const { state, connection, id } = this;
+    this.state = PortalState.closed;
+    this.failure = null;
+    if (connection === null) {
+      return;
+    }
+    // A portal that stays open, also one read to its end, keeps its tables from DDL. COMMIT and ROLLBACK close it too.
+    if (!ending) {
+      if (state === PortalState.fetching) {
+        // Asks the server to stop. The Close below goes out when that is settled.
+        this[_handle].cancel();
+      }
+      try {
+        // The request that waits for fetch() has the portal. The server takes a Close for a portal that it has not.
+        const handle =
+          state === PortalState.suspended
+            ? this[_handle]
+            : createPostgresQuery("", [], [] as unknown as SQLResultArray<unknown>, false, false);
+        handle.setCursor("close", id, 0);
+        handle.fetch(connection);
+      } catch {
+        // The connection is closed, and the portal with it.
+      }
+    }
+    // What closes the portal is queued: a Bind of the same name comes after it.
+    openPortals.get(connection)?.delete(id);
+  }
+
+  /// No rows: the consumer has had them. `command` is null for a cursor that stopped before its statement ended.
+  summary() {
+    const summary = new SQLResultArray();
+    const { command, delivered } = this;
+    const count = (summary.count = delivered > 0 ? delivered : this.commandCount);
+    summary.command = command;
+    summary.statement = this.statement;
+    // INSERT, DELETE, UPDATE and MERGE: each row that they return is one that they wrote.
+    const written = command === null ? 0 : cmds.indexOf(command);
+    summary.affectedRows = written >= 1 && written <= 4 ? count : 0;
+    return summary;
   }
 }
 

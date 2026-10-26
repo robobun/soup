@@ -2476,145 +2476,148 @@ if (isDockerServiceEnabled("postgres_plain")) {
     //   return [0, (await sql`select 1 as x`.forEach(() => { /* noop */ })).length]
     // })
 
-    // t('Cursor', async() => {
-    //   const order = []
-    //   await sql`select 1 as x union select 2 as x`.cursor(async([x]) => {
-    //     order.push(x.x + 'a')
-    //     await delay(100)
-    //     order.push(x.x + 'b')
-    //   })
-    //   return ['1a1b2a2b', order.join('')]
-    // })
+    // As in the tests of the postgres package, without their delays: the callback gives the event loop a turn.
+    const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 
-    // t('Unsafe cursor', async() => {
-    //   const order = []
-    //   await sql.unsafe('select 1 as x union select 2 as x').cursor(async([x]) => {
-    //     order.push(x.x + 'a')
-    //     await delay(100)
-    //     order.push(x.x + 'b')
-    //   })
-    //   return ['1a1b2a2b', order.join('')]
-    // })
+    test("Cursor", async () => {
+      const order: string[] = [];
+      await sql`select 1 as x union select 2 as x`.cursor(async ([x]) => {
+        order.push(x.x + "a");
+        await turn();
+        order.push(x.x + "b");
+      });
+      expect(order.join("")).toBe("1a1b2a2b");
+    });
 
-    // t('Cursor custom n', async() => {
-    //   const order = []
-    //   await sql`select * from generate_series(1,20)`.cursor(10, async(x) => {
-    //     order.push(x.length)
-    //   })
-    //   return ['10,10', order.join(',')]
-    // })
+    test("Unsafe cursor", async () => {
+      const order: string[] = [];
+      await sql.unsafe("select 1 as x union select 2 as x").cursor(async ([x]) => {
+        order.push(x.x + "a");
+        await turn();
+        order.push(x.x + "b");
+      });
+      expect(order.join("")).toBe("1a1b2a2b");
+    });
 
-    // t('Cursor custom with rest n', async() => {
-    //   const order = []
-    //   await sql`select * from generate_series(1,20)`.cursor(11, async(x) => {
-    //     order.push(x.length)
-    //   })
-    //   return ['11,9', order.join(',')]
-    // })
+    test("Cursor custom n", async () => {
+      const order: number[] = [];
+      await sql`select * from generate_series(1,20)`.cursor(10, async x => {
+        order.push(x.length);
+      });
+      expect(order.join(",")).toBe("10,10");
+    });
 
-    // t('Cursor custom with less results than batch size', async() => {
-    //   const order = []
-    //   await sql`select * from generate_series(1,20)`.cursor(21, async(x) => {
-    //     order.push(x.length)
-    //   })
-    //   return ['20', order.join(',')]
-    // })
+    test("Cursor custom with rest n", async () => {
+      const order: number[] = [];
+      await sql`select * from generate_series(1,20)`.cursor(11, async x => {
+        order.push(x.length);
+      });
+      expect(order.join(",")).toBe("11,9");
+    });
 
-    // t('Cursor cancel', async() => {
-    //   let result
-    //   await sql`select * from generate_series(1,10) as x`.cursor(async([{ x }]) => {
-    //     result = x
-    //     return sql.CLOSE
-    //   })
-    //   return [1, result]
-    // })
+    test("Cursor custom with less results than batch size", async () => {
+      const order: number[] = [];
+      await sql`select * from generate_series(1,20)`.cursor(21, async x => {
+        order.push(x.length);
+      });
+      expect(order.join(",")).toBe("20");
+    });
 
-    // t('Cursor throw', async() => {
-    //   const order = []
-    //   await sql`select 1 as x union select 2 as x`.cursor(async([x]) => {
-    //     order.push(x.x + 'a')
-    //     await delay(100)
-    //     throw new Error('watty')
-    //   }).catch(() => order.push('err'))
-    //   return ['1aerr', order.join('')]
-    // })
+    test("Cursor cancel", async () => {
+      let result;
+      await sql`select * from generate_series(1,10) as x`.cursor(async ([{ x }]) => {
+        result = x;
+        return sql.CLOSE;
+      });
+      expect(result).toBe(1);
+    });
 
-    // t('Cursor error', async() => [
-    //   '42601',
-    //   await sql`wat`.cursor(() => { /* noop */ }).catch((err) => err.code)
-    // ])
+    test("Cursor throw", async () => {
+      const order: string[] = [];
+      await sql`select 1 as x union select 2 as x`
+        .cursor(async ([x]) => {
+          order.push(x.x + "a");
+          await turn();
+          throw new Error("watty");
+        })
+        .catch(() => order.push("err"));
+      expect(order.join("")).toBe("1aerr");
+    });
 
-    // t('Multiple Cursors', { timeout: 2 }, async() => {
-    //   const result = []
-    //   await sql.begin(async sql => [
-    //     await sql`select 1 as cursor, x from generate_series(1,4) as x`.cursor(async([row]) => {
-    //       result.push(row.x)
-    //       await new Promise(r => setTimeout(r, 20))
-    //     }),
-    //     await sql`select 2 as cursor, x from generate_series(101,104) as x`.cursor(async([row]) => {
-    //       result.push(row.x)
-    //       await new Promise(r => setTimeout(r, 10))
-    //     })
-    //   ])
+    test("Cursor error", async () => {
+      // The postgres package has the SQLSTATE in `code`. Bun has it in `errno`.
+      expect(
+        await sql`wat`
+          .cursor(() => {
+            /* noop */
+          })
+          .catch(err => err.errno),
+      ).toBe("42601");
+    });
 
-    //   return ['1,2,3,4,101,102,103,104', result.join(',')]
-    // })
+    test("Multiple Cursors", async () => {
+      const result: number[] = [];
+      await sql.begin(async sql => [
+        await sql`select 1 as cursor, x from generate_series(1,4) as x`.cursor(async ([row]) => {
+          result.push(row.x);
+          await turn();
+        }),
+        await sql`select 2 as cursor, x from generate_series(101,104) as x`.cursor(async ([row]) => {
+          result.push(row.x);
+          await turn();
+        }),
+      ]);
+      expect(result.join(",")).toBe("1,2,3,4,101,102,103,104");
+    });
 
-    // t('Cursor as async iterator', async() => {
-    //   const order = []
-    //   for await (const [x] of sql`select generate_series(1,2) as x;`.cursor()) {
-    //     order.push(x.x + 'a')
-    //     await delay(10)
-    //     order.push(x.x + 'b')
-    //   }
+    test("Cursor as async iterator", async () => {
+      const order: string[] = [];
+      for await (const [x] of sql`select generate_series(1,2) as x;`.cursor()) {
+        order.push(x.x + "a");
+        await turn();
+        order.push(x.x + "b");
+      }
+      expect(order.join("")).toBe("1a1b2a2b");
+    });
 
-    //   return ['1a1b2a2b', order.join('')]
-    // })
+    test("Cursor as async iterator with break", async () => {
+      const order: string[] = [];
+      for await (const xs of sql`select generate_series(1,2) as x;`.cursor()) {
+        order.push(xs[0].x + "a");
+        await turn();
+        order.push(xs[0].x + "b");
+        break;
+      }
+      expect(order.join("")).toBe("1a1b");
+    });
 
-    // t('Cursor as async iterator with break', async() => {
-    //   const order = []
-    //   for await (const xs of sql`select generate_series(1,2) as x;`.cursor()) {
-    //     order.push(xs[0].x + 'a')
-    //     await delay(10)
-    //     order.push(xs[0].x + 'b')
-    //     break
-    //   }
+    test("Async Iterator Unsafe cursor", async () => {
+      const order: string[] = [];
+      for await (const [x] of sql.unsafe("select 1 as x union select 2 as x").cursor()) {
+        order.push(x.x + "a");
+        await turn();
+        order.push(x.x + "b");
+      }
+      expect(order.join("")).toBe("1a1b2a2b");
+    });
 
-    //   return ['1a1b', order.join('')]
-    // })
+    test("Async Iterator Cursor custom n", async () => {
+      const order: number[] = [];
+      for await (const x of sql`select * from generate_series(1,20)`.cursor(10)) order.push(x.length);
+      expect(order.join(",")).toBe("10,10");
+    });
 
-    // t('Async Iterator Unsafe cursor', async() => {
-    //   const order = []
-    //   for await (const [x] of sql.unsafe('select 1 as x union select 2 as x').cursor()) {
-    //     order.push(x.x + 'a')
-    //     await delay(10)
-    //     order.push(x.x + 'b')
-    //   }
-    //   return ['1a1b2a2b', order.join('')]
-    // })
+    test("Async Iterator Cursor custom with rest n", async () => {
+      const order: number[] = [];
+      for await (const x of sql`select * from generate_series(1,20)`.cursor(11)) order.push(x.length);
+      expect(order.join(",")).toBe("11,9");
+    });
 
-    // t('Async Iterator Cursor custom n', async() => {
-    //   const order = []
-    //   for await (const x of sql`select * from generate_series(1,20)`.cursor(10))
-    //     order.push(x.length)
-
-    //   return ['10,10', order.join(',')]
-    // })
-
-    // t('Async Iterator Cursor custom with rest n', async() => {
-    //   const order = []
-    //   for await (const x of sql`select * from generate_series(1,20)`.cursor(11))
-    //     order.push(x.length)
-
-    //   return ['11,9', order.join(',')]
-    // })
-
-    // t('Async Iterator Cursor custom with less results than batch size', async() => {
-    //   const order = []
-    //   for await (const x of sql`select * from generate_series(1,20)`.cursor(21))
-    //     order.push(x.length)
-    //   return ['20', order.join(',')]
-    // })
+    test("Async Iterator Cursor custom with less results than batch size", async () => {
+      const order: number[] = [];
+      for await (const x of sql`select * from generate_series(1,20)`.cursor(21)) order.push(x.length);
+      expect(order.join(",")).toBe("20");
+    });
 
     // t('Transform row', async() => {
     //   const sql = postgres({
@@ -3743,26 +3746,35 @@ if (isDockerServiceEnabled("postgres_plain")) {
     //   ]
     // })
 
-    // t('concurrent cursors', async() => {
-    //   const xs = []
+    test("concurrent cursors", async () => {
+      await using sql = postgres({ ...options, max: 1 });
+      const xs: number[] = [];
 
-    //   await Promise.all([...Array(7)].map((x, i) => [
-    //     sql`select ${ i }::int as a, generate_series(1, 2) as x`.cursor(([x]) => xs.push(x.a + x.x))
-    //   ]).flat())
+      await Promise.all(
+        [...Array(7)]
+          .map((x, i) => [
+            sql`select ${i}::int as a, generate_series(1, 2) as x`.cursor(([x]) => void xs.push(x.a + x.x)),
+          ])
+          .flat(),
+      );
 
-    //   return ['12233445566778', xs.join('')]
-    // })
+      expect(xs.join("")).toBe("12233445566778");
+    });
 
-    // t('concurrent cursors multiple connections', async() => {
-    //   const sql = postgres({ ...options, max: 2 })
-    //   const xs = []
+    test("concurrent cursors multiple connections", async () => {
+      await using sql = postgres({ ...options, max: 2 });
+      const xs: number[] = [];
 
-    //   await Promise.all([...Array(7)].map((x, i) => [
-    //     sql`select ${ i }::int as a, generate_series(1, 2) as x`.cursor(([x]) => xs.push(x.a + x.x))
-    //   ]).flat())
+      await Promise.all(
+        [...Array(7)]
+          .map((x, i) => [
+            sql`select ${i}::int as a, generate_series(1, 2) as x`.cursor(([x]) => void xs.push(x.a + x.x)),
+          ])
+          .flat(),
+      );
 
-    //   return ['12233445566778', xs.sort().join('')]
-    // })
+      expect(xs.sort().join("")).toBe("12233445566778");
+    });
 
     test("limits of types", async () => {
       await sql

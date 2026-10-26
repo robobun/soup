@@ -38,6 +38,7 @@ pub fn write_query<Context: WriterContext>(
 
 pub use crate::postgres::protocol::authentication::Authentication;
 pub use crate::postgres::protocol::backend_key_data::BackendKeyData;
+pub use crate::postgres::protocol::close::Close;
 pub use crate::postgres::protocol::command_complete::CommandComplete;
 pub use crate::postgres::protocol::copy_data::CopyData;
 pub use crate::postgres::protocol::data_row as DataRow;
