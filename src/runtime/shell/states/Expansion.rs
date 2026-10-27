@@ -1,4 +1,5 @@
-//! Word expansion: tilde, variable, command substitution, brace, and glob.
+//! Word expansion: tilde, variable, command substitution, arithmetic, brace,
+//! and glob.
 //!
 //! If a word contains command substitution or glob expansion syntax then it
 //! needs to be evaluated at runtime — this state node walks the atom and
@@ -9,10 +10,12 @@ use crate::shell::interpreter::{
     EventLoopHandle, Interpreter, Node, NodeId, ShellExecEnv, ShellExecEnvKind, StateKind, log,
 };
 use crate::shell::io::{IO, OutKind};
+use crate::shell::states::assigns::AssignCtx;
 use crate::shell::states::base::Base;
 use crate::shell::states::script::Script;
 use crate::shell::yield_::Yield;
-use crate::shell::{ExitCode, ShellErr};
+use crate::shell::{EnvStr, ExitCode, ShellErr};
+use bun_shell_parser::arith;
 
 pub(crate) struct Expansion {
     pub(crate) base: Base,
@@ -36,13 +39,18 @@ pub(crate) struct Expansion {
     /// (JS interpolation, quoted text, `$var`, command substitution) are data
     /// and must not change the expansion structure or broaden the glob.
     pub(crate) meta_offsets: Vec<u32>,
-    pub(crate) child_script: Option<NodeId>,
+    /// The node in flight: the `Script` of a `$(...)`, or the `Expansion` of
+    /// the expression of a `$((...))`.
+    pub(crate) child: Option<NodeId>,
     /// Whether the in-flight command substitution was `"$(...)"` (no IFS
     /// splitting on its result). Only meaningful while `state == CmdSubst`.
     pub(crate) cmd_subst_quoted: bool,
     /// The atom is an assignment value (`A=v`, `export A=v`), so
     /// command-substitution output is not field split (POSIX 2.9.1).
     pub(crate) assign_ctx: bool,
+    /// The atom is the expression of a `$((...))`. What an expansion adds to
+    /// it is data: a number, see `arith::operand`.
+    pub(crate) arith: bool,
     /// Set when a `""`/`''` literal
     /// was seen so an *empty* expansion is still pushed as an argv word.
     /// Without this, `$unset` and `""` are indistinguishable in
@@ -60,6 +68,8 @@ pub enum ExpansionState {
     Idle,
     Walking,
     CmdSubst,
+    /// The expression of a `$((...))` is being expanded.
+    Arith,
     Glob,
     BraceExpand,
     Done,
@@ -100,9 +110,10 @@ impl Expansion {
             out: ExpansionOut::default(),
             current_out: Vec::new(),
             meta_offsets: Vec::new(),
-            child_script: None,
+            child: None,
             cmd_subst_quoted: false,
             assign_ctx,
+            arith: false,
             has_quoted_empty: false,
             out_exit_code: 0,
         }))
@@ -126,7 +137,7 @@ impl Expansion {
                     me.state = ExpansionState::Walking;
                     continue;
                 }
-                ExpansionState::CmdSubst | ExpansionState::Glob => {
+                ExpansionState::CmdSubst | ExpansionState::Arith | ExpansionState::Glob => {
                     // Re-entered while a child is in flight.
                     return Yield::suspended();
                 }
@@ -163,7 +174,8 @@ impl Expansion {
                     ast::Atom::Compound(c) => &c.atoms[me.word_idx as usize],
                 };
                 let shell = me.base.shell();
-                let is_cmd_subst = interp.vm_args_utf8.with_mut(|vm_args_utf8| {
+                let start = me.current_out.len();
+                let needs_child = interp.vm_args_utf8.with_mut(|vm_args_utf8| {
                     Self::expand_simple_no_io(
                         shell,
                         simple,
@@ -176,15 +188,32 @@ impl Expansion {
                         vm_args_utf8,
                     )
                 });
-                if !is_cmd_subst {
+                if !needs_child {
+                    if me.arith
+                        && !matches!(simple, ast::SimpleAtom::Text(_))
+                        && !Self::splice_arith_operand(me, start)
+                    {
+                        break;
+                    }
                     me.word_idx += 1;
                     continue;
                 }
+                let sub = match simple {
+                    ast::SimpleAtom::CmdSubst(sub) => sub,
+                    // ── Arithmetic: the expression is a word of its own. Once
+                    //    it is expanded, `arith_expanded` evaluates it.
+                    ast::SimpleAtom::Arith(expression) => {
+                        me.state = ExpansionState::Arith;
+                        let shell_ptr: *mut ShellExecEnv = me.base.shell;
+                        let child = Expansion::init(interp, shell_ptr, expression, this, true);
+                        interp.as_expansion_mut(child).arith = true;
+                        interp.as_expansion_mut(this).child = Some(child);
+                        return Expansion::start(interp, child);
+                    }
+                    _ => unreachable!(),
+                };
                 // ── Command substitution: spawn a Script with stdout piped
                 //    into a fresh owned buffer.
-                let ast::SimpleAtom::CmdSubst(sub) = simple else {
-                    unreachable!()
-                };
                 let quoted = sub.quoted;
                 me.state = ExpansionState::CmdSubst;
                 me.cmd_subst_quoted = quoted;
@@ -207,8 +236,12 @@ impl Expansion {
                     }
                 };
                 let script = Script::init(interp, duped, &sub.script, this, io);
-                interp.as_expansion_mut(this).child_script = Some(script);
+                interp.as_expansion_mut(this).child = Some(script);
                 return Script::start(interp, script);
+            }
+
+            if matches!(me.state, ExpansionState::Err(_)) {
+                continue;
             }
 
             // All sub-atoms expanded — post-process leading tilde then finish.
@@ -454,8 +487,8 @@ impl Expansion {
     }
 
     /// Appends the no-IO expansion of
-    /// one [`ast::SimpleAtom`] to `out`. Returns `true` for `CmdSubst` so the
-    /// caller spawns a `Script` for it.
+    /// one [`ast::SimpleAtom`] to `out`. Returns `true` for `CmdSubst` and
+    /// `Arith`, which the caller runs a child node for.
     fn expand_simple_no_io(
         shell: &ShellExecEnv,
         atom: &ast::SimpleAtom,
@@ -467,7 +500,6 @@ impl Expansion {
         command_ctx: *mut bun_options_types::context::ContextData,
         vm_args_utf8: &mut Vec<bun_core::Utf8Bytes<'static>>,
     ) -> bool {
-        use crate::shell::env_str::EnvStr;
         match atom {
             ast::SimpleAtom::Text(txt) => out.extend_from_slice(txt),
             ast::SimpleAtom::QuotedEmpty => {
@@ -524,7 +556,7 @@ impl Expansion {
                     out.push(b'~');
                 }
             }
-            ast::SimpleAtom::CmdSubst(_) => return true,
+            ast::SimpleAtom::CmdSubst(_) | ast::SimpleAtom::Arith(_) => return true,
         }
         false
     }
@@ -595,6 +627,9 @@ impl Expansion {
         child: NodeId,
         exit_code: ExitCode,
     ) -> Yield {
+        if matches!(interp.node(child).kind(), StateKind::Expansion) {
+            return Self::arith_expanded(interp, this, child, exit_code);
+        }
         // Child is a Script (command substitution). Its captured stdout lives
         // in the duped `ShellExecEnv` it owns; read it before deinit.
         debug_assert!(matches!(interp.node(child).kind(), StateKind::Script));
@@ -603,7 +638,7 @@ impl Expansion {
             {
                 let me = interp.as_expansion_mut(this);
                 me.state = ExpansionState::Done;
-                me.child_script = None;
+                me.child = None;
             }
             interp.deinit_node(child);
             let parent = interp.as_expansion(this).base.parent;
@@ -646,19 +681,90 @@ impl Expansion {
                 while hi > 0 && matches!(stdout[hi - 1], b' ' | b'\n' | b'\r' | b'\t') {
                     hi -= 1;
                 }
+                let start = me.current_out.len();
                 me.current_out.extend_from_slice(&stdout[..hi]);
                 // A quoted substitution that printed only NUL bytes expands to one empty word.
                 if had_nul && me.cmd_subst_quoted {
                     me.has_quoted_empty = true;
                 }
+                if me.arith {
+                    Self::splice_arith_operand(me, start);
+                }
             } else {
                 Self::post_subshell_expansion(me, stdout);
             }
-            me.word_idx += 1;
-            me.state = ExpansionState::Walking;
-            me.child_script = None;
+            me.child = None;
+            if !matches!(me.state, ExpansionState::Err(_)) {
+                me.word_idx += 1;
+                me.state = ExpansionState::Walking;
+            }
         }
         interp.deinit_node(child);
+        Yield::Next(this)
+    }
+
+    /// In the expression of a `$((...))`, what an expansion added to
+    /// `current_out` from `start` on is data. It stays if it is a number, in
+    /// parentheses if it has a sign. Anything else is the error of this word,
+    /// and `false`.
+    fn splice_arith_operand(me: &mut Expansion, start: usize) -> bool {
+        let continues = start > 0 && arith::is_number_char(me.current_out[start - 1]);
+        let operand: Vec<u8> = match arith::operand(&me.current_out[start..], continues) {
+            Ok(arith::Operand::Empty) => Vec::new(),
+            Ok(arith::Operand::Text(text)) => text.to_vec(),
+            Ok(arith::Operand::Signed(text)) => [b"(", text, b")"].concat(),
+            Err(err) => {
+                me.state = ExpansionState::Err(Box::new(ShellErr::Custom(err.message().into())));
+                return false;
+            }
+        };
+        me.current_out.truncate(start);
+        me.current_out.extend_from_slice(&operand);
+        true
+    }
+
+    /// The expression of a `$((...))` is expanded: its value is what the
+    /// `$((...))` adds to the word.
+    fn arith_expanded(
+        interp: &Interpreter,
+        this: NodeId,
+        child: NodeId,
+        exit_code: ExitCode,
+    ) -> Yield {
+        if exit_code != 0 {
+            let err = Self::take_err(interp, child);
+            interp.deinit_node(child);
+            let me = interp.as_expansion_mut(this);
+            me.child = None;
+            let Some(err) = err else {
+                // The script failed or was killed in a `$(...)` of the expression.
+                me.state = ExpansionState::Done;
+                let parent = me.base.parent;
+                return interp.child_done(parent, this, 1);
+            };
+            me.state = ExpansionState::Err(Box::new(err));
+            return Yield::Next(this);
+        }
+
+        let expression = Self::take_out(interp, child).buf;
+        interp.deinit_node(child);
+        let me = interp.as_expansion_mut(this);
+        me.child = None;
+        let value = arith::evaluate(&expression, &mut ShellVariables(me.base.shell_mut()));
+        match value {
+            Ok(value) => {
+                use std::io::Write as _;
+                let start = me.current_out.len();
+                let _ = write!(me.current_out, "{value}");
+                if !me.arith || Self::splice_arith_operand(me, start) {
+                    me.word_idx += 1;
+                    me.state = ExpansionState::Walking;
+                }
+            }
+            Err(err) => {
+                me.state = ExpansionState::Err(Box::new(ShellErr::Custom(err.message().into())));
+            }
+        }
         Yield::Next(this)
     }
 
@@ -743,7 +849,7 @@ impl Expansion {
 
     pub(crate) fn deinit(interp: &Interpreter, this: NodeId) {
         log!("Expansion {} deinit", this);
-        let child = interp.as_expansion_mut(this).child_script.take();
+        let child = interp.as_expansion_mut(this).child.take();
         if let Some(c) = child {
             interp.deinit_node(c);
         }
@@ -760,5 +866,31 @@ impl Expansion {
         out.out_exit_code = me.out_exit_code;
         out.has_quoted_empty = me.has_quoted_empty;
         out
+    }
+}
+
+/// The variables of a shell, as the expression of a `$((...))` reads and
+/// assigns them: where `$name` looks, and where `name=value` puts them.
+struct ShellVariables<'a>(&'a mut ShellExecEnv);
+
+impl arith::Variables for ShellVariables<'_> {
+    fn get(&self, name: &[u8]) -> Option<Vec<u8>> {
+        let key = EnvStr::init_slice(name);
+        let value = self
+            .0
+            .shell_env
+            .get(key)
+            .or_else(|| self.0.export_env.get(key))?;
+        let bytes = value.slice().to_vec();
+        value.deref();
+        Some(bytes)
+    }
+
+    fn set(&mut self, name: &[u8], value: i64) {
+        let label = EnvStr::dupe_ref_counted(name);
+        let value = EnvStr::dupe_ref_counted(value.to_string().as_bytes());
+        self.0.assign_var(label, value, AssignCtx::Shell);
+        label.deref();
+        value.deref();
     }
 }
