@@ -38,6 +38,55 @@ describe("parse shell", () => {
     expect(JSON.parse(result)).toEqual(expected);
   });
 
+  test("arithmetic", () => {
+    const expected = {
+      stmts: [
+        {
+          exprs: [
+            {
+              cmd: {
+                assigns: [],
+                name_and_args: [
+                  { simple: { Text: "echo" } },
+                  {
+                    simple: {
+                      arith: {
+                        compound: {
+                          atoms: [{ Text: "1 + " }, { Var: "x" }],
+                          brace_expansion_hint: false,
+                          glob_hint: false,
+                        },
+                      },
+                    },
+                  },
+                  {
+                    compound: {
+                      atoms: [{ Text: "a" }, { arith: { simple: { Text: "2" } } }],
+                      brace_expansion_hint: false,
+                      glob_hint: false,
+                    },
+                  },
+                  {
+                    simple: {
+                      arith: { compound: { atoms: [], brace_expansion_hint: false, glob_hint: false } },
+                    },
+                  },
+                ],
+                redirect: redirect({}),
+                redirect_file: null,
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(JSON.parse(parse`echo $((1 + $x)) a$((2)) $(())`)).toEqual(expected);
+    expect(JSON.parse(parse`i=$((i + 1))`)).toEqual({
+      stmts: [{ exprs: [{ assign: [{ label: "i", value: { simple: { arith: { simple: { Text: "i + 1" } } } } }] }] }],
+    });
+  });
+
   test("basic redirect", () => {
     const expected = {
       stmts: [

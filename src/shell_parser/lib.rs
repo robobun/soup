@@ -4,6 +4,9 @@
 pub mod error;
 pub use error::{Error, Result};
 
+#[path = "arith.rs"]
+pub mod arith;
+
 #[path = "braces.rs"]
 pub mod braces;
 

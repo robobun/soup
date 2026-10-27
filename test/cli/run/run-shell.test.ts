@@ -37,6 +37,34 @@ describe.concurrent("run-shell", () => {
     const stderr = await proc.stderr.text();
     expect(stderr).toBe("error: Failed to run script.sh due to error Unexpected ')'\n");
   });
+
+  test("arithmetic in a shell script, with its arguments", async () => {
+    using dir = tempDir("run-shell-arith", {
+      "count.sh": [
+        "i=0",
+        "while [[ $i -lt $1 ]]; do",
+        "  i=$((i + 1))",
+        "done",
+        "echo $i $(($1 * $2)) $((total = $1 + $2)) $total",
+        "x=$((1 / 0))",
+        'echo "x=$x"',
+        "",
+      ].join("\n"),
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "count.sh", "3", "4"],
+      cwd: String(dir),
+      env: bunEnv,
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout: "3 12 7 7\nx=\n",
+      stderr: 'bun: 1 / 0: division by 0 (error token is "0")\n',
+      exitCode: 0,
+    });
+  });
 });
 
 test.skipIf(isWindows)(
