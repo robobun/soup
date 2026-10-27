@@ -502,6 +502,58 @@ describe("lex shell", () => {
     expect(result).toEqual(expected);
   });
 
+  test("arithmetic", () => {
+    expect(JSON.parse(lex`echo $((1 + $x * $(echo 2))) "a$((3))" i=$((i+1))`)).toEqual([
+      { Text: "echo" },
+      { Delimit: {} },
+      { ArithBegin: {} },
+      { DoubleQuotedText: "1 + " },
+      { Var: "x" },
+      { DoubleQuotedText: " * " },
+      { CmdSubstBegin: {} },
+      { CmdSubstQuoted: {} },
+      { Text: "echo" },
+      { Delimit: {} },
+      { Text: "2" },
+      { Delimit: {} },
+      { CmdSubstEnd: {} },
+      { ArithEnd: {} },
+      { Delimit: {} },
+      { DoubleQuotedText: "a" },
+      { ArithBegin: {} },
+      { DoubleQuotedText: "3" },
+      { ArithEnd: {} },
+      { Delimit: {} },
+      { Text: "i=" },
+      { ArithBegin: {} },
+      { DoubleQuotedText: "i+1" },
+      { ArithEnd: {} },
+      { Eof: {} },
+    ]);
+  });
+
+  test("$(( that no )) closes is a command substitution", () => {
+    expect(JSON.parse(lex`echo $((echo hi); echo there)`)).toEqual([
+      { Text: "echo" },
+      { Delimit: {} },
+      { CmdSubstBegin: {} },
+      { OpenParen: {} },
+      { Text: "echo" },
+      { Delimit: {} },
+      { Text: "hi" },
+      { Delimit: {} },
+      { CloseParen: {} },
+      { Semicolon: {} },
+      { Text: "echo" },
+      { Delimit: {} },
+      { Text: "there" },
+      { Delimit: {} },
+      { CmdSubstEnd: {} },
+      { Eof: {} },
+    ]);
+    expect(() => lex`echo $((1 + 2)`).toThrow("Unclosed command substitution");
+  });
+
   test("cmd_sub_dollar", () => {
     const expected = [
       {
@@ -829,6 +881,37 @@ describe("lex shell", () => {
       await TestBuilder.command`FOO=bar ${BUN} -e "console.log(process.env) > ${buffer}"`
         .error("JS object reference not allowed in double quotes")
         .run();
+    });
+
+    test("interpolated values in arithmetic", () => {
+      const message = (run: () => unknown) => {
+        try {
+          run();
+        } catch (e) {
+          return (e as Error).message;
+        }
+      };
+      expect(message(() => lex`echo $((${"1 + 1"}))`)).toBe(
+        "Interpolated value in arithmetic expansion must be an integer",
+      );
+      // The rest of the expression is read: one error for each value, and none for the `))`.
+      expect(message(() => lex`echo $((${new Uint8Array(1)} + 1)) $((${"x"}))`)).toBe(
+        "JS object reference not allowed in arithmetic expansion\nInterpolated value in arithmetic expansion must be an integer",
+      );
+      // A value with a sign is one operand. After the expression, a value is the text it was before.
+      expect(JSON.parse(lex`echo $(( ${5} * ${"0x10"}-${-2} )) ${"x"} y${"z"}=1`)).toEqual([
+        { Text: "echo" },
+        { Delimit: {} },
+        { ArithBegin: {} },
+        { DoubleQuotedText: " 5 * 0x10-(-2) " },
+        { ArithEnd: {} },
+        { Delimit: {} },
+        { Text: "x" },
+        { Delimit: {} },
+        { Text: "yz=1" },
+        { Delimit: {} },
+        { Eof: {} },
+      ]);
     });
 
     describe("Unexpected ')'", async () => {

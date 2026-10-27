@@ -423,7 +423,7 @@ Things to know:
 - `!` does not negate a command yet. In `while ! cmd; do ...; done` the `!` is looked up as a program, the condition fails, and the loop ends at once with exit code `0`. Write `until cmd; do ...; done`.
 - In a script file, indent the body with spaces and put comments on lines of their own. A tab in front of a command and a comment at the end of a line are not read correctly yet, and in a `while true` loop either one can mean that `break` is never reached.
 - `sleep` is not a builtin. It is the program of that name on the system, and Windows does not ship one. A script that has to wait there can run `bun -e "await Bun.sleep(1000)"` instead.
-- Bun Shell has no arithmetic expansion (`$((i + 1))`) yet. For a loop over a range of numbers, use `for i in $(seq 1 10)`.
+- To count the rounds of a loop, use arithmetic: `i=$((i + 1))`. For a loop over a range of numbers, `for i in $(seq 1 10)` is shorter.
 - Redirecting a whole loop (`done < file`) and `read` are not supported yet.
 - Loops can be nested 128 deep.
 
@@ -475,6 +475,92 @@ It prints:
 Use the `$(...)` syntax instead.
 
 </Note>
+
+---
+
+## Arithmetic (`$((...))`)
+
+`$((expression))` is replaced by the value of an integer expression:
+
+```js
+import { $ } from "bun";
+
+await $`echo $((1 + 2 * 3))`; // 7
+
+// Count the rounds of a loop
+await $`
+  i=0
+  while [[ $i -lt 3 ]]; do
+    echo attempt $i
+    i=$((i + 1))
+  done
+`;
+
+// A name is a variable of the shell or of the environment, with or without a $
+await $`echo port $((PORT + 1))`.env({ ...process.env, PORT: "3000" }); // port 3001
+
+// A value from JavaScript has to be an integer
+const width = 80;
+await $`echo $((${width} / 2 - 1))`; // 39
+```
+
+The operators, their precedence and the error messages are those of bash. From the operators that bind tightest to those that bind loosest:
+
+| Operators                                                | Meaning                                                                 |
+| -------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `x++` `x--` `++x` `--x`                                  | Increment and decrement a variable                                      |
+| `-` `+` `!` `~`                                          | Sign, logical NOT, bitwise NOT                                          |
+| `**`                                                     | Power. It groups from the right, and a sign binds first: `-2 ** 2` is 4 |
+| `*` `/` `%`                                              | Multiply, divide, remainder. Division truncates toward zero             |
+| `+` `-`                                                  | Add, subtract                                                           |
+| `<<` `>>`                                                | Bitwise shifts                                                          |
+| `<` `<=` `>` `>=`, then `==` `!=`                        | Comparisons, which are `1` or `0`                                       |
+| `&`, then `^`, then `\|`                                 | Bitwise AND, XOR, OR                                                    |
+| `&&`, then `\|\|`                                        | Logical AND, OR. The right side is not evaluated when the left decides  |
+| `a ? b : c`                                              | Only the arm that is chosen is evaluated                                |
+| `=` `+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `^=` `\|=` | Assign to a shell variable                                              |
+| `a, b`                                                   | Evaluate both. The value is that of `b`                                 |
+
+Numbers are 64-bit signed integers that wrap around on overflow. `010` is octal, `0x1F` is hexadecimal, and `base#digits` is a number in any base from 2 to 64, like `2#1010`.
+
+A name in an expression is a variable, and one that is unset or empty is `0`. An assignment sets a shell variable, like `name=value` does:
+
+```js
+import { $ } from "bun";
+
+await $`
+  files=$(ls | wc -l)
+  echo showing $((files > 10 ? 10 : files)) of $files files
+  echo $((total += files)) files so far, in $((++dirs)) directories
+`;
+```
+
+An expression that cannot be evaluated fails its command, which does not run, with the message on stderr and exit code `1`:
+
+```js
+import { $ } from "bun";
+
+const { stderr, exitCode } = await $`echo $((1 / 0))`.nothrow().quiet();
+console.log(exitCode); // 1
+console.log(stderr.toString()); // bun: 1 / 0: division by 0 (error token is "0")
+```
+
+### Data is a number, never a part of the expression
+
+The expression is what the script says. What comes from somewhere else can only be a number in it:
+
+- The value of a variable has to be an integer: `12`, `-3`, `0x1F`. In bash, a variable that holds `1 + 2` or the name of another variable is evaluated again. Here it is an error, as in `dash`: `bun: 1 + 2: not an integer (error token is "1 + 2")`.
+- What `$name` or `$(command)` adds has to be an integer too, and it is one operand: with `n=-1`, `$((x-$n))` is `x - (-1)`. It can also be the rest of a number or a name that the script starts: `$((10#$month))` reads `08` as a decimal number, `$((0x$hex))` and `$((count_$i))` work as well.
+- An interpolated JavaScript value follows the same rule, and it is checked before the script runs: `${5}`, `${"-12"}` and `${"0x1F"}` are fine, while `${"1 + 1"}`, `${1.5}`, `${"x"}` and `${undefined}` throw `Interpolated value in arithmetic expansion must be an integer`. To build an expression from text, interpolate `{ raw: "1 + 1" }`.
+
+So a value that a user controls cannot assign a variable, read one, or change what the expression computes.
+
+Things to know:
+
+- `$((` that no `))` closes is a command substitution that starts with a subshell, as in `$((cd src && ls) | wc -l)`.
+- The redirect target of a command and the assignments in front of it are expanded before its arguments. In `echo $n > out$((n++)).txt`, `echo` already sees the new value of `n`.
+- The `((expression))` command, `for ((i = 0; i < 3; i++))`, `let` and arrays are not supported yet. In a condition, write `[[ $((i % 2)) -eq 0 ]]`.
+- Parentheses, signs, `**`, `?:` and assignments can be nested 128 deep in total.
 
 ---
 

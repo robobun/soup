@@ -316,6 +316,10 @@ fn write_simple_atom(w: &mut impl Write, s: &SimpleAtom<'_>) -> fmt::Result {
             w.write_str("{\"cmd_subst\":")?;
             write_cmd_subst(w, c)?;
         }
+        SimpleAtom::Arith(expression) => {
+            w.write_str("{\"arith\":")?;
+            write_atom(w, expression)?;
+        }
     }
     w.write_char('}')
 }

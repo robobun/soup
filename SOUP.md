@@ -7968,8 +7968,162 @@ ReadyForQuery and PortalSuspended arms), `src/sql_jsc/postgres/PostgresRequest.r
 `test/js/sql/wire-frames.test.ts`, `test/integration/bun-types/fixture/sql.ts`,
 `test/docker/prestart-map.mjs`.
 
+### 2026-10-27: arithmetic in Bun Shell, `$((i + 1))`
+
+Bun Shell got `while` and `until` on 2026-10-16, and the docs of that patch had to end with "Bun
+Shell has no arithmetic expansion yet". So a loop could not count without a program to do it, and
+the loop every shell tutorial starts with did not run:
+`` $`i=0; while [[ $i -lt 3 ]]; do echo $i; i=$((i + 1)); done` `` threw
+`expected a command or assignment but got: "CmdSubstEnd"` before anything ran, because `$((` was
+read as a command substitution that starts with a subshell. `$((expression))` is POSIX, so a
+`package.json` script that computes a port or a count worked on Linux and macOS, where `bun run`
+hands it to `sh`, and failed on Windows, where `bun run` uses Bun Shell. Upstream has no issue and
+no pull request for it (its open shell work is `:` in oven-sh/bun#46375 and `${NAME}` in
+oven-sh/bun#46691). Now:
+
+```ts
+import { $ } from "bun";
+
+await $`echo $((1 + 2 * 3))`; // 7
+
+// count the rounds of a loop
+await $`
+  i=0
+  while [[ $i -lt 3 ]]; do
+    echo attempt $i
+    i=$((i + 1))
+  done
+`;
+
+// a name is a variable of the shell or of the environment
+await $`echo port $((PORT + 1))`.env({ ...process.env, PORT: "3000" }); // port 3001
+
+// a value from JavaScript has to be an integer
+const width = 80;
+await $`echo $((${width} / 2 - 1))`; // 39
+```
+
+```json
+{
+  "scripts": {
+    "dev": "bun run server.ts --port $((PORT + 1))"
+  }
+}
+```
+
+The expression language is the one of bash: C's integer operators on 64-bit signed integers that
+wrap, `**`, `?:`, the comma, `=` and the ten compound assignments, and `++` and `--` on both sides
+of a name. Numbers are decimal, octal (`010`), hexadecimal (`0x1F`) or `base#digits` up to base 64.
+A name is a shell variable, then an environment variable, and one that is unset or empty is 0. An
+assignment sets a shell variable the way `name=value` does. It works wherever a word does: in an
+argument, inside double quotes, next to other parts of a word, as the value of an assignment
+(`i=$((i + 1))`, `FOO=$((n * 2)) cmd`, `export N=$((2 ** 5))`), in the words of `for`, in `[[ ]]`
+and in the target of a redirect. It also runs in a `.sh` file and in a `package.json` script under
+`bun run --shell=bun`.
+
+An expression that cannot be evaluated fails its command, which does not run, with exit code 1 and
+bash's message on stderr: `bun: 1/0: division by 0 (error token is "0")`. The rest of the script
+goes on, which is what Bun Shell already does when a glob matches nothing (bash gives up on the
+whole line). The operand that C would not evaluate is read and not run, so `$((0 && 1/0))` is 0 and
+`$((1 || x++))` leaves `x` alone.
+
+One rule is not bash's, and it is the one that took the day: data is a number in an expression,
+never a part of it. bash reads the value of a variable as an expression of its own, and pastes in
+what `$name` and `$(command)` expand to. Then `n=$input; echo $((n + 1))` lets the input assign any
+shell variable (`PATH=0`), read one, and print its value in an error message, and one variable that
+names itself in a sum keeps the thread busy for 2^n steps. Bun Shell treats `$name` as one word
+that is never split or globbed again, and this is the same idea:
+
+- The value of a variable has to be an integer, as in dash. `x="1 + 2"; echo $((x * 3))` is
+  `bun: 1 + 2: not an integer (error token is "1 + 2")`.
+- What `$name`, `$(command)` and a nested `$(( ))` add is one operand. A signed one goes in
+  parentheses, so with `n=-1`, `$((x-$n))` is 6 for `x=5` (bash reads `x--1`, decrements `x` and
+  fails). It can also end a number or a name that the script starts, which keeps `$((10#$month))`,
+  `$((0x$hex))` and `$((count_$i))`.
+- An interpolated JavaScript value follows the same rule and is checked before the script runs:
+  `${"1 + 1"}`, `${1.5}`, `${undefined}` and `${"x++"}` throw `Interpolated value in arithmetic
+  expansion must be an integer`. `{ raw: "1 + 1" }` is the way to build an expression from text.
+
+With integers in the variables, nothing is different from bash.
+
+How it is built:
+
+- Lexer. At `$((` a scan looks for the `))`: the `)` that closes the inner `(` has to be directly
+  followed by another, and a parenthesis in a string, in a `$(...)` or in backticks does not
+  count. If there is none, this is what it was before, a command substitution that starts with a
+  subshell, so `$((cd src && ls) | wc -l)` keeps working. The expression is then read like the
+  inside of a double-quoted string, between the new tokens `ArithBegin` and `ArithEnd`: `$x` and
+  `$(cmd)` are expansions, and a `*`, a `>`, a `|`, a `;` or a `#` is just text. A double quote in
+  it is dropped, as bash does for `$(("1" + 2))`.
+- Parser. `SimpleAtom::Arith` holds the expression as a word of its own.
+- Evaluator. `src/shell_parser/arith.rs` is a port of bash's `expr.c` in safe Rust, next to the
+  brace expansion that lives in the same crate. It evaluates while it reads, with bash's look-ahead,
+  so it reports an error at the token bash reports it at. It sees variables through a two-method
+  trait. Parentheses, signs, `**`, `?:` and assignments recurse, so they nest 128 deep, with the
+  stack check the parser uses, and then fail with bash's `expression recursion level exceeded`.
+  Operators that group from the left are a loop (`1 + 1 + ...` 100,000 times is fine).
+- Interpreter. `Expansion` runs a child `Expansion` for the expression, checks what each expansion
+  in it added, evaluates the text and appends the number. Variables are read where `$name` reads
+  them and written where `name=value` writes them, so an assignment in a subshell or a command
+  substitution stays there.
+- Assignments print their errors. `x=$((1/0))` failed without a word, because `Assigns` dropped the
+  error of a value that did not expand (until now only a brace expansion with too many results
+  could get there). It writes the message to stderr now, like `for` and `[[ ]]` do.
+- Interpolated values. A string with a digit or a special character already reaches the lexer by
+  reference, so the lexer can check it where it stands in an expression. A string without one
+  (`x`, `x++`) is pasted into the script as text, and in an expression that text is syntax. So once
+  a template has a `$((`, such a string comes by reference as well, under a second marker: in an
+  expression the lexer checks it, and anywhere else it appends the bytes as the text they would
+  have been, so `FOO${name}=1` and `[[ 1 -${op} 1 ]]` after an expression behave as before.
+
+It was checked against bash 5.2 in three ways. The tests are tables: 97 expressions with the value
+bash prints and 66 with the message bash prints, plus the scripts around them. A generator of
+expressions (valid ones, and ones with a token inserted or removed) ran 2,381 of them through both
+shells: the value, the message and the variables afterwards were the same for all but 10, and
+those never reached bash's arithmetic (bash reads a `#` after a blank as a comment even inside
+`$(( ))`, and `$*` is a parameter Bun Shell does not have). And the diff went through an
+adversarial review, four readers with bash and the ASAN build: lexer, evaluator, interpreter,
+tests and docs. The evaluator reader ran about 600,000 more generated cases against bash and found
+three messages that differed (the token of a division by zero after a line break, a run of names
+before a bad number, and the expression quoted for a bad number, which bash cuts at the number).
+The other findings are what changed the design above or were fixed here:
+
+- The first version evaluated variable values like bash and only checked values interpolated
+  straight into an expression. The readers showed the routes around that (a variable, the
+  environment, a command substitution), the sign that joins an operator (`$((x-${-1}))` was
+  `x--1`), and the 2^n evaluation that `.timeout()` and `.kill()` cannot stop. Hence the rule.
+- That version also passed every value by reference after a `$((`, which cut `FOO${name}=1` into
+  two tokens anywhere later in the template. Hence the second marker.
+- The scan for `))` did not know that `"$(echo ")")"` nests, so a command substitution that
+  released bun runs, `$((echo "$(echo "))")"); echo b)`, became an unclosed expression.
+- 127 nested parentheses overflowed a 2 MB stack in the debug build. Hence the stack check.
+- A backtick substitution after other text in an expression gave a wrong number with exit code 0.
+  The cause is upstream's (below), and the lexer now ends the text before a backtick in an
+  expression.
+
+Three faults of upstream's shell turned up on the way. They reproduce on released bun, so they
+are upstream's to fix and are not patched in this stack: `echo $( (echo a) )` is a parse error when
+the subshell is the last thing in a command substitution, ``echo a`echo 1` `` runs `aecho`, and the
+redirect target and the prefix assignments of a command are expanded before its arguments, which
+`$((n++))` now makes visible (`echo $n > out$((n++)).txt`; the docs say so).
+
+Not in this patch: the `((expression))` command, `for ((i = 0; i < 3; i++))`, `let` and arrays.
+
+Files: `src/shell_parser/arith.rs` (new), `src/shell_parser/parse.rs` (`arith_end`, `eat_arith`,
+`arith_value`, `parse_arith`, the second marker), `src/shell_parser/json_fmt.rs`,
+`src/shell_parser/lib.rs`, `src/runtime/shell/states/Expansion.rs` (`arith_expanded`,
+`splice_arith_operand`, `ShellVariables`), `src/runtime/shell/states/Assigns.rs` and
+`src/runtime/shell/IOWriter.rs` (the error of an assignment), `src/runtime/shell/states/Cmd.rs`,
+`src/runtime/shell/interpreter.rs`, `src/runtime/shell/shell_body.rs` (`ArithSeen`, the second
+marker, the tokens for the lexer tests), `docs/runtime/shell.mdx`,
+`test/js/bun/shell/bunshell.test.ts`, `test/js/bun/shell/lex.test.ts`,
+`test/js/bun/shell/parse.test.ts`, `test/cli/run/run-shell.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
   oven-sh/bun#45304 adds `db.function()` upstream, with the same better-sqlite3 signature and
   options, and `db.aggregate()` next to it.
+- 2026-09-02, zip in `Bun.Archive`: dropped on 2026-10-27. oven-sh/bun#46638 removes libarchive
+  from bun, and the patch was libarchive's zip reader and writer behind `Bun.Archive`. Upstream's
+  new `src/tar` reads and writes tar only, so zip would need a reader and a writer of its own.

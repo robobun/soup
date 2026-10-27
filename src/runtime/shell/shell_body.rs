@@ -29,9 +29,9 @@ pub(crate) use super::subproc; // declared once in `shell/mod.rs`
 // (still-draft) JSC bridge below. This file keeps the JSC-coupled half
 // (ShellErr, GlobalJS/Mini, shell_cmd_from_js, ShellSrcBuilder, TestingAPIs).
 pub(crate) use bun_shell_parser::parse::{
-    IfClauseTok, LEX_JS_OBJREF_PREFIX, LEX_JS_REF_TERMINATOR, LEX_JS_STRING_PREFIX, LexerAscii,
-    LexerUnicode, ParseError, Parser, Token, ast, is_if_clause_keyword_bunstr, needs_escape_bunstr,
-    needs_escape_utf8_ascii_latin1,
+    IfClauseTok, LEX_JS_OBJREF_PREFIX, LEX_JS_REF_TERMINATOR, LEX_JS_STRING_PREFIX,
+    LEX_JS_TEXT_PREFIX, LexerAscii, LexerUnicode, ParseError, Parser, Token, ast,
+    is_if_clause_keyword_bunstr, needs_escape_bunstr, needs_escape_utf8_ascii_latin1,
 };
 
 #[cfg(windows)]
@@ -123,6 +123,8 @@ pub(crate) mod test {
         CmdSubstBegin,
         CmdSubstQuoted,
         CmdSubstEnd,
+        ArithBegin,
+        ArithEnd,
         OpenParen,
         CloseParen,
         Var(&'a [u8]),
@@ -165,6 +167,8 @@ pub(crate) mod test {
                 Token::CmdSubstBegin => TestToken::CmdSubstBegin,
                 Token::CmdSubstQuoted => TestToken::CmdSubstQuoted,
                 Token::CmdSubstEnd => TestToken::CmdSubstEnd,
+                Token::ArithBegin => TestToken::ArithBegin,
+                Token::ArithEnd => TestToken::ArithEnd,
                 Token::OpenParen => TestToken::OpenParen,
                 Token::CloseParen => TestToken::CloseParen,
                 Token::DoubleBracketOpen => TestToken::DoubleBracketOpen,
@@ -206,6 +210,8 @@ pub(crate) mod test {
                 T::CmdSubstBegin => unit!("CmdSubstBegin"),
                 T::CmdSubstQuoted => unit!("CmdSubstQuoted"),
                 T::CmdSubstEnd => unit!("CmdSubstEnd"),
+                T::ArithBegin => unit!("ArithBegin"),
+                T::ArithEnd => unit!("ArithEnd"),
                 T::OpenParen => unit!("OpenParen"),
                 T::CloseParen => unit!("CloseParen"),
                 T::Var(s) => {
@@ -267,8 +273,9 @@ pub(crate) fn shell_cmd_from_js(
     out_script: &mut Vec<u8>,
     out_jsobjs: &mut MarkedArgumentBuffer,
 ) -> JsResult<()> {
-    let mut builder = ShellSrcBuilder::init(global, out_script, jsstrings);
+    let mut builder = ShellSrcBuilder::init(global, out_script, jsstrings, false);
     let mut jsobjref_buf = [0u8; 128];
+    let mut arith = ArithSeen::default();
 
     let mut string_iter = string_args.array_iterator(global)?;
     let mut i: u32 = 0;
@@ -294,12 +301,34 @@ pub(crate) fn shell_cmd_from_js(
                 jsstrings,
                 &mut jsobjref_buf[..],
                 0,
+                &mut arith,
             )?;
-            builder = ShellSrcBuilder::init(global, out_script, jsstrings);
+            builder = ShellSrcBuilder::init(global, out_script, jsstrings, false);
         }
         i += 1;
     }
     Ok(())
+}
+
+/// Whether the script so far has a `$((`. From there on a value may be in an
+/// arithmetic expression, where text without a special character is still
+/// syntax (`x++`). Such a value then comes by reference, and the lexer, which
+/// knows where an expression is, takes only a number in one.
+#[derive(Default)]
+pub(crate) struct ArithSeen {
+    seen: bool,
+    /// How much of the script was searched.
+    searched: usize,
+}
+
+impl ArithSeen {
+    fn update(&mut self, script: &[u8]) -> bool {
+        if !self.seen {
+            self.seen = strings::contains(&script[self.searched.saturating_sub(2)..], b"$((");
+            self.searched = script.len();
+        }
+        self.seen
+    }
 }
 
 const MAX_TEMPLATE_ARRAY_DEPTH: u32 = 100;
@@ -312,8 +341,10 @@ pub(crate) fn handle_template_value(
     jsstrings: &mut Vec<BunString>,
     jsobjref_buf: &mut [u8],
     depth: u32,
+    arith: &mut ArithSeen,
 ) -> JsResult<()> {
-    let mut builder = ShellSrcBuilder::init(global, out_script, jsstrings);
+    let in_arith = arith.update(out_script);
+    let mut builder = ShellSrcBuilder::init(global, out_script, jsstrings, in_arith);
     if !template_value.is_empty() {
         if let Some(_array_buffer) = template_value.as_array_buffer(global) {
             let idx = out_jsobjs.size();
@@ -425,10 +456,11 @@ pub(crate) fn handle_template_value(
                     jsstrings,
                     jsobjref_buf,
                     depth + 1,
+                    arith,
                 )?;
                 if i < last {
                     let str = BunString::static_(" ");
-                    let mut b = ShellSrcBuilder::init(global, out_script, jsstrings);
+                    let mut b = ShellSrcBuilder::init(global, out_script, jsstrings, false);
                     if !b.append_bun_str::<false>(str)? {
                         return Err(global
                             .throw(format_args!("Shell script string contains invalid UTF-16")));
@@ -497,6 +529,8 @@ pub(crate) struct ShellSrcBuilder<'a> {
     pub(crate) outbuf: &'a mut Vec<u8>,
     pub(crate) jsstrs_to_escape: &'a mut Vec<BunString>,
     pub(crate) jsstr_ref_buf: [u8; 128],
+    /// See [`ArithSeen`].
+    pub(crate) arith: bool,
 }
 
 impl<'a> ShellSrcBuilder<'a> {
@@ -504,12 +538,14 @@ impl<'a> ShellSrcBuilder<'a> {
         global: &'a JSGlobalObject,
         outbuf: &'a mut Vec<u8>,
         jsstrs_to_escape: &'a mut Vec<BunString>,
+        arith: bool,
     ) -> Self {
         Self {
             global_this: global,
             outbuf,
             jsstrs_to_escape,
             jsstr_ref_buf: [0u8; 128],
+            arith,
         }
     }
 
@@ -556,6 +592,10 @@ impl<'a> ShellSrcBuilder<'a> {
                 self.append_js_str_ref(bunstr)?;
                 return Ok(true);
             }
+            if self.arith {
+                self.append_js_ref(LEX_JS_TEXT_PREFIX, bunstr);
+                return Ok(true);
+            }
         }
         if bunstr.is_utf16() {
             self.append_utf16_impl(bunstr.utf16())?;
@@ -584,6 +624,10 @@ impl<'a> ShellSrcBuilder<'a> {
                 || self.outbuf_ends_with_var_ref()
             {
                 self.append_js_str_ref(BunString::clone_utf8(utf8))?;
+                return Ok(true);
+            }
+            if self.arith {
+                self.append_js_ref(LEX_JS_TEXT_PREFIX, BunString::clone_utf8(utf8));
                 return Ok(true);
             }
         }
@@ -633,12 +677,17 @@ impl<'a> ShellSrcBuilder<'a> {
         &mut self,
         bunstr: BunString,
     ) -> Result<(), bun_alloc::AllocError> {
+        self.append_js_ref(LEX_JS_STRING_PREFIX, bunstr);
+        Ok(())
+    }
+
+    fn append_js_ref(&mut self, prefix: &[u8], bunstr: BunString) {
         let idx = self.jsstrs_to_escape.len();
         let mut cursor = std::io::Cursor::new(&mut self.jsstr_ref_buf[..]);
         write!(
             cursor,
             "{}{}{}",
-            bstr::BStr::new(LEX_JS_STRING_PREFIX),
+            bstr::BStr::new(prefix),
             idx,
             LEX_JS_REF_TERMINATOR as char
         )
@@ -646,7 +695,6 @@ impl<'a> ShellSrcBuilder<'a> {
         let n = cursor.position() as usize;
         self.outbuf.extend_from_slice(&self.jsstr_ref_buf[..n]);
         self.jsstrs_to_escape.push(bunstr);
-        Ok(())
     }
 }
 

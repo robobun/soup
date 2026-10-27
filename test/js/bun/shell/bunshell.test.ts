@@ -3265,6 +3265,533 @@ until false; do false; break; done
   });
 });
 
+describe("arithmetic", () => {
+  // Each row is an expression and what bash 5.2 prints for `echo $((expression))`: the value, or the message
+  // after `bash: line 1: `. The rows of a table run as one script. Where a test says so, Bun Shell leaves bash
+  // on purpose: data (the value of a variable, what `$name`, `$(command)` or `${value}` adds) is a number in an
+  // expression, and never an operator, an assignment or the name of a variable.
+  type Rows = [expression: string, printed: string][];
+
+  async function evaluate(rows: Rows) {
+    const script = rows.map(([expression]) => `echo $((${expression}))`).join("\n");
+    const { stdout, stderr, exitCode } = await $`${{ raw: script }}`.quiet();
+    return { stdout: stdout.toString(), stderr: stderr.toString(), exitCode };
+  }
+
+  function itIs(name: string, rows: Rows) {
+    test(name, async () => {
+      expect(await evaluate(rows)).toEqual({
+        stdout: rows.map(([, value]) => value + "\n").join(""),
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+  }
+
+  function itFails(name: string, rows: Rows) {
+    test(name, async () => {
+      expect(await evaluate(rows)).toEqual({
+        stdout: "",
+        stderr: rows.map(([, message]) => `bun: ${message}\n`).join(""),
+        exitCode: 1,
+      });
+    });
+  }
+
+  itIs("operators and their precedence", [
+    ["1 + 2", "3"],
+    ["7 - 10", "-3"],
+    ["6 * 7", "42"],
+    ["7 / 2", "3"],
+    ["-7 / 2", "-3"],
+    ["7 % 3", "1"],
+    ["-7 % 2", "-1"],
+    ["2 ** 10", "1024"],
+    ["2**3**2", "512"],
+    ["-2**2", "4"],
+    ["3 ** 0", "1"],
+    ["0 ** 0", "1"],
+    ["1 + 2 * 3", "7"],
+    ["(1 + 2) * 3", "9"],
+    ["2 * (3 + (4 - 1))", "12"],
+    ["1 << 4", "16"],
+    ["-16 >> 2", "-4"],
+    ["5 & 3", "1"],
+    ["5 | 3", "7"],
+    ["5 ^ 3", "6"],
+    ["~5", "-6"],
+    ["!5", "0"],
+    ["!0", "1"],
+    ["!!5", "1"],
+    ["~~5", "5"],
+    ["-!0", "-1"],
+    ["- -1", "1"],
+    ["+-+-1", "1"],
+    ["1 - - 1", "2"],
+    ["1 ++ 1", "2"],
+    ["1 -- 1", "2"],
+    ["++5", "5"],
+    ["--5", "5"],
+    ["1 < 2", "1"],
+    ["2 < 2", "0"],
+    ["2 <= 1", "0"],
+    ["2 <= 2", "1"],
+    ["3 >= 3", "1"],
+    ["3 > 3", "0"],
+    ["1 == 1", "1"],
+    ["1 != 1", "0"],
+    ["1 && 0", "0"],
+    ["1 && 2", "1"],
+    ["0 || 0", "0"],
+    ["0 || 3", "1"],
+    ["1 ? 2 : 3", "2"],
+    ["0 ? 2 : 3", "3"],
+    ["1 ? 2 : 3 ? 4 : 5", "2"],
+    ["0 ? 2 : 0 ? 4 : 5", "5"],
+    ["1 ? 2, 3 : 4", "3"],
+    ["1, 2, 3", "3"],
+    ["1 + 2 << 3", "24"],
+    ["1 << 2 < 5", "1"],
+    ["1 < 2 == 1", "1"],
+    ["3 == 3 & 1", "1"],
+    ["1 & 3 ^ 2", "3"],
+    ["1 ^ 3 | 4", "6"],
+    ["1 | 3 ^ 3", "1"],
+    ["0 | 1 && 0", "0"],
+    ["2 | 1 && 1", "1"],
+    ["1 || 0 && 0", "1"],
+    ["0 || 0 ? 1 : 2", "2"],
+    ["2 + 3 * 4 ** 2 / 8 % 5", "3"],
+    ["-3 ** 2 + !0 * ~0", "8"],
+    ["10 - 2 - 3", "5"],
+    ["100 / 5 / 2", "10"],
+    ["2 ** 2 ** 3", "256"],
+    ["1 - -1 - - -1", "1"],
+  ]);
+
+  itIs("numbers in base 8, 16 and base#digits", [
+    ["0", "0"],
+    ["010", "8"],
+    ["0x1F", "31"],
+    ["0X1f", "31"],
+    ["0x", "0"],
+    ["2#101", "5"],
+    ["16#ff", "255"],
+    ["36#z", "35"],
+    ["36#Z", "35"],
+    ["62#Z", "61"],
+    ["64#@_", "4031"],
+    ["37#1", "1"],
+    ["3#2", "2"],
+  ]);
+
+  itIs("64-bit integers that wrap", [
+    ["9223372036854775807", "9223372036854775807"],
+    ["9223372036854775807 + 1", "-9223372036854775808"],
+    ["9223372036854775808", "-9223372036854775808"],
+    ["-9223372036854775808 / -1", "-9223372036854775808"],
+    ["-9223372036854775808 % -1", "0"],
+    ["2 ** 62 * 2", "-9223372036854775808"],
+    ["2 ** 64", "0"],
+    ["1<<64", "1"],
+    ["1<<-1", "-9223372036854775808"],
+  ]);
+
+  itIs("an operand that is not evaluated cannot divide by zero", [
+    ["0 && 1/0", "0"],
+    ["1 || 1/0", "1"],
+    ["1 ? 2 : 1/0", "2"],
+    ["0 ? 1/0 : 3", "3"],
+    ["0 && (1 || 1/0)", "0"],
+    ["1 || 0 && 1/0", "1"],
+    ["0 ? 1 % 0 : 1 ? 5 : 1/0", "5"],
+  ]);
+
+  itFails("errors", [
+    ["1/0", '1/0: division by 0 (error token is "0")'],
+    ["1 % 0", '1 % 0: division by 0 (error token is "0")'],
+    [" 1/0 ", '1/0 : division by 0 (error token is "0 ")'],
+    ["3 / (1 - 1) * 2", '3 / (1 - 1) * 2: division by 0 (error token is "(1 - 1) * 2")'],
+    ["6 /\n0", '6 /\n0: division by 0 (error token is "\n0")'],
+    ["a %= 0", 'a %= 0: division by 0 (error token is "0")'],
+    ["a /= 0", 'a /= 0: division by 0 (error token is "0")'],
+    ["a = 1/0", 'a = 1/0: division by 0 (error token is "0")'],
+    ["2**-1", '2**-1: exponent less than 0 (error token is "1")'],
+    ["0 && 2**-1", '0 && 2**-1: exponent less than 0 (error token is "1")'],
+    ["1 +", '1 +: syntax error: operand expected (error token is "+")'],
+    ["1 + (2 * ) ", '1 + (2 * ) : syntax error: operand expected (error token is ") ")'],
+    ["a=", 'a=: syntax error: operand expected (error token is "=")'],
+    ["()", '(): syntax error: operand expected (error token is ")")'],
+    ["!", '!: syntax error: operand expected (error token is "!")'],
+    ["~", '~: syntax error: operand expected (error token is "~")'],
+    ["*2", '*2: syntax error: operand expected (error token is "*2")'],
+    ["? 1", '? 1: syntax error: operand expected (error token is "? 1")'],
+    ["@", '@: syntax error: operand expected (error token is "@")'],
+    ["#", '#: syntax error: operand expected (error token is "#")'],
+    ["$", '$: syntax error: operand expected (error token is "$")'],
+    ["'1'", `'1': syntax error: operand expected (error token is "'1'")`],
+    ["1 */ 2", '1 */ 2: syntax error: operand expected (error token is "/ 2")'],
+    ["1 <=> 2", '1 <=> 2: syntax error: operand expected (error token is "> 2")'],
+    ["1 >< 2", '1 >< 2: syntax error: operand expected (error token is "< 2")'],
+    ["1 & & 2", '1 & & 2: syntax error: operand expected (error token is "& 2")'],
+    ["1 && && 2", '1 && && 2: syntax error: operand expected (error token is "&& 2")'],
+    ["a **= 2", 'a **= 2: syntax error: operand expected (error token is "= 2")'],
+    ["5++", '5++: syntax error: operand expected (error token is "+")'],
+    ["1--", '1--: syntax error: operand expected (error token is "-")'],
+    ["x++++", 'x++++: syntax error: operand expected (error token is "+")'],
+    ["(x)++", '(x)++: syntax error: operand expected (error token is "+")'],
+    ["1 2", '1 2: syntax error in expression (error token is "2")'],
+    ["x y", 'x y: syntax error in expression (error token is "y")'],
+    ["a b c 08", 'a b c 08: value too great for base (error token is "08")'],
+    ["(1 + 2) 3", '(1 + 2) 3: syntax error in expression (error token is "3")'],
+    ["1 ? 2 : 3 : 4", '1 ? 2 : 3 : 4: syntax error in expression (error token is ": 4")'],
+    ["1.5", '1.5: syntax error: invalid arithmetic operator (error token is ".5")'],
+    ["a.b", 'a.b: syntax error: invalid arithmetic operator (error token is ".b")'],
+    ["1;2", '1;2: syntax error: invalid arithmetic operator (error token is ";2")'],
+    ["1 $", '1 $: syntax error: invalid arithmetic operator (error token is "$")'],
+    ["(1 2)", '(1 2): missing `)\' (error token is "2)")'],
+    ["1 ? 2", '1 ? 2: `:\' expected for conditional expression (error token is "2")'],
+    ["1 ?", '1 ?: expression expected (error token is "?")'],
+    ["1 ? :", '1 ? :: expression expected (error token is ":")'],
+    ["5=3", '5=3: attempted assignment to non-variable (error token is "=3")'],
+    ["1 = 2", '1 = 2: attempted assignment to non-variable (error token is "= 2")'],
+    ["1 =< 2", '1 =< 2: attempted assignment to non-variable (error token is "=< 2")'],
+    ["1 <<= 2", '1 <<= 2: attempted assignment to non-variable (error token is "<<= 2")'],
+    ["a + b = 5", 'a + b = 5: attempted assignment to non-variable (error token is "= 5")'],
+    ["(a) = 5", '(a) = 5: attempted assignment to non-variable (error token is "= 5")'],
+    ["x++ = 5", 'x++ = 5: attempted assignment to non-variable (error token is "= 5")'],
+    ["--x=7", '--x=7: attempted assignment to non-variable (error token is "=7")'],
+    ["++x++", '++x++: ++: assignment requires lvalue (error token is "++")'],
+    ["--x--", '--x--: --: assignment requires lvalue (error token is "--")'],
+    ["09", '09: value too great for base (error token is "09")'],
+    ["1 + 09 * 2", '1 + 09: value too great for base (error token is "09")'],
+    ["x 09", 'x 09: value too great for base (error token is "09")'],
+    ["2#102 - 1", '2#102: value too great for base (error token is "2#102")'],
+    ["0x1G", '0x1G: value too great for base (error token is "0x1G")'],
+    ["1e3", '1e3: value too great for base (error token is "1e3")'],
+    ["1_000", '1_000: value too great for base (error token is "1_000")'],
+    ["16#", '16#: invalid integer constant (error token is "16#")'],
+    ["65#1", '65#1: invalid arithmetic base (error token is "65#1")'],
+    ["1#1", '1#1: invalid arithmetic base (error token is "1#1")'],
+    ["2#1#1", '2#1#1: invalid number (error token is "2#1#1")'],
+  ]);
+
+  TestBuilder.command`x=3; y=; echo $((x)) $(($x)) $((x + 1)) $((x * x)) $((unset_var)) $((y)) $((unset_var + 1))`
+    .stdout("3 3 4 9 0 0 1\n")
+    .runAsTest("a name is a variable, and one that is unset or empty is 0");
+
+  TestBuilder.command`echo $((PORT + 1)) $((PORT_$PORT))`
+    .env({ ...bunEnv, PORT: "3000", PORT_3000: "7" })
+    .stdout("3001 7\n")
+    .runAsTest("an environment variable is a variable, and $name can end a name");
+
+  // bash reads the value of a variable as an expression of its own: 9, 7 and 5.
+  TestBuilder.command`x="1 + 2"; echo $((x * 3)); echo $(($x * 3)); a=b; b=5; echo $((a)); c=08; echo $((c + 1)); d=" -12 "; e=0x1F; echo $((d + e))`
+    .stdout("19\n")
+    .stderr(
+      'bun: 1 + 2: not an integer (error token is "1 + 2")\n' +
+        'bun: 1 + 2: not an integer (error token is "1 + 2")\n' +
+        'bun: b: not an integer (error token is "b")\n' +
+        'bun: 08: value too great for base (error token is "08")\n',
+    )
+    .runAsTest("the value of a variable has to be an integer");
+
+  TestBuilder.command`n=-1; x=5; echo $((x-$n)) $x $((2*$n)) $(($n ** 2)) $(( $(echo " 4 ") + 1 )) $((1-$((0-5)))) $(( $unset + 1 ))`
+    .stdout("6 5 -2 1 5 6 1\n")
+    .runAsTest("what an expansion adds is one operand, with its sign");
+
+  TestBuilder.command`m=08; h=ff; i=2; count_2=7; echo $((10#$m)) $((0x$h)) $((16#$h)) $((count_$i)) $((1$i * 2))`
+    .stdout("8 255 255 7 24\n")
+    .runAsTest("an expansion can end a number or a name that the script starts");
+
+  // bash pastes the text in: 3, then x is 9, then 2.
+  TestBuilder.command`op="+"; echo $((1 $op 2)); n="x=9"; echo $(($n)); echo $(( $(echo 1 + 1) )); h=ff; echo $(($h)); echo "x=$x"`
+    .stdout("x=\n")
+    .stderr(
+      'bun: +: not an integer (error token is "+")\n' +
+        'bun: x=9: not an integer (error token is "x=9")\n' +
+        'bun: 1 + 1: not an integer (error token is "1 + 1")\n' +
+        'bun: ff: not an integer (error token is "ff")\n',
+    )
+    .runAsTest("an expansion that is not a number is an error, and is not evaluated");
+
+  TestBuilder.command`x="1 +"; echo $((0 && x)) $((1 || x)) $((1 ? 2 : x))`
+    .stdout("0 1 2\n")
+    .runAsTest("a variable in an operand that is not evaluated is not read");
+
+  TestBuilder.command`echo $((x = 5)) $x; echo $((x += 2)) $((x -= 1)) $((x *= 3)) $((x /= 4)) $((x %= 3)) $((x <<= 3)) $((x >>= 1)) $((x |= 3)) $((x &= 6)) $((x ^= 5)) $x`
+    .stdout("5 5\n7 6 18 4 1 8 4 7 6 3 3\n")
+    .runAsTest("assignments set a shell variable");
+
+  TestBuilder.command`x=6; echo $((x += 3)) $((x -= 5)) $((x |= 5)) $((x ^= 6)) $((x &= 6)) $x`
+    .stdout("9 4 5 3 2 2\n")
+    .runAsTest("each compound assignment is its own operator");
+
+  TestBuilder.command`echo $((a = b = 4, a + b)) $a $b; echo $((i++)) $((i++)) $((++i)) $((i--)) $((--i)) $i`
+    .stdout("8 4 4\n0 1 3 3 1 1\n")
+    .runAsTest("chained assignments, ++ and --");
+
+  TestBuilder.command`x="1 +"; echo $((x = 7)) $x`
+    .stdout("7 7\n")
+    .runAsTest("an assignment does not evaluate what the variable held");
+
+  TestBuilder.command`x=5; echo $((0 && (x = 9))) $((1 || x++)) $((1 ? 7 : (x = 1))) $((0 ? x-- : 8)) $x`
+    .stdout("0 1 7 8 5\n")
+    .runAsTest("an operand that is not evaluated assigns nothing");
+
+  TestBuilder.command`x=1; echo $(echo $((x += 1))) $x; (echo $((x += 10))); echo $x`
+    .stdout("2 1\n11\n1\n")
+    .runAsTest("an assignment in a command substitution or a subshell stays there");
+
+  TestBuilder.command`echo "sum: $((1 + 2))" 'lit: $((1 + 2))' pre$((1 + 2))post $((1 + 2))$((3 + 4)) "$((3))$((4))" a$((1)){b,c}`
+    .stdout("sum: 3 lit: $((1 + 2)) pre3post 37 34 a1b a1c\n")
+    .runAsTest("in a word, in quotes and next to other parts of a word");
+
+  TestBuilder.command`echo $((2*3)) $((6/2)) $((1<2)) $((1>2)) $((1&1)) $((1|2)) $((1?2:3)) $((1,2)) $((~0)) $((5%3)) $((16#ff)); ls`
+    .ensureTempDir()
+    .stdout("6 3 1 0 1 3 2 2 -1 2 255\n")
+    .runAsTest("what is a glob, a redirect or a pipe in a command is an operator in an expression");
+
+  TestBuilder.command`echo $(( )) $(()) $((
+    1 +
+    2
+  )) $(("1" + "2"))`
+    .stdout("0 0 3 3\n")
+    .runAsTest("an empty expression is 0, and newlines and double quotes are dropped");
+
+  TestBuilder.command`n=$((6 * 7)); echo $n; m=a$((n + 1))b; echo $m; export E=$((2 ** 5)); ${BUN} -e "console.log(process.env.E)"; F=$((n / 2)) ${BUN} -e "console.log(process.env.F)"`
+    .stdout("42\na43b\n32\n21\n")
+    .runAsTest("as the value of an assignment");
+
+  TestBuilder.command`i=0; while [[ $i -lt 3 ]]; do echo $i; i=$((i + 1)); done; echo end $i`
+    .stdout("0\n1\n2\nend 3\n")
+    .runAsTest("counts the rounds of a while loop");
+
+  TestBuilder.command`for i in $((1 + 1)) $((2 + 2)); do echo $i; done; [[ $((2 + 2)) -eq 4 ]] && echo yes; echo $((1 + 2)) | cat`
+    .stdout("2\n4\nyes\n3\n")
+    .runAsTest("in the words of a for loop, in [[ ]] and in a pipeline");
+
+  TestBuilder.command`echo hi > out$((1 + 1)).txt; cat out2.txt`
+    .ensureTempDir()
+    .stdout("hi\n")
+    .runAsTest("in the target of a redirect");
+
+  TestBuilder.command`echo $(( $(echo 2) * 3 )) $((1 + $((2 * 3)))) $(echo $((1 + 1))) $(( (1 + 2) * 3 )) $(((1 + 2) * 3))`
+    .stdout("6 7 2 9 9\n")
+    .runAsTest("with a command substitution, nested, and with parentheses");
+
+  TestBuilder.command`echo $((echo hi); echo there) $((echo sub) | cat)`
+    .stdout("hi there sub\n")
+    .runAsTest("$(( that no )) closes is a command substitution that starts with a subshell");
+
+  TestBuilder.command`echo a $((1/0)) b; echo next`
+    .stdout("next\n")
+    .stderr('bun: 1/0: division by 0 (error token is "0")\n')
+    .exitCode(0)
+    .runAsTest("an error fails its command, and the script goes on");
+
+  TestBuilder.command`x=1; echo $((x = 2, 1/0)); echo $x; echo $((1/0)) || echo or`
+    .stdout("2\nor\n")
+    .stderr('bun: x = 2, 1/0: division by 0 (error token is "0")\nbun: 1/0: division by 0 (error token is "0")\n')
+    .runAsTest("what an expression assigned before its error stays assigned");
+
+  TestBuilder.command`x=$((1/0)); echo "x=$x"; FOO=$((1 +)) echo never; echo $((1 + $((2 *))))`
+    .stdout("x=\n")
+    .stderr(
+      'bun: 1/0: division by 0 (error token is "0")\n' +
+        'bun: 1 +: syntax error: operand expected (error token is "+")\n' +
+        'bun: 2 *: syntax error: operand expected (error token is "*")\n',
+    )
+    .exitCode(1)
+    .runAsTest("an error in the value of an assignment is printed, and nothing is assigned or run");
+
+  test("a failed assignment keeps the old value, also when stderr is captured", async () => {
+    const { stdout, stderr, exitCode } = await $`x=1; x=$((1/0)); echo "x=$x"; y=$((1 +))`.quiet();
+    expect({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode }).toEqual({
+      stdout: "x=1\n",
+      stderr:
+        'bun: 1/0: division by 0 (error token is "0")\n' +
+        'bun: 1 +: syntax error: operand expected (error token is "+")\n',
+      exitCode: 1,
+    });
+  });
+
+  TestBuilder.command`for i in $((1/0)); do echo never; done; [[ $((1/0)) -eq 0 ]] && echo never; echo never > $((1/0)); echo end`
+    .ensureTempDir()
+    .stdout("end\n")
+    .stderr('bun: 1/0: division by 0 (error token is "0")\n'.repeat(3))
+    .runAsTest("an error in a for loop, in [[ ]] and in a redirect");
+
+  test("what is in a command substitution of an expression does not end the expression", async () => {
+    // Backticks cannot be written in this template. These scripts are what a .sh file has.
+    const run = async (script: string) => {
+      const { stdout, stderr, exitCode } = await $`${{ raw: script }}`.quiet();
+      return { stdout: stdout.toString(), stderr: stderr.toString(), exitCode };
+    };
+    expect(await run('echo $(( $(echo "$(echo "1)")" | wc -c) + 1 ))')).toEqual({
+      stdout: "4\n",
+      stderr: "",
+      exitCode: 0,
+    });
+    expect(await run("echo $(( $(echo 1 # it's (\n) + 1 ))")).toEqual({ stdout: "2\n", stderr: "", exitCode: 0 });
+    expect(await run("echo $(( `echo '))'` + 1 ))")).toEqual({
+      stdout: "",
+      stderr: 'bun: )): not an integer (error token is "))")\n',
+      exitCode: 1,
+    });
+    expect(await run("x=$(( 10 - `echo 4` )); echo $x $(( 1 + `echo 1` )) $((`echo 2`*`echo 3`))")).toEqual({
+      stdout: "6 2 6\n",
+      stderr: "",
+      exitCode: 0,
+    });
+    // No `))` closes these: they are command substitutions, as they were before there was arithmetic.
+    expect(await run('echo $((echo "$(echo "))")"); echo b)')).toEqual({ stdout: ")) b\n", stderr: "", exitCode: 0 });
+    expect(await run("echo $((echo '))'); echo b)")).toEqual({ stdout: ")) b\n", stderr: "", exitCode: 0 });
+  });
+
+  test("in a script that is not ASCII", async () => {
+    expect(await $`${{ raw: 'x=4; echo "é$((1 + 2))é" 日本$((x * x))語 $(( $(echo 2 é | wc -w) + 1 ))' }}`.text()).toBe(
+      "é3é 日本16語 3\n",
+    );
+  });
+
+  test("parentheses, signs, **, ?: and assignments nest 128 deep", async () => {
+    const nested = (open: string, close: string, count: number) =>
+      $`${{ raw: `echo $((${open.repeat(count)}1${close.repeat(count)}))` }}`.quiet();
+    for (const [open, close, value] of [
+      ["- ", "", "1"],
+      ["(", ")", "1"],
+      ["1 ? ", " : 0", "1"],
+      ["x = ", "", "1"],
+      ["1 ** ", "", "1"],
+    ]) {
+      // Signs take the least stack for each level, so they say where the limit is.
+      const ok = await nested(open, close, open === "- " ? 128 : 64);
+      expect({ stdout: ok.stdout.toString(), stderr: ok.stderr.toString(), exitCode: ok.exitCode }).toEqual({
+        stdout: value + "\n",
+        stderr: "",
+        exitCode: 0,
+      });
+      const tooDeep = await nested(open, close, 129);
+      expect(tooDeep.stderr.toString()).toContain(": expression recursion level exceeded (error token is ");
+      expect(tooDeep.stdout.toString()).toBe("");
+      expect(tooDeep.exitCode).toBe(1);
+    }
+    // Operators that group from the left do not nest.
+    const sum = await $`${{ raw: `echo $((${"1 + ".repeat(5000)}1))` }}`.quiet();
+    expect(sum.stdout.toString()).toBe("5001\n");
+  });
+
+  describe("interpolated values", () => {
+    test("a number is a number", async () => {
+      const n = 20;
+      expect(
+        await $`x=5; echo $((${n} + ${1} * 2)) $((${"0x10"} + ${-5})) $((${10n} ** 2)) "$((${n}))" $((x-${-1})) $x`.text(),
+      ).toBe("22 11 100 20 6 5\n");
+    });
+
+    test("a value can end a number that the script starts", async () => {
+      expect(await $`echo $((10#${"08"})) $((0x${"ff"})) $((${"1"}${"0"} * 2)) $((${" 7 "} + 1))`.text()).toBe(
+        "8 255 20 8\n",
+      );
+    });
+
+    // What is not a number could read a variable (`x`), assign one (`x=9`, `x++`) or be an expression.
+    test.each([
+      "1 + 1",
+      "x=9",
+      "x++",
+      "x",
+      "1.5",
+      "",
+      "1;",
+      "$x",
+      "(1)",
+      "-",
+      "12px",
+      "1e3",
+      "08",
+      "0xZZ",
+      "€x++".slice(1),
+      1.5,
+      NaN,
+      Infinity,
+      true,
+      null,
+      undefined,
+    ])("%p is an error", async value => {
+      let error: Error | undefined;
+      try {
+        await $`x=5; echo $((${value})) $x`.quiet();
+      } catch (e) {
+        error = e as Error;
+      }
+      expect(error?.message).toBe("Interpolated value in arithmetic expansion must be an integer");
+    });
+
+    test("the error comes before the script runs", async () => {
+      using dir = tempDir("shell-arith", {});
+      let error: Error | undefined;
+      try {
+        await $`echo ran > ran.txt; echo $((${"x"}))`.cwd(String(dir)).quiet();
+      } catch (e) {
+        error = e as Error;
+      }
+      expect(error?.message).toBe("Interpolated value in arithmetic expansion must be an integer");
+      expect(await Bun.file(join(String(dir), "ran.txt")).exists()).toBe(false);
+    });
+
+    test("a JavaScript object is an error", async () => {
+      let error: Error | undefined;
+      try {
+        await $`echo $((${new Uint8Array(1)} + 1))`.quiet();
+      } catch (e) {
+        error = e as Error;
+      }
+      expect(error?.message).toBe("JS object reference not allowed in arithmetic expansion");
+    });
+
+    test("raw text is part of the expression", async () => {
+      expect(await $`x=5; echo $((${{ raw: "1 + 1" }} * 2)) $((${{ raw: "x++" }})) $x`.text()).toBe("3 5 6\n");
+    });
+
+    test("a value after raw text that opens an expression is still a value", async () => {
+      for (const run of [
+        () => $`x=5; echo $(${{ raw: "(" }}${"x++"})) $x`.quiet(),
+        () => $`x=5; echo ${[{ raw: "$((" }, "x++", { raw: "))" }]} $x`.quiet(),
+      ]) {
+        let error: Error | undefined;
+        try {
+          await run();
+        } catch (e) {
+          error = e as Error;
+        }
+        expect(error?.message).toBe("Interpolated value in arithmetic expansion must be an integer");
+      }
+    });
+
+    test("a value through a variable or a command is not evaluated either", async () => {
+      const { stdout, stderr } =
+        await $`n=${"x=9"}; echo $((n + 1)); echo $(($n + 1)); echo $(( $(echo ${"x=9"}) )); echo "x=$x"`.quiet();
+      expect({ stdout: stdout.toString(), stderr: stderr.toString() }).toEqual({
+        stdout: "x=\n",
+        stderr: 'bun: x=9: not an integer (error token is "x=9")\n'.repeat(3),
+      });
+    });
+
+    test("values outside an expression are what they were", async () => {
+      const values = ["if", "a b", "x++", "*", "$x", "name"];
+      expect(await $`x=$((1 + 1)); echo ${values} ${"x"}=1 $x`.text()).toBe("if a b x++ * $x name x=1 2\n");
+      // A value without a special character is still pasted into its word.
+      expect(
+        await $`x=$((1 + 1)); FOO${"BAR"}=$x; echo $FOOBAR; [[ 1 -${"eq"} 1 ]] && echo yes; for it${"em"} in a b; do echo $item; done`.text(),
+      ).toBe("2\nyes\na\nb\n");
+      // In a command substitution of an expression, a value is an argument as anywhere else.
+      expect(await $`echo $(( $(echo ${"2"} ${"x++"} | wc -w) + 1 ))`.text()).toBe("3\n");
+    });
+  });
+});
+
 describe("condexprs", () => {
   TestBuilder.command`[[ -f package.json ]] && echo yes!`.file("package.json", "hi").stdout("yes!\n").runAsTest("-f");
   TestBuilder.command`[[ -f mumbo.jumbo ]] && echo yes!`.exitCode(1).runAsTest("-f non-existent");

@@ -1020,7 +1020,7 @@ impl Interpreter {
             ast::Expr::Cmd(c) => Cmd::init(self, shell, *c, parent, io),
             ast::Expr::Binary(b) => Binary::init(self, shell, *b, parent, io),
             ast::Expr::Pipeline(p) => Pipeline::init(self, shell, *p, parent, io),
-            ast::Expr::Assign(a) => Assigns::init(self, shell, *a, parent, AssignCtx::Shell),
+            ast::Expr::Assign(a) => Assigns::init(self, shell, *a, parent, AssignCtx::Shell, io),
             ast::Expr::If(i) => If::init(self, shell, *i, parent, io),
             ast::Expr::For(f) => For::init(self, shell, *f, parent, io),
             ast::Expr::While(w) => While::init(self, shell, *w, parent, io),
