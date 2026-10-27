@@ -251,7 +251,9 @@ impl Cmd {
                 CmdState::Idle => {
                     if !n.assigns.is_empty() {
                         interp.as_cmd_mut(this).state = CmdState::ExpandingAssigns;
-                        let child = Assigns::init(interp, shell, n.assigns, this, AssignCtx::Cmd);
+                        let io = interp.as_cmd(this).io.clone();
+                        let child =
+                            Assigns::init(interp, shell, n.assigns, this, AssignCtx::Cmd, io);
                         return Assigns::start(interp, child);
                     }
                     interp.as_cmd_mut(this).state = CmdState::ExpandingRedirect { idx: 0 };

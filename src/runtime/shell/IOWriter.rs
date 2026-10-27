@@ -84,6 +84,7 @@ impl ChildPtr {
 pub(crate) enum WriterTag {
     /// Builtin running inside a Cmd — dispatch via `Builtin::on_io_writer_chunk`.
     Builtin,
+    Assigns,
     Cmd,
     CondExpr,
     For,
@@ -1168,9 +1169,12 @@ pub(crate) fn on_io_writer_chunk(
     err: Option<sys::SystemError>,
 ) -> Yield {
     use crate::shell::builtin::Builtin;
-    use crate::shell::states::{cmd, cond_expr, r#for, pipeline};
+    use crate::shell::states::{assigns, cmd, cond_expr, r#for, pipeline};
     match child.tag {
         WriterTag::Builtin => Builtin::on_io_writer_chunk(interp, child.node, written, err),
+        WriterTag::Assigns => {
+            assigns::Assigns::on_io_writer_chunk(interp, child.node, written, err)
+        }
         WriterTag::Cmd => cmd::Cmd::on_io_writer_chunk(interp, child.node, written, err),
         WriterTag::CondExpr => {
             cond_expr::CondExpr::on_io_writer_chunk(interp, child.node, written, err)

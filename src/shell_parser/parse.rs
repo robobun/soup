@@ -10,6 +10,8 @@ use bun_alloc::Arena as Bump;
 use bun_alloc::ArenaVecExt as _;
 use bun_core::{StackCheck, String as BunString, strings};
 
+use crate::arith;
+
 // `strings::Cursor` aliased as `CodepointCursor` for readability.
 type CodepointCursor = strings::Cursor;
 
@@ -737,6 +739,9 @@ pub mod ast {
         Comma,
         Tilde,
         CmdSubst(CmdSubst<'arena>),
+        /// `$((expression))`. The expression is a word: what `$x` and `$(cmd)` in it expand to
+        /// is part of its text.
+        Arith(&'arena Atom<'arena>),
     }
 
     #[derive(Clone)]
@@ -1824,21 +1829,14 @@ impl<'bump> Parser<'bump> {
                         }
                     }
                     Token::CmdSubstBegin => {
-                        let _ = self.expect(TokenTag::CmdSubstBegin);
-                        let is_quoted = self.r#match(TokenTag::CmdSubstQuoted);
-                        let mut subparser = self.make_subparser(SubshellKind::CmdSubst);
-                        let script = match subparser.parse_impl() {
-                            Ok(s) => s,
-                            Err(e) => {
-                                self.continue_from_subparser(&mut subparser);
-                                return Err(e);
-                            }
-                        };
-                        atoms.push(ast::SimpleAtom::CmdSubst(ast::CmdSubst {
-                            script,
-                            quoted: is_quoted,
-                        }));
-                        self.continue_from_subparser(&mut subparser);
+                        atoms.push(ast::SimpleAtom::CmdSubst(self.parse_cmd_subst()?));
+                        if self.delimits(self.peek()) {
+                            let _ = self.r#match(TokenTag::Delimit);
+                            break;
+                        }
+                    }
+                    Token::ArithBegin => {
+                        atoms.push(ast::SimpleAtom::Arith(self.parse_arith()?));
                         if self.delimits(self.peek()) {
                             let _ = self.r#match(TokenTag::Delimit);
                             break;
@@ -1912,6 +1910,7 @@ impl<'bump> Parser<'bump> {
                     | Token::Newline
                     | Token::CmdSubstQuoted
                     | Token::CmdSubstEnd
+                    | Token::ArithEnd
                     | Token::JSObjRef(_)
                     | Token::Delimit
                     | Token::Eof
@@ -1930,6 +1929,73 @@ impl<'bump> Parser<'bump> {
                 glob_hint: has_glob_syntax,
             })),
         })
+    }
+
+    /// `$(script)`, from its `CmdSubstBegin`.
+    fn parse_cmd_subst(&mut self) -> ParseResult<ast::CmdSubst<'bump>> {
+        let _ = self.expect(TokenTag::CmdSubstBegin);
+        let quoted = self.r#match(TokenTag::CmdSubstQuoted);
+        let mut subparser = self.make_subparser(SubshellKind::CmdSubst);
+        let script = subparser.parse_impl();
+        self.continue_from_subparser(&mut subparser);
+        Ok(ast::CmdSubst {
+            script: script?,
+            quoted,
+        })
+    }
+
+    /// `$((expression))`, from its `ArithBegin`: the word that the expression is.
+    fn parse_arith(&mut self) -> ParseResult<&'bump ast::Atom<'bump>> {
+        let _ = self.expect(TokenTag::ArithBegin);
+        let mut atoms = bun_alloc::ArenaVec::new_in(self.alloc);
+        loop {
+            match self.peek() {
+                Token::ArithEnd => {
+                    let _ = self.advance();
+                    break;
+                }
+                Token::Text(range)
+                | Token::SingleQuotedText(range)
+                | Token::DoubleQuotedText(range) => {
+                    let _ = self.advance();
+                    let text = self.text(range);
+                    if !text.is_empty() {
+                        atoms.push(ast::SimpleAtom::Text(text));
+                    }
+                }
+                Token::Var(range) => {
+                    let _ = self.advance();
+                    atoms.push(ast::SimpleAtom::Var(self.text(range)));
+                }
+                Token::VarArgv(int) => {
+                    let _ = self.advance();
+                    atoms.push(ast::SimpleAtom::VarArgv(int));
+                }
+                Token::CmdSubstBegin => {
+                    atoms.push(ast::SimpleAtom::CmdSubst(self.parse_cmd_subst()?));
+                }
+                Token::ArithBegin => atoms.push(ast::SimpleAtom::Arith(self.parse_arith()?)),
+                Token::Delimit => {
+                    let _ = self.advance();
+                }
+                token => {
+                    self.add_error(format_args!(
+                        "Unexpected token in arithmetic expansion: {}",
+                        bstr::BStr::new(token.as_human_readable(self.strpool))
+                    ))?;
+                    return Err(ParseError::Unexpected.into());
+                }
+            }
+        }
+        let expression = match atoms.len() {
+            1 => ast::Atom::new_simple(atoms.into_iter().next().unwrap()),
+            _ => ast::Atom::Compound(ast::CompoundAtom {
+                atoms: atoms.into_bump_slice(),
+                brace_expansion_hint: false,
+                glob_hint: false,
+            }),
+        };
+        Ok(self.allocate(expression))
     }
 
     fn allocate<T>(&self, val: T) -> &'bump mut T {
@@ -2266,6 +2332,8 @@ pub enum TokenTag {
     CmdSubstBegin,
     CmdSubstQuoted,
     CmdSubstEnd,
+    ArithBegin,
+    ArithEnd,
     OpenParen,
     CloseParen,
     Var,
@@ -2316,6 +2384,11 @@ pub enum Token {
     /// echo "test$(echo "1    2")" -> test1    2\n
     CmdSubstQuoted,
     CmdSubstEnd,
+    /// `$((`. The tokens up to `ArithEnd` are the expression, read like the inside of a
+    /// double-quoted string.
+    ArithBegin,
+    /// `))`
+    ArithEnd,
     OpenParen,
     CloseParen,
 
@@ -2375,6 +2448,8 @@ impl Token {
             Token::CmdSubstBegin => b"`$(`",
             Token::CmdSubstQuoted => b"CmdSubstQuoted",
             Token::CmdSubstEnd => b"`)`",
+            Token::ArithBegin => b"`$((`",
+            Token::ArithEnd => b"`))`",
             Token::OpenParen => b"`(`",
             Token::CloseParen => b"`)",
             Token::Var(r) => &strpool[r.start as usize..r.end as usize],
@@ -2426,6 +2501,10 @@ const SPECIAL_JS_CHAR: u8 = 8;
 const MAX_SUBSHELL_DEPTH: u32 = 128;
 pub const LEX_JS_OBJREF_PREFIX: &[u8] = b"\x08__bun_";
 pub const LEX_JS_STRING_PREFIX: &[u8] = b"\x08__bunstr_";
+/// A string with no special character, which is pasted into the script as text. It comes by
+/// reference where it may be in an arithmetic expression: there the lexer has to know that it is
+/// a value. Anywhere else it is read as the text it would have been.
+pub const LEX_JS_TEXT_PREFIX: &[u8] = b"\x08__buntxt_";
 pub const LEX_JS_REF_TERMINATOR: u8 = SPECIAL_JS_CHAR;
 
 #[derive(Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
@@ -2448,6 +2527,8 @@ pub enum SubShellKind {
     Backtick,
     /// $(echo hi; echo hello)
     Dollar,
+    /// $((1 + 2))
+    Arith,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2491,6 +2572,8 @@ pub struct Lexer<'bump, const ENCODING: StringEncoding> {
     pub(crate) delimit_quote: bool,
     pub(crate) in_subshell: Option<SubShellKind>,
     pub(crate) subshell_depth: u32,
+    /// In `SubShellKind::Arith`: where in the source the `))` of the expression starts.
+    pub(crate) arith_end: usize,
     pub(crate) errors: bun_alloc::ArenaVec<'bump, LexError>,
 
     /// Strpool ranges that hold bytes spliced in from interpolated JS values
@@ -2525,6 +2608,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             delimit_quote: false,
             in_subshell: None,
             subshell_depth: 0,
+            arith_end: 0,
             string_refs: strings_to_escape,
             jsobjs_len,
         }
@@ -2567,6 +2651,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             ),
             in_subshell: Some(kind),
             subshell_depth: self.subshell_depth + 1,
+            arith_end: 0,
             word_start: self.word_start,
             j: self.j,
             delimit_quote: false,
@@ -2621,6 +2706,12 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
 
     pub fn lex(&mut self) -> Result<(), LexerError> {
         loop {
+            if self.in_subshell == Some(SubShellKind::Arith)
+                && self.chars.cursor_pos() >= self.arith_end
+            {
+                return self.end_arith();
+            }
+
             // Fast path: bulk-consume runs of non-special bytes in Normal state.
             // The guard-arm chain below does not compile to a jump table in
             // debug, so a 1 MiB literal word (see
@@ -2687,12 +2778,32 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             if char == u32::from(SPECIAL_JS_CHAR) {
                 if self.looks_like_js_string_ref() {
                     if let Some(bunstr) = self.eat_js_string_ref() {
-                        self.break_word(AddDelimiter::No)?;
-                        self.handle_js_string_ref(bunstr)?;
+                        if self.in_subshell == Some(SubShellKind::Arith) {
+                            self.arith_value(bunstr);
+                        } else {
+                            self.break_word(AddDelimiter::No)?;
+                            self.handle_js_string_ref(bunstr)?;
+                        }
+                        continue;
+                    }
+                } else if self.looks_like_js_text_ref() {
+                    if let Some(bunstr) = self.eat_js_text_ref() {
+                        if self.in_subshell == Some(SubShellKind::Arith) {
+                            self.arith_value(bunstr);
+                        } else {
+                            self.append_string_to_str_pool(bunstr)?;
+                        }
                         continue;
                     }
                 } else if self.looks_like_js_obj_ref() {
                     if let Some(tok) = self.eat_js_obj_ref() {
+                        if self.in_subshell == Some(SubShellKind::Arith) {
+                            // The rest of the expression is read, so that this is the one error.
+                            self.add_error(
+                                b"JS object reference not allowed in arithmetic expansion",
+                            );
+                            continue;
+                        }
                         if self.chars.state == CharState::Double {
                             self.add_error(b"JS object reference not allowed in double quotes");
                             return Ok(());
@@ -2919,6 +3030,9 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                                 self.tokens.push(Token::CmdSubstEnd);
                                 return Ok(());
                             } else {
+                                if self.in_subshell == Some(SubShellKind::Arith) {
+                                    self.break_word(AddDelimiter::No)?;
+                                }
                                 self.eat_subshell(SubShellKind::Backtick)?;
                             }
                             fell_through = true;
@@ -2936,7 +3050,10 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                             });
                             if !peeked.escaped && peeked.char == u32::from(b'(') {
                                 self.break_word(AddDelimiter::No)?;
-                                self.eat_subshell(SubShellKind::Dollar)?;
+                                match self.arith_end() {
+                                    Some(end) => self.eat_arith(end)?,
+                                    None => self.eat_subshell(SubShellKind::Dollar)?,
+                                }
                                 fell_through = true;
                                 break 'escaped;
                             }
@@ -3138,6 +3255,11 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                             if self.chars.state == CharState::Single {
                                 break 'escaped;
                             }
+                            // `$(("1" + 2))`: a quote in an expression is dropped.
+                            if self.in_subshell == Some(SubShellKind::Arith) {
+                                fell_through = true;
+                                break 'escaped;
+                            }
                             if self.chars.state == CharState::Normal {
                                 self.break_word(AddDelimiter::No)?;
                                 self.chars.state = CharState::Double;
@@ -3184,6 +3306,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                     self.add_error(b"Unclosed command substitution")
                 }
                 SubShellKind::Normal => self.add_error(b"Unclosed subshell"),
+                SubShellKind::Arith => self.add_error(b"Unclosed arithmetic expansion"),
             }
             return Ok(());
         }
@@ -3266,6 +3389,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                 | TokenTag::Comma
                 | TokenTag::BraceEnd
                 | TokenTag::CmdSubstEnd
+                | TokenTag::ArithEnd
                 | TokenTag::Asterisk => true,
 
                 TokenTag::Pipe
@@ -3278,6 +3402,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                 | TokenTag::Newline
                 | TokenTag::CmdSubstBegin
                 | TokenTag::CmdSubstQuoted
+                | TokenTag::ArithBegin
                 | TokenTag::OpenParen
                 | TokenTag::CloseParen
                 | TokenTag::JSObjRef
@@ -3424,12 +3549,122 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                 }
             }
             SubShellKind::Normal => self.tokens.push(Token::OpenParen),
+            SubShellKind::Arith => unreachable!("`eat_arith` reads a `$((`"),
         }
         let prev_quote_state = self.chars.state;
         let mut sublexer = self.make_sublexer(kind);
         sublexer.lex()?;
         self.continue_from_sublexer(&mut sublexer);
         self.chars.state = prev_quote_state;
+        Ok(())
+    }
+
+    /// At the `(` of a `$(`: where the `))` of `$((expression))` starts, if that is what this
+    /// is.
+    ///
+    /// `$((` also starts a command substitution whose first command is a subshell, as in
+    /// `$((cd dir && ls) | wc -l)`. It is arithmetic when the `)` that closes the inner `(` is
+    /// directly followed by another, which is how other shells tell the two apart. A parenthesis
+    /// in a string, in a `$(...)` or in backticks is none of the expression's.
+    fn arith_end(&self) -> Option<usize> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum In {
+            /// `$(...)` or `(...)`
+            Parens,
+            Backticks,
+            /// `"..."` in one of the two above
+            Quotes,
+        }
+
+        let bytes = self.chars.src_bytes_at_cursor();
+        if !bytes.starts_with(b"((") {
+            return None;
+        }
+        // What is open inside the expression, and the parentheses of the expression itself.
+        let mut open: Vec<In> = Vec::new();
+        let mut depth: u32 = 0;
+        let mut i = 2;
+        while let Some(&byte) = bytes.get(i) {
+            let next = bytes.get(i + 1).copied();
+            match (open.last().copied(), byte) {
+                (Some(In::Quotes), b'\\') => {
+                    if matches!(next, Some(b'$' | b'`' | b'"' | b'\\' | b'\n' | b'#')) {
+                        i += 1;
+                    }
+                }
+                (_, b'\\') => i += 1,
+                (Some(In::Quotes), b'"') => {
+                    open.pop();
+                }
+                (_, b'$') if next == Some(b'(') => {
+                    open.push(In::Parens);
+                    i += 1;
+                }
+                (Some(In::Backticks), b'`') => {
+                    open.pop();
+                }
+                (Some(In::Quotes), b'`') if open.iter().rev().nth(1) == Some(&In::Backticks) => {
+                    open.truncate(open.len() - 2);
+                }
+                (_, b'`') => open.push(In::Backticks),
+                (Some(In::Quotes), _) => {}
+                (_, b'\'') => i += 1 + strings::index_of_char_usize(&bytes[i + 1..], b'\'')?,
+                (_, b'"') => open.push(In::Quotes),
+                (None, b'(') => depth += 1,
+                (None, b')') if depth > 0 => depth -= 1,
+                (None, b')') => {
+                    return (next == Some(b')')).then(|| self.chars.cursor_pos() + i);
+                }
+                (None, _) => {}
+                (Some(_), b'#') if matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r') => {
+                    i += strings::index_of_char_usize(&bytes[i..], b'\n')?;
+                }
+                (Some(_), b'(') => open.push(In::Parens),
+                (Some(In::Parens), b')') => {
+                    open.pop();
+                }
+                _ => {}
+            }
+            if open.len() > MAX_SUBSHELL_DEPTH as usize {
+                return None;
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Reads `((expression))`, with the lexer at the first `(`. The expression is read like the
+    /// inside of a double-quoted string: `$x`, `$(cmd)` and backticks are expansions in it, and
+    /// everything else, a `*` or a `>` included, is its text.
+    fn eat_arith(&mut self, end: usize) -> Result<(), LexerError> {
+        if self.subshell_depth >= MAX_SUBSHELL_DEPTH {
+            self.add_error(b"Subshell nesting depth exceeded");
+            return Err(LexerError::SubshellDepthExceeded);
+        }
+        let _ = self.eat();
+        let _ = self.eat();
+        self.tokens.push(Token::ArithBegin);
+        let prev_quote_state = self.chars.state;
+        let mut sublexer = self.make_sublexer(SubShellKind::Arith);
+        sublexer.chars.state = CharState::Double;
+        sublexer.arith_end = end;
+        sublexer.lex()?;
+        self.continue_from_sublexer(&mut sublexer);
+        self.chars.state = prev_quote_state;
+        Ok(())
+    }
+
+    /// The lexer of an expression is at or past the `))` that `arith_end` found.
+    fn end_arith(&mut self) -> Result<(), LexerError> {
+        if self.chars.cursor_pos() != self.arith_end {
+            // A `$(cmd)` in the expression did not end where `arith_end` saw it end.
+            self.add_error(b"Unclosed arithmetic expansion");
+            return Ok(());
+        }
+        self.break_word(AddDelimiter::No)?;
+        let _ = self.eat();
+        let _ = self.eat();
+        self.tokens.push(Token::ArithEnd);
         Ok(())
     }
 
@@ -3503,6 +3738,46 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             self.word_start = self.j;
         }
         Ok(())
+    }
+
+    /// An interpolated value in an arithmetic expression is a number, see [`arith::operand`].
+    /// Unlike what a `$name` adds, it is known now, so one that is not a number is an error
+    /// before the script runs.
+    fn arith_value(&mut self, bunstr: &BunString) {
+        let continues =
+            self.j > self.word_start && arith::is_number_char(self.strpool[self.strpool.len() - 1]);
+        let value = bunstr.to_utf8();
+        let (before, text, after): (&[u8], &[u8], &[u8]) = match arith::operand(&value, continues) {
+            Ok(arith::Operand::Text(text)) if continues || arith::is_integer(text) => {
+                (b"", text, b"")
+            }
+            Ok(arith::Operand::Signed(text)) if arith::is_integer(text) => (b"(", text, b")"),
+            _ => {
+                self.add_error(b"Interpolated value in arithmetic expansion must be an integer");
+                return;
+            }
+        };
+        for part in [before, text, after] {
+            self.strpool.extend_from_slice(part);
+            self.j += part.len() as u32;
+        }
+    }
+
+    fn looks_like_js_text_ref(&mut self) -> bool {
+        let bytes = self.chars.src_bytes_at_cursor();
+        if LEX_JS_TEXT_PREFIX.len() > bytes.len() {
+            return false;
+        }
+        bytes[..LEX_JS_TEXT_PREFIX.len() - 1] == LEX_JS_TEXT_PREFIX[1..]
+    }
+
+    fn eat_js_text_ref(&mut self) -> Option<&'bump BunString> {
+        let idx = self.eat_js_substitution_idx(
+            LEX_JS_TEXT_PREFIX,
+            "JS string ref",
+            Self::validate_js_string_ref_idx,
+        )?;
+        Some(&self.string_refs[idx])
     }
 
     fn looks_like_js_obj_ref(&mut self) -> bool {
