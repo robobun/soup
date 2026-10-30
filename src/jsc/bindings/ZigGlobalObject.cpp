@@ -1630,6 +1630,28 @@ JSC_DEFINE_CUSTOM_GETTER(getEventSourceConstructor, (JSGlobalObject * lexicalGlo
     return JSValue::encode(BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalEventSource, "EventSource"));
 }
 
+// `FileReader` and `ProgressEvent` are two classes of one JavaScript module
+// (src/js/internal/file_reader.ts), read the way `EventSource` is.
+JSC_DEFINE_CUSTOM_GETTER(getFileReaderConstructor, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue, PropertyName))
+{
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue fileReader = BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalFileReader, "FileReader", "FileReader"_s);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, JSValue::encode(fileReader.get(globalObject, JSC::Identifier::fromString(vm, "FileReader"_s))));
+}
+
+JSC_DEFINE_CUSTOM_GETTER(getProgressEventConstructor, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue, PropertyName))
+{
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue fileReader = BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalFileReader, "ProgressEvent", "ProgressEvent"_s);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, JSValue::encode(fileReader.get(globalObject, JSC::Identifier::fromString(vm, "ProgressEvent"_s))));
+}
+
 // `localStorage` is a property of the global object only when `--localstorage-file` names the
 // file it is stored in, so it is not in the static table.
 JSC_DEFINE_CUSTOM_GETTER(getLocalStorage, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue, PropertyName))
@@ -3526,6 +3548,8 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onerror"_s), JSC::CustomGetterSetter::create(vm, globalOnError, setGlobalOnError), 0);
 
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "EventSource"_s), JSC::CustomGetterSetter::create(vm, getEventSourceConstructor, nullptr), PropertyAttribute::CustomValue | 0);
+    putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "FileReader"_s), JSC::CustomGetterSetter::create(vm, getFileReaderConstructor, nullptr), PropertyAttribute::CustomValue | PropertyAttribute::DontEnum);
+    putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "ProgressEvent"_s), JSC::CustomGetterSetter::create(vm, getProgressEventConstructor, nullptr), PropertyAttribute::CustomValue | PropertyAttribute::DontEnum);
     if (!Bun::localStorageFile().isNull())
         putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "localStorage"_s), JSC::CustomGetterSetter::create(vm, getLocalStorage, nullptr), PropertyAttribute::CustomValue | 0);
 

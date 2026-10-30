@@ -54,6 +54,8 @@ declare module "bun" {
     type LibEmptyOrNodeMessagePort = LibDomIsLoaded extends true ? {} : import("node:worker_threads").MessagePort;
     type LibEmptyOrBroadcastChannel = LibDomIsLoaded extends true ? {} : import("node:worker_threads").BroadcastChannel;
     type LibEmptyOrEventSource = LibDomIsLoaded extends true ? {} : import("undici-types").EventSource;
+    type LibEmptyOrBunProgressEvent<T extends EventTarget> = LibDomIsLoaded extends true ? {} : Bun.BunProgressEvent<T>;
+    type LibEmptyOrBunFileReader = LibDomIsLoaded extends true ? {} : Bun.BunFileReader;
 
     type LibEmptyOrReadableByteStreamController = LibDomIsLoaded extends true
       ? {}
@@ -1866,6 +1868,44 @@ declare var EventSource: Bun.__internal.UseLibDomIfAvailable<
     readonly CONNECTING: 0;
     readonly OPEN: 1;
     readonly CLOSED: 2;
+  }
+>;
+
+interface ProgressEvent<T extends EventTarget = EventTarget> extends Bun.__internal.LibEmptyOrBunProgressEvent<T> {}
+/**
+ * An event that says how far an operation is. A {@link FileReader} fires one
+ * for every step of a read.
+ */
+declare var ProgressEvent: Bun.__internal.UseLibDomIfAvailable<
+  "ProgressEvent",
+  {
+    prototype: ProgressEvent;
+    new (type: string, eventInitDict?: Bun.ProgressEventInit): ProgressEvent;
+  }
+>;
+
+interface FileReader extends Bun.__internal.LibEmptyOrBunFileReader {}
+/**
+ * Reads a `Blob` or a `File` and reports the outcome with events, as in a
+ * browser. New code can call `blob.text()`, `blob.arrayBuffer()` and
+ * `blob.bytes()` instead.
+ *
+ * @example
+ * ```ts
+ * const reader = new FileReader();
+ * reader.onload = () => console.log(reader.result); // "data:text/plain;charset=utf-8;base64,aGVsbG8="
+ * reader.onerror = () => console.error(reader.error);
+ * reader.readAsDataURL(new Blob(["hello"], { type: "text/plain;charset=utf-8" }));
+ * ```
+ */
+declare var FileReader: Bun.__internal.UseLibDomIfAvailable<
+  "FileReader",
+  {
+    prototype: FileReader;
+    new (): FileReader;
+    readonly EMPTY: 0;
+    readonly LOADING: 1;
+    readonly DONE: 2;
   }
 >;
 

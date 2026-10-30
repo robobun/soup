@@ -1671,6 +1671,9 @@ export default b.declarations(
   b.static("localStorage", b.property(b.any)),
   // A class of the library (src/js/internal/event_source.ts) that native code loads where the global is first read.
   b.static("EventSource", b.property(b.any)),
+  // Two classes of one module of the library (src/js/internal/file_reader.ts), loaded the same way.
+  b.static("FileReader", b.property(b.any)),
+  b.static("ProgressEvent", b.property(b.any)),
   b.fn("addEventListener", listenerRegistration(globalObject)),
   b.fn("removeEventListener", listenerRemoval),
 

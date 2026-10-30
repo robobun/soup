@@ -114,6 +114,13 @@ export default b.declarations(
     "EventSource",
     ...nativeBindings("Cpp", "EventSourceBinding.cpp", "createEventSourceBinding"),
   ),
+  // src/js/internal/file_reader.ts: the events and their target, the stream of the blob, and what the four results are made with.
+  extendAll(
+    ["Events", "Bodies", "WebStreams", "TextDecoder", "LegacyEncodings", "Buffer"],
+    "FileReader",
+    ...nativeBindings("Cpp", "FileReaderBinding.cpp", "createFileReaderBinding"),
+  ),
+  extendAll(["Events"], "ProgressEvent"),
   extendAll(abortSignalFeatures, "AbortSignal", "AbortController"),
   extendAll(["Headers"], "Headers"),
   extendAll(["FormData", "Bodies"], "FormData"),

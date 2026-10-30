@@ -8119,6 +8119,220 @@ marker, the tokens for the lexer tests), `docs/runtime/shell.mdx`,
 `test/js/bun/shell/bunshell.test.ts`, `test/js/bun/shell/lex.test.ts`,
 `test/js/bun/shell/parse.test.ts`, `test/cli/run/run-shell.test.ts`.
 
+### 2026-10-30: `FileReader` and `ProgressEvent`
+
+`FileReader` is how code for the browser reads a `Blob`, and it was the one class of the File API
+that Bun did not have. `Blob`, `File` and `FormData` are there, so a `File` arrives from
+`request.formData()`, and the library it is handed to then fails. With bun 1.4.3,
+`JSZip.loadAsync(file)` rejects with `Can't read the data of 'the loaded zip file'. Is it in a
+supported JavaScript type (String, Blob, ArrayBuffer, etc) ?`, because JSZip reads a blob with a
+`FileReader` and takes it for something else when there is none, and `Papa.parse(file)` throws
+`FileReaderSync is not defined`. A test of browser code that reads a file needs happy-dom or jsdom
+for this class alone. Deno has `FileReader` and `ProgressEvent`; Node.js has neither. Upstream has
+no issue and no pull request for them (a search for "FileReader" finds the Rust type of that name
+behind `Bun.file().stream()`). Now:
+
+```ts
+const reader = new FileReader();
+reader.onload = () => console.log(reader.result); // "data:image/png;base64,iVBORw0KGgo..."
+reader.onerror = () => console.error(reader.error);
+reader.readAsDataURL(Bun.file("./logo.png"));
+
+// what a library does with the File of an upload
+const form = await request.formData();
+const zip = await JSZip.loadAsync(form.get("archive") as File);
+Papa.parse(form.get("table") as File, { header: true, complete: result => console.log(result.data) });
+
+// a large file, with progress
+reader.onprogress = event => console.log(`${event.loaded} of ${event.total} bytes`);
+reader.readAsArrayBuffer(Bun.file("./video.mp4"));
+```
+
+What is there is the interface of the File API: `readAsArrayBuffer()`, `readAsText()`,
+`readAsDataURL()`, `readAsBinaryString()`, `abort()`, `readyState` with `EMPTY`, `LOADING` and
+`DONE`, `result`, `error`, the six events and their `on...` attributes. `ProgressEvent` is the
+interface of the XMLHttpRequest standard, a global of its own with `lengthComputable`, `loaded` and
+`total`, because that is what the events are and what `instanceof` in a handler asks for. The
+`undici` module exported an empty `FileReader` class and now exports this one.
+
+- A read takes any `Blob`: a `File` of a form, a slice, a `Bun.file()`, an S3 file. It asks the
+  blob for its `stream()`, so a file is read in chunks, and a subclass that overrides `stream()` is
+  read through its own stream. `progress` says how far the read is, with the bytes so far in
+  `loaded` and the size of the blob in `total`: one for the first chunk, then at most every 50
+  milliseconds, and one more when the last chunk has arrived. An empty blob fires none. The read
+  goes on when the listeners of an event have run, so the events arrive while the data is read (ten
+  of them, 50 milliseconds apart, for a 256 MB file in the debug build), and `abort()` in a
+  `progress` listener stops the read there.
+- `readAsText()` picks the encoding the way the standard says: its argument, then the `charset` of
+  the blob's type, then UTF-8, and a byte order mark wins over all three. A label that names no
+  encoding is not an error, and the labels of the replacement encoding (`iso-2022-kr`,
+  `hz-gb-2312` and four more) give U+FFFD. `readAsDataURL()` uses the type of the blob and
+  `application/octet-stream` when it has none.
+- The order is `loadstart`, `progress`, `load`, `loadend`. A read that fails fires `error` and
+  `loadend`, with no `loadstart` when it fails before its first chunk. `abort()` fires `abort` and
+  `loadend` before it returns, nothing of the aborted read arrives afterwards, and `error` is an
+  `AbortError` then: the standard does not say so, and Chrome, Firefox and Safari all do it. A
+  second read during a read throws an `InvalidStateError`. A read that a `load` listener starts, or
+  the code behind an `await` of `load`, takes the place of the `loadend` of the first one, as the
+  standard has it.
+- `reader.error` is a `DOMException`, as in a browser: `NotFoundError` for a file or an S3 object
+  that does not exist and `NotReadableError` otherwise. What the file system or S3 said (`ENOENT`,
+  `EISDIR`, `NoSuchKey`) is its `cause`. What a blob throws for its `size` or its `stream()` is
+  reported the same way.
+- The handler attributes are what HTML says they are: a function keeps its place among the
+  listeners when another one replaces it, `null` takes it away, and an object that is not a
+  function is kept and not called.
+- A pending read keeps the process alive until `loadend`, like a pending `fetch()`.
+
+Both classes are TypeScript (`src/js/internal/file_reader.ts`, about 500 lines) and load when the
+global is first read, the way the `EventSource` of 2026-09-01 does: a custom getter on the global
+object that asks for the internal module. The globals are not enumerable and can be assigned, which
+a polyfill or a test does. The members of the two prototypes are enumerable, as WebIDL has them.
+
+What the module is built on does not come from the global object. The first read of the global can
+be inside happy-dom's `GlobalRegistrator.register()`, which asks for the descriptor of every global
+while its own `Event` is in place, or under a fake clock that has replaced `setImmediate`. The
+first version of this patch took `Event`, `EventTarget` and `setImmediate` from the global object
+at that moment. A review of it found that after `register()` and `unregister()` no `FileReader` of
+the process fired an event again, that a read queued into a fake clock never ended, and that
+`require("undici")` threw in a program that had replaced `Event`. Now a native binding
+(`FileReaderBinding.cpp`) hands the module the `Event`, `EventTarget`, `DOMException` and
+`setImmediate` of the realm, the way `Undici.cpp` and `node:worker_threads` (oven-sh/bun#40268) get
+theirs. `EventSource` had the same fault, and `require("undici")` threw in a program without
+`EventTarget`, which upstream's `undici` does not. It got a binding of the same kind in its own
+commit (`EventSourceBinding.cpp`, with `MessageEvent` and `AbortController` too).
+
+The part that took thought is when the events are fired. The standard queues a task for
+`loadstart` and for each `progress`, and fires `load` and `loadend` from one more task. A browser
+runs the promise callbacks of a listener before it fires the next event, because it calls the
+listener from native code, and code depends on that: `await` one event, then add the listener for
+the next. So `loadstart` and each `progress` is a native `setImmediate` task that the read waits
+for. The last task fires `load`, runs the promise callbacks and ticks that wait (the microtask
+checkpoint that `node:http` already runs from JavaScript, `drainMicrotasks` of
+`hw_exports.bind.ts`), looks at the state again and fires `loadend`. The first version fired
+`loadend` one microtask after `load`. That was enough for `await new Promise(...)` and not for
+`await once(reader, "load")` of `node:events`, whose listener for `loadend` was then added too
+late, and the review found the program that hung. A task of its own for `loadend` would have fixed
+that and let a timer of the program run between the two events, where a read that the timer starts
+silently takes the `loadend` away. The events of `abort()` are fired inside the call, as in a
+browser. The native `setImmediate` is not stopped by the fake timers of `bun test`, so a read
+finishes in a test that has stopped the clock. The 50 milliseconds are measured with
+`Bun.nanoseconds()`, which those fake timers do stop: under them a read fires `progress` for its
+first chunk and for its last.
+
+The tests are written from the cases of the web platform tests for `FileAPI/reading-data-section`
+and for the `ProgressEvent` constructor (the results of the four methods, the encodings, the order
+of the events with a listener that is only added after the event before it, `abort()` at each
+point, the states during each event), plus what is Bun's own: a `Bun.file()` with progress, a blob
+whose `stream()` decides the chunks (`progress` at each point, `abort()` in a `progress` listener,
+the exact events under fake timers), a file of /proc that says its size is 0, the three errors (a
+missing file, a directory, a missing S3 object of a local server), a `File` out of `FormData`,
+`once()` of `node:events` and an async function between `load` and `loadend`, the handler
+attributes, a process that stays alive while its read waits for a pipe, the globals replaced before
+and after they are first read, `require("undici")` without `Event` and `EventTarget`. 44 tests; all
+of them fail on bun 1.4.3. Run by hand on the build: JSZip 3.10.1 and PapaParse 5.5.3 with a `File`
+from `formData()` (both fail on 1.4.3 as quoted above and both work now), happy-dom 17 (`register()`
+and `unregister()` before a read, and two test files of which the first registers), `mock.timers`
+of `node:test`, lolex, and a program that uses `FileReader` built with `bun build --compile` and
+with `bun build --compile --aot`.
+
+Not done: `FileReaderSync`, which browsers only have in workers (PapaParse asks for it only when
+there is no `FileReader`). `isTrusted` of the events is `false`, because they are dispatched from
+JavaScript. No promise callback runs between two listeners of one event, as with every
+`EventTarget` of Bun. `readAsDataURL()` of a `text/plain` blob says
+`data:text/plain;charset=utf-8;base64,...`, because that is what `blob.type` is in Bun; a browser
+keeps the type as it was given. `--trim` could not be tried: the debug build has no trim table, so
+the rows that say which features the two classes keep in a trimmed executable are written after
+upstream's and are not tested.
+
+One fault of upstream turned up on the way. It reproduces on released bun, so it is upstream's to
+fix and is not patched in this stack: `Bun.file(path).size` pins the size, and a file that says 0,
+like those of /proc, reads as empty afterwards (`const f = Bun.file("/proc/cpuinfo"); f.size; await
+f.text()` gives `""` on 1.4.3, and the contents of the file without the `f.size`). A read asks the
+blob for its size to know `total`. It asks after it has the stream, so the `FileReader` reads such
+a file to its end, and the caller's `BunFile` is pinned all the same.
+
+Rebase notes: three days of upstream, 25 commits, and the largest rebase so far, because
+oven-sh/bun#45631 landed: `bun build --compile --aot` compiles TypeScript to machine code ahead of
+time. With it came a table of built-ins that every global, method and native binding has to be
+declared in, a rule that native code loads an internal module only through
+`BUN_REQUIRE_INTERNAL_MODULE`, a check that every runtime flag says what it needs in a trimmed
+executable, and a check that every bundler option is classified for the compiler. The other 24
+commits removed some 700 `unsafe` blocks across the shell, the test runner, the CLI, the bundler,
+the package manager and usockets, which changed the signatures that soup's patches call. 26 of the
+62 patches had conflicts, about ten more needed a line or two, no patch was dropped, and each patch
+was brought up to date in its own commit:
+
+- Table of built-ins: rows for `lines()` (`Blob.prototype.lines`, and the built-in function of
+  `ReadableStream`), `EventSource`, `navigator.locks` and `WebLocks.cpp`, `$isAbortSignal` (which
+  `$.signal()` is the first to use), `copyTo` of S3 files, `localStorage` (a global that an option
+  adds, like `gc`), and `keyObjectFromCryptoKey` of the crypto binding that `Bun.JWT` reads.
+  `Bun.JWT`, `Bun.Queue`, `EventSource`, `navigator.locks` and the watcher of `Bun.build` load their
+  module through the new macro. The generator was run on every patch of the stack in turn, so each
+  commit passes it.
+- `bun build --compile --aot`, and `bun compile`, which is the same: `--alias`, `--global-name`,
+  `--legal-comments=linked` and `external`, an import with the `bytes` loader and a call of
+  `import.meta.glob()` stop the build with `TS100050: --aot does not support ...`, like
+  `--format=iife` already does. The compiler has a front end of its own, which knows nothing of
+  them. The one for `import.meta.glob()` is a new diagnostic in the lowering of a call, beside
+  upstream's for `ShadowRealm`. `Bun.build({ watch: true, compile: { aot: true } })` throws,
+  because such a build does not say which files it read. The docs of each option say so, and
+  upstream's table of what `bun compile` does not support has three more rows. Without `--aot` all
+  of them work as before.
+- Runtime flags: `--watch-path`, `--watch-exclude` and `--localstorage-file` have their rows.
+  `--watch-path` needs what `--watch` needs. `bun --aot serve` is refused with a message of its
+  own, `bun --check --watch serve` has nothing to check, and `bun test --aot --last-failed` says
+  once which files it runs (it is two processes there).
+- Redis: the schema now says that a command answers `this` in a transaction and that `multi()`
+  answers an object, which is what they do. Upstream's new comparison of the schemas with the
+  published types found the difference.
+- Shell: the readers and writers are `Rc` now, the AST nodes are handed around as references, and
+  the flag parser lends slices. `wc`, `head`, `tail`, `sort`, `uniq`, `for`, `while`, `$((...))`
+  and `.kill()` follow. The new task tags (the unpolled read of `wc`, the yield of a loop) are
+  released through `release_in!([Shell], ...)`.
+- Package manager: the lockfile loader no longer hands out the lockfile it filled, so the merge of
+  a conflicted `bun.lock` reports `merged_conflict` on the result alone, and `bun install` gets the
+  loader for installs through `PackageManager::load_lockfile_from_cwd_for_install`.
+- Smaller ones: the idle time of the event loop reads through `&Loop` and `Cell` fields, `bun
+  compile` is one more row in the table of commands behind "did you mean", the states of
+  `EventSource` are a `const enum` (a new lint wants a constant that two built-in modules declare
+  to have one value, and `CLOSED` is 3 in `ws`), `collectCoverageFrom` gets its VM from
+  `vm.as_mut()`, cursors set `row_type` where the query object is known, the native function of
+  `navigator.locks.request()` no longer asserts what it also checks (upstream now calls every native
+  function with no arguments in a debug build), `EventSource`, `FileReader` and `ProgressEvent` are
+  in the list of classes with an inspect method, and the docs of `node:sea`, the `bytes` loader and
+  `legalComments` link to `/compiler/executables`, where upstream moved that page.
+
+The list above is longer than the conflicts were. A review read the rebased stack against the new
+compiler and found nine places where a patch and `--aot` did not know of each other: `--alias` was
+silently ignored by `bun compile`, `Bun.JWT` threw for a `CryptoKey` and `localStorage` was
+`undefined` in an ahead-of-time executable, `import.meta.glob()` built and then threw at the call,
+and five smaller ones. Upstream's own tests of the table (`test/aot/builtins`) found the inspect
+methods and the assertion.
+
+After the rebase the whole workspace passes `cargo check`, the debug build links, and these test
+files of the stack were run on it and pass: the shell (`bunshell`, `lex`, `parse`, `kill`, the five
+builtins, `run-shell`), `bun test` (`coverage`, `parallel`, `test-last-failed`, `expect-poll`,
+`fake-timers`, `bun-test`), the bundler (`bundler_iife`, `bundler_loader`, `bundler_comments`,
+`bundler_import_meta_glob`, `bun-build-watch`), `EventSource`, Web Locks, Web Storage, `Bun.JWT`,
+`Bun.Queue`, `Bun.msgpack`, `Bun.CSV`, `Bun.INI`, `unescapeHTML`, the `bytes` loader, `node:sea`,
+`perf_hooks`, `bun serve`, response compression and routes of `Bun.serve`, `bun pm sbom`, `jsr:`,
+the merge of `bun.lock`, S3 copy, SQL cursors, Redis, `streams`, `blob`, `console.log`,
+`Bun.write`, watch mode. The bun-types tests, the source lints and upstream's checks of the table
+against the build (`own-properties`, `module-exports`, `classes-with-inspect-method`,
+`native-contract`) pass too. What does not pass here is not the stack: the recursive scans of
+`scan.test.ts` time out in the debug build, which walks this checkout with its build directories,
+and `semver.test.ts` needs the `semver` package, which this machine's `test/node_modules` did not
+have.
+
+Files: `src/js/internal/file_reader.ts` (new), `src/jsc/bindings/FileReaderBinding.cpp` and `.h`
+(new), `src/jsc/bindings/ZigGlobalObject.cpp` (the two getters), `src/js/thirdparty/undici.ts`,
+`src/codegen/builtins/host/globals.builtins.ts`, `features-web.builtins.ts`,
+`unseen-code.builtins.ts` and `classes-with-inspect-method.ts`, `packages/bun-types/globals.d.ts`,
+`packages/bun-types/bun.d.ts` (`ProgressEventInit`, `BunProgressEvent`, `BunFileReader`,
+`FileReaderEventMap`), `docs/runtime/web-apis.mdx`, `test/js/web/filereader/filereader.test.ts`
+(new), `test/integration/bun-types/fixture/globals.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
