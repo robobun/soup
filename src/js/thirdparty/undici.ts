@@ -21,15 +21,7 @@ const CloseEvent = bindings[9];
 const ErrorEvent = bindings[10];
 const MessageEvent = bindings[11];
 
-class FileReader extends EventTarget {
-  constructor() {
-    super();
-  }
-
-  static EMPTY = 0;
-  static LOADING = 1;
-  static DONE = 2;
-}
+const { FileReader } = require("internal/file_reader");
 
 function notImplemented(): never {
   throw new Error("This function is not yet implemented in Bun");
