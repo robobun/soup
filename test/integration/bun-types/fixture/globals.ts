@@ -331,6 +331,33 @@ const writableStream = new WritableStream();
     headers: { Authorization: "Bearer token" },
   });
 }
+{
+  const reader = new FileReader();
+  reader.readyState === FileReader.EMPTY;
+  reader.readyState === reader.DONE;
+  expectType<string | ArrayBuffer | null>(reader.result);
+  expectType<DOMException | null>(reader.error);
+  reader.onload = event => {
+    expectType<number>(event.loaded);
+    expectType<number>(event.total);
+    expectType<boolean>(event.lengthComputable);
+  };
+  reader.addEventListener("progress", event => event.loaded / event.total);
+  reader.addEventListener("loadend", () => {}, { once: true });
+  reader.readAsText(new Blob(["a"]), "utf-16le");
+  reader.readAsArrayBuffer(Bun.file("index.test-d.ts"));
+  reader.readAsDataURL(new File(["a"], "a.txt"));
+  reader.readAsBinaryString(new Blob(["a"]));
+  reader.abort();
+  // @ts-expect-error a string is not a Blob
+  reader.readAsText("a");
+
+  const progress = new ProgressEvent("progress", { lengthComputable: true, loaded: 1, total: 2 });
+  expectType<number>(progress.loaded);
+  expectType<string>(progress.type);
+  // @ts-expect-error loaded is a number
+  new ProgressEvent("progress", { loaded: "1" });
+}
 
 atob("asf");
 btoa("asdf");

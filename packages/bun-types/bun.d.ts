@@ -392,6 +392,12 @@ declare module "bun" {
     wasClean?: boolean;
   }
 
+  interface ProgressEventInit extends EventInit {
+    lengthComputable?: boolean;
+    loaded?: number;
+    total?: number;
+  }
+
   interface MessageEventInit<T = any> extends EventInit {
     data?: T;
     lastEventId?: string;
@@ -427,6 +433,93 @@ declare module "bun" {
   }
 
   type MessageEvent<T = any> = Bun.__internal.UseLibDomIfAvailable<"MessageEvent", BunMessageEvent<T>>;
+
+  /** How far an operation is, such as the read of a `FileReader`. */
+  interface BunProgressEvent<T extends EventTarget = EventTarget> extends Event {
+    /** Whether `total` is known. */
+    readonly lengthComputable: boolean;
+    /** How much of the work is done. For a `FileReader`, the bytes read so far. */
+    readonly loaded: number;
+    readonly target: T | null;
+    /** How much work there is. A `FileReader` says `0` for a blob that does not know its size. */
+    readonly total: number;
+  }
+
+  interface FileReaderEventMap {
+    abort: ProgressEvent<FileReader>;
+    error: ProgressEvent<FileReader>;
+    load: ProgressEvent<FileReader>;
+    loadend: ProgressEvent<FileReader>;
+    loadstart: ProgressEvent<FileReader>;
+    progress: ProgressEvent<FileReader>;
+  }
+
+  /** Reads a `Blob` or a `File` and reports the outcome with events. */
+  interface BunFileReader extends EventTarget {
+    /** Why the last read failed, an `AbortError` after `abort()`. `null` after a read that succeeded. */
+    readonly error: DOMException | null;
+    /** `abort()` ended the read. */
+    onabort: ((this: FileReader, ev: ProgressEvent<FileReader>) => any) | null;
+    /** The read failed. `error` says why. */
+    onerror: ((this: FileReader, ev: ProgressEvent<FileReader>) => any) | null;
+    /** The read is complete and `result` has the data. */
+    onload: ((this: FileReader, ev: ProgressEvent<FileReader>) => any) | null;
+    /** The read has ended, whether it succeeded, failed or was aborted. */
+    onloadend: ((this: FileReader, ev: ProgressEvent<FileReader>) => any) | null;
+    /** The first chunk of the blob has been read. A read that fails before that fires `error` alone. */
+    onloadstart: ((this: FileReader, ev: ProgressEvent<FileReader>) => any) | null;
+    /**
+     * More of the blob has been read. Fired for the first chunk, then at most every 50
+     * milliseconds, and once more when all of the blob has been read.
+     */
+    onprogress: ((this: FileReader, ev: ProgressEvent<FileReader>) => any) | null;
+    /** `EMPTY` before the first read, `LOADING` during a read and `DONE` after it. */
+    readonly readyState: 0 | 1 | 2;
+    /**
+     * What the last read gave: an `ArrayBuffer` after `readAsArrayBuffer()` and a
+     * string after the other three. `null` before the `load` event.
+     */
+    readonly result: string | ArrayBuffer | null;
+    /** Ends the read that is in progress. Fires `abort` and `loadend`, and `error` is an `AbortError`. */
+    abort(): void;
+    /** Reads the bytes of `blob` into an `ArrayBuffer`. */
+    readAsArrayBuffer(blob: Blob): void;
+    /**
+     * Reads `blob` into a string with one character for each byte.
+     * @deprecated Use `readAsArrayBuffer()`
+     */
+    readAsBinaryString(blob: Blob): void;
+    /** Reads `blob` into a `data:` URL with the type of the blob and its bytes in base64. */
+    readAsDataURL(blob: Blob): void;
+    /**
+     * Decodes `blob` into a string.
+     * @param encoding The label of an encoding. Default: the `charset` of the type of the blob, then UTF-8.
+     */
+    readAsText(blob: Blob, encoding?: string): void;
+    readonly EMPTY: 0;
+    readonly LOADING: 1;
+    readonly DONE: 2;
+    addEventListener<K extends keyof FileReaderEventMap>(
+      type: K,
+      listener: (this: FileReader, ev: FileReaderEventMap[K]) => any,
+      options?: boolean | AddEventListenerOptions,
+    ): void;
+    addEventListener(
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ): void;
+    removeEventListener<K extends keyof FileReaderEventMap>(
+      type: K,
+      listener: (this: FileReader, ev: FileReaderEventMap[K]) => any,
+      options?: boolean | EventListenerOptions,
+    ): void;
+    removeEventListener(
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions,
+    ): void;
+  }
 
   interface ReadableStreamDefaultReadManyResult<T> {
     done: boolean;
