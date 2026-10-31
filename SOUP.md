@@ -7617,6 +7617,425 @@ Files: `src/js/internal/file_reader.ts` (new), `src/jsc/bindings/FileReaderBindi
 `FileReaderEventMap`), `docs/runtime/web-apis.mdx`, `test/js/web/filereader/filereader.test.ts`
 (new), `test/integration/bun-types/fixture/globals.ts`.
 
+### 2026-10-31: `globalSetup` and `globalTeardown`, setup that runs once per `bun test` run
+
+`bun test` had no place for code that runs once per run: start the database, the container or the
+server that all test files share, and stop it when they are done. What the docs called "Global
+Setup and Teardown" is a `--preload` file with `beforeAll` and `afterAll`, and that is once per
+run only while all files share one global. With `--isolate` the preload is loaded again for every
+file, and with `--parallel` in every worker, where its hooks wrap every file
+(`docs/test/parallel.mdx`: "Preload-level `beforeAll`/`afterAll` hooks still wrap every file,
+since a worker never knows which file is its last"). With two test files and a preload that logs,
+`bun test --preload ./setup.ts` logs one setup and one teardown, and
+`bun test --isolate --preload ./setup.ts` logs two of each. Jest has `globalSetup` and
+`globalTeardown`, Vitest has `globalSetup`, Node.js has `--test-global-setup`, and Bun's guide for
+people who come from Jest ends with "Settings without an equivalent are not supported". Upstream
+knows the gap. oven-sh/bun#23066 (closed) reported that a preload's `beforeAll` runs once per test
+file, and a comment there from 2026-06-11 reports the same for `bun test --parallel --preload`.
+oven-sh/bun#44833 (open, Vitest compatibility) documents `inject()` as a function that always
+returns `undefined`, "because `bun test` has no `provide` option or global setup file". For
+`node:test`, oven-sh/bun#35404 did the `globalSetupPath` of `run()`. It was closed when it was
+folded into oven-sh/bun#35395, which is an open draft. Now:
+
+```toml
+# bunfig.toml
+[test]
+globalSetup = "./test/global-setup.ts"
+```
+
+```ts
+// test/global-setup.ts
+import { $ } from "bun";
+
+export default async function setup() {
+  await $`docker compose up --detach --wait`;
+  process.env.DATABASE_URL = "postgres://postgres:postgres@localhost:5432/test";
+
+  // once, after the last test file
+  return async function teardown() {
+    await $`docker compose down --volumes`;
+  };
+}
+```
+
+```sh
+bun test              # one setup, the test files, one teardown
+bun test --isolate    # the same
+bun test --parallel   # the same, and every worker has DATABASE_URL
+bun test --global-setup ./test/global-setup.ts --global-teardown ./test/global-teardown.ts
+```
+
+What a file can be:
+
+- Vitest's two shapes, with Vitest's rule for which function is the teardown: a default export
+  whose teardown is the function it returns, or, without a default export, exports named `setup`
+  and `teardown`, where a function that `setup` returns is the teardown only when none is
+  exported. Node's names for the two, `globalSetup` and `globalTeardown`, are read as well, so
+  the module that `run({ globalSetupPath })` takes is a setup file too.
+- Jest's: a default export (`module.exports = async () => {}` too), with the teardown in a file
+  of its own that `globalTeardown` names. The two run in one process, so
+  `globalThis.__MONGOD__` of the setup file is there in the teardown file, which is how Jest's
+  docs pass it.
+- Both keys take a path or an array. Setup files run in the order given. Their teardowns run in
+  reverse, and then the `globalTeardown` files in order. A path is resolved from the project root
+  like a test file on the command line, so `test/setup.ts` and `./test/setup.ts` are the same
+  file and `some-preset/setup` is a file of a package. The flags replace the keys, as
+  `--test-match` replaces `testMatch`. The functions get no arguments, so a setup of a Jest
+  preset that reads `globalConfig` needs a file that calls it with what it reads.
+
+What it promises:
+
+- Once, in every mode: one process, `--isolate`, `--parallel` (with and without `--no-isolate`),
+  `--shard`, `--rerun-each`, `--aot`. Nothing is set up when nothing runs: no test file matches,
+  a shard has no file, `--dry-run`, a type error under `--check`.
+- What the setup starts stays up until the teardown: a `Bun.serve` server, a child process, a
+  timer. Under `--isolate` that is the point, because Bun closes every socket, timer and child
+  process of the test process between two files.
+- What the setup does to `process.env` reaches every test file and every worker: a variable it
+  sets, changes or deletes. That is how Jest and Vitest suites hand a URL or a port to their
+  tests. `TZ` and the proxy variables take effect, as they do when a test file sets them, and a
+  `PATH` it extends finds its programs. Nothing else is shared: a global or a module of the
+  setup file is not the one a test file sees, in any mode.
+- A setup that throws fails the run before a test file is loaded, with exit code 1. What was set
+  up by then is torn down. The `globalTeardown` files do not run, as in Jest and Node.js: they
+  are the other half of a setup that completed.
+- A teardown that throws fails the run with exit code 1, also when every test passed and when a
+  test called `process.exit(0)`, and the other teardowns still run. An error that nothing
+  catches in the setup process while the tests run fails the run too, with a message of its own
+  (`an error was not caught in the global setup process while the tests ran`): it is printed,
+  the run goes on, and the teardown still happens. During the setup such an error fails the
+  setup. A teardown that ends with `process.exit(0)`, as one written for Jest may, has finished.
+- `bun test` waits for the teardown wherever it ends the run itself: at the end of the run, on
+  `--bail`, when a test calls `process.exit()` and when a signal stops the workers of
+  `--parallel`. Before it waits it closes what the test files left open, so a server of the
+  setup that waits for its clients to leave can close. Neither wait has a time limit, as in
+  Jest: a setup may pull images for minutes, and a limit on a teardown leaves behind what it
+  was about to remove.
+- When the test process is killed (Ctrl-C without `--parallel`, `kill -9`, a crash), nothing
+  waits, and on Linux and macOS the teardown runs all the same, on its own. That is more than
+  Jest and Vitest do, where the teardown is code of the runner's own process, and it is a best
+  effort: not with `--no-orphans`, not on Windows, and a run that is started right away can
+  overlap with it.
+- Ctrl-C and the other signals of a terminal go to both processes. The setup process ignores
+  SIGINT, SIGTERM and SIGHUP for as long as the run lasts and goes by the test process alone:
+  when that one ends, the teardown runs (also in the middle of a setup, for the files that had
+  completed), and when it handles the signal and goes on, what was set up stays. During the
+  teardown a signal ends the setup process.
+- `--watch`: every run has its setup and its teardown. A run that a file change interrupts is
+  torn down before the next one is set up, the next setup starts from the environment the first
+  one started from, and a change to a setup file starts a new run, also when the setup had
+  failed. After a setup that failed, a change to a test file does too.
+- `node:test`: `run()` starts a `bun test` per file, and those do not set up the `globalSetup`
+  of `bunfig.toml` once each. The run is the caller's, so `run({ globalSetupPath })` works now,
+  with Node's rules: the exports `globalSetup` and `globalTeardown` of the module, called once in
+  the process that called `run()`.
+
+Where it runs decided the design. The three candidates:
+
+- In the test process, before the first file. That is what Jest and Vitest do, and it does not
+  work here: between two files of `--isolate`, `swap_global_for_test_isolation` closes every
+  socket group, kills every child process and cancels every timer of the process, so a server
+  of the setup is gone after the first file. Without `--isolate` the setup would share its
+  global and its modules with the test files, and with `--parallel` it would not.
+- In the test process, with the files moved into a worker whenever a setup is configured. Then a
+  key in `bunfig.toml` changes where `bun test --inspect` attaches, what `process.exit()` in a
+  test does and whether the tests see a terminal.
+- In a process of its own. That is what this patch does. The setup is the same thing in every
+  mode, the test files run where they ran before, and a teardown that outlives the test process
+  comes for free. The price is one more `bun` process for a run that has a `globalSetup`, and
+  nothing for a run that has none.
+
+How it is built:
+
+- The host. Once the test files are known, `bun test` starts `bun -e` with
+  `global-setup-entry.ts`, a script that is embedded in the binary the way the entry of the
+  security scanner of `bun install` is. It imports the files, calls their functions, waits, and
+  runs the teardowns. Every part of how it is started is a decision:
+  - The flags of the run that decide how code is loaded (`--define`, `--loader`,
+    `--conditions`, `--tsconfig-override`, the JSX flags and the rest), which are the ones a
+    `--parallel` worker gets: `build_worker_argv` is split so that both take them from one
+    function. Each is one argument now (`--conditions=test`), because the host has no command
+    in front of them and `bun --conditions test -e ...` is a `bun test`.
+  - `--no-install`, because a test file installs nothing either, and the `--config` of the run,
+    because without it the host read `./bunfig.toml` when the run had named another file.
+  - `TZ=Etc/UTC` when the run has no `TZ`: the test files are in UTC then, and a setup that
+    seeds dates is in the same zone.
+  - Not `BUN_OPTIONS` and not the `BUN_INSPECT` variables, which are meant for the test
+    process. The debugger of an editor would otherwise get a second debuggee.
+  - The process group of `bun test`, so that a terminal can stop a setup that hangs.
+  - The script binds the globals it uses, so `--drop=console` of the run does not take the one
+    statement that prints why a setup failed, and it removes itself from `process.execArgv`, so
+    a child that a setup starts with `process.execArgv` runs its own program.
+- Who starts it. Only the process that owns the run: not a `--parallel` worker, not the process
+  that compiles for `--aot`, and not a file of `node:test`'s `run()`, which gets the hidden flag
+  `--test-run-child` (it is not in the `process.argv` or `process.execArgv` of the file, and a
+  `bun test` that the file starts itself is a run of its own again).
+- Two pipes. On its descriptor 3 the host reports: the setup is over, with what it did to
+  `process.env`, and later the teardown is over. Descriptor 4 carries one byte, which says that
+  the run is going to happen. The host is started before the file watcher and the type check of
+  `--check`, and set to work after them, so a type error sets nothing up. After that byte
+  nothing is written: `bun test` closes its end to ask for the teardown, and the kernel closes
+  it when `bun test` dies, which is why the teardown runs whatever happens to the test process.
+  The parent's ends are close-on-exec, so no child of a test holds the host up.
+- The waits are blocking reads, under one lock: before the setup has reported there is nothing
+  to run, and after the last file there is nothing left. So the patch adds no event-loop state
+  to the test process, and `--isolate` has nothing of it to sweep.
+- The exit. A teardown may wait for the test process: `net.Server#close` and the shutdown of a
+  database wait for their clients, and a test that left a socket open is one. The first version
+  waited with the VM alive and hung there, in every mode that runs files in the test process.
+  Now `ExitHandler` has a `before_process_exit` hook that `bun test` sets while a host is up.
+  With it `global_exit` runs the stop phase of the VM teardown first (step A of `teardown`, as
+  `Teardown::MainThreadStop`): script is forbidden and every server, socket and handle that the
+  files left open is closed natively. Then it waits for the global teardown, and lets it turn
+  an exit code of 0 into 1. That covers the end of a run, `--bail` and `process.exit()`. The
+  ways out that do not go through the VM (the abort of the coordinator, an error before a file
+  loads) are covered by a pre-exit callback, which runs ahead of the callback `--no-orphans`
+  kills the children of the process from.
+- The environment. The host takes a copy of `process.env` before the first file and reports the
+  difference. `bun test` applies it to the environment of its VM before a test file, a preload
+  or a worker exists, and then reads the time zone and the proxy variables of `--isolate` from
+  it again (the block of `exec` that did this is a function now).
+- `--watch` restarts with `execve`, from the watcher thread, with no hook that could wait. The
+  descriptors close, so the old host starts its teardown, and the next run is the same process
+  with the old host still its child. It waits for that child before its own setup. Which child
+  that is comes through the real environment, as the path of the `--changed` trigger file does
+  (`BUN_INTERNAL_TEST_GLOBAL_SETUP_PID`, set before the watcher thread exists). Every run
+  reads it, waits, and removes it before its own watcher thread starts, whether or not it has
+  a setup of its own. On Windows a restart is a new process, and this is not done there.
+- Signals. The end of the control pipe is the only thing that ends the run for the host. It
+  ignores SIGINT, SIGTERM and SIGHUP until then, and takes them as any process does during the
+  teardown. The first version started the teardown on a signal once the setup was over, which
+  tore down under a test process that had handled the signal, and was killed by Ctrl-C during
+  the setup with nothing torn down.
+- `run({ globalSetupPath })` follows `loadGlobalSetupModule` of oven-sh/bun#35404. It awaits
+  nothing when the option is not passed.
+
+A design review ran next to the first version, which is the host process as described and was
+pushed first so that it could not get lost. The review weighed the host process against five
+other designs (the two above, a second VM on a thread of the test process, a supervisor process
+in front of `bun test`, no change) and kept it. It then listed what the first version got wrong,
+and all but two of those are fixed here:
+
+- The files of `node:test`'s `run()` each started a host: two setups and two teardowns for two
+  files. Hence the owner rule, and `globalSetupPath`.
+- The hang described under "The exit", and `process.exit(0)` with a teardown that fails, which
+  exited with 0.
+- `bun test --check` with a type error ran the setup and the teardown around no test.
+- With `BUN_FEATURE_FLAG_NO_ORPHANS=1`, which bun's own CI sets on its sanitizer lanes,
+  `--bail`, `process.exit()` and the abort of the coordinator killed the host before it was
+  asked for the teardown, because the callback that kills the children ran first.
+- A run without a `globalSetup` took the lock of the host once. It takes nothing now.
+- Three tests were named for the wait at exit and could not fail without it: the host holds the
+  output pipes of the run, so the test that read them waited for the host in any case. They now
+  ask for what only a process that waited can do: print that the teardown failed, and exit
+  with 1.
+
+Not taken from the review, with the reason:
+
+- A callback before the restart of `--watch` that waits for the teardown, for Windows and for
+  `--no-orphans` on Linux, where the kernel ends the host with the thread that started it. It
+  was written and it deadlocks: the test process is still running its files then and cannot be
+  stopped from the watcher thread, so a teardown that waits for the clients of its server waits
+  for a process that waits for it (`setup, test connected, teardown-begin` and nothing more,
+  where the plain restart gives `teardown-end, setup, test connected`). So with `--no-orphans`
+  on Linux, a run that `--watch` restarts is not torn down, like one that is killed.
+- Writing the variables of the setup to the C environment of the test process too. Code that
+  reads it natively would then see them without `--parallel` as well: `NODE_EXTRA_CA_CERTS`,
+  the time zone of SQLite's `localtime`. Bun does not do that for an assignment to
+  `process.env` on POSIX either, the write races with the watcher thread once the setup runs
+  after the type check, and under `--watch` the variables would be in the environment of the
+  next run. The docs say what a test file sees instead.
+
+A second review then read the diff of that version and ran its own probes against the build. It
+kept the design again and raised 31 points about the details. These are fixed here, each with a
+test:
+
+- Ctrl-C during the setup killed the host, and nothing that was set up was torn down. A signal
+  while the tests ran started the teardown under a test process that had handled the signal and
+  went on. Hence the one rule for signals.
+- The host installed a package that a setup file imported and was not there, with `--no-install`
+  on the run too, and with `--config=ci.toml` it ran the preload of `./bunfig.toml`.
+- `bun test --conditions test` made the host a second `bun test`, which ran the test files with
+  no setup.
+- `--drop=console` removed the statement that prints why a setup failed. A child that a setup
+  started with `process.execArgv` was the entry script again and not its own program.
+- A setup that left a number in a `process.env` of its own (`{ ...process.env, PORT: 3000 }`)
+  crashed the host while it compared the environment, and nothing was torn down. A variable
+  that is not enumerable (`BUN_CONFIG_VERBOSE_FETCH`) never reached the test files.
+- Without `TZ` the setup ran in the zone of the machine and the test files in UTC. A setup that
+  set `TZ` to the empty string got a zone that depended on the mode.
+- An error that nothing caught while the tests ran was reported as "the global teardown
+  failed", and the same error during the setup passed the run.
+- A teardown that ends with `process.exit(0)` failed a run whose tests passed.
+- The rule for which function is the teardown was neither Jest's nor Vitest's: a returned
+  function replaced an exported `teardown`, and a `teardown` next to a default export ran.
+- When the host died in the middle of a run, the error did not say how. It names the exit code
+  or the signal now.
+- `bun test --watch` with a setup path that does not resolve waited for changes to no file. It
+  exits with 1, as a preload that does not resolve does. After a setup that failed, only the
+  setup file restarted the run.
+- The variable of the `--watch` hand-off stayed in the environment of a run that had no setup of
+  its own.
+- What the resolver logs about a setup path was printed after the first test file, or not at
+  all when the path did not resolve.
+- A setup path that contained the placeholder of the teardown list got that list spliced in.
+  The script has one placeholder now.
+- Untested until now: the proxy variables under `--isolate`, a report that takes more than one
+  read of the pipe, the `BUN_INSPECT` variables, `--aot`, a shard without files.
+
+Not taken from the second review, with the reason:
+
+- A time limit on the setup and teardown waits. A setup may pull images for minutes, and a
+  teardown that is cut off leaves behind what it was about to remove. Jest has no limit either.
+  A setup or a teardown that never finishes holds the run, and the docs say so.
+- A signal handler in `bun test` itself, so that Ctrl-C waits for the teardown without
+  `--parallel` as well. The run still ends at once there and the teardown runs on its own.
+- Ending the run when the host dies in the middle of it. The remaining files run, and fail by
+  themselves if they need what is gone.
+- Answering the debugger while the setup runs. The test process does not service its inspector
+  during the blocking wait, so a client that attaches during a long setup waits for it.
+- Watching the modules that a setup file imports. `--watch` has the setup and teardown files
+  only, because the test process never loads them.
+- The host as a hidden mode of `bun test` with a built-in module, in place of `bun -e`. The
+  faults that came from `bun -e` are fixed one by one above. What is left is that `Bun.main` of
+  a setup file is `[eval]` in the project root.
+- One table in `reload_process` for what a restart hands to the next image, in place of the
+  three `setenv` markers that `--watch` features keep (this one, `--changed`, the bake
+  plugins). That is a change to three features. What it would fix here: the variable still
+  names the host of a run that ended normally, so the next restart calls `waitpid` on a pid
+  that is gone, which returns at once unless the test process got a new child with that pid.
+
+The review also marked `ExitHandler::before_process_exit` as examined by none of its findings.
+With a host up, `global_exit` ran the whole VM teardown of `BUN_DESTRUCT_VM_ON_EXIT` in release
+builds, which bun's CI runs on sanitizer lanes only: after the stop phase it waits for the work
+that left the thread, parks the HTTP thread and destroys the JSC VM. By that code a run with a
+setup waits at exit for a job on another thread, which every other run abandons. Measured, a
+test process of 408 MB took 167 ms longer to exit. Only the stop phase is what the wait needs,
+so only that runs now, and the same process exits 24 ms later than without a setup.
+
+For whoever cherry-picks: the review's verdict is that the feature is wanted and that this
+commit is cut as the wrong unit for upstream. The hunk of `src/js/node/test.ts`
+(`loadGlobalSetupModule` and the two calls in `runFiles`) stands alone and belongs with
+oven-sh/bun#35395, which has its own `loadGlobalSetupModule` and its own marker for a `run()`
+child (`NODE_TEST_CONTEXT`), where this patch passes `--test-run-child`. oven-sh/bun#44833
+touches 13 of the 22 files of this patch, among them `test_command.rs` and `runner.rs`, where
+this patch turns the time zone block and the flag list of `build_worker_argv` into functions,
+and its `inject()` needs a `provide()` in an argument of the setup function, which this patch
+does not pass. oven-sh/bun#41935 forwards `--config` to
+the workers of `--parallel` and changes the same flag list. Three choices of this patch are a
+maintainer's to make: the teardown after a kill, a setup per run and not per session under
+`--watch`, and `--no-orphans` winning over the teardown when a run is killed or restarted.
+
+The tests are 95 cases in `test/cli/test/global-setup.test.ts`, and all of them fail on the
+commit before this one. Each of the core ones runs in three modes (one process, `--isolate`,
+`--parallel`): once per run, a server and a child process that stay up across three files, the
+environment (set, change, delete, `TZ`, `PATH`, a `process.env` that the setup replaces, a proxy,
+150 KB of variables), nothing else shared, a setup that throws, a teardown that throws. Then the
+shapes and which function is the teardown, the order of several files, the flags, a file of a
+package, `--define`, `--drop`, `--conditions test`, `--config`, no install, `process.execArgv`,
+`BUN_OPTIONS`, `BUN_INSPECT`, a run with an IPC channel, each error, `--shard`, `--rerun-each`,
+`--parallel=1`, `--no-isolate`, `--aot`, `--check` with and without a type error, a socket that
+a test leaves open against a server that closes once its clients are gone (at the end of a run,
+with `--isolate`, on `--bail`, on `process.exit()`), the waits with and without `--no-orphans`,
+`kill -9` of the test process during the tests and during the setup, a signal to the process
+group during the setup and during the tests, the `--watch` cases, and `run()` of `node:test`
+with and without `globalSetupPath`. The processes tell the test what happened through a local
+server, so no test waits for time to pass. The file passes with the environment of bun's
+sanitizer lanes too (`BUN_FEATURE_FLAG_NO_ORPHANS=1`, `BUN_DESTRUCT_VM_ON_EXIT=1`). Run by hand:
+Ctrl-C in a terminal with and without `--parallel` (once and twice), and a variable of 1 MB.
+`cargo check` passes for `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`.
+
+Not done, and known:
+
+- Windows and macOS are type-checked and not run. The pipes and the spawn follow the security
+  scanner, which runs there. On Windows the setup process ends with a test process that is
+  killed or that `--watch` restarts, so nothing is torn down then, and 13 of the 95 tests are
+  skipped there: the ones that kill, signal or restart, and the ones that need `sh` or a unix
+  socket.
+- Without `--parallel`, Ctrl-C ends the test process at once and the teardown runs on its own,
+  so the prompt is back before it is done and a run that is started right away can overlap with
+  it. With `--parallel` the coordinator waits.
+- Under `--watch` the test process lives on after a run, so a teardown that waits for something
+  a test file left open waits until the next change. A teardown that writes to a file that the
+  run watches starts a new run.
+- `--no-orphans` ends the host with a test process that is killed, and on Linux with one that
+  `--watch` restarts. Nothing is torn down then.
+- The functions get no arguments: not Jest's two configs, and not Vitest's `provide()` with
+  `inject()` on the other side.
+- `bun test --inspect` debugs the test process. Nothing attaches a debugger to the setup files.
+- The setup process shares the terminal or the pipes of the run, as every child with inherited
+  output does. What that does to the flags of a shared pipe was not looked at.
+- A variable that Bun reads when it starts (`NO_COLOR`, `NODE_ENV` for JSX) is read before the
+  setup in the test process and after it in a worker. A variable that is too large to pass to a
+  process (1 MB) reaches the test files of one process and fails the spawn of a worker.
+- `--changed` and `--last-failed` decide which files run before the setup is asked for. No test
+  runs them with a setup.
+- Node's `--test-global-setup` flag has no counterpart.
+
+What it costs, measured on release builds of the commit before this one and of this one:
+
+|                                                                   | without                              | with                        |
+| ----------------------------------------------------------------- | ------------------------------------ | --------------------------- |
+| binary (`size`): text                                             | 138,568,276 bytes                    | 138,594,925 bytes (+26,649) |
+| binary (`size`): data                                             | 118,488 bytes                        | 118,624 bytes (+136)        |
+| `bun test` of 4 files without a `globalSetup`, median of 40 pairs | 14.419 ms                            | 14.072 ms                   |
+| the same pairs in the other order                                 | 13.650 ms                            | 13.264 ms                   |
+| two runs of the same binary, for comparison                       | 13.216 ms                            | 13.123 ms                   |
+| this patch, without and with `--global-setup ./noop.ts`           | 12.9 ms                              | 29.5 ms (+16.5 ms)          |
+| the same two with `--parallel=4`                                  | 29.4 ms                              | 43.6 ms (+14.2 ms)          |
+| the same two with a test process of 408 MB                        | 444.3 ms                             | 468.7 ms (+24.4 ms)         |
+| peak memory of the host process (`VmHWM`, 5 runs)                 |                                      | 39.1 MB                     |
+| `TestOptions`, which every bun process has                        | 352 bytes                            | 400 bytes                   |
+| `DebugOptions`, which every bun process has                       |                                      | 16 bytes more               |
+| `ExitHandler`, which every VM has                                 | 3 bytes                              | 16 bytes                    |
+
+Of the 27 KB, 7,829 bytes are the embedded entry script and 12,448 bytes the twelve symbols of
+`GlobalSetup.rs`. A run without a `globalSetup` executes two more flag lookups, two more key
+lookups in a `[test]` section, one `getenv` (the hand-off variable of `--watch`) and one
+comparison in `exec`: no process, no pipe, no lock and no allocation. A process that is started
+with `--config` copies that path once. A `run()` of `node:test` without `globalSetupPath`
+awaits nothing more, and gives each file one more argument. System calls and instructions were
+not counted: this machine has no `strace`, `perf` or `valgrind`. The two binaries of a
+comparison were copied to fresh files right before it. The same bytes started 3.7 ms slower
+from a file that had been copied while a build was linking, which is ten times the difference
+that the first two rows could show.
+
+One fault of an earlier patch of this stack turned up on the way and is fixed in that patch:
+`Bun.Queue` (2026-10-06) read `Bun.randomUUIDv7` and `Bun.sleepSync` while it was being defined,
+which put those two keys before `Queue` in `Object.keys(Bun)` from the first read of `Bun.Queue`
+on. Upstream's test "reading process.env adds no property to Bun" compares the keys before and
+after, and has failed on the stack since oven-sh/bun#45631 added it. The module reads the two
+functions on first use now.
+
+Rebase notes: one day of upstream, five commits (the glob walker, hot fields of the checker, cold
+paths of lint). No conflicts, nothing dropped, 63 patches before this one. The debug build links.
+Upstream got five more commits while this patch was made, among them oven-sh/bun#47316, which
+changes 9,195 files. The stack is on 34cbc70fa1 and not on those yet.
+Of the stack's tests, the ones this patch could touch were run on it and pass: `parallel`,
+`isolation`, `bun-test`, `test-changed`, `test-last-failed`, `test-shard`, `test-randomize`,
+`retry-flag`, `rerun-each`, `pass-with-no-tests`, `parallel-startup-failure`,
+`path-ignore-patterns`, `concurrent-test-glob`, `node-test`, `queue`, `process` and the four
+vendored `test-runner-*` files that call `run()` or validate its options. One test of
+`parallel.test.ts` (a worker id per worker) races a 200 ms sleep against the start of a second
+worker and failed one run in four on the debug build. The patch changes nothing that it measures.
+One test of `process.test.js` expects a `node` of another version than this machine has. The
+source lints pass except for two tests that need more than their five seconds on the debug build
+and pass on a release build.
+
+Files: `src/runtime/cli/test/GlobalSetup.rs` and `global-setup-entry.ts` (new, with
+`global-setup-entry-globals.d.ts`), `src/runtime/cli/test_command.rs` (the two phases of the
+start, `apply_environment`), `src/jsc/VirtualMachine.rs` (`ExitHandler::before_process_exit`,
+`Teardown::MainThreadStop`),
+`src/runtime/cli/test/parallel/runner.rs` (`push_code_loading_argv`), `src/js/node/test.ts`
+(`globalSetupPath`, `--test-run-child`), `src/runtime/cli/Arguments.rs`,
+`src/options_types/context.rs`, `src/bunfig/bunfig.rs`, `src/bunfig/arguments.rs` (the path that
+`--config` named), `src/runtime/cli/mod.rs`,
+`docs/test/lifecycle.mdx`, `docs/test/configuration.mdx`, `docs/test/parallel.mdx`,
+`docs/runtime/bunfig.mdx`, `docs/runtime/nodejs-compat.mdx`,
+`docs/guides/test/migrate-from-jest.mdx`, `docs/snippets/cli/test.mdx`, `completions/bun.zsh`,
+`test/cli/test/global-setup.test.ts` (new). And `src/js/internal/queue.ts`, in the commit of
+`Bun.Queue`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

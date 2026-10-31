@@ -795,6 +795,10 @@ pub struct ExitHandler {
     /// `process.exit()`, a fatal error or the end of a `bun test` run, as opposed to the event loop running dry.
     /// See `VirtualMachine::exit_tears_down_napi_envs`.
     pub requested: bool,
+    /// `bun test` sets this while the process of its `globalSetup` is up. `global_exit` then
+    /// runs the stop phase of the VM teardown, so that the process has let go of what script
+    /// left open, and calls this with the exit code. It answers the code to exit with.
+    pub before_process_exit: Option<fn(u8) -> u8>,
 }
 
 impl ExitHandler {
@@ -2509,13 +2513,22 @@ impl VirtualMachine {
         // doing it causes like 50+ tests to break
         // self.event_loop().tick();
 
+        let before_process_exit = self.exit_handler.before_process_exit.take();
         if self.should_destruct_main_thread_on_exit() {
             // SAFETY: main-thread VM on the main thread; exit handlers have run.
             unsafe { Self::teardown(core::ptr::from_mut(self), Teardown::MainThreadExit) };
         } else {
+            if before_process_exit.is_some() {
+                // SAFETY: main-thread VM on the main thread; exit handlers have run.
+                unsafe { Self::teardown(core::ptr::from_mut(self), Teardown::MainThreadStop) };
+            }
             self.close_sqlite_databases_for_exit();
         }
-        bun_core::Global::exit(u32::from(self.exit_handler.exit_code))
+        let mut exit_code = self.exit_handler.exit_code;
+        if let Some(before_process_exit) = before_process_exit {
+            exit_code = before_process_exit(exit_code);
+        }
+        bun_core::Global::exit(u32::from(exit_code))
     }
 
     /// Ends this thread's VM, which is not the main thread's: its exit handlers,
@@ -2576,6 +2589,7 @@ impl VirtualMachine {
     /// Tear down this thread's VM: the one sequence both a finished worker
     /// thread and the exiting main thread (under `BUN_DESTRUCT_VM_ON_EXIT`) run.
     /// The exit handlers ran before this (`on_exit`); nothing below enters script.
+    /// [`Teardown::MainThreadStop`] ends after step A.
     ///
     ///  A. stop — script forbidden (microtasks/modules cleared, termination
     ///     requested), WebCore stop phase (child workers asked to terminate;
@@ -2641,6 +2655,9 @@ impl VirtualMachine {
             }
         }
         teardown_log!("teardown: stopped");
+        if matches!(kind, Teardown::MainThreadStop) {
+            return;
+        }
 
         // ---- B. release ------------------------------------------------------
         #[cfg(windows)]
@@ -2730,6 +2747,7 @@ impl VirtualMachine {
         match kind {
             Teardown::Worker => WebWorker__teardownJSCVM(vm.global()),
             Teardown::MainThreadExit => Zig__GlobalObject__destructOnExit(vm.global()),
+            Teardown::MainThreadStop => unreachable!("it returned after the stop phase"),
         }
         // Finalizers just closed the sockets only they owned; `us_socket_close`
         // queues onto `loop->data.closed_head`, normally freed on the next tick.
@@ -2908,6 +2926,11 @@ impl GraphContextStopAndFree {
 pub(crate) enum Teardown {
     Worker,
     MainThreadExit,
+    /// The exiting main thread, step A alone: script is forbidden and what it
+    /// left open is closed. For an exit that waits on another process first
+    /// (`ExitHandler::before_process_exit`), and leaves the rest to the exit
+    /// of the process as every other exit does.
+    MainThreadStop,
 }
 
 /// What one stop-phase sweep found (see `VirtualMachine::stop_phase_sweep`).

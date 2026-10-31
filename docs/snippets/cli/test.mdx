@@ -34,6 +34,16 @@ bun test <patterns>
   Set the random seed for test randomization
 </ParamField>
 
+<ParamField path="--global-setup" type="string">
+  Modules to run once before the first test file, in a process of their own. What their default export returns runs once
+  after the last test file. Repeatable. Replaces <code>globalSetup</code> in <code>bunfig.toml</code>
+</ParamField>
+
+<ParamField path="--global-teardown" type="string">
+  Modules to run once after the last test file. Repeatable. Replaces <code>globalTeardown</code> in{" "}
+  <code>bunfig.toml</code>
+</ParamField>
+
 <ParamField path="--bail" type="number">
   Exit the test suite after <code>NUMBER</code> failures. If you do not specify a number, it defaults to 1.
 </ParamField>
