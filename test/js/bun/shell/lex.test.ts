@@ -38,12 +38,14 @@ describe("lex shell", () => {
   });
 
   test("quoted_var", () => {
+    // A quoted word that is only variables ends in an empty quoted text: it is a word even when they are empty.
     const expected = [
       { "Text": "next" },
       { "Delimit": {} },
       { "Text": "dev" },
       { "Delimit": {} },
       { "Var": "PORT" },
+      { "DoubleQuotedText": "" },
       { "Eof": {} },
     ];
     const result = JSON.parse(lex`next dev "$PORT"`);
@@ -58,6 +60,7 @@ describe("lex shell", () => {
       { "Delimit": {} },
       { "Text": "foo" },
       { "Var": "PORT" },
+      { "DoubleQuotedText": "" },
       { "Eof": {} },
     ];
     const result = JSON.parse(lex`next dev foo"$PORT"`);
@@ -70,12 +73,56 @@ describe("lex shell", () => {
       { "Delimit": {} },
       { "Text": "foo" },
       { "Var": "NICE" },
+      { "DoubleQuotedText": "" },
       { "Text": "good" },
       { "DoubleQuotedText": "NICE" },
       { "Eof": {} },
     ];
     const result = JSON.parse(lex`echo foo"$NICE"good"NICE"`);
     expect(result).toEqual(expected);
+  });
+
+  test("quoted variables", () => {
+    const tokens = (script: string) => JSON.parse(lex`${{ raw: script }}`).slice(0, -1);
+    const empty = { "DoubleQuotedText": "" };
+    // Only variables between the quotes: the word ends in an empty quoted text.
+    expect(tokens(`"$A"`)).toEqual([{ "Var": "A" }, empty]);
+    expect(tokens(`"$A$B"`)).toEqual([{ "Var": "A" }, { "Var": "B" }, empty]);
+    expect(tokens(`"$1"`)).toEqual([{ "VarArgv": 1 }, empty]);
+    expect(tokens(`"$A""$B"`)).toEqual([{ "Var": "A" }, empty, { "Var": "B" }, empty]);
+    // Text between the quotes already makes it a word.
+    expect(tokens(`"$A "`)).toEqual([{ "Var": "A" }, { "DoubleQuotedText": " " }]);
+    expect(tokens(`"a$A"`)).toEqual([{ "DoubleQuotedText": "a" }, { "Var": "A" }]);
+    expect(tokens(`"$"`)).toEqual([{ "DoubleQuotedText": "$" }]);
+    // Not quoted, or quoted in a way that does not expand.
+    expect(tokens(`$A`)).toEqual([{ "Var": "A" }]);
+    expect(tokens(`'$A'`)).toEqual([{ "SingleQuotedText": "$A" }]);
+    // A quoted substitution is marked as such, and the word around it gets no extra token.
+    expect(tokens(`"$(true)"`)).toEqual([
+      { "CmdSubstBegin": {} },
+      { "CmdSubstQuoted": {} },
+      { "Text": "true" },
+      { "Delimit": {} },
+      { "CmdSubstEnd": {} },
+    ]);
+    expect(tokens(`"$A$(true)"`)).toEqual([
+      { "Var": "A" },
+      { "CmdSubstBegin": {} },
+      { "CmdSubstQuoted": {} },
+      { "Text": "true" },
+      { "Delimit": {} },
+      { "CmdSubstEnd": {} },
+    ]);
+    expect(tokens(`"$(echo "$A")"`)).toEqual([
+      { "CmdSubstBegin": {} },
+      { "CmdSubstQuoted": {} },
+      { "Text": "echo" },
+      { "Delimit": {} },
+      { "Var": "A" },
+      empty,
+      { "Delimit": {} },
+      { "CmdSubstEnd": {} },
+    ]);
   });
 
   test("semicolon", () => {
