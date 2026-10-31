@@ -8036,6 +8036,198 @@ start, `apply_environment`), `src/jsc/VirtualMachine.rs` (`ExitHandler::before_p
 `test/cli/test/global-setup.test.ts` (new). And `src/js/internal/queue.ts`, in the commit of
 `Bun.Queue`.
 
+### 2026-10-31: `"$VAR"` in Bun Shell is an argument, also when it is empty
+
+This is the feature of the run of 2026-10-24, which pushed its rebase and no feature. It is two
+commits: this one and, below it, `Reject an empty path operand in the shell builtins`, which it
+needs (see "The commit below").
+
+Bun Shell dropped a word that expands to nothing, and it did that to a word in double quotes too.
+POSIX keeps that word. `"$VAR"` is one argument, an empty one when the variable is empty or not
+set, and so is `"$(command)"` when the command prints nothing. bash and dash do that, and scripts
+are written for it. With the word gone, each of these ran a different command and reported no
+error:
+
+```sh
+[ -n "$CI" ] || bun run build      # ran `[ -n ]`, which is true, so no build
+[ -f "$CONFIG" ] && echo found     # ran `[ -f ]`, which is true, so "found"
+git commit -m "$MESSAGE" --amend   # -m took `--amend` as the message
+export "$NAME"                     # ran `export`, which prints every exported variable
+cd "$DIR" && rm -rf build          # ran `cd`, which goes to the home directory
+```
+
+A `package.json` script runs in Bun Shell on Windows and in `sh` elsewhere, so such a line did
+one thing on Linux and macOS and another on Windows. Upstream keeps the literal `""` and `''`
+since oven-sh/bun#27231, and a quoted substitution that prints only NUL bytes since
+oven-sh/bun#46021. Its branch `farm/e0c3d2d4/shell-brace-empty-argv`, which is not merged, does it
+for `"$(command)"`. Nothing upstream does it for `"$VAR"`. Now:
+
+```ts
+import { $ } from "bun";
+
+await $`EMPTY=; bun -e 'console.log(process.argv.length - 1)' -- "$EMPTY" "$UNSET" "$(true)"`; // 3
+await $`EMPTY=; bun -e 'console.log(process.argv.length - 1)' -- $EMPTY $UNSET $(true)`; // 0
+await $`[ -n "$UNSET" ] && echo set || echo "not set"`; // not set
+```
+
+How it is built:
+
+- Lexer. When a `"` closes a region that held nothing but variables (`"$A"`, `"$A$B"`, `"$1"`),
+  the lexer adds a `DoubleQuotedText` token of length zero. The parser already reads that token
+  as `SimpleAtom::QuotedEmpty`, which is how `""` became an argument in oven-sh/bun#27231. A
+  region with text or a substitution in it gets no token, because text makes the word and the
+  substitution has its own flag. The lexer keeps one index for it, `double_quote_start`.
+- Expansion. A quoted substitution marks its word as quoted whatever it printed. Until now it
+  did so only when the output had a NUL byte in it.
+- Command name. A word that expands to `""` where the command name goes fails with
+  `bun: command not found: ` and exit code 1, which is what Bun Shell does for any name it cannot
+  resolve. Until now the command was skipped with exit code 0, also for the literal `"" args`.
+  The last two points follow df0dbd61e8 and daa56265e0 of the branch named above.
+
+What changes for a script that was not broken. This is the list to read before a cherry-pick:
+
+- `"$UNSET" args` ran `args`. It fails now, as in bash and dash. `"" args`, and `${""} args` with
+  an empty string from JavaScript, ran nothing and exited 0. They fail too.
+- A command gets the empty operand it was written with. `cd "$UNSET"` stays where it is (it went
+  to the home directory). `ls "$UNSET"` fails (it listed the cwd). `cat "$UNSET"` fails (it read
+  stdin). `exit "$UNSET"` fails with `exit: numeric argument required` (it exited 0).
+- `export "$UNSET"` fails with `export: not a valid variable name: ""` and exit code 1. `export`
+  skipped an empty argument before, so the literal `export ""` fails now as well, and so does
+  `export =value`, which used to put a variable with no name into the environment. The other
+  arguments of the same `export` are still exported.
+- `~"$UNSET"` is one empty argument (it was no argument). It is not the home directory. Only the
+  literal `~""` is that, as before: `rm -rf ~"$SUBDIR"` must not come to mean `rm -rf ~`. The
+  same rule makes `~""$UNSET` and `~$UNSET""` an empty argument. They were the home directory.
+- In this stack, `for x in "$UNSET"` runs its body once with an empty `x`, as in bash. It did not
+  run it at all. No test of this commit uses `for`, because upstream does not have it.
+- `{"$A","$A"}` with an empty `A` is one empty argument (it was none, bash has two).
+- Not changed: `$VAR` without quotes is no argument and is never split. An assignment such as
+  `A="$B"` and a redirect to `"$UNSET"` (an error, `ambiguous redirect`) behave as before.
+
+The commit below. With this change `"$UNSET"` reaches the file builtins as `""`, and on the base
+they took `""` for the cwd: `touch ""` exited 0 and set the timestamps of the cwd, `mkdir -p ""`
+exited 0, `cp f ""` exited 0, and `rm ""` in `/tmp` refused to remove `/tmp`. On Windows it is
+worse, according to the branch it comes from: `rm -r ""` empties the cwd, because the emulation
+of `unlinkat` takes an empty name for the directory itself. Before this change, a script with
+`rm -rf "$UNSET"` ran `rm -rf` with nothing to remove. With this change and without the guard it
+would empty the cwd on Windows. The guard commit makes an empty operand fail with ENOENT in `rm`,
+`mv`, `cp`, `mkdir`, `touch` and in `shell_openat`, which `ls`, `cat`, `wc`, `head`, `tail`,
+`sort` and `uniq` open their files with. It is the diff of upstream's branch
+`farm/88acb2b4/shell-touch-mkdir-empty-operand`, which is not merged, applied to today's code,
+with its tests. `shell_statat` and `shell_lstatat` are newer than that branch and get the same
+check, because `ls` now asks them about an operand that did not open. It is a commit of its own so
+that it drops out of the stack cleanly when upstream merges that branch. Do not take the commit
+above it without it.
+
+Checked against bash 5.2: 61 one-line scripts (a word with `"$A"` in every position, next to
+text, other quotes, substitutions and braces, as a command name, and as the operand of `[`, `cd`,
+`export` and the file builtins) ran in both shells and were compared on stdout and on success or
+failure. Released bun 1.4.3 agrees with bash on 25 of them (two of its misses are `$(( ))`, which
+it does not have), this build on 57. The four that are left: `"$(printf ' ')"` is `""` (Bun Shell
+trims blanks at the end of a substitution, bash only newlines), `~"$UNSET"` and `~$UNSET` are `~`
+in bash, and `{"$A",y}` loses its empty alternative (upstream's branch above works on that one).
+
+Tests: 21 in `bunshell.test.ts` (the arguments a child process gets, the positional parameters of
+a `.bun.sh` file, `cd`, the tilde, `export`, `[` on POSIX, the empty command name), of which 18
+fail on the base and 3 are controls that pass on both. One new lexer test of 12 inputs, and three
+lexer snapshots get the new token. One `"$UNSET_VARIABLE"` row for each of `touch`, `mkdir -p`,
+`rm -r`, `rm -rf`, `mv`, `cp -R` and `ls`. The guard commit has 29 tests of its own in
+`test/js/bun/shell/commands/`: 17 fail on the base on Linux, and 12 cover what is only wrong on
+Windows and pass on both. On the debug build the shell tests pass: `bunshell.test.ts` 698,
+`commands/` with `lex`, `parse` and `17294` 475, the 24 other files of `test/js/bun/shell` 342,
+and `run-shell`, `shell-keepalive`, `22650` and `23316`. `leak.test.ts` and `shell-load.test.ts`
+were not run, they need more than their time limits on a debug build. The guard commit was also
+built and tested alone (`commands/` 378, `bunshell.test.ts` 677, no failure). The source lints
+pass except for the two tests that need more than five seconds on the debug build and pass on the
+release build.
+
+Not run on Windows, neither commit. `cargo check --workspace` for `x86_64-pc-windows-msvc`
+passes, and that is the only check of that target. That `rm -rf "$UNSET"` removes nothing was
+tested on Linux x64 only. Before a cherry-pick, run `rm -rf`, `rm -r`, `ls`, `mv`, `cp -R` and
+`touch` with `"$UNSET"` in a scratch directory on Windows. The system layer there still takes an
+empty name for the directory itself, so the guard is the only thing between `rm` and the cwd. In
+`rm` one of five unlink and rmdir calls has the check, and the other four are only reached after
+it. Upstream's branch `farm/37b725e0/windows-empty-path-enoent`, not merged, moves the check down
+into that layer.
+
+Not in this patch: `"${VAR}"`, `$?`, `$#` and `$@`, which Bun Shell does not expand at all
+(upstream's branch `farm/0377cbbb/shell-special-params` adds the first three). When they get
+tokens of their own, those tokens belong in the check at the closing quote, next to `Var` and
+`VarArgv`. A backslash and a newline in double quotes. The empty alternative at the front of a
+brace expansion, which is still dropped. Exit code 127 for a command that is not found (Bun Shell
+uses 1 for every name). An error message of the shell itself that a `2>` of the command does not
+redirect, which is true for every name that is not found.
+
+What the run of 2026-10-24 wrote first was a `test` and `[` builtin, so that `[ -f file ]` works
+in a `package.json` script on Windows. It was not shipped, for three reasons that a later try has
+to solve:
+
+- Its parser followed bash's `test.c` function by function and carried nine of its messages.
+  bash is GPL and bun is MIT. A builtin for this stack has to be written from the text of POSIX,
+  with a structure and messages of its own. The same question is open for
+  `src/shell_parser/arith.rs` (2026-10-27), which its commit calls a port of bash's `expr.c`,
+  and, far smaller, for the one message `[[: x: integer expression expected` (2026-08-20). A
+  person has to decide that before either is taken upstream.
+- Without the change of this entry it would have made things worse: `[ -n "$UNSET" ]` took the
+  wrong branch with no error, and on Windows it would have done that in place of "command not
+  found".
+- `[ "${A}" = x ]` and `[ $? -eq 0 ]` are common, and Bun Shell expands neither.
+
+What a second version should do: share one evaluator with `[[ ]]`. Check access with
+`faccessat` relative to the cwd of the shell, not of the process. Answer `-t` from what the
+shell's writer and reader hold, and say false when the output is captured. Refuse `-ef` when an
+inode is 0, as `cp` does. Read a trailing `-X` as a string. Keep `for`, `while`, `until` and
+`head` out of its tests and docs, because upstream does not have them. Put bash's exit codes in a
+table in the test file and not in a run of bash at test time. Say in the docs that `! [ ... ]`
+is not negation in Bun Shell. And say why it is a builtin on POSIX too: one answer on every
+platform, and no `[` that a package put into `node_modules/.bin`.
+
+Four things turned up on the way. `rm`, `mv` and the builtin `cat` stop at the first operand
+that fails, for any reason, where POSIX goes on with the others. For `rm` that is more than a
+missing line of output: on bun 1.4.3, `rm -r dir missing` left `dir` half deleted in 9 of 20 runs,
+whole in 6 and gone in 5, because the error of one operand stops the walk of the other wherever
+it is. That is upstream's code and a bug of its own, which this stack does not patch. So the
+other operands of a command with an empty one are processed by `mkdir`, `touch` and `cp`, and by
+`rm`, `mv` and `cat` as far as they would be next to any operand that does not exist. `rm -fv ""`
+prints an empty line, as `rm -fv missing` prints `missing`. Released bun 1.4.3 crashes on
+`cp -R "" out` with the builtin `cp`, which is the default on Windows (seen on Linux with the
+builtin switched on): it copies the cwd into itself until the process gets a segmentation fault.
+Upstream's main already refuses that copy. `export "$NAME"` with no such variable printed every
+exported variable to stdout, which in CI is the log. This patch ends that. And
+`test/js/bun/shell/file-io.test.ts` leaves `pwd_output.txt` and `append_output.txt` in the
+directory the tests run from.
+
+Rebase notes. This commit did no rebase of the stack. It went on top of the stack of the run of
+2026-10-31, 64 patches on oven-sh/bun 34cbc70fa1. That run amended its commit while these two
+were tested, so they were moved onto the amended commit, with no conflict, and the build and the
+shell tests were run again there. Upstream has five commits since that base, which wait for the
+next sync. What was never written down is the rebase of 2026-10-24: seven commits of upstream up
+to 179664ea89, among them oven-sh/bun#46540, which removed `#[bun_jsc::host_fn]`, `$rust`,
+`$newRustFunction` and the callback tables in favor of `*.bind.ts` schemas, oven-sh/bun#46641,
+which moved the sinks to schemas, and oven-sh/bun#46690, a WebKit upgrade. 14 of the 60 patches
+stopped the rebase, 2 more used an API that was gone, and none was dropped. Seven patches moved
+their native functions into schemas: `expect.poll()` (`dontCountAsAssertion` in
+`expect.bind.ts`), `addSnapshotSerializer`
+(`snapshot_serializer.bind.ts`, new), `--watch-path` (`watch_path.bind.ts`, new),
+`Bun.build({ watch })` (`buildForWatch` in `JSBundler.bind.ts`), `Bun.unescapeHTML()`
+(`unescape_html.bind.ts`, new), `eventLoopUtilization()` (`node_perf_hooks_binding.bind.ts`, new)
+and the async fake timers (four `*Async` rows and `FakeTimersInternals.bind.ts`, new). The other
+nine were small: the JSON reporter, the `append` option and `Bun.INI` followed a changed
+signature, and the rest were lines next to lines (the imports of `Bun.semver`, `BunObject.cpp`
+for CSV and msgpack, the subspaces of Web Storage, the types table for `node:sea`). The stack
+built on the first try, and the tests of the ported patches passed.
+
+Files: `src/shell_parser/parse.rs` (`double_quote_start`, the token at the closing quote,
+`Atom::has_expansion`), `src/runtime/shell/states/Expansion.rs` (the quoted substitution, the
+tilde), `src/runtime/shell/states/Cmd.rs` (the empty command name),
+`src/runtime/shell/builtin/export.rs`, `docs/runtime/shell.mdx`,
+`test/js/bun/shell/bunshell.test.ts`, `test/js/bun/shell/lex.test.ts`, and one row each in the six
+test files of the guard. The guard commit: `src/runtime/shell/interpreter.rs`
+(`reject_empty_path`, `shell_openat`, `shell_statat`, `shell_lstatat`),
+`src/runtime/shell/builtin/rm.rs`, `mv.rs`, `cp.rs`, `mkdir.rs`, `touch.rs`, and
+`test/js/bun/shell/commands/rm.test.ts`, `mv.test.ts`, `cp.test.ts`, `mkdir.test.ts`,
+`touch.test.ts`, `ls.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

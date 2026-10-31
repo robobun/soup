@@ -289,7 +289,7 @@ describe.concurrent("bunshell ls", () => {
 
     // On Windows the shell's openat emulation used to resolve an empty operand
     // to the cwd itself, so `ls ""` listed the cwd and exited 0.
-    test.each(['ls ""', 'ls -R ""'])("%s fails with ENOENT", async cmd => {
+    test.each(['ls ""', 'ls -R ""', 'ls "$UNSET_VARIABLE"'])("%s fails with ENOENT", async cmd => {
       await TestBuilder.command`${{ raw: cmd }}`
         .file("a", "")
         .exitCode(1)

@@ -253,9 +253,8 @@ impl Expansion {
                         me.current_out.splice(0..0, home.slice().iter().copied());
                     }
                     Some(_) => me.current_out.insert(0, b'~'),
-                    // `~""` expands to $HOME,
-                    // but `~$unset` expands to nothing (word is dropped).
-                    None if me.has_quoted_empty => {
+                    // Only a literal `~""` is $HOME. `~$unset` is no word and `~"$unset"` is an empty word.
+                    None if me.has_quoted_empty && !atom.has_expansion() => {
                         me.current_out.extend_from_slice(home.slice());
                     }
                     None => {}
@@ -683,8 +682,8 @@ impl Expansion {
                 }
                 let start = me.current_out.len();
                 me.current_out.extend_from_slice(&stdout[..hi]);
-                // A quoted substitution that printed only NUL bytes expands to one empty word.
-                if had_nul && me.cmd_subst_quoted {
+                // A quoted substitution is one word, also when it printed nothing.
+                if me.cmd_subst_quoted {
                     me.has_quoted_empty = true;
                 }
                 if me.arith {

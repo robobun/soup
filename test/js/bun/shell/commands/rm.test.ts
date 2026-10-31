@@ -499,6 +499,8 @@ describe.concurrent("rm with an empty operand", () => {
     ['rm -d ""', { stdout: "", stderr: ENOENT, exitCode: 1 }],
     ['rm -f ""', { stdout: "", stderr: "", exitCode: 0 }],
     ['rm -rf ""', { stdout: "", stderr: "", exitCode: 0 }],
+    ['rm -r "$UNSET_VARIABLE"', { stdout: "", stderr: ENOENT, exitCode: 1 }],
+    ['rm -rf "$UNSET_VARIABLE"', { stdout: "", stderr: "", exitCode: 0 }],
   ])("%s removes nothing", async (command, expected) => {
     using dir = tempDir("rm-empty-operand", files);
 

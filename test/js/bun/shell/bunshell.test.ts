@@ -745,6 +745,112 @@ describe("bunshell", () => {
     TestBuilder.command`FOO="" $FOO`.runAsTest("empty var");
   });
 
+  describe("a quoted expansion is one argument, also when it is empty", () => {
+    const printArgv = `console.log(JSON.stringify(process.argv.slice(2)))`;
+    const argv = (expected: string[]) => (out: string) => expect(JSON.parse(out)).toEqual(expected);
+
+    TestBuilder.command`A=; B=; ${BUN} run ./argv.ts x "$A" y "$UNSET_VARIABLE" z "$A$B" w`
+      .ensureTempDir()
+      .file("argv.ts", printArgv)
+      .stdout(argv(["x", "", "y", "", "z", "", "w"]))
+      .runAsTest("a variable that is empty or not set");
+
+    TestBuilder.command`A=; ${BUN} run ./argv.ts x "$(true)" y "$(echo)" z "$A$(true)" w`
+      .ensureTempDir()
+      .file("argv.ts", printArgv)
+      .stdout(argv(["x", "", "y", "", "z", "", "w"]))
+      .runAsTest("a command substitution that prints nothing");
+
+    TestBuilder.command`A=; ${BUN} run ./argv.ts x $A y $UNSET_VARIABLE z $(true) w`
+      .ensureTempDir()
+      .file("argv.ts", printArgv)
+      .stdout(argv(["x", "y", "z", "w"]))
+      .runAsTest("without the quotes it is still no argument");
+
+    TestBuilder.command`A=; B=b; ${BUN} run ./argv.ts "$A"x x"$A" "$A$B" "$A $A" "$B" "$(echo b)" "$A"'' "$A""$A"`
+      .ensureTempDir()
+      .file("argv.ts", printArgv)
+      .stdout(argv(["x", "x", "b", " ", "b", "b", "", ""]))
+      .runAsTest("next to text, to other variables and to other quotes");
+
+    // echo joins its arguments with one space, so an empty argument shows as two spaces.
+    TestBuilder.command`${BUN} run ./positional.bun.sh; ${BUN} run ./positional.bun.sh a`
+      .ensureTempDir()
+      .file("positional.bun.sh", `echo x "$1" y $1 z "$2" w\n`)
+      .stdout("x  y z  w\nx a y a z  w\n")
+      .runAsTest("a positional parameter that is not set");
+
+    TestBuilder.command`A=; B="$A"; C="$A$(true)"; echo "[$B]" "[$C]"`.stdout("[] []\n").runAsTest("in an assignment");
+
+    TestBuilder.command`cd "$UNSET_VARIABLE" && pwd`
+      .ensureTempDir()
+      .stdout("$TEMP_DIR\n")
+      .runAsTest("cd gets the empty operand and does not go to the home directory");
+
+    TestBuilder.command`echo x ~"$UNSET_VARIABLE" y ~"$(true)" z ~$UNSET_VARIABLE w`
+      .stdout("x  y  z w\n")
+      .runAsTest("after a tilde it is an empty argument and not the home directory");
+
+    TestBuilder.command`export A=1 "$UNSET_VARIABLE" B=2 && echo not reached; echo "$A$B"; export =3 || echo failed`
+      .stdout("12\nfailed\n")
+      .stderr('export: not a valid variable name: ""\nexport: not a valid variable name: "=3"\n')
+      .runAsTest("export fails on the empty name and still exports the others");
+
+    // `[` is a program on POSIX. Windows has none.
+    describe.skipIf(isWindows)("as the operand of test(1)", () => {
+      TestBuilder.command`A=; [ -n "$A" ] && echo "not empty" || echo empty`
+        .stdout("empty\n")
+        .runAsTest("-n is false for an empty variable");
+
+      TestBuilder.command`A=; [ "$A" = x ] && echo equal || echo different`
+        .stdout("different\n")
+        .runAsTest("a comparison keeps its left side");
+
+      TestBuilder.command`[ -f "$UNSET_VARIABLE" ] && echo "a file" || echo "no file"`
+        .stdout("no file\n")
+        .runAsTest("-f is false for a variable that is not set");
+    });
+  });
+
+  describe("an empty word is not a command", () => {
+    const NOT_FOUND = "bun: command not found: \n";
+    const run = async (script: string) => {
+      const { stdout, stderr, exitCode } = await $`${{ raw: script }}`.nothrow().quiet();
+      return { stdout: stdout.toString(), stderr: stderr.toString(), exitCode };
+    };
+
+    test.each([`""`, `''`, `"$UNSET_VARIABLE"`, `"$(true)"`, `"" echo hi`, `"$UNSET_VARIABLE" echo hi`])(
+      "%s fails",
+      async script => {
+        expect(await run(script)).toEqual({ stdout: "", stderr: NOT_FOUND, exitCode: 1 });
+      },
+    );
+
+    test("an interpolated empty string fails", async () => {
+      const { stdout, stderr, exitCode } = await $`${""} echo hi`.nothrow().quiet();
+      expect({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode }).toEqual({
+        stdout: "",
+        stderr: NOT_FOUND,
+        exitCode: 1,
+      });
+    });
+
+    test("the next command still runs", async () => {
+      expect(await run(`"$UNSET_VARIABLE" || echo fallback`)).toEqual({
+        stdout: "fallback\n",
+        stderr: NOT_FOUND,
+        exitCode: 0,
+      });
+    });
+
+    test("an expansion without quotes is no word, and the command is the next word", async () => {
+      expect(await run(`$UNSET_VARIABLE echo hi`)).toEqual({ stdout: "hi\n", stderr: "", exitCode: 0 });
+      expect(await run(`$UNSET_VARIABLE`)).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+      expect(await run(`$(true)`)).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+      expect(await run(`$(false)`)).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+    });
+  });
+
   describe("tilde_expansion", () => {
     describe("with paths", async () => {
       TestBuilder.command`echo ~/Documents`.stdout(`${process.env.HOME}/Documents\n`).runAsTest("normal");
