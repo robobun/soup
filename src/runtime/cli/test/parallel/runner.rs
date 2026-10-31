@@ -130,7 +130,7 @@ pub(crate) fn run_as_coordinator(
         spawn: SpawnContext {
             vm,
             cwd: FileSystem::get().top_level_dir(),
-            argv: CStrList::from_unterminated(&mut argv.0),
+            argv: CStrList::from_unterminated(&mut argv.args),
             envps: &envps,
             compiled_program: crate::cli::run_compiled::graph_descriptor(),
             #[cfg(windows)]
@@ -247,11 +247,25 @@ fn make_schedule(
 
 /// The strings live in the CLI arena.
 #[derive(Default)]
-struct Argv(Vec<Option<CStrRef<'static>>>);
+pub(crate) struct Argv {
+    pub(crate) args: Vec<Option<CStrRef<'static>>>,
+    /// See [`Argv::joined`].
+    joined: bool,
+}
 
 impl Argv {
-    fn push(&mut self, arg: &[u8]) {
-        self.0.push(Some(crate::cli::cli_dupe_z(arg)));
+    /// An option and its value are one argument, `name=value`. For a command line with no
+    /// command in front of its options, where a value that is an argument of its own would be
+    /// read as one: `--conditions test` would make it a `bun test`.
+    pub(crate) fn joined() -> Self {
+        Self {
+            args: Vec::new(),
+            joined: true,
+        }
+    }
+
+    pub(crate) fn push(&mut self, arg: &[u8]) {
+        self.args.push(Some(crate::cli::cli_dupe_z(arg)));
     }
 
     fn flag(&mut self, name: &str, is_set: bool) {
@@ -270,6 +284,10 @@ impl Argv {
     /// `name value`, for each of `values`
     fn pairs<'v>(&mut self, name: &str, values: impl IntoIterator<Item = &'v [u8]>) {
         for value in values {
+            if self.joined {
+                self.push(&[name.as_bytes(), b"=", value].concat());
+                continue;
+            }
             self.push(name.as_bytes());
             self.push(value);
         }
@@ -286,12 +304,8 @@ impl Argv {
 /// `--pass-with-no-tests`, `--parallel` itself — are intentionally not
 /// forwarded.
 fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Argv> {
-    use bun_core::CodeGenerationFromStrings as CodeGeneration;
-    let (opts, args, runtime) = (&ctx.test_options, &ctx.args, &ctx.runtime_options);
+    let (opts, runtime) = (&ctx.test_options, &ctx.runtime_options);
     let unless_zero = |count: u32| (count > 0).then_some(count);
-    fn unless_empty(value: &[u8]) -> Option<&[u8]> {
-        (!value.is_empty()).then_some(value)
-    }
 
     let mut argv = Argv::default();
     let exe = bun_core::self_exe_path().map_err(|_| crate::Error::SelfExePathFailed)?;
@@ -334,6 +348,34 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Argv> {
         argv.pairs("--heap-prof-dir", unless_empty(runtime.heap_prof.dir));
     }
     argv.pairs("--preload", ctx.preloads.iter().map(|it| &**it));
+    push_code_loading_argv(ctx, &mut argv);
+    argv.flag("--aot-checked=-", crate::cli::run_compiled::is_checked());
+    if let Some(flag) = crate::cli::run_compiled::graph_flag_of_test_worker() {
+        argv.push(&flag);
+    }
+    argv.flag("--coverage", opts.coverage.enabled);
+    if opts.coverage.enabled {
+        // `coverageSkipTestFiles` asks a worker which of the files it loads are tests.
+        // It reads `testMatch` from bunfig.toml itself.
+        for pattern in &opts.test_match_flag {
+            argv.option("--test-match", Some(BStr::new(pattern)));
+        }
+    }
+    argv.option("--environment", opts.environment.map(|it| it.name()));
+    argv.option("--globals", opts.globals.map(|it| it.name()));
+    // Each worker reads `include` and `exclude` from bunfig.toml itself.
+    argv.flag("--react-compiler", opts.react_compiler.is_some());
+    Ok(argv)
+}
+
+/// The flags that decide how code is resolved, transpiled and run, as this
+/// process got them from its command line and its bunfig.toml. A process that
+/// runs code on behalf of this one gets them: a worker, and the host of
+/// `globalSetup`.
+pub(crate) fn push_code_loading_argv(ctx: &Command::ContextData, argv: &mut Argv) {
+    use bun_core::CodeGenerationFromStrings as CodeGeneration;
+    let (args, runtime) = (&ctx.args, &ctx.runtime_options);
+
     if let Some(define) = &args.define {
         debug_assert_eq!(define.keys.len(), define.values.len());
         for (key, value) in define.keys.iter().zip(&define.values) {
@@ -361,10 +403,6 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Argv> {
         argv.pairs(name, values.iter().map(|it| &**it));
     }
     argv.flag("--preserve-symlinks", args.preserve_symlinks == Some(true));
-    argv.flag("--aot-checked=-", crate::cli::run_compiled::is_checked());
-    if let Some(flag) = crate::cli::run_compiled::graph_flag_of_test_worker() {
-        argv.push(&flag);
-    }
     argv.flag("--smol", runtime.smol);
     if let Some(file) = crate::cli::Bun__Node__LocalStorageFile.get() {
         argv.push(&[b"--localstorage-file=", &**file].concat());
@@ -402,19 +440,10 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Argv> {
         argv.option("--jsx-runtime", Some(jsx_runtime_tag_name(jsx.runtime)));
         argv.flag("--jsx-side-effects", jsx.side_effects);
     }
-    argv.flag("--coverage", opts.coverage.enabled);
-    if opts.coverage.enabled {
-        // `coverageSkipTestFiles` asks a worker which of the files it loads are tests.
-        // It reads `testMatch` from bunfig.toml itself.
-        for pattern in &opts.test_match_flag {
-            argv.option("--test-match", Some(BStr::new(pattern)));
-        }
-    }
-    argv.option("--environment", opts.environment.map(|it| it.name()));
-    argv.option("--globals", opts.globals.map(|it| it.name()));
-    // Each worker reads `include` and `exclude` from bunfig.toml itself.
-    argv.flag("--react-compiler", opts.react_compiler.is_some());
-    Ok(argv)
+}
+
+fn unless_empty(value: &[u8]) -> Option<&[u8]> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// Local shim for `@tagName(jsx.runtime)`.
