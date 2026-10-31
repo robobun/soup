@@ -4,7 +4,8 @@ use crate::node::PathLike;
 use crate::shell::builtin::{Builtin, BuiltinState, IoKind, Kind};
 use crate::shell::interpreter::{
     EventLoopHandle, FlagParser, Interpreter, NodeId, OutputSrc, OutputTask, OutputTaskVTable,
-    ParseFlagResult, ShellTask, parse_flags, shell_join_path, shell_resolve_operand,
+    ParseFlagResult, ShellTask, parse_flags, reject_empty_path, shell_join_path,
+    shell_resolve_operand,
 };
 use crate::shell::io_writer::{ChildPtr, WriterTag};
 use crate::shell::yield_::Yield;
@@ -699,6 +700,11 @@ impl ShellCpTask {
     /// (<https://man7.org/linux/man-pages/man1/cp.1p.html>), then hands off to
     /// the node:fs async cp implementation.
     fn run_from_thread_pool_impl(&mut self, poster: &bun_jsc::ConcurrentPoster) -> Check {
+        if let Err(e) = reject_empty_path(&self.src, bun_sys::Tag::copyfile)
+            .and_then(|()| reject_empty_path(&self.tgt, bun_sys::Tag::copyfile))
+        {
+            return Check::Fail(Box::new(ShellErr::new_sys(&e)));
+        }
         // We have to give an absolute path to our cp implementation for it to
         // work with cwd.
         let src = match shell_resolve_operand(bun_sys::Tag::copyfile, &self.cwd_path, &self.src) {

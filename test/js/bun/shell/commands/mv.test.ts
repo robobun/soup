@@ -66,6 +66,45 @@ describe("mv", async () => {
     .stderr("mv: a: Not a directory\n")
     .runAsTest("move dir -> file fails");
 
+  // On Windows the fd-relative open and rename resolved an empty operand to the cwd
+  // itself: `mv a ""` moved a into the cwd and exited 0, `mv "" b` tried to rename the cwd.
+  describe("empty operand", () => {
+    TestBuilder.command`mv a ""`
+      .ensureTempDir()
+      .file("a", "A\n")
+      .exitCode(2 /* ENOENT */)
+      .stderr("mv: No such file or directory\n")
+      .fileEquals("a", "A\n")
+      .runAsTest("as the destination fails");
+
+    TestBuilder.command`mv "" b`
+      .ensureTempDir()
+      .file("a", "A\n")
+      .exitCode(2 /* ENOENT */)
+      .stderr("mv: No such file or directory\n")
+      .fileEquals("a", "A\n")
+      .doesNotExist("b")
+      .runAsTest("as the source fails");
+
+    TestBuilder.command`mkdir d; mv "" d`
+      .ensureTempDir()
+      .file("a", "A\n")
+      .exitCode(2 /* ENOENT */)
+      .stderr("mv: d: No such file or directory\n")
+      .fileEquals("a", "A\n")
+      .runAsTest("as a source moved into a directory fails");
+
+    TestBuilder.command`mv a b ""`
+      .ensureTempDir()
+      .file("a", "A\n")
+      .file("b", "B\n")
+      .exitCode(1)
+      .stderr("mv: : No such file or directory\n")
+      .fileEquals("a", "A\n")
+      .fileEquals("b", "B\n")
+      .runAsTest("as the directory for several sources fails");
+  });
+
   test("-n does not overwrite an existing destination", async () => {
     using dir = tempDir("mv-n", { a: "new a", b: "new b", c: "new c", dst: "old", d: { a: "old a" } });
     const read = (name: string) => readFileSync(join(String(dir), name), "utf8");
