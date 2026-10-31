@@ -109,6 +109,9 @@ fn load_bunfig(
     // Set this even if the read fails. Otherwise the later stages of `bun run` that check the flag
     // would try to load the file again and print the warning twice.
     ctx.debug.loaded_bunfig = true;
+    if file == ConfigFile::Named {
+        ctx.debug.named_bunfig = Some(Box::from(config_path.as_bytes()));
+    }
     let source =
         match bun_ast::to_source(config_path, bun_ast::ToSourceOptions { convert_bom: true }) {
             Ok(s) => s,

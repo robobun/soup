@@ -5,6 +5,7 @@ use crate::cli::run_compiled;
 use crate::cli::test::changed_files_filter as ChangedFilesFilter;
 use crate::cli::test::coverage_html;
 use crate::cli::test::coverage_include;
+use crate::cli::test::global_setup;
 use crate::cli::test::json_reporter::JsonReporter;
 use crate::cli::test::last_failed::LastFailed;
 use crate::cli::test::parallel_runner as ParallelRunner;
@@ -2881,6 +2882,10 @@ impl core::fmt::Display for QuotedPatterns<'_> {
     }
 }
 
+/// The time zone of the test files when `TZ` is not set. It is "Etc/UTC" and
+/// not "UTC" so that there is no normalization difference.
+pub(crate) const DEFAULT_TIME_ZONE: &[u8] = b"Etc/UTC";
+
 pub(crate) struct TestCommand;
 
 impl TestCommand {
@@ -3167,27 +3172,8 @@ impl TestCommand {
             vm.global().vm().enable_control_flow_profiler();
         }
 
-        // For tests, we default to UTC time zone
-        // unless the user inputs TZ="", in which case we use local time zone
-        let mut tz_name: &[u8] =
-            // We use the string "Etc/UTC" instead of "UTC" so there is no normalization difference.
-            b"Etc/UTC";
-
-        // SAFETY: `vm.transpiler.env` is the process-lifetime DotEnv loader pointer.
-        if let Some(tz) = unsafe { (*vm.transpiler.env).get(b"TZ") } {
-            tz_name = tz;
-        }
-
-        if !tz_name.is_empty() {
-            _ = vm
-                .global()
-                .set_time_zone(&EncodedSlice::from_bytes(tz_name));
-        }
-        vm.test_isolation_state.time_zone = Some(Box::from(tz_name));
+        Self::apply_environment(vm);
         if vm.test_isolation_enabled {
-            vm.test_isolation_state.proxy_env = Some(
-                bun_jsc::rare_data::ProxyEnvSnapshot::capture(&vm.env_loader().map),
-            );
             vm.test_isolation_state.synthetic_allocation_limit =
                 Some(bun_jsc::virtual_machine::synthetic_allocation_limit());
         }
@@ -3487,6 +3473,22 @@ impl TestCommand {
             }
         }
 
+        // A restart of `--watch` can leave the setup process of the run
+        // before behind, in the middle of its teardown.
+        #[cfg(unix)]
+        global_setup::wait_for_previous_host(vm);
+
+        // Once per run, and only when something is going to run. The process
+        // that runs the setup starts before the watcher does (see
+        // `global_setup::spawn`), and the setup itself once nothing can keep
+        // the files from running any more.
+        let runs_global_setup = !test_files.is_empty() && !dry_run && global_setup::owns_run(ctx);
+        let global_setup_spawned = runs_global_setup && global_setup::spawn(ctx, vm);
+        if runs_global_setup && !global_setup_spawned {
+            // The reason is printed. Nothing that `--watch` watches can make it go away.
+            Global::exit(1);
+        }
+
         // Normally the watcher is only enabled when there are test files to
         // run; `bun test --watch` with nothing matching should still exit.
         // With --changed we always want to keep watching as long as any test
@@ -3533,6 +3535,7 @@ impl TestCommand {
                 _ => {}
             }
             vm.add_env_files_to_watcher_if_needed();
+            global_setup::watch_files(vm);
         }
 
         if run_compiled::is_requested(ctx) && !test_files.is_empty() {
@@ -3562,12 +3565,28 @@ impl TestCommand {
             let paths = test_files.iter().map(|path| EntryPoint::file(path));
             !check_before(&paths.collect::<Vec<_>>(), watching(vm))
         };
-        if has_type_errors {
-            // No test is run.
+        let global_setup_failed =
+            global_setup_spawned && !has_type_errors && !global_setup::run(vm);
+        if has_type_errors || global_setup_failed {
+            // No test is run. What the setup did start is torn down, and a
+            // setup that was not asked for yet ends without a word.
+            if global_setup_failed {
+                // No test file is loaded, so `--watch` has none of them yet.
+                for path in test_files.iter() {
+                    vm.add_to_watcher_if_needed(path);
+                }
+            }
+            if global_setup_spawned {
+                global_setup::finish_now(vm);
+            }
             if !vm.is_watcher_enabled() {
                 Global::exit(1);
             }
             vm.run_with_api_lock_mut(Self::run_event_loop_for_watch);
+        }
+        if global_setup_spawned {
+            // The setup may have changed the time zone or a proxy.
+            Self::apply_environment(vm);
         }
 
         let mut coverage_options: CodeCoverageOptions = ctx.test_options.coverage.clone();
@@ -4067,6 +4086,11 @@ impl TestCommand {
         reporter.write_last_failed_if_needed();
 
         if vm.hot_reload == jsc::virtual_machine::HotReload::Watch {
+            // The process goes on, so nothing else ends the run. When it
+            // exits, `global_exit` sees to the teardown and to the exit code.
+            if global_setup_spawned {
+                global_setup::finish_now(vm);
+            }
             vm.run_with_api_lock_mut(Self::run_event_loop_for_watch);
         }
         let summary = reporter.summary();
@@ -4105,6 +4129,33 @@ impl TestCommand {
         drop(all_test_files);
         vm.run_with_api_lock_mut(|vm| vm.global_exit());
         Ok(())
+    }
+
+    /// What the test command takes from the environment of `vm` for the test
+    /// files: the time zone, and the proxy variables that `--isolate` gives
+    /// back to every file. Runs again when the global setup has changed the
+    /// environment.
+    fn apply_environment(vm: &mut VirtualMachine) {
+        // For tests, we default to UTC time zone
+        // unless the user inputs TZ="", in which case we use local time zone
+        let mut tz_name: &[u8] = DEFAULT_TIME_ZONE;
+
+        // SAFETY: `vm.transpiler.env` is the process-lifetime DotEnv loader pointer.
+        if let Some(tz) = unsafe { (*vm.transpiler.env).get(b"TZ") } {
+            tz_name = tz;
+        }
+
+        // An empty name takes the override away. The second time there is
+        // one to take away: the default of the first time.
+        _ = vm
+            .global()
+            .set_time_zone(&EncodedSlice::from_bytes(tz_name));
+        vm.test_isolation_state.time_zone = Some(Box::from(tz_name));
+        if vm.test_isolation_enabled {
+            vm.test_isolation_state.proxy_env = Some(
+                bun_jsc::rare_data::ProxyEnvSnapshot::capture(&vm.env_loader().map),
+            );
+        }
     }
 
     fn run_event_loop_for_watch(vm: &mut VirtualMachine) {
