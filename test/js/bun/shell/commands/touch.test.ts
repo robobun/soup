@@ -73,6 +73,7 @@ describe.concurrent("touch with an empty operand", () => {
   test.each([
     ['touch ""', () => $`touch ""`],
     ['touch ${""}', () => $`touch ${""}`],
+    ['touch "$UNSET_VARIABLE"', () => $`touch "$UNSET_VARIABLE"`],
   ])("%s fails and leaves the cwd as it is", async (_name, command) => {
     using dir = tempDir("touch-empty", {});
     const cwd = String(dir);

@@ -722,6 +722,20 @@ pub mod ast {
                 Atom::Compound(c) => c.brace_expansion_hint,
             }
         }
+
+        /// Part of the word is the value of a variable or the output of a command.
+        pub fn has_expansion(&self) -> bool {
+            let expands = |atom: &SimpleAtom| {
+                matches!(
+                    atom,
+                    SimpleAtom::Var(_) | SimpleAtom::VarArgv(_) | SimpleAtom::CmdSubst(_)
+                )
+            };
+            match self {
+                Atom::Simple(s) => expands(s),
+                Atom::Compound(c) => c.atoms.iter().any(expands),
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -2569,6 +2583,8 @@ pub struct Lexer<'bump, const ENCODING: StringEncoding> {
 
     pub(crate) strpool: bun_alloc::ArenaVec<'bump, u8>,
     pub(crate) tokens: bun_alloc::ArenaVec<'bump, Token>,
+    /// Where the tokens of the `"..."` that is open begin.
+    pub(crate) double_quote_start: usize,
     pub(crate) delimit_quote: bool,
     pub(crate) in_subshell: Option<SubShellKind>,
     pub(crate) subshell_depth: u32,
@@ -2605,6 +2621,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             js_string_ranges: bun_alloc::ArenaVec::new_in(bump),
             word_start: 0,
             j: 0,
+            double_quote_start: 0,
             delimit_quote: false,
             in_subshell: None,
             subshell_depth: 0,
@@ -2654,6 +2671,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             arith_end: 0,
             word_start: self.word_start,
             j: self.j,
+            double_quote_start: 0,
             delimit_quote: false,
             string_refs: self.string_refs,
             jsobjs_len: self.jsobjs_len,
@@ -3263,8 +3281,22 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                             if self.chars.state == CharState::Normal {
                                 self.break_word(AddDelimiter::No)?;
                                 self.chars.state = CharState::Double;
+                                self.double_quote_start = self.tokens.len();
                             } else if self.chars.state == CharState::Double {
                                 self.break_word(AddDelimiter::No)?;
+                                // `"$A"` is a word even when `A` is empty: the parser reads zero-length quoted text as a quoted empty.
+                                let quoted = &self.tokens[self.double_quote_start..];
+                                if !quoted.is_empty()
+                                    && quoted
+                                        .iter()
+                                        .all(|tok| matches!(tok, Token::Var(_) | Token::VarArgv(_)))
+                                {
+                                    let pos = self.j;
+                                    self.tokens.push(Token::DoubleQuotedText(TextRange {
+                                        start: pos,
+                                        end: pos,
+                                    }));
+                                }
                                 self.chars.state = CharState::Normal;
                             }
                             fell_through = true;

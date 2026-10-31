@@ -77,6 +77,14 @@ describe("mv", async () => {
       .fileEquals("a", "A\n")
       .runAsTest("as the destination fails");
 
+    TestBuilder.command`mv a "$UNSET_VARIABLE"`
+      .ensureTempDir()
+      .file("a", "A\n")
+      .exitCode(2 /* ENOENT */)
+      .stderr("mv: No such file or directory\n")
+      .fileEquals("a", "A\n")
+      .runAsTest("as a destination that is a variable not set fails");
+
     TestBuilder.command`mv "" b`
       .ensureTempDir()
       .file("a", "A\n")

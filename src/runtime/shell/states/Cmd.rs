@@ -432,7 +432,7 @@ impl Cmd {
             }
         }
 
-        // Empty/null argv[0] → exit
+        // No argv[0] → exit
         // with the exit code from a sole command-substitution (stashed by
         // `child_done` from `Expansion::out_exit_code`), else 0.
         let first_arg: Vec<u8> = {
@@ -442,7 +442,15 @@ impl Cmd {
                     // strip the trailing NUL we just added
                     a[..a.len() - 1].to_vec()
                 }
-                _ => {
+                // An empty word (`""`, `"$UNSET"`) names a command, which nothing is.
+                Some(_) => {
+                    return Builtin::cmd_write_failing_error(
+                        interp,
+                        this,
+                        format_args!("bun: command not found: \n"),
+                    );
+                }
+                None => {
                     let exit = me.exit_code.unwrap_or(0);
                     let parent = me.base.parent;
                     return interp.child_done(parent, this, exit);

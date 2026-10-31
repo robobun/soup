@@ -1,3 +1,5 @@
+use std::io::Write as _;
+
 use crate::shell::EnvStr;
 use crate::shell::builtin::{Builtin, BuiltinState, IoKind};
 use crate::shell::interpreter::{Interpreter, NodeId};
@@ -15,6 +17,7 @@ enum State {
     #[default]
     Idle,
     WaitingIo,
+    WaitingWriteErr,
     Done,
 }
 
@@ -25,15 +28,22 @@ impl Export {
             // No args: print all exported vars.
             return Self::print_all(interp, cmd);
         }
+        let mut invalid: Vec<u8> = Vec::new();
         for i in 0..argc {
             let s = Builtin::of(interp, cmd).arg_bytes(i);
-            if s.is_empty() {
-                continue;
-            }
             let (name, value) = match bun_core::strings::index_of_char_usize(s, b'=') {
                 Some(eq) => (&s[..eq], &s[eq + 1..]),
                 None => (s, &b""[..]),
             };
+            // `export ""` and `export =value` name no variable. The other arguments are still exported.
+            if name.is_empty() {
+                let _ = writeln!(
+                    invalid,
+                    "export: not a valid variable name: \"{}\"",
+                    bstr::BStr::new(s)
+                );
+                continue;
+            }
             // The argv backing is freed when the Cmd retires,
             // so the key/value MUST be duplicated into ref-counted storage —
             // `init_slice` here would leave dangling EnvStr in `export_env`.
@@ -47,6 +57,10 @@ impl Export {
                 .insert(label, val);
             label.deref();
             val.deref();
+        }
+        if !invalid.is_empty() {
+            Self::state_mut(interp, cmd).state = State::WaitingWriteErr;
+            return Builtin::write_failing_error(interp, cmd, &invalid, 1);
         }
         Builtin::done(interp, cmd, 0)
     }
@@ -84,7 +98,9 @@ impl Export {
         _: usize,
         err: Option<bun_sys::SystemError>,
     ) -> Yield {
-        Self::state_mut(interp, cmd).state = State::Done;
-        Builtin::done(interp, cmd, err.map_or(0, |_| 1))
+        let state = Self::state_mut(interp, cmd);
+        let failed = matches!(state.state, State::WaitingWriteErr) || err.is_some();
+        state.state = State::Done;
+        Builtin::done(interp, cmd, if failed { 1 } else { 0 })
     }
 }

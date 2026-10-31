@@ -122,6 +122,7 @@ describe.concurrent("mkdir with an empty operand", () => {
     ['mkdir -p ""', () => $`mkdir -p ""`],
     ['mkdir -pv ""', () => $`mkdir -pv ""`],
     ['mkdir -v ""', () => $`mkdir -v ""`],
+    ['mkdir -p "$UNSET_VARIABLE"', () => $`mkdir -p "$UNSET_VARIABLE"`],
   ])("%s fails with ENOENT", async (_name, command) => {
     using dir = tempDir("mkdir-empty", {});
     const cwd = String(dir);
