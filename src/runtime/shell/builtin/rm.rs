@@ -11,7 +11,8 @@ use crate::node::fs::{
 use crate::shell::builtin::{BadFlag, Builtin, Kind};
 use crate::shell::builtins::batch::Batch;
 use crate::shell::interpreter::{
-    EventLoopHandle, Interpreter, NodeId, ShellTask, WorkPoolTask, names_two_files, shell_openat,
+    EventLoopHandle, Interpreter, NodeId, ShellTask, WorkPoolTask, names_two_files,
+    reject_empty_path, shell_openat,
 };
 use crate::shell::yield_::Yield;
 
@@ -76,6 +77,10 @@ pub(crate) fn start(interp: &Interpreter, cmd: NodeId) -> Yield {
     // Check that none of the paths will delete the root.
     let cwd_path = Builtin::shell(interp, cmd).cwd();
     for path in paths {
+        // Joined below, `""` would resolve to the cwd itself.
+        if path.is_empty() {
+            continue;
+        }
         let resolved = match bun_paths::is_absolute(path) {
             true => Path::from(path),
             false => Path::join(&[cwd_path, path]),
@@ -493,7 +498,9 @@ impl ShellRmTask {
     }
 
     fn remove_entry_file(&self, dir_task: *mut DirTask, path: &ZStr) -> Maybe<Unlinked> {
-        let Err(e) = bun_sys::unlinkat(self.cwd, path) else {
+        let unlinked = reject_empty_path(path.as_bytes(), bun_sys::Tag::unlink)
+            .and_then(|()| bun_sys::unlinkat(self.cwd, path));
+        let Err(e) = unlinked else {
             self.verbose_deleted(dir_task, path);
             return Ok(Unlinked::Done);
         };

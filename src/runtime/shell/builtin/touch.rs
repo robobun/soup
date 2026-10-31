@@ -1,6 +1,8 @@
 use crate::shell::builtin::{BadFlag, Builtin, Kind};
 use crate::shell::builtins::batch::Batch;
-use crate::shell::interpreter::{Interpreter, NodeId, PoolTask, ShellTask, ShellWork};
+use crate::shell::interpreter::{
+    Interpreter, NodeId, PoolTask, ShellTask, ShellWork, reject_empty_path,
+};
 use crate::shell::yield_::Yield;
 
 const USAGE: &[u8] = b"usage: touch [-A [-][[hh]mm]SS] [-achm] [-r file] [-t [[CC]YY]MMDDhhmm[.SS]]\n       [-d YYYY-MM-DDThh:mm:SS[.frac][tz]] file ...\n";
@@ -50,6 +52,10 @@ impl ShellWork for ShellTouchTask {
     /// utimes() the path; on ENOENT
     /// fall back to `open(O_CREAT|O_WRONLY, 0o664)`.
     fn run_from_thread_pool(&mut self, _: &ShellTask) {
+        if let Err(e) = reject_empty_path(&self.filepath, bun_sys::Tag::utime) {
+            self.err = Some(e);
+            return;
+        }
         // We have to give an absolute path. An operand that does not fit the
         // path buffer is still passed on whole, so the OS reports ENAMETOOLONG
         // for it like for any other operand.
