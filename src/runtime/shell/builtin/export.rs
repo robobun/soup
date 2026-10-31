@@ -1,3 +1,5 @@
+use std::io::Write as _;
+
 use crate::shell::EnvStr;
 use crate::shell::builtin::{Builtin, IoKind};
 use crate::shell::interpreter::{Interpreter, NodeId};
@@ -9,18 +11,28 @@ pub(crate) fn start(interp: &Interpreter, cmd: NodeId) -> Yield {
     if args.is_empty() {
         return print_all(interp, cmd);
     }
+    let mut invalid: Vec<u8> = Vec::new();
     for s in args {
-        if s.is_empty() {
-            continue;
-        }
         let (name, value) = match bun_core::strings::index_of_char_usize(s, b'=') {
             Some(eq) => (&s[..eq], &s[eq + 1..]),
             None => (s.get(), &b""[..]),
         };
+        // `export ""` and `export =value` name no variable. The other arguments are still exported.
+        if name.is_empty() {
+            let _ = writeln!(
+                invalid,
+                "export: not a valid variable name: \"{}\"",
+                bstr::BStr::new(s.get())
+            );
+            continue;
+        }
         // Copied: argv is freed with the Cmd.
         let label = EnvStr::init_ref_counted(name.into());
         let val = EnvStr::init_ref_counted(value.into());
         interp.as_cmd_mut(cmd).shell.export_env.insert(label, val);
+    }
+    if !invalid.is_empty() {
+        return Builtin::finish(interp, cmd, IoKind::Stderr, &invalid, 1);
     }
     Builtin::done(interp, cmd, 0)
 }

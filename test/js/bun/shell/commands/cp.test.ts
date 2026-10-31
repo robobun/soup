@@ -335,6 +335,7 @@ describe.concurrent("bunshell cp src/dest validation", () => {
       ['cp -R "" out', ENOENT],
       ['cp f ""', ENOENT],
       ['cp -R f ""', ENOENT],
+      ['cp -R f "$UNSET_VARIABLE"', ENOENT],
       ['cp f g ""', ENOENT + ENOENT],
     ])("%s fails with ENOENT and copies nothing", async (command, stderr) => {
       using dir = tempDir("cp-empty", { f: "F\n", g: "G\n" });
