@@ -433,10 +433,12 @@ pub struct TestIsolationState {
     /// The time zone the test runner applied at startup (`TZ`, default
     /// `Etc/UTC`). Empty means no override (local time). With `--isolate`, re-applied
     /// after every file so a `process.env.TZ` write stays with the file that made it.
-    pub time_zone: OnceCell<Box<[u8]>>,
+    /// Set again once a `globalSetup` has run: it can change `TZ`.
+    pub time_zone: JsCell<Option<Box<[u8]>>>,
     /// The proxy env keys as the env map held them at startup, restored after
     /// every file. See [`crate::rare_data::ProxyEnvSnapshot`].
-    pub proxy_env: OnceCell<crate::rare_data::ProxyEnvSnapshot>,
+    /// Captured again once a `globalSetup` has run.
+    pub proxy_env: JsCell<Option<crate::rare_data::ProxyEnvSnapshot>>,
     /// The synthetic allocation limit at startup, restored after every file.
     /// `setSyntheticAllocationLimitForTesting` lowers it process-wide.
     pub synthetic_allocation_limit: Cell<Option<usize>>,
@@ -777,6 +779,10 @@ pub struct ExitHandler {
     /// `process.exit()`, a fatal error or the end of a `bun test` run, as opposed to the event loop running dry.
     /// See `VirtualMachine::exit_tears_down_napi_envs`.
     pub requested: Cell<bool>,
+    /// `bun test` sets this while the process of its `globalSetup` is up. `global_exit` then
+    /// runs the stop phase of the VM teardown, so that the process has let go of what script
+    /// left open, and calls this with the exit code. It answers the code to exit with.
+    pub before_process_exit: Cell<Option<fn(u8) -> u8>>,
 }
 
 impl ExitHandler {
@@ -2208,17 +2214,29 @@ impl VirtualMachine {
         // doing it causes like 50+ tests to break
         // self.event_loop().tick();
 
+        let before_process_exit = self.exit_handler.before_process_exit.take();
         if !self.should_destruct_main_thread_on_exit() {
+            if before_process_exit.is_some() {
+                // SAFETY: main-thread VM on the main thread; exit handlers have run.
+                unsafe { Self::teardown(Self::get_mut_ptr(), Teardown::MainThreadStop) };
+            }
             self.close_sqlite_databases_for_exit();
-            bun_core::Global::exit(u32::from(self.exit_handler.exit_code.get()))
+            let mut exit_code = self.exit_handler.exit_code.get();
+            if let Some(before_process_exit) = before_process_exit {
+                exit_code = before_process_exit(exit_code);
+            }
+            bun_core::Global::exit(u32::from(exit_code))
         }
         let this = Self::get_mut_ptr();
         // SAFETY: main-thread VM on the main thread; exit handlers have run.
         let can_drop = unsafe { Self::teardown(this, Teardown::MainThreadExit) };
-        let exit_code = self.exit_handler.exit_code.get();
+        let mut exit_code = self.exit_handler.exit_code.get();
         if can_drop {
             // SAFETY: no frame of this thread resumes. The allocation stays for signal handlers.
             unsafe { core::ptr::drop_in_place(this) };
+        }
+        if let Some(before_process_exit) = before_process_exit {
+            exit_code = before_process_exit(exit_code);
         }
         bun_core::Global::exit(u32::from(exit_code))
     }
@@ -2268,6 +2286,7 @@ impl VirtualMachine {
     /// Tear down this thread's VM: the one sequence both a finished worker
     /// thread and the exiting main thread (under `BUN_DESTRUCT_VM_ON_EXIT`) run.
     /// The exit handlers ran before this (`on_exit`); nothing below enters script.
+    /// [`Teardown::MainThreadStop`] ends after step A.
     ///
     ///  A. stop — script forbidden (microtasks/modules cleared, termination
     ///     requested), WebCore stop phase (child workers asked to terminate;
@@ -2332,6 +2351,9 @@ impl VirtualMachine {
             }
         }
         teardown_log!("teardown: stopped");
+        if matches!(kind, Teardown::MainThreadStop) {
+            return false;
+        }
 
         // ---- B. release ------------------------------------------------------
         #[cfg(windows)]
@@ -2409,6 +2431,7 @@ impl VirtualMachine {
                 Zig__GlobalObject__destructOnExit(vm.global());
                 VMHolder::set_cached_global_object(Some(core::ptr::null_mut()));
             }
+            Teardown::MainThreadStop => unreachable!("it returned after the stop phase"),
         }
         // Finalizers just closed the sockets only they owned; `us_socket_close`
         // queues onto `loop->data.closed_head`, normally freed on the next tick.
@@ -2591,6 +2614,11 @@ impl GraphContextStopAndFree {
 enum Teardown {
     Worker,
     MainThreadExit,
+    /// The exiting main thread, step A alone: script is forbidden and what it
+    /// left open is closed. For an exit that waits on another process first
+    /// (`ExitHandler::before_process_exit`), and leaves the rest to the exit
+    /// of the process as every other exit does.
+    MainThreadStop,
 }
 
 /// What one stop-phase sweep found (see `VirtualMachine::stop_phase_sweep`).
