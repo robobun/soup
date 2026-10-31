@@ -334,7 +334,6 @@ function run(options: Record<string, unknown> = kEmptyObject) {
   if (opts.shard) throwNotImplemented("run({ shard })", 5090);
   if (opts.isolation === "none") throwNotImplemented("run({ isolation: 'none' })", 5090);
   if (opts.globPatterns?.length > 0) throwNotImplemented("run({ globPatterns })", 5090);
-  if (opts.globalSetupPath != null) throwNotImplemented("run({ globalSetupPath })", 5090);
   if (opts.only) throwNotImplemented("run({ only: true })", 5090);
   if (opts.testNamePatterns != null) throwNotImplemented("run({ testNamePatterns })", 5090);
   if (opts.testSkipPatterns != null) throwNotImplemented("run({ testSkipPatterns })", 5090);
@@ -345,6 +344,22 @@ function run(options: Record<string, unknown> = kEmptyObject) {
 
   runFiles(opts, reporter);
   return reporter;
+}
+
+// node's setupGlobalSetupTeardownFunctions: the module is imported once, in the process that
+// called run() and never in the per-file children, and only its `globalSetup` and
+// `globalTeardown` exports are consulted.
+async function loadGlobalSetupModule(globalSetupPath: string, cwd: string) {
+  const { resolve } = require("node:path");
+  const { pathToFileURL } = require("node:url");
+  const { globalSetup, globalTeardown } = await import(pathToFileURL(resolve(cwd, globalSetupPath)).href);
+  if (globalSetup) validateFunction(globalSetup, "globalSetupModule.globalSetup");
+  if (globalTeardown) validateFunction(globalTeardown, "globalSetupModule.globalTeardown");
+  return {
+    __proto__: null,
+    globalSetup: (globalSetup || undefined) as Function | undefined,
+    globalTeardown: (globalTeardown || undefined) as Function | undefined,
+  };
 }
 
 function makeRunCounts() {
@@ -388,6 +403,13 @@ async function runFiles(opts: ReturnType<typeof validateRunOptions>, reporter: T
   await Promise.resolve();
 
   try {
+    // node awaits the global setup before the run's own setup callback.
+    let globalTeardown: Function | undefined;
+    if (opts.globalSetupPath != null) {
+      const hooks = await loadGlobalSetupModule(opts.globalSetupPath as string, opts.cwd as string);
+      globalTeardown = hooks.globalTeardown;
+      if (hooks.globalSetup !== undefined) await hooks.globalSetup();
+    }
     if (typeof opts.setup === "function") await (opts.setup as (reporter: TestsStream) => unknown)(reporter);
 
     const files = opts.files ?? [];
@@ -412,6 +434,8 @@ async function runFiles(opts: ReturnType<typeof validateRunOptions>, reporter: T
       duration_ms: durationMs,
       file: undefined,
     });
+    // After the summary, and not at all when globalSetup threw, as in node.
+    if (globalTeardown !== undefined) await globalTeardown();
   } catch (err) {
     reporter.destroy(err as Error);
     return;
@@ -466,7 +490,15 @@ async function runOneFile(
   // Node's getRunArgs builds [...execArgv, path, ...argv] so runtime flags land
   // in the child's process.execArgv; bun's CLI likewise takes runtime flags
   // before the `test` keyword and user args after the path.
-  const args = [process.execPath, ...(opts.execArgv as string[]), "test", absolute, ...(opts.argv as string[])];
+  // `--test-run-child`: the run is this process's, so the child starts no `globalSetup` of its own.
+  const args = [
+    process.execPath,
+    ...(opts.execArgv as string[]),
+    "test",
+    "--test-run-child",
+    absolute,
+    ...(opts.argv as string[]),
+  ];
   const fileStarted = Date.now();
   const fileCounts = makeRunCounts();
 

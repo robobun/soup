@@ -195,6 +195,31 @@ mock.module("./external-api", () => ({
 }));
 ```
 
+### Global Setup and Teardown
+
+`globalSetup` and `globalTeardown` name files that run once per run, in a process of their own: the setup before the first test file is loaded, the teardown after the last one has finished. Unlike a preload, they run once with `--isolate` and `--parallel` too.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+globalSetup = "./test/global-setup.ts"
+# with the teardown in a file of its own, as in Jest:
+# globalTeardown = "./test/global-teardown.ts"
+```
+
+```ts title="test/global-setup.ts" icon="/icons/typescript.svg"
+export default async function () {
+  const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+  // the test files read it from process.env
+  process.env.API_URL = server.url.href;
+
+  return async () => {
+    await server.stop(true);
+  };
+}
+```
+
+Both keys take a path or an array of paths. The equivalent CLI flags are `--global-setup` and `--global-teardown`, which replace the `bunfig.toml` value for the run. See [Global setup and teardown](/test/lifecycle#global-setup-and-teardown) for the shapes a file can have, where it runs and what happens when it fails.
+
 ### Path Ignore Patterns
 
 `pathIgnorePatterns` excludes files and directories from test discovery entirely, using glob patterns. Unlike `coveragePathIgnorePatterns`, which only affects coverage reports, `pathIgnorePatterns` prevents Bun from discovering matching paths and running them as tests.

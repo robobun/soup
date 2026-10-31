@@ -980,11 +980,18 @@ pub(crate) const TEST_ONLY_PARAMS: &[ParamType] = &[
         "--test-worker                    (internal) Run as a --parallel worker, receiving files over IPC."
     ),
     parse_param!(
+        "--test-run-child                 (internal) Run as one file of node:test run(), which owns the run."
+    ),
+    parse_param!(
         "--shard <STR>                    Run a subset of test files, e.g. '--shard=1/3' runs the first of three shards. Useful for splitting tests across multiple CI jobs."
     ),
     parse_param!(
         "--dry-run                        Load the test files and list the tests that would run, without running any test or hook."
     ),
+    parse_param!(
+        "--global-setup <STR>...          Modules to run once before the first test file. What their default export returns runs once after the last."
+    ),
+    parse_param!("--global-teardown <STR>...       Modules to run once after the last test file."),
     parse_param!(
         "--timings <STR>...               JSON file(s) of per-file durations (ms); several are merged, e.g. one per CI shard. Balances --shard by total time and makes --parallel start the slowest files first."
     ),
@@ -2386,6 +2393,33 @@ fn parse_test_command_options(args: &clap::Args<clap::Help>, ctx: Context<'_>) {
         Global::exit(1);
     }
     ctx.test_options.dry_run = args.flag(b"--dry-run");
+    for (flag, paths, from_cli) in [
+        (
+            &b"--global-setup"[..],
+            &mut ctx.test_options.global_setup,
+            &mut ctx.test_options.global_setup_from_cli,
+        ),
+        (
+            &b"--global-teardown"[..],
+            &mut ctx.test_options.global_teardown,
+            &mut ctx.test_options.global_teardown_from_cli,
+        ),
+    ] {
+        let values = args.options(flag);
+        if values.is_empty() {
+            continue;
+        }
+        if values.iter().any(|path| path.is_empty()) {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r>: {} expects a file path, e.g. {}=./test/global-setup.ts",
+                BStr::new(flag),
+                BStr::new(flag)
+            );
+            Global::exit(1);
+        }
+        *paths = slice_to_owned(values);
+        *from_cli = true;
+    }
     ctx.test_options.last_failed = args.flag(b"--last-failed");
     ctx.test_options.update_snapshots = args.flag(b"--update-snapshots");
     ctx.test_options.run_todo = args.flag(b"--todo");
@@ -2396,6 +2430,7 @@ fn parse_test_command_options(args: &clap::Args<clap::Help>, ctx: Context<'_>) {
     let no_isolate = args.flag(b"--no-isolate");
     ctx.test_options.isolate = args.flag(b"--isolate") && !no_isolate;
     ctx.test_options.test_worker = args.flag(b"--test-worker");
+    ctx.test_options.run_child = args.flag(b"--test-run-child");
 
     if let Some(parallel_str) = args.option(b"--parallel") {
         let parsed: u32 = if !parallel_str.is_empty() {

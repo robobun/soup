@@ -110,7 +110,138 @@ Not supported in concurrent tests; use `test.serial` instead.
 
 ## Global Setup and Teardown
 
-To scope the hooks to an entire multi-file test run, define the hooks in a separate file.
+Two things run code around a whole test run. They differ in how often the code runs, and where.
+
+|                    | `globalSetup`                                          | `beforeAll` and `afterAll` in a `preload`                            |
+| ------------------ | ------------------------------------------------------ | -------------------------------------------------------------------- |
+| Runs               | once per run                                           | once per run, or around every file with `--isolate` and `--parallel` |
+| Where              | in a process of its own                                | where the test file runs                                             |
+| The test files get | the environment variables it sets                      | everything: globals, modules, mocks, matchers                        |
+| Use it to          | start a database, a container or a server; build; seed | add matchers and mocks, reset state, open a connection for the tests |
+
+### Once per run: `globalSetup`
+
+`globalSetup` names a file whose default export Bun calls once, before it loads the first test file. The function it returns is called once, after the last test file has finished.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+globalSetup = "./test/global-setup.ts"
+```
+
+```ts title="test/global-setup.ts" icon="/icons/typescript.svg"
+import { $ } from "bun";
+
+export default async function setup() {
+  await $`docker compose up --detach --wait`;
+  process.env.DATABASE_URL = "postgres://postgres:postgres@localhost:5432/test";
+
+  return async function teardown() {
+    await $`docker compose down --volumes`;
+  };
+}
+```
+
+```ts title="users.test.ts" icon="/icons/typescript.svg"
+import { SQL } from "bun";
+import { expect, test } from "bun:test";
+
+test("the database is there", async () => {
+  const sql = new SQL(process.env.DATABASE_URL!);
+  const [row] = await sql`SELECT 1 AS one`;
+  expect(row.one).toBe(1);
+});
+```
+
+The same happens with `bun test --isolate`, `--parallel` and `--shard`: one setup, then the test files, then one teardown.
+
+A setup file can also export two functions named `setup` and `teardown`, as in Vitest, or `globalSetup` and `globalTeardown`, as the module of Node's `--test-global-setup` does:
+
+```ts title="test/global-setup.ts" icon="/icons/typescript.svg"
+let server: ReturnType<typeof Bun.serve>;
+
+export async function setup() {
+  server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+  process.env.API_URL = server.url.href;
+}
+
+export async function teardown() {
+  await server.stop(true);
+}
+```
+
+Jest has a second key for the teardown. `globalTeardown` names a file whose default export runs after the last test file, in the same process as the setup, so a global that the setup file assigned is there:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+globalSetup = "./test/setup.js"
+globalTeardown = "./test/teardown.js"
+```
+
+```js title="test/teardown.js" icon="/icons/javascript.svg"
+module.exports = async function () {
+  await globalThis.__MONGOD__.stop();
+};
+```
+
+Both keys take one path or an array. Setup files run in the order given, each one after the one before it has finished. The teardowns that belong to the setup files run in reverse order, and then the `globalTeardown` files in the order given. A path is resolved from the project root, like a test file on the command line, and can name a file of a package. The functions are called without arguments.
+
+`--global-setup` and `--global-teardown` do the same from the command line, and replace the key of `bunfig.toml`:
+
+```bash terminal icon="terminal"
+bun test --global-setup ./test/global-setup.ts
+```
+
+#### Where the setup runs
+
+The setup and teardown files run in a process of their own, which `bun test` starts once it knows that there are test files to run and keeps until the run is over. They are loaded the way `bun ./test/global-setup.ts` would load them, with the `define`, `loader`, `conditions` and JSX settings of the run. Three things follow:
+
+- **What the setup starts stays up.** A `Bun.serve` server, a child process, a socket or a timer of the setup lives until the teardown, whatever [`--isolate`](/test/parallel#--isolate) closes between two test files and however many workers [`--parallel`](/test/parallel) starts.
+- **The test files share no memory with it.** A global or a module-level variable of the setup file is not there in a test file, and `bun:test` functions such as `beforeAll` and `expect.extend` belong in a [preload](#around-every-test-file-preload). Values reach the tests through `process.env`: every variable that the setup sets, changes or deletes is set, changed or deleted for all test files, in every worker. Under `--parallel`, combine them with [`BUN_TEST_WORKER_ID`](/test/parallel#worker-environment) when each worker needs a database of its own. `TZ` takes effect in the test files too.
+- **The teardown runs however the run ends.** `bun test` waits for it when the tests finish, when [`--bail`](/test#bail-out-with---bail) stops the run, when a test calls `process.exit()` and when a signal stops the workers of `--parallel`. Before it waits, the test process closes what the test files left open, so a server of the setup that waits for its clients to leave can close. When the test process itself is killed (`Ctrl-C` without `--parallel`, a crash, `kill -9`), the setup process notices, runs the teardown and then exits. It runs it on its own then, so a run that is started right away can overlap with it. A signal that reaches the setup process while the tests run starts the teardown too, and a signal during the teardown ends it.
+
+What the setup and the teardown print goes to the terminal of the run.
+
+In a test file that runs in the process of `bun test` itself (no `--parallel`, or a single worker), the variables of the setup are what an assignment to `process.env` at the top of the file would be. Code that reads the environment of the process natively does not see them there: `NODE_EXTRA_CA_CERTS` is read once, and so is the home directory of `os.homedir()`. A worker of `--parallel` starts with them, so it does.
+
+#### When it fails
+
+- A setup that throws, or whose file cannot be loaded, fails the run: no test file is loaded and the exit code is 1. The teardowns of the setup files that had completed still run. The `globalTeardown` files do not, since they are the other half of a setup that did not complete.
+- A teardown that throws fails the run: the exit code is 1, also when every test passed or a test called `process.exit(0)`. The other teardowns still run.
+- An error that nothing catches in the setup process while the tests run (a rejected promise in a server handler, for example) is printed and fails the run at its end. The process keeps going, because it still owes the teardown.
+
+#### When it does not run
+
+- When no test file matches, and with [`--dry-run`](/test/discovery#listing-tests-without-running-them), nothing runs, so nothing is set up. With `--check`, the setup starts once the type check has passed.
+- With `--watch`, every run has its own setup and teardown. A run that a file change interrupts is torn down before the next one is set up. A change to a setup or teardown file starts a new run. A teardown that waits for something a test file left open waits until the next change, because the test process lives on.
+- With [`--no-orphans`](/runtime/bunfig#bun-run), the setup process ends with a test process that is killed, like every other child of it, and nothing is torn down. On Linux that includes a run that `--watch` restarts.
+
+#### With `node:test`
+
+`run()` of `node:test` starts a `bun test` for every file. Those do not read `globalSetup`: the run belongs to the process that called `run()`, and a setup per file would not be one per run. Pass `globalSetupPath` instead, as in Node.js. It names a module whose exports `globalSetup` and `globalTeardown` are called once, in the calling process, before the first file and after the last. What `globalSetup` assigns to `process.env` is there in every file.
+
+```js title="run-tests.mjs" icon="/icons/javascript.svg"
+import { run } from "node:test";
+
+const stream = run({
+  files: ["./a.test.js", "./b.test.js"],
+  globalSetupPath: "./test/global-hooks.mjs",
+});
+for await (const event of stream);
+```
+
+```js title="test/global-hooks.mjs" icon="/icons/javascript.svg"
+export async function globalSetup() {
+  process.env.DATABASE_URL = await startDatabase();
+}
+
+export async function globalTeardown() {
+  await stopDatabase();
+}
+```
+
+### Around every test file: `preload`
+
+To run hooks in the process that runs the tests, define them in a separate file.
 
 ```ts title="setup.ts" icon="/icons/typescript.svg"
 import { beforeAll, afterAll } from "bun:test";
@@ -140,6 +271,8 @@ To avoid typing `--preload` every time you run tests, add it to your `bunfig.tom
 [test]
 preload = ["./setup.ts"]
 ```
+
+Without `--isolate` and `--parallel`, all test files share one global, the preload is loaded once, and its `beforeAll` and `afterAll` run once. With either flag every test file gets a fresh global, so the preload is loaded again and its hooks run before and after each file. Use [`globalSetup`](#once-per-run-globalsetup) for what must happen once.
 
 ## Practical Examples
 

@@ -307,6 +307,44 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Box<[bun_spawn
         argv.push(lit(b"--preload\0"));
         argv.push(dupe_z(preload));
     }
+    push_code_loading_argv(ctx, &mut argv)?;
+    if crate::cli::run_compiled::is_checked() {
+        argv.push(lit(b"--aot-checked=-\0"));
+    }
+    if opts.coverage.enabled {
+        argv.push(lit(b"--coverage\0"));
+        // `coverageSkipTestFiles` asks a worker which of the files it loads are tests.
+        // It reads `testMatch` from bunfig.toml itself.
+        for pattern in &opts.test_match_flag {
+            argv.push(print_z(format_args!(
+                "--test-match={}",
+                bstr::BStr::new(pattern)
+            ))?);
+        }
+    }
+
+    argv.push(core::ptr::null());
+    // Callers index by .len(), so keep the trailing null in the boxed slice.
+    Ok(argv.into_boxed_slice())
+}
+
+/// The flags that decide how code is resolved, transpiled and run, as this
+/// process got them from its command line and its bunfig.toml. A process that
+/// runs code on behalf of this one gets them: a worker, and the host of
+/// `globalSetup`.
+pub(crate) fn push_code_loading_argv(
+    ctx: &Command::ContextData,
+    argv: &mut Vec<bun_spawn::CStrPtr>,
+) -> crate::Result<()> {
+    let print_z = |args: core::fmt::Arguments<'_>| -> crate::Result<*const c_char> {
+        let mut buf = Vec::<u8>::new();
+        buf.write_fmt(args)
+            .map_err(|_| crate::Error::FormatFailed)?;
+        Ok(crate::cli::cli_dupe_z(&buf))
+    };
+    let dupe_z = |s: &[u8]| -> *const c_char { crate::cli::cli_dupe_z(s) };
+    let lit = |s: &'static [u8]| -> *const c_char { s.as_ptr().cast::<c_char>() };
+
     if let Some(define) = &ctx.args.define {
         debug_assert_eq!(define.keys.len(), define.values.len());
         for (key, value) in define.keys.iter().zip(define.values.iter()) {
@@ -351,9 +389,6 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Box<[bun_spawn
     }
     if ctx.args.preserve_symlinks.unwrap_or(false) {
         argv.push(lit(b"--preserve-symlinks\0"));
-    }
-    if crate::cli::run_compiled::is_checked() {
-        argv.push(lit(b"--aot-checked=-\0"));
     }
     if ctx.runtime_options.smol {
         argv.push(lit(b"--smol\0"));
@@ -417,21 +452,7 @@ fn build_worker_argv(ctx: &Command::ContextData) -> crate::Result<Box<[bun_spawn
             argv.push(lit(b"--jsx-side-effects\0"));
         }
     }
-    if opts.coverage.enabled {
-        argv.push(lit(b"--coverage\0"));
-        // `coverageSkipTestFiles` asks a worker which of the files it loads are tests.
-        // It reads `testMatch` from bunfig.toml itself.
-        for pattern in &opts.test_match_flag {
-            argv.push(print_z(format_args!(
-                "--test-match={}",
-                bstr::BStr::new(pattern)
-            ))?);
-        }
-    }
-
-    argv.push(core::ptr::null());
-    // Callers index by .len(), so keep the trailing null in the boxed slice.
-    Ok(argv.into_boxed_slice())
+    Ok(())
 }
 
 /// Local shim for `@tagName(loader)` — `bun_options_types::schema::api::Loader`

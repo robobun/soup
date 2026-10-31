@@ -514,6 +514,20 @@ pub struct TestOptions {
     /// `bun test --dry-run`: load the test files and report every test that
     /// would run, without running any test or hook.
     pub dry_run: bool,
+    /// `globalSetup` in bunfig.toml or `--global-setup`, in the order given:
+    /// modules that run once per run, before the first test file, in a
+    /// process of their own.
+    pub global_setup: Vec<Box<[u8]>>,
+    /// `--global-setup` was passed, so bunfig's `globalSetup` does not replace `global_setup`.
+    pub global_setup_from_cli: bool,
+    /// `globalTeardown` in bunfig.toml or `--global-teardown`: modules that
+    /// run once per run, after the last test file, in the process of `global_setup`.
+    pub global_teardown: Vec<Box<[u8]>>,
+    /// `--global-teardown` was passed, so bunfig's `globalTeardown` does not replace `global_teardown`.
+    pub global_teardown_from_cli: bool,
+    /// Internal: this process runs one file for `node:test`'s `run()`, which
+    /// owns the run. It starts no `global_setup` of its own.
+    pub run_child: bool,
 
     pub reporters: Reporters,
     pub reporter_outfile: Option<Box<[u8]>>,
@@ -587,6 +601,11 @@ impl Default for TestOptions {
             timings_files: Vec::new(),
             update_timings: false,
             dry_run: false,
+            global_setup: Vec::new(),
+            global_setup_from_cli: false,
+            global_teardown: Vec::new(),
+            global_teardown_from_cli: false,
+            run_child: false,
             reporters: Reporters::default(),
             reporter_outfile: None,
         }

@@ -194,6 +194,28 @@ Same as the top-level `preload` field, but only applies to `bun test`.
 preload = ["./setup.ts"]
 ```
 
+### `test.globalSetup`
+
+A file, or an array of files, that runs once per run, before the first test file is loaded. Bun calls the default export of each. A function that it returns runs once after the last test file, and so does an export named `teardown`. The files run in a process of their own, so what they start stays up with `--isolate` and `--parallel`, and the environment variables they set reach every test file.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+globalSetup = "./test/global-setup.ts"
+```
+
+Equivalent CLI flag: `--global-setup`. CLI flags replace the `bunfig.toml` value for the run. See [Global setup and teardown](/test/lifecycle#global-setup-and-teardown).
+
+### `test.globalTeardown`
+
+A file, or an array of files, whose default export runs once per run, after the last test file, in the process of `test.globalSetup`.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+globalTeardown = "./test/global-teardown.ts"
+```
+
+Equivalent CLI flag: `--global-teardown`.
+
 ### `test.testMatch`
 
 Glob patterns for the files that `bun test` runs as tests, in place of the default `*.test.*`, `*_test.*`, `*.spec.*` and `*_spec.*` names. Bun matches them against the path of a file relative to the project root, so a name at any depth is `**/*.unit.ts`. A pattern that starts with `!` takes files away.

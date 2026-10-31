@@ -289,6 +289,40 @@ impl<'a> Parser<'a, '_> {
         Ok(())
     }
 
+    /// A string or an array of strings, none of them empty: the value of `key`.
+    fn module_paths(&mut self, expr: &Expr, key: &str) -> crate::Result<Vec<Box<[u8]>>> {
+        let items = match &expr.data {
+            ExprData::EArray(array) => array.items.slice(),
+            ExprData::EString(_) => core::slice::from_ref(expr),
+            _ => {
+                self.add_error_format(
+                    expr.loc,
+                    format_args!("{key} must be a string or array of strings"),
+                )?;
+                return Ok(Vec::new());
+            }
+        };
+        let mut paths: Vec<Box<[u8]>> = Vec::with_capacity(items.len());
+        for item in items {
+            match &item.data {
+                ExprData::EString(s) if s.len() > 0 => paths.push(estring_to_owned(s, self.bump)),
+                ExprData::EString(_) => {
+                    self.add_error_format(
+                        item.loc,
+                        format_args!("{key} cannot be an empty string"),
+                    )?;
+                }
+                _ => {
+                    self.add_error_format(
+                        item.loc,
+                        format_args!("{key} must be a string or array of strings"),
+                    )?;
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     fn load_env_config(&mut self, expr: &Expr) -> crate::Result<()> {
         match &expr.data {
             ExprData::ENull(_) => {
@@ -850,6 +884,19 @@ impl<'a> Parser<'a, '_> {
                             return Ok(());
                         }
                     }
+                }
+
+                // A flag replaces its key, like `--test-match`.
+                if !self.ctx.test_options.global_setup_from_cli
+                    && let Some(expr) = test.get(b"globalSetup")
+                {
+                    self.ctx.test_options.global_setup = self.module_paths(&expr, "globalSetup")?;
+                }
+                if !self.ctx.test_options.global_teardown_from_cli
+                    && let Some(expr) = test.get(b"globalTeardown")
+                {
+                    self.ctx.test_options.global_teardown =
+                        self.module_paths(&expr, "globalTeardown")?;
                 }
             }
         }

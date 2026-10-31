@@ -93,6 +93,11 @@ pub(crate) mod test {
     #[path = "LastFailed.rs"]
     pub(crate) mod last_failed;
 
+    /// `globalSetup` and `globalTeardown`: modules that run once per run, in
+    /// a process of their own.
+    #[path = "GlobalSetup.rs"]
+    pub(crate) mod global_setup;
+
     /// `collectCoverageFrom`: the files the coverage report is about, loaded
     /// or not.
     #[path = "CoverageInclude.rs"]

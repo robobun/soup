@@ -55,6 +55,8 @@ Each worker gets `BUN_TEST_WORKER_ID` and `JEST_WORKER_ID` set to its 1-based in
 const dbName = `app_test_${process.env.BUN_TEST_WORKER_ID ?? "1"}`;
 ```
 
+A `--preload` script runs in every worker, and its `beforeAll` runs before every file. To start something once for the whole run, such as the database server that those per-worker databases live in, use [`globalSetup`](/test/lifecycle#once-per-run-globalsetup): it runs in a process of its own before the first worker starts, and every worker gets the environment variables it sets.
+
 Flags that affect how tests execute (`--timeout`, `--preload`, `--define`, `--coverage`, `--update-snapshots`, `-t`, `--retry`, `--rerun-each`, `--concurrent`, `--randomize`/`--seed`, …) are forwarded to workers. The coordinator handles `--bail` at file granularity: once the failure threshold is reached it starts no new files, but files already running finish.
 
 The coordinator merges coverage, JUnit XML and snapshot writes, so `--parallel --coverage --reporter=junit --reporter-outfile=junit.xml` produces one report.

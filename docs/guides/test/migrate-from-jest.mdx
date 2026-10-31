@@ -111,6 +111,7 @@ Many other settings have an equivalent in the `[test]` section of `bunfig.toml`.
 
 - `setupFiles`/`setupFilesAfterEnv` → `preload`
 - `testMatch` → `testMatch` (relative to the project root, see [what differs](/test/configuration#lists-from-jest-and-vitest))
+- `globalSetup`/`globalTeardown` → `globalSetup`/`globalTeardown` (the functions get no arguments, see [where they run](/test/lifecycle#where-the-setup-runs))
 - `testPathIgnorePatterns` → `pathIgnorePatterns`
 - `rootDir` → `root`
 - `collectCoverageFrom` → `collectCoverageFrom`

@@ -786,6 +786,11 @@ pub struct ExitHandler {
     /// `process.exit()`, a fatal error or the end of a `bun test` run, as opposed to the event loop running dry.
     /// See `VirtualMachine::exit_tears_down_napi_envs`.
     pub requested: bool,
+    /// `bun test` sets this while the process of its `globalSetup` is up. `global_exit` then
+    /// tears the VM down, as it does under `BUN_DESTRUCT_VM_ON_EXIT`, so that the process has let
+    /// go of what script left open, and calls this with the exit code. It answers the code to
+    /// exit with.
+    pub before_process_exit: Option<fn(u8) -> u8>,
 }
 
 impl ExitHandler {
@@ -2423,13 +2428,18 @@ impl VirtualMachine {
         // doing it causes like 50+ tests to break
         // self.event_loop().tick();
 
-        if self.should_destruct_main_thread_on_exit() {
+        let before_process_exit = self.exit_handler.before_process_exit.take();
+        if self.should_destruct_main_thread_on_exit() || before_process_exit.is_some() {
             // SAFETY: main-thread VM on the main thread; exit handlers have run.
             unsafe { Self::teardown(core::ptr::from_mut(self), Teardown::MainThreadExit) };
         } else {
             self.close_sqlite_databases_for_exit();
         }
-        bun_core::Global::exit(u32::from(self.exit_handler.exit_code))
+        let mut exit_code = self.exit_handler.exit_code;
+        if let Some(before_process_exit) = before_process_exit {
+            exit_code = before_process_exit(exit_code);
+        }
+        bun_core::Global::exit(u32::from(exit_code))
     }
 
     /// Ends this thread's VM, which is not the main thread's: its exit handlers,
