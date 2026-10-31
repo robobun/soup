@@ -2,7 +2,9 @@ use crate::node::fs::{MkdirCtx, NodeFS, args as fs_args};
 use crate::node::types::PathLike;
 use crate::shell::builtin::{BadFlag, Builtin, Kind};
 use crate::shell::builtins::batch::Batch;
-use crate::shell::interpreter::{Interpreter, NodeId, PoolTask, ShellTask, ShellWork};
+use crate::shell::interpreter::{
+    Interpreter, NodeId, PoolTask, ShellTask, ShellWork, reject_empty_path,
+};
 use crate::shell::yield_::Yield;
 
 const USAGE: &[u8] = b"usage: mkdir [-pv] [-m mode] directory_name ...\n";
@@ -50,6 +52,10 @@ impl ShellWork for ShellMkdirTask {
 
     fn run_from_thread_pool(&mut self, _: &ShellTask) {
         use bun_paths::{Platform, platform, resolve_path};
+        if let Err(e) = reject_empty_path(&self.filepath, bun_sys::Tag::mkdir) {
+            self.err = Some(e);
+            return;
+        }
         // We have to give an absolute path to our mkdir implementation for it
         // to work with cwd.
         let mut spill = Vec::new();

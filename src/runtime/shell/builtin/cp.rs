@@ -8,7 +8,8 @@ use crate::shell::ShellErr;
 use crate::shell::builtin::{BadFlag, Builtin, Kind};
 use crate::shell::builtins::batch::Batch;
 use crate::shell::interpreter::{
-    Interpreter, NodeId, ShellTask, ShellTaskCtx, shell_join_path, shell_resolve_operand,
+    Interpreter, NodeId, ShellTask, ShellTaskCtx, reject_empty_path, shell_join_path,
+    shell_resolve_operand,
 };
 use crate::shell::yield_::Yield;
 
@@ -381,6 +382,8 @@ impl ShellCpTask {
     /// POSIX `cp` synopses
     /// (<https://man7.org/linux/man-pages/man1/cp.1p.html>), and says what to copy.
     fn resolve(&self) -> Result<ThreadIsolated<args::Cp<'static>>, Stop> {
+        reject_empty_path(&self.src, bun_sys::Tag::copyfile)?;
+        reject_empty_path(&self.tgt, bun_sys::Tag::copyfile)?;
         // We have to give an absolute path to our cp implementation for it to
         // work with cwd.
         let src = shell_resolve_operand(bun_sys::Tag::copyfile, &self.cwd_path, &self.src)?;

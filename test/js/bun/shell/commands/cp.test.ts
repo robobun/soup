@@ -325,6 +325,32 @@ describe.concurrent("bunshell cp src/dest validation", () => {
     expect(list(dir, "d2")).toEqual(["f", "sub"]);
   });
 
+  // An empty operand was joined onto the cwd of the shell, which is the cwd itself:
+  // `cp -R "" out` copied the cwd into itself, and `cp f ""` copied f into the cwd and exited 0.
+  describe("an empty operand", () => {
+    const ENOENT = "cp: No such file or directory\n";
+
+    test.each([
+      ['cp "" out', ENOENT],
+      ['cp -R "" out', ENOENT],
+      ['cp f ""', ENOENT],
+      ['cp -R f ""', ENOENT],
+      ['cp f g ""', ENOENT + ENOENT],
+    ])("%s fails with ENOENT and copies nothing", async (command, stderr) => {
+      using dir = tempDir("cp-empty", { f: "F\n", g: "G\n" });
+      expect(await cp(String(dir), command)).toEqual({ stderr, exitCode: 1 });
+      expect(list(dir, ".")).toEqual(["f", "g"]);
+      expect(readFileSync(join(String(dir), "f"), "utf8")).toBe("F\n");
+    });
+
+    test("the other sources are still copied when one is empty", async () => {
+      using dir = tempDir("cp-empty", { f: "F\n", out: {} });
+      expect(await cp(String(dir), 'cp "" f out')).toEqual({ stderr: ENOENT, exitCode: 1 });
+      expect(list(dir, "out")).toEqual(["f"]);
+      expect(readFileSync(join(String(dir), "out", "f"), "utf8")).toBe("F\n");
+    });
+  });
+
   // The path is too long for macOS (PATH_MAX is 1024), and Windows fails to create it.
   test.skipIf(isMacOS || isWindows)("copies a very deep tree", async () => {
     const depth = 800;

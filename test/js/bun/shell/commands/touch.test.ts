@@ -1,5 +1,7 @@
-import { expect, test } from "bun:test";
+import { $ } from "bun";
+import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isWindows, tempDir } from "harness";
+import { existsSync, statSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 
 // Every operand, absolute or not, was joined into a fixed-size path buffer, so
@@ -60,4 +62,45 @@ test("operands longer than the path buffer are reported, not a crash", async () 
     dotSlashes: { exitCode: 0, stderr: "", created: true },
   });
   expect(exitCode).toBe(0);
+});
+
+// An empty operand was joined onto the cwd of the shell, which is the cwd itself:
+// `touch ""` exited 0 and set the timestamps of the cwd.
+describe.concurrent("touch with an empty operand", () => {
+  const ENOENT = "touch: No such file or directory\n";
+  const past = new Date("2000-01-01T00:00:00Z");
+
+  test.each([
+    ['touch ""', () => $`touch ""`],
+    ['touch ${""}', () => $`touch ${""}`],
+  ])("%s fails and leaves the cwd as it is", async (_name, command) => {
+    using dir = tempDir("touch-empty", {});
+    const cwd = String(dir);
+    utimesSync(cwd, past, past);
+
+    const { stdout, stderr, exitCode } = await command().cwd(cwd).nothrow().quiet();
+
+    expect({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode }).toEqual({
+      stdout: "",
+      stderr: ENOENT,
+      exitCode: 1,
+    });
+    expect(statSync(cwd).mtimeMs).toBe(past.getTime());
+  });
+
+  test("the other operands are still touched when one is empty", async () => {
+    using dir = tempDir("touch-empty-multi", { existing: "" });
+    const cwd = String(dir);
+    utimesSync(join(cwd, "existing"), past, past);
+
+    const { stdout, stderr, exitCode } = await $`touch created "" existing`.cwd(cwd).nothrow().quiet();
+
+    expect({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode }).toEqual({
+      stdout: "",
+      stderr: ENOENT,
+      exitCode: 1,
+    });
+    expect(existsSync(join(cwd, "created"))).toBeTrue();
+    expect(statSync(join(cwd, "existing")).mtimeMs).toBeGreaterThan(past.getTime());
+  });
 });

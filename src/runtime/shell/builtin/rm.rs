@@ -11,7 +11,7 @@ use crate::node::fs::{
 use crate::shell::builtin::{BadFlag, Builtin, Kind};
 use crate::shell::builtins::batch::Batch;
 use crate::shell::interpreter::{
-    EventLoopHandle, Interpreter, NodeId, ShellTask, WorkPoolTask, shell_openat,
+    EventLoopHandle, Interpreter, NodeId, ShellTask, WorkPoolTask, reject_empty_path, shell_openat,
 };
 use crate::shell::yield_::Yield;
 
@@ -79,6 +79,10 @@ pub(crate) fn start(interp: &Interpreter, cmd: NodeId) -> Yield {
     let mut join_spill = Vec::new();
     let mut normalize_buf = Vec::new();
     for path in paths {
+        // Joined below, `""` would resolve to the cwd itself.
+        if path.is_empty() {
+            continue;
+        }
         let resolved: &[u8] = if Platform::AUTO.is_absolute(path) {
             path
         } else {
@@ -509,7 +513,9 @@ impl ShellRmTask {
     }
 
     fn remove_entry_file(&self, dir_task: *mut DirTask, path: &ZStr) -> Maybe<Unlinked> {
-        let Err(e) = bun_sys::unlinkat(self.cwd, path) else {
+        let unlinked = reject_empty_path(path.as_bytes(), bun_sys::Tag::unlink)
+            .and_then(|()| bun_sys::unlinkat(self.cwd, path));
+        let Err(e) = unlinked else {
             self.verbose_deleted(dir_task, path);
             return Ok(Unlinked::Done);
         };
