@@ -7,7 +7,8 @@ use bun_ptr::BackRef;
 use crate::shell::ExitCode;
 use crate::shell::builtin::{Builtin, BuiltinState, IoKind, Kind};
 use crate::shell::interpreter::{
-    Interpreter, NodeId, ShellTask, closefd, shell_lstatat, shell_openat, shell_statat,
+    Interpreter, NodeId, ShellTask, closefd, reject_empty_path, shell_lstatat, shell_openat,
+    shell_statat,
 };
 use crate::shell::io_writer::{ChildPtr, WriterTag};
 use crate::shell::yield_::Yield;
@@ -509,6 +510,8 @@ impl ShellMvBatchedTask {
     ) -> Result<(), bun_sys::Error> {
         use bun_sys::E;
 
+        reject_empty_path(src.as_bytes(), bun_sys::Tag::rename)?;
+        reject_empty_path(dst.as_bytes(), bun_sys::Tag::rename)?;
         if no_clobber {
             if shell_lstatat(dst_dir, dst).is_ok() {
                 // `dst` stays. A missing `src` is still an error.

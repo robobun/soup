@@ -1,5 +1,7 @@
-import { expect, test } from "bun:test";
+import { $ } from "bun";
+import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isDebug, isWindows, tempDir } from "harness";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 // A relative operand was joined onto the cwd in a fixed 4096-byte buffer, so an
@@ -108,3 +110,44 @@ test.skipIf(isDebug)(
     expect(exitCode).toBe(0);
   },
 );
+
+// An empty operand was joined onto the cwd of the shell, which is the cwd itself:
+// `mkdir ""` reported that the cwd exists and `mkdir -p ""` exited 0.
+describe.concurrent("mkdir with an empty operand", () => {
+  const ENOENT = "mkdir: No such file or directory\n";
+
+  test.each([
+    ['mkdir ""', () => $`mkdir ""`],
+    ['mkdir ${""}', () => $`mkdir ${""}`],
+    ['mkdir -p ""', () => $`mkdir -p ""`],
+    ['mkdir -pv ""', () => $`mkdir -pv ""`],
+    ['mkdir -v ""', () => $`mkdir -v ""`],
+  ])("%s fails with ENOENT", async (_name, command) => {
+    using dir = tempDir("mkdir-empty", {});
+    const cwd = String(dir);
+
+    const { stdout, stderr, exitCode } = await command().cwd(cwd).nothrow().quiet();
+
+    expect({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode }).toEqual({
+      stdout: "",
+      stderr: ENOENT,
+      exitCode: 1,
+    });
+    expect(readdirSync(cwd)).toEqual([]);
+  });
+
+  test("the other operands are still created when one is empty", async () => {
+    using dir = tempDir("mkdir-empty-multi", {});
+    const cwd = String(dir);
+
+    const { stdout, stderr, exitCode } = await $`mkdir -p a "" b/c`.cwd(cwd).nothrow().quiet();
+
+    expect({ stdout: stdout.toString(), stderr: stderr.toString(), exitCode }).toEqual({
+      stdout: "",
+      stderr: ENOENT,
+      exitCode: 1,
+    });
+    expect(readdirSync(cwd).sort()).toEqual(["a", "b"]);
+    expect(readdirSync(join(cwd, "b"))).toEqual(["c"]);
+  });
+});
