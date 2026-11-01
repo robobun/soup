@@ -95,6 +95,8 @@ pub struct PackageJSON {
     pub config: Option<Box<StringArrayHashMap<&'static [u8]>>>,
     /// `"engines"`, read for the project's own package.json only (with `scripts`).
     pub engines: Option<Box<StringArrayHashMap<&'static [u8]>>>,
+    /// `"devEngines"`, read with `engines`.
+    pub dev_engines: Option<Box<bun_install_types::dev_engines::Parsed>>,
 
     pub(crate) package_manager_package_id: PackageID,
     pub dependencies: DependencyMap,
@@ -154,6 +156,7 @@ impl Default for PackageJSON {
             scripts: None,
             config: None,
             engines: None,
+            dev_engines: None,
             package_manager_package_id: INVALID_PACKAGE_ID,
             dependencies: DependencyMap::default(),
             installed_dependency_rows: Default::default(),
@@ -533,6 +536,7 @@ impl PackageJSON {
             scripts: None,
             config: None,
             engines: None,
+            dev_engines: None,
             package_manager_package_id: INVALID_PACKAGE_ID,
             dependencies: DependencyMap::default(),
             installed_dependency_rows: Default::default(),
@@ -1065,6 +1069,11 @@ impl PackageJSON {
             }
             if let Some(engines) = property_string_map(b"engines") {
                 package_json.engines = Some(engines);
+            }
+            if let Some(dev_engines) = json.get(b"devEngines") {
+                package_json.dev_engines = Some(Box::new(
+                    bun_install_types::dev_engines::DevEngines::parse(&dev_engines),
+                ));
             }
         }
         let _ = (include_scripts, package_id);

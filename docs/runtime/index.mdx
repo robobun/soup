@@ -152,6 +152,8 @@ If the `package.json` has a `"bun"` entry in its `"engines"` field, Bun checks i
 }
 ```
 
+Bun checks the [`devEngines`](/pm/cli/install#devengines) field of that `package.json` at the same moment, as `npm run` does. In a project whose `devEngines.packageManager` names only `pnpm`, `bun run` fails before it runs a script, unless the `onFail` of that field says `"warn"` or `"ignore"`.
+
 ### `--bun`
 
 It's common for `package.json` scripts to reference locally-installed CLIs like `vite` or `next`. These CLIs are often JavaScript files marked with a [shebang](<https://en.wikipedia.org/wiki/Shebang_(Unix)>) to indicate that they should be executed with `node`.

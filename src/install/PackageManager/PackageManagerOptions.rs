@@ -1127,6 +1127,10 @@ impl Options {
             self.do_.set(Do::RUN_SCRIPTS, false);
         }
 
+        if cli.ignore_engines {
+            self.do_.set(Do::CHECK_ENGINES, false);
+        }
+
         if cli.trusted {
             self.do_.set(Do::TRUST_DEPENDENCIES_FROM_ARGS, true);
         }
@@ -1337,7 +1341,8 @@ bitflags::bitflags! {
         /// `bun update --depth 0`: only the dependencies of the root and of workspaces are
         /// re-resolved.
         const UPDATE_DIRECT_ONLY           = 1 << 14;
-        // _: u1 padding
+        /// Cleared by `--ignore-engines`: `engines.bun` and `devEngines` of the root package.json.
+        const CHECK_ENGINES                = 1 << 15;
     }
 }
 
@@ -1351,6 +1356,7 @@ impl Default for Do {
             | Do::VERIFY_INTEGRITY
             | Do::SUMMARY
             | Do::PREFETCH_RESOLVED_TARBALLS
+            | Do::CHECK_ENGINES
     }
 }
 
@@ -1436,6 +1442,10 @@ impl Do {
     #[inline]
     pub fn update_direct_only(self) -> bool {
         self.contains(Do::UPDATE_DIRECT_ONLY)
+    }
+    #[inline]
+    pub(crate) fn check_engines(self) -> bool {
+        self.contains(Do::CHECK_ENGINES)
     }
 }
 

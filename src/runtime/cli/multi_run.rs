@@ -952,11 +952,12 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
             let Some(pkg_scripts) = &package.json.scripts else {
                 continue;
             };
+            let run_in_bun = ctx.debug.run_in_bun;
             if script_names
                 .iter()
                 .any(|name| names_a_script(name, pkg_scripts))
             {
-                RunCommand::enforce_engines(&package.json);
+                RunCommand::enforce_engines(&package.json, run_in_bun);
             }
             let mut owned_scripts = OwnedScriptsMap::with_capacity(pkg_scripts.count());
             for (key, value) in pkg_scripts.iter() {
@@ -965,7 +966,6 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
                     .unwrap_or_oom();
             }
 
-            let run_in_bun = ctx.debug.run_in_bun;
             let pkg_path_env = RunCommand::path_for_run(
                 this_transpiler.env_mut(),
                 &package.dir,
@@ -1067,7 +1067,7 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
                 .iter()
                 .any(|name| names_a_script(name, scripts))
         {
-            RunCommand::enforce_engines(package_json);
+            RunCommand::enforce_engines(package_json, run_in_bun);
         }
 
         for raw_name in &script_names {
