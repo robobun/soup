@@ -865,12 +865,12 @@ pub(crate) fn run_scripts_with_filter(
             continue;
         };
 
+        let run_in_bun = ctx.debug.run_in_bun;
         let names = [&pre_script_name[..], script_name, &post_script_name[..]];
         if names.iter().any(|name| pkgscripts.get(*name).is_some()) {
-            RunCommand::enforce_engines(&package.json);
+            RunCommand::enforce_engines(&package.json, run_in_bun);
         }
 
-        let run_in_bun = ctx.debug.run_in_bun;
         let path_var: Vec<u8> =
             RunCommand::path_for_run(this_transpiler.env_mut(), path, None, path, run_in_bun)?;
 

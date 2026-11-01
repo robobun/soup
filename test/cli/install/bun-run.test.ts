@@ -1729,4 +1729,218 @@ describe.concurrent("bun run", () => {
       });
     });
   });
+
+  describe.concurrent("devEngines", () => {
+    // The check compares the bare `major.minor.patch`: a debug build of 1.2.3 is 1.2.3.
+    const running = Bun.version.replace(/-.*$/, "");
+    const note = (engine: string) =>
+      `note: "devEngines.${engine}" in ${join("<dir>", "package.json")} sets the requirement`;
+
+    async function run(devEngines: unknown, ...args: string[]) {
+      using dir = tempDir("bun-run-dev-engines", {
+        "package.json": JSON.stringify({
+          name: "foo",
+          devEngines,
+          scripts: { prehello: "echo pre", hello: "echo hello" },
+        }),
+        "hello.ts": "console.log('hello from a file');",
+      });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), ...args],
+        cwd: String(dir),
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout, stderr: stderr.replaceAll(String(dir), "<dir>"), exitCode };
+    }
+
+    for (const withRun of [false, true]) {
+      const cmd = withRun ? ["run"] : [];
+      const name = withRun ? "bun run" : "bun";
+
+      it(`${name} <script> fails when the package manager is not bun`, async () => {
+        expect(await run({ packageManager: { name: "pnpm", version: ">=9" } }, ...cmd, "hello")).toEqual({
+          stdout: "",
+          stderr: [
+            `error: this project requires pnpm >=9 as its package manager, but bun ${running} is running`,
+            note("packageManager"),
+            "",
+          ].join("\n"),
+          exitCode: 1,
+        });
+      });
+
+      it(`${name} <script> fails when bun is outside the range of the runtime`, async () => {
+        expect(await run({ runtime: { name: "bun", version: ">=999.0.0" } }, ...cmd, "hello")).toEqual({
+          stdout: "",
+          stderr: [
+            `error: this project requires bun >=999.0.0 as its runtime, but bun ${running} is running`,
+            note("runtime"),
+            "",
+          ].join("\n"),
+          exitCode: 1,
+        });
+      });
+
+      it(`${name} <script> runs when the requirements are met`, async () => {
+        expect(
+          await run(
+            {
+              runtime: [
+                { name: "node", version: ">=999" },
+                { name: "bun", version: `>=${running}` },
+              ],
+              packageManager: [{ name: "npm" }, { name: "bun" }],
+              os: { name: process.platform },
+              cpu: { name: process.arch },
+            },
+            ...cmd,
+            "hello",
+          ),
+        ).toEqual({ stdout: "pre\nhello\n", stderr: "$ echo pre\n$ echo hello\n", exitCode: 0 });
+      });
+
+      it(`${name} <script> warns once and runs with onFail: "warn"`, async () => {
+        expect(await run({ packageManager: { name: "pnpm", onFail: "warn" } }, ...cmd, "hello")).toEqual({
+          stdout: "pre\nhello\n",
+          stderr: [
+            `warn: this project requires pnpm as its package manager, but bun ${running} is running`,
+            note("packageManager"),
+            "$ echo pre",
+            "$ echo hello",
+            "",
+          ].join("\n"),
+          exitCode: 0,
+        });
+      });
+    }
+
+    it("--bun makes bun the runtime, so another runtime is not met", async () => {
+      const runtime = [{ name: "node", version: ">=20" }, { name: "deno" }];
+      expect(await run({ runtime }, "run", "hello")).toMatchObject({ stdout: "pre\nhello\n", exitCode: 0 });
+      expect(await run({ runtime }, "--bun", "run", "hello")).toEqual({
+        stdout: "",
+        stderr: [
+          `error: this project requires node >=20 or deno as its runtime, but bun ${running} is running`,
+          note("runtime"),
+          "",
+        ].join("\n"),
+        exitCode: 1,
+      });
+      expect(
+        await run({ runtime: [...runtime, { name: "bun", version: `>=${running}` }] }, "--bun", "run", "hello"),
+      ).toMatchObject({ stdout: "pre\nhello\n", exitCode: 0 });
+    });
+
+    it("rejects a field that does not have the shape", async () => {
+      expect(await run({ runtime: "bun" }, "run", "hello")).toEqual({
+        stdout: "",
+        stderr: `error: "devEngines.runtime" in ${join("<dir>", "package.json")} must be an object or an array of objects\n`,
+        exitCode: 1,
+      });
+    });
+
+    it("does not apply to a file", async () => {
+      for (const devEngines of [{ packageManager: { name: "pnpm" }, runtime: { name: "bun", version: "<1.0.0" } }, 1]) {
+        expect(await run(devEngines, "run", "./hello.ts")).toEqual({
+          stdout: "hello from a file\n",
+          stderr: "",
+          exitCode: 0,
+        });
+      }
+    });
+
+    describe("with --filter, --workspaces, --parallel and --sequential", () => {
+      async function runInWorkspace(b: object, ...args: string[]) {
+        using dir = tempDir("bun-run-dev-engines-workspace", {
+          "package.json": JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+          "packages/a/package.json": JSON.stringify({
+            name: "a",
+            scripts: { hello: "echo a" },
+            devEngines: { packageManager: [{ name: "npm" }, { name: "bun" }] },
+          }),
+          "packages/b/package.json": JSON.stringify({ name: "b", scripts: { hello: "echo b" }, devEngines: b }),
+          // It has no `hello`, so nothing of it runs and nothing of it is checked.
+          "packages/c/package.json": JSON.stringify({
+            name: "c",
+            scripts: { other: "echo c" },
+            devEngines: { packageManager: { name: "yarn" } },
+          }),
+        });
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "run", ...args, "hello"],
+          cwd: String(dir),
+          env: bunEnv,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        return { stdout, stderr: stderr.replaceAll(String(dir), "<dir>"), exitCode };
+      }
+      const noteOfB = `note: "devEngines.packageManager" in ${join("<dir>", "packages", "b", "package.json")} sets the requirement`;
+      const modes = [
+        ["--filter", "*"],
+        ["--workspaces", "--if-present"],
+        ["--parallel", "--filter", "*"],
+      ];
+
+      it.each(modes)("%s %s fails for a package whose script would run", async (...mode) => {
+        expect(await runInWorkspace({ packageManager: { name: "pnpm" } }, ...mode.filter(Boolean))).toEqual({
+          stdout: "",
+          stderr: [
+            `error: this project requires pnpm as its package manager, but bun ${running} is running`,
+            noteOfB,
+            "",
+          ].join("\n"),
+          exitCode: 1,
+        });
+      });
+
+      it.each(modes)('%s %s warns and runs with onFail: "warn"', async (...mode) => {
+        const { stdout, stderr, exitCode } = await runInWorkspace(
+          { packageManager: { name: "pnpm", onFail: "warn" } },
+          ...mode.filter(Boolean),
+        );
+        expect(stderr).toStartWith(
+          [`warn: this project requires pnpm as its package manager, but bun ${running} is running`, noteOfB, ""].join(
+            "\n",
+          ),
+        );
+        expect(stderr).not.toContain("yarn");
+        // `a hello: a` with --filter, `a:hello | a` with --parallel.
+        expect(stdout).toMatch(/^a[ :]hello(:| \|) a$/m);
+        expect(stdout).toMatch(/^b[ :]hello(:| \|) b$/m);
+        expect(exitCode).toBe(0);
+      });
+
+      it.each(["--parallel", "--sequential"])("%s fails in a single package", async mode => {
+        using dir = tempDir("bun-run-dev-engines-multi", {
+          "package.json": JSON.stringify({
+            name: "foo",
+            devEngines: { runtime: { name: "bun", version: "<1.0.0" } },
+            scripts: { "build:a": "echo a", "build:b": "echo b" },
+          }),
+        });
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "run", mode, "build:*"],
+          cwd: String(dir),
+          env: bunEnv,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect({ stdout, stderr: stderr.replaceAll(String(dir), "<dir>"), exitCode }).toEqual({
+          stdout: "",
+          stderr: [
+            `error: this project requires bun <1.0.0 as its runtime, but bun ${running} is running`,
+            note("runtime"),
+            "",
+          ].join("\n"),
+          exitCode: 1,
+        });
+      });
+    });
+  });
 });

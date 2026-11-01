@@ -13,6 +13,7 @@ import {
   isLinux,
   isWindows,
   joinP,
+  libcFamily,
   MAX_PATH_BYTES,
   normalizeBunSnapshot,
   readdirSorted,
@@ -26,6 +27,7 @@ import {
   toHaveBins,
 } from "harness";
 import { connect, createServer, type AddressInfo, type Socket as NetSocket } from "net";
+import { release as osRelease } from "os";
 import { basename, join, relative, resolve, sep } from "path";
 import {
   createTestContext,
@@ -7661,6 +7663,329 @@ describe.concurrent("bun-install", () => {
       expect(stderr).toStartWith(`error: this project requires bun <1.0.0, but bun ${running} is running`);
       expect(exitCode).toBe(1);
       expect(after).toBe(packageJson);
+    });
+  });
+
+  describe.concurrent("devEngines in the root package.json", () => {
+    // The check compares the bare `major.minor.patch`: a debug build of 1.2.3 is 1.2.3.
+    const running = Bun.version.replace(/-.*$/, "");
+    const note = (engine: string) => `note: "devEngines.${engine}" in <dir>/package.json sets the requirement`;
+
+    async function install(devEngines: unknown, more: Record<string, string> = {}, cwd = ".", args: string[] = []) {
+      using dir = tempDir("dev-engines", {
+        "package.json": JSON.stringify({ name: "foo", devEngines }),
+        ...more,
+      });
+      await using proc = spawn({
+        cmd: [bunExe(), "install", ...args],
+        cwd: join(String(dir), cwd),
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout).toMatch(/^bun (install|add) v1\./);
+      return {
+        // The lines of the check, without those of an install that went on.
+        stderr: stderr
+          .replaceAll(realpathSync(String(dir)), "<dir>")
+          .replaceAll(String(dir), "<dir>")
+          .replaceAll("\\", "/")
+          .split("\n")
+          .filter(line => /^(error|warn|note):/.test(line))
+          .join("\n"),
+        exitCode,
+        packageJson: await file(join(String(dir), "package.json")).text(),
+      };
+    }
+
+    it("fails when the package manager is not bun", async () => {
+      expect(await install({ packageManager: { name: "pnpm", version: ">=9" } })).toMatchObject({
+        stderr: [
+          `error: this project requires pnpm >=9 as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+    });
+
+    it("fails when bun is outside the range of the package manager", async () => {
+      expect(await install({ packageManager: { name: "bun", version: ">=999.0.0" } })).toMatchObject({
+        stderr: [
+          `error: this project requires bun >=999.0.0 as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+    });
+
+    it("installs when bun meets the package manager", async () => {
+      for (const packageManager of [
+        { name: "bun" },
+        { name: "bun", version: `>=${running}` },
+        { name: "bun", version: "^1.0.0 || >=2" },
+        { name: "bun", version: running },
+        { name: "bun", version: "" },
+        [],
+      ]) {
+        expect(await install({ packageManager }), JSON.stringify(packageManager)).toMatchObject({
+          stderr: "",
+          exitCode: 0,
+        });
+      }
+    });
+
+    it("one of several package managers is enough", async () => {
+      expect(
+        await install({ packageManager: [{ name: "npm", version: ">=10" }, { name: "bun" }, { name: "pnpm" }] }),
+      ).toMatchObject({ stderr: "", exitCode: 0 });
+
+      expect(await install({ packageManager: [{ name: "npm", version: ">=10" }, { name: "pnpm" }] })).toMatchObject({
+        stderr: [
+          `error: this project requires npm >=10 or pnpm as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+    });
+
+    it("a version that is not a range is compared as text", async () => {
+      for (const version of ["latest", `>=${running} && <999`]) {
+        expect(await install({ packageManager: { name: "bun", version } })).toMatchObject({
+          stderr: [
+            `error: this project requires bun ${version} as its package manager, but bun ${running} is running`,
+            note("packageManager"),
+          ].join("\n"),
+          exitCode: 1,
+        });
+      }
+    });
+
+    it('onFail: "warn" installs with a warning and "ignore" without one', async () => {
+      expect(await install({ packageManager: { name: "pnpm", onFail: "warn" } })).toMatchObject({
+        stderr: [
+          `warn: this project requires pnpm as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+        ].join("\n"),
+        exitCode: 0,
+      });
+      expect(await install({ packageManager: { name: "pnpm", onFail: "ignore" } })).toMatchObject({
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
+    it('onFail: "download" fails, as in npm', async () => {
+      expect(await install({ packageManager: { name: "pnpm", onFail: "download" } })).toMatchObject({
+        stderr: [
+          `error: this project requires pnpm as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+    });
+
+    it("onFail of the last requirement decides, as in npm", async () => {
+      expect(
+        await install({
+          packageManager: [
+            { name: "npm", onFail: "error" },
+            { name: "pnpm", onFail: "warn" },
+          ],
+        }),
+      ).toMatchObject({
+        stderr: [
+          `warn: this project requires npm or pnpm as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+        ].join("\n"),
+        exitCode: 0,
+      });
+    });
+
+    it("leaves a project with another runtime alone", async () => {
+      for (const runtime of [{ name: "node", version: ">=999" }, [{ name: "node" }, { name: "deno", version: "<1" }]]) {
+        expect(await install({ runtime, packageManager: { name: "bun" } }), JSON.stringify(runtime)).toMatchObject({
+          stderr: "",
+          exitCode: 0,
+        });
+      }
+    });
+
+    it("holds bun to the runtime entries that name it", async () => {
+      expect(await install({ runtime: [{ name: "node" }, { name: "bun", version: `>=${running}` }] })).toMatchObject({
+        stderr: "",
+        exitCode: 0,
+      });
+
+      expect(await install({ runtime: [{ name: "bun", version: ">=999.0.0" }, { name: "node" }] })).toMatchObject({
+        stderr: [
+          `error: this project requires bun >=999.0.0 as its runtime, but bun ${running} is running`,
+          note("runtime"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+
+      // onFail is the one of the last requirement of the key, also when that one names another runtime.
+      expect(
+        await install({
+          runtime: [
+            { name: "bun", version: ">=999.0.0", onFail: "error" },
+            { name: "node", onFail: "ignore" },
+          ],
+        }),
+      ).toMatchObject({ stderr: "", exitCode: 0 });
+    });
+
+    it("checks the operating system, the CPU and the libc", async () => {
+      const release = osRelease();
+      const libc = isLinux ? libcFamily : undefined;
+
+      expect(
+        await install({
+          os: [{ name: "aix" }, { name: process.platform, version: ">=1" }],
+          cpu: { name: process.arch },
+          ...(libc ? { libc: { name: libc } } : {}),
+        }),
+      ).toMatchObject({ stderr: "", exitCode: 0 });
+
+      // The release of a Linux kernel has a suffix, `6.8.0-85-generic`. The same text is met, as in npm.
+      expect(await install({ os: { name: process.platform, version: release } })).toMatchObject({
+        stderr: "",
+        exitCode: 0,
+      });
+
+      expect(
+        await install({
+          os: { name: process.platform, version: ">=99999" },
+          cpu: [{ name: "s390x" }, { name: "ppc64" }],
+          libc: { name: libc === "musl" ? "glibc" : "musl" },
+        }),
+      ).toMatchObject({
+        stderr: [
+          `error: this project requires the operating system ${process.platform} >=99999, but this is ${process.platform} ${release}`,
+          note("os"),
+          `error: this project requires the CPU architecture s390x or ppc64, but this is ${process.arch}`,
+          note("cpu"),
+          `error: this project requires the C library ${libc === "musl" ? "glibc" : "musl"}, but this is ${libc ?? process.platform}`,
+          note("libc"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+    });
+
+    it("a CPU has no version to compare with", async () => {
+      expect(await install({ cpu: { name: process.arch, version: "*" } })).toMatchObject({
+        stderr: [
+          `error: this project requires the CPU architecture ${process.arch} *, but this is ${process.arch}`,
+          note("cpu"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+    });
+
+    it("reports every engine, warnings too, before it fails", async () => {
+      expect(
+        await install({
+          cpu: { name: "s390x", onFail: "warn" },
+          runtime: { name: "bun", version: "<1.0.0" },
+          packageManager: { name: "yarn" },
+        }),
+      ).toMatchObject({
+        stderr: [
+          `error: this project requires yarn as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+          `error: this project requires bun <1.0.0 as its runtime, but bun ${running} is running`,
+          note("runtime"),
+          `warn: this project requires the CPU architecture s390x, but this is ${process.arch}`,
+          note("cpu"),
+        ].join("\n"),
+        exitCode: 1,
+      });
+    });
+
+    it("skips the keys it does not know", async () => {
+      expect(
+        await install({
+          editor: "vim",
+          packageManager: { name: "bun", registry: "https://example.com" },
+        }),
+      ).toMatchObject({ stderr: "", exitCode: 0 });
+    });
+
+    it.each([
+      ["bun", '"devEngines" in <dir>/package.json must be an object'],
+      [["bun"], '"devEngines" in <dir>/package.json must be an object'],
+      [{ runtime: "bun" }, '"devEngines.runtime" in <dir>/package.json must be an object or an array of objects'],
+      [{ os: ["linux"] }, '"devEngines.os" in <dir>/package.json must be an object or an array of objects'],
+      [{ cpu: { version: "1" } }, '"devEngines.cpu" in <dir>/package.json needs a "name"'],
+      [{ libc: {} }, '"devEngines.libc" in <dir>/package.json needs a "name"'],
+      [{ packageManager: { name: 1 } }, '"devEngines.packageManager.name" in <dir>/package.json must be a string'],
+      [
+        { packageManager: { name: "bun", version: 1 } },
+        '"devEngines.packageManager.version" in <dir>/package.json must be a string',
+      ],
+      [
+        { runtime: [{ name: "node" }, { name: "bun", onFail: "explode" }] },
+        '"devEngines.runtime.onFail" in <dir>/package.json must be "ignore", "warn", "error" or "download", not "explode"',
+      ],
+    ])("rejects %j", async (devEngines, message) => {
+      expect(await install(devEngines)).toMatchObject({ stderr: `error: ${message}`, exitCode: 1 });
+    });
+
+    it("checks the workspace root from a workspace package", async () => {
+      const { stderr, exitCode } = await install(
+        { packageManager: { name: "pnpm" } },
+        {
+          "package.json": JSON.stringify({
+            name: "root",
+            workspaces: ["packages/*"],
+            devEngines: { packageManager: { name: "pnpm" } },
+          }),
+          "packages/a/package.json": JSON.stringify({ name: "a", devEngines: { packageManager: { name: "bun" } } }),
+        },
+        "packages/a",
+      );
+      expect(stderr).toBe(
+        [
+          `error: this project requires pnpm as its package manager, but bun ${running} is running`,
+          note("packageManager"),
+        ].join("\n"),
+      );
+      expect(exitCode).toBe(1);
+    });
+
+    it("--ignore-engines skips devEngines and engines.bun", async () => {
+      const files = {
+        "package.json": JSON.stringify({
+          name: "foo",
+          engines: { bun: ">=999.0.0" },
+          devEngines: { packageManager: { name: "pnpm" }, runtime: "bun" },
+        }),
+        "dep/package.json": JSON.stringify({ name: "dep", version: "1.0.0" }),
+      };
+      expect(await install(undefined, files, ".", ["--ignore-engines"])).toMatchObject({ stderr: "", exitCode: 0 });
+
+      const added = await install(undefined, files, ".", ["--ignore-engines", "dep@file:./dep"]);
+      expect(added).toMatchObject({ stderr: "", exitCode: 0 });
+      expect(JSON.parse(added.packageJson).dependencies).toEqual({ dep: "file:./dep" });
+    });
+
+    it("stops bun add before it writes package.json", async () => {
+      const {
+        stderr,
+        exitCode,
+        packageJson: after,
+      } = await install(
+        { packageManager: { name: "npm" } },
+        { "dep/package.json": JSON.stringify({ name: "dep", version: "1.0.0" }) },
+        ".",
+        ["dep@file:./dep"],
+      );
+      expect(stderr).toStartWith(
+        `error: this project requires npm as its package manager, but bun ${running} is running`,
+      );
+      expect(exitCode).toBe(1);
+      expect(after).toBe(JSON.stringify({ name: "foo", devEngines: { packageManager: { name: "npm" } } }));
     });
   });
 

@@ -6550,7 +6550,9 @@ const upload = await fetch(s3.presign("quarantine/upload.bin"));
 const etag = upload.headers.get("etag");
 if (!upload.ok || !etag) throw new Error("cannot read the upload");
 await scan(upload.body);
-await s3.copy("quarantine/upload.bin", "files/upload.bin", { copySourceIfMatch: etag });
+await s3.copy("quarantine/upload.bin", "files/upload.bin", {
+  copySourceIfMatch: etag,
+});
 
 // a new object with its own type and metadata, or the same object in another storage class
 await s3.copy("uploads/scan-0001.bin", "reports/january.pdf", {
@@ -6741,19 +6743,19 @@ the fixed names around the window as they now split at `x-amz-date`, or the gene
 What it costs a program that never copies, on two release builds (the stack without this commit
 and with it, same toolchain):
 
-|                                                                        | without                                      | with                    |
-| ---------------------------------------------------------------------- | -------------------------------------------- | ----------------------- |
-| `sign_request::<false>` (disassembly)                                  | 3,416 instructions, 299 conditional jumps    | the same, none differs  |
-| `SignedHeaders::get`, `execute_simple_s3_request`, the `stat()` thunk  | 68, 756 and 145 instructions                 | the same, none differs  |
-| `CanonicalRequest::format` for a `stat()`, callees included            | 2,780 instructions, 494 conditional branches | 2,779, 494              |
-| the same for an upload without metadata                                | 2,776, 494                                   | 2,775, 494              |
-| the same for an upload with 1, 3 and 10 metadata keys                  | 3,414, 4,678 and 9,232 instructions          | 3,529, 4,795 and 9,356  |
-| `SignedHeaders::with_metadata` for an upload with 3 keys               | 241 instructions, 42 conditional branches    | 312, 47                 |
-| `S3HttpSimpleTask::on_response` for a `stat()`, its own body           | 190 instructions, 24 conditional branches    | 190, 24                 |
-| `SignResult`, `SignOptions`, the request options, the task, `Metadata` | 488, 128, 144, 3,176 and 24 bytes            | the same                |
-| 21 requests and 4 presigned URLs, recorded with a fixed clock          |                                              | 0 of 25 lines differ    |
-| host functions of `S3Client` and `S3File`                              | 20                                           | 23                      |
-| binary (`size`, text)                                                  | 108,623,540 bytes                            | 108,656,564 bytes       |
+|                                                                        | without                                      | with                   |
+| ---------------------------------------------------------------------- | -------------------------------------------- | ---------------------- |
+| `sign_request::<false>` (disassembly)                                  | 3,416 instructions, 299 conditional jumps    | the same, none differs |
+| `SignedHeaders::get`, `execute_simple_s3_request`, the `stat()` thunk  | 68, 756 and 145 instructions                 | the same, none differs |
+| `CanonicalRequest::format` for a `stat()`, callees included            | 2,780 instructions, 494 conditional branches | 2,779, 494             |
+| the same for an upload without metadata                                | 2,776, 494                                   | 2,775, 494             |
+| the same for an upload with 1, 3 and 10 metadata keys                  | 3,414, 4,678 and 9,232 instructions          | 3,529, 4,795 and 9,356 |
+| `SignedHeaders::with_metadata` for an upload with 3 keys               | 241 instructions, 42 conditional branches    | 312, 47                |
+| `S3HttpSimpleTask::on_response` for a `stat()`, its own body           | 190 instructions, 24 conditional branches    | 190, 24                |
+| `SignResult`, `SignOptions`, the request options, the task, `Metadata` | 488, 128, 144, 3,176 and 24 bytes            | the same               |
+| 21 requests and 4 presigned URLs, recorded with a fixed clock          |                                              | 0 of 25 lines differ   |
+| host functions of `S3Client` and `S3File`                              | 20                                           | 23                     |
+| binary (`size`, text)                                                  | 108,623,540 bytes                            | 108,656,564 bytes      |
 
 The disassembly is `objdump` of the two binaries without addresses. In `sign_request` the only
 lines that differ are two calls of `encode_uri_component`, which has the same body under another
@@ -6968,7 +6970,9 @@ for await (const [event] of sql`SELECT * FROM events ORDER BY id`.cursor()) {
 
 // in a transaction, the other statements run between two batches
 await sql.begin(async tx => {
-  const users = tx<{ id: number }[]>`SELECT id FROM users WHERE NOT notified ORDER BY id`;
+  const users = tx<
+    { id: number }[]
+  >`SELECT id FROM users WHERE NOT notified ORDER BY id`;
   for await (const rows of users.cursor(500)) {
     await tx`UPDATE users SET notified = true WHERE id IN ${tx(rows.map(row => row.id))}`;
   }
@@ -7051,25 +7055,25 @@ this commit and with it. `perf`, `valgrind`, `strace` and `bloaty` are not in th
 instruction counts are from gdb, one step at a time, which is exact, and from `perf_event_open`
 for the whole process. Syscalls are from `qemu-x86_64 -strace`.
 
-| Per                                              | Without the commit      | With it                 |
-| ------------------------------------------------ | ----------------------- | ----------------------- |
-| query: bytes of the native request               | 96                      | 96                      |
-| query: bytes of its JS wrapper                   | 64                      | 64                      |
-| query: GC cells allocated (cached, awaited)      | 32.06                   | 32.06                   |
-| query: instructions of native `run()`, cached    | 2,715                   | 2,666                   |
-| query: the same with `prepare: false`            | 3,019                   | 3,008                   |
-| query: the same for `.simple()`                  | 780                     | 772                     |
-| query: instructions of the dispatch that writes  | 1,457                   | 1,457                   |
-| query: instructions per message read             | 1,733 / 53 / 2,900      | 1,733 / 53 / 2,900      |
-| query: instructions of the whole process         | 29,179 (28,914-29,391)  | 29,215 (28,518-29,655)  |
-| query: the same with a result of 100 rows        | 137,322                 | 137,432                 |
-| query: sendto (42 bytes), recvfrom, epoll_pwait  | 1, 1, 1                 | 1, 1, 1                 |
-| `sql.begin()` with one statement: GC cells       | 124.01                  | 124.01                  |
-| `reserve()` and `release()`: GC cells            | 34.57                   | 34.57                   |
-| savepoint, released / rolled back: GC cells      | 214.07 / 226.07         | 214.01 / 226.08         |
-| `new SQL()` on PostgreSQL: GC cells, bytes held  | 55.07, 2,893            | 55.07, 2,952            |
-| process: host functions of the query prototype   | 10                      | 12                      |
-| process: text of the binary                      | 108,629,396             | 108,653,497 (+24.1 KB)  |
+| Per                                             | Without the commit     | With it                |
+| ----------------------------------------------- | ---------------------- | ---------------------- |
+| query: bytes of the native request              | 96                     | 96                     |
+| query: bytes of its JS wrapper                  | 64                     | 64                     |
+| query: GC cells allocated (cached, awaited)     | 32.06                  | 32.06                  |
+| query: instructions of native `run()`, cached   | 2,715                  | 2,666                  |
+| query: the same with `prepare: false`           | 3,019                  | 3,008                  |
+| query: the same for `.simple()`                 | 780                    | 772                    |
+| query: instructions of the dispatch that writes | 1,457                  | 1,457                  |
+| query: instructions per message read            | 1,733 / 53 / 2,900     | 1,733 / 53 / 2,900     |
+| query: instructions of the whole process        | 29,179 (28,914-29,391) | 29,215 (28,518-29,655) |
+| query: the same with a result of 100 rows       | 137,322                | 137,432                |
+| query: sendto (42 bytes), recvfrom, epoll_pwait | 1, 1, 1                | 1, 1, 1                |
+| `sql.begin()` with one statement: GC cells      | 124.01                 | 124.01                 |
+| `reserve()` and `release()`: GC cells           | 34.57                  | 34.57                  |
+| savepoint, released / rolled back: GC cells     | 214.07 / 226.07        | 214.01 / 226.08        |
+| `new SQL()` on PostgreSQL: GC cells, bytes held | 55.07, 2,893           | 55.07, 2,952           |
+| process: host functions of the query prototype  | 10                     | 12                     |
+| process: text of the binary                     | 108,629,396            | 108,653,497 (+24.1 KB) |
 
 The "whole process" rows are the slope between 20,000 and 40,000 awaited queries, the median of
 five interleaved runs, and the difference is inside the spread. The lower counts of `run()` are
@@ -7326,7 +7330,7 @@ that is never split or globbed again, and this is the same idea:
   `$((0x$hex))` and `$((count_$i))`.
 - An interpolated JavaScript value follows the same rule and is checked before the script runs:
   `${"1 + 1"}`, `${1.5}`, `${undefined}` and `${"x++"}` throw `Interpolated value in arithmetic
-  expansion must be an integer`. `{ raw: "1 + 1" }` is the way to build an expression from text.
+expansion must be an integer`. `{ raw: "1 + 1" }` is the way to build an expression from text.
 
 With integers in the variables, nothing is different from bash.
 
@@ -7425,10 +7429,14 @@ reader.readAsDataURL(Bun.file("./logo.png"));
 // what a library does with the File of an upload
 const form = await request.formData();
 const zip = await JSZip.loadAsync(form.get("archive") as File);
-Papa.parse(form.get("table") as File, { header: true, complete: result => console.log(result.data) });
+Papa.parse(form.get("table") as File, {
+  header: true,
+  complete: result => console.log(result.data),
+});
 
 // a large file, with progress
-reader.onprogress = event => console.log(`${event.loaded} of ${event.total} bytes`);
+reader.onprogress = event =>
+  console.log(`${event.loaded} of ${event.total} bytes`);
 reader.readAsArrayBuffer(Bun.file("./video.mp4"));
 ```
 
@@ -7578,7 +7586,7 @@ was brought up to date in its own commit:
   a conflicted `bun.lock` reports `merged_conflict` on the result alone, and `bun install` gets the
   loader for installs through `PackageManager::load_lockfile_from_cwd_for_install`.
 - Smaller ones: the idle time of the event loop reads through `&Loop` and `Cell` fields, `bun
-  compile` is one more row in the table of commands behind "did you mean", the states of
+compile` is one more row in the table of commands behind "did you mean", the states of
   `EventSource` are a `const enum` (a new lint wants a constant that two built-in modules declare
   to have one value, and `CLOSED` is 3 in `ws`), `collectCoverageFrom` gets its VM from
   `vm.as_mut()`, cursors set `row_type` where the query object is known, the native function of
@@ -7974,20 +7982,20 @@ Not done, and known:
 
 What it costs, measured on release builds of the commit before this one and of this one:
 
-|                                                                   | without                              | with                        |
-| ----------------------------------------------------------------- | ------------------------------------ | --------------------------- |
-| binary (`size`): text                                             | 138,568,276 bytes                    | 138,594,925 bytes (+26,649) |
-| binary (`size`): data                                             | 118,488 bytes                        | 118,624 bytes (+136)        |
-| `bun test` of 4 files without a `globalSetup`, median of 40 pairs | 14.419 ms                            | 14.072 ms                   |
-| the same pairs in the other order                                 | 13.650 ms                            | 13.264 ms                   |
-| two runs of the same binary, for comparison                       | 13.216 ms                            | 13.123 ms                   |
-| this patch, without and with `--global-setup ./noop.ts`           | 12.9 ms                              | 29.5 ms (+16.5 ms)          |
-| the same two with `--parallel=4`                                  | 29.4 ms                              | 43.6 ms (+14.2 ms)          |
-| the same two with a test process of 408 MB                        | 444.3 ms                             | 468.7 ms (+24.4 ms)         |
-| peak memory of the host process (`VmHWM`, 5 runs)                 |                                      | 39.1 MB                     |
-| `TestOptions`, which every bun process has                        | 352 bytes                            | 400 bytes                   |
-| `DebugOptions`, which every bun process has                       |                                      | 16 bytes more               |
-| `ExitHandler`, which every VM has                                 | 3 bytes                              | 16 bytes                    |
+|                                                                   | without           | with                        |
+| ----------------------------------------------------------------- | ----------------- | --------------------------- |
+| binary (`size`): text                                             | 138,568,276 bytes | 138,594,925 bytes (+26,649) |
+| binary (`size`): data                                             | 118,488 bytes     | 118,624 bytes (+136)        |
+| `bun test` of 4 files without a `globalSetup`, median of 40 pairs | 14.419 ms         | 14.072 ms                   |
+| the same pairs in the other order                                 | 13.650 ms         | 13.264 ms                   |
+| two runs of the same binary, for comparison                       | 13.216 ms         | 13.123 ms                   |
+| this patch, without and with `--global-setup ./noop.ts`           | 12.9 ms           | 29.5 ms (+16.5 ms)          |
+| the same two with `--parallel=4`                                  | 29.4 ms           | 43.6 ms (+14.2 ms)          |
+| the same two with a test process of 408 MB                        | 444.3 ms          | 468.7 ms (+24.4 ms)         |
+| peak memory of the host process (`VmHWM`, 5 runs)                 |                   | 39.1 MB                     |
+| `TestOptions`, which every bun process has                        | 352 bytes         | 400 bytes                   |
+| `DebugOptions`, which every bun process has                       |                   | 16 bytes more               |
+| `ExitHandler`, which every VM has                                 | 3 bytes           | 16 bytes                    |
 
 Of the 27 KB, 7,829 bytes are the embedded entry script and 12,448 bytes the twelve symbols of
 `GlobalSetup.rs`. A run without a `globalSetup` executes two more flag lookups, two more key
@@ -8228,6 +8236,212 @@ test files of the guard. The guard commit: `src/runtime/shell/interpreter.rs`
 `test/js/bun/shell/commands/rm.test.ts`, `mv.test.ts`, `cp.test.ts`, `mkdir.test.ts`,
 `touch.test.ts`, `ls.test.ts`.
 
+### 2026-11-01: `devEngines` in package.json
+
+`devEngines` is the field of package.json for the tools a project is developed with: the package
+manager, the runtime, the operating system, the CPU and the libc. npm checks it before
+`npm install` and `npm run` since 10.9, and pnpm reads its `runtime` and `packageManager`. bun read
+none of it (oven-sh/bun#26512, 22 upvotes). A project could not say "this is installed with pnpm"
+or "this needs bun 1.3" in the field the other tools already honor, and `bun install` in an npm or
+pnpm project wrote a `bun.lock` next to the lockfile of that project without a word. Now
+`bun install` (with `add`, `remove`, `update`, `link` and `ci`, everything that installs) and
+`bun run <script>` check the field, in the two places where the `engines.bun` check of 2026-08-27
+runs:
+
+```json
+{
+  "devEngines": {
+    "packageManager": { "name": "bun", "version": ">=1.3.0" },
+    "runtime": [
+      { "name": "bun", "version": ">=1.3.0" },
+      { "name": "node", "version": ">=22" }
+    ],
+    "os": { "name": "linux", "onFail": "warn" }
+  }
+}
+```
+
+```
+error: this project requires pnpm >=9 as its package manager, but bun 1.4.4 is running
+note: "devEngines.packageManager" in /home/me/my-app/package.json sets the requirement
+```
+
+The rules are the ones of npm, read from `lib/dev-engines.js` of `npm-install-checks`:
+
+- The keys are `packageManager`, `runtime`, `os`, `cpu` and `libc`. Each holds one requirement or
+  an array of them, one requirement that is met is enough, and `[]` requires nothing.
+- A requirement is `{ name, version?, onFail? }`. `name` is compared as text: with `bun` for the
+  first two keys, with `process.platform`, `process.arch`, and `glibc` or `musl` for the others.
+  `version` is a semver range. A value that npm does not take for a range (`latest`,
+  `>=1 && <2`) is compared as text, and a value that is the same text is always met. For `os`
+  the version is `os.release()`.
+- `onFail` of the last requirement of a key decides what happens when none is met. `"error"`, the
+  default, ends the command with exit code 1, after every key is reported. `"warn"` prints the
+  same lines and goes on. `"ignore"` prints nothing. `"download"` is read as `"error"`.
+- A `devEngines` that is not an object, a key that is neither an object nor an array of objects, a
+  requirement with no `name` or with a `name`, `version` or `onFail` that is not a string, and an
+  `onFail` that is none of the four values are errors, whatever `onFail` says.
+
+Where bun differs from npm. This is the list to read before a cherry-pick:
+
+- `runtime`. The entry of 2026-08-27 left `devEngines` out because of one question: what does
+  `"name": "node"` mean to bun? npm takes the runtime to be the `node` that runs npm. bun is a
+  runtime and a package manager, and a project that runs on Node.js and installs with bun is
+  common. bun cannot tell which runtime a script is going to start. So it holds itself to the
+  entries that name `bun`: a `runtime` that names only other runtimes is not checked, and with an
+  entry for `bun` the running bun has to meet one of those. `bun --bun run` is the exception. It
+  makes bun the `node` of every script, so there all entries count and `{ "name": "node" }` fails.
+  pnpm 11 goes another way: it compares every runtime that the field names with the one it finds
+  on the system. bun starts no process for this check.
+- `bun run <script>` checks `packageManager` too, as `npm run` does, and as pnpm refuses to work
+  in a project that names another package manager. A project that names only `pnpm` no longer runs
+  its scripts with `bun run`, unless it says `"onFail": "warn"`. This is the strictest part of the
+  change. If it is too strict for bun, the check of that one key can be left to the commands that
+  install: `enforce_dev_engines` takes a flag for the one difference between its two callers
+  already.
+- The version of `os` is the three numbers of `os.release()`. npm hands the whole string to
+  semver, where the release of an Ubuntu kernel, `6.8.0-85-generic`, is a prerelease and is outside
+  `>=6`. The whole string is still met by the same text, as in npm.
+- Keys of `devEngines` and properties of a requirement that bun does not know are skipped. npm
+  throws on them. A package.json that is written for a later form of the field still installs.
+- A `version` on `cpu` or `libc`, and a `libc` on a system that is not Linux, are a requirement
+  that is not met. npm throws, because it cannot find what to compare with.
+- npm turns the error into a warning with `--force`. `bun install --force` means something else,
+  so the way around the check is `--ignore-engines`, the flag that yarn has for it. Upstream
+  accepts that flag and does nothing with it. Here it skips `devEngines` and `engines.bun` for the
+  commands that install (`Do::CHECK_ENGINES`, next to the flag that `--ignore-scripts` clears),
+  and its row is gone from the table of npm flags in the docs. `bun run` has no such flag.
+
+What is checked where, as for `engines.bun`: `bun install` reads the package.json of the workspace
+root, from whichever package it runs in, before it resolves or writes anything, so a failing
+`bun add` leaves package.json as it was. `bun run` reads the package.json the script comes from,
+which in a workspace package is not the root. With `--filter`, `--workspaces`, `--parallel` and
+`--sequential` it reads the package.json of every package that has a script to run, before the
+first script starts. Running a file (`bun ./file.ts`), `bun test`, `bunx` and the lifecycle
+scripts of an install check nothing, and the `devEngines` of a dependency is never read.
+
+The commit needs the one of 2026-08-27 (`Check engines.bun in the root package.json`): it uses
+the module and the call sites of that commit. The parsed form of the field and its parser are
+in `bun_install_types::dev_engines`, below the resolver and `bun install`, because the two read
+the file in different parses: the resolver keeps the result in `PackageJSON` for the project's own
+package.json only (with `scripts` and `engines`), and an error of the shape is reported when a
+script runs, not when the file is read. `bun_install::engines::enforce_dev_engines` compares and
+prints. `check_bun_range` is now `check_range` with the version as an argument, and it drops what
+follows the three numbers of that version, which changes nothing for the version of bun.
+
+A review of the diff before the commit found one bug: a `version` that is the release of the
+kernel itself, `6.8.0-85-generic`, was not met, because the comparison of exact versions looks at
+the prerelease that the range check had just dropped. The same review led to the strict reading
+of ranges, to a `cpu` or `libc` with a version never being met (it was compared with `0.0.0`),
+and to `--ignore-engines`.
+
+Tests: 26 in `bun-install.test.ts` and 19 in `bun-run.test.ts`. On the release build of upstream
+22 and 16 of them fail, and 4 and 3 are controls that pass on both (a field that is met, unknown
+keys, `--ignore-engines`, a file). They cover every key, the array forms, the three `onFail`
+values and `"download"`, the last-requirement rule, the runtime rule with and without `--bun`,
+the release of the kernel as a version, the order of the report, every error of the shape, the
+workspace root, `bun add` leaving package.json alone, and the four flags that run the scripts of
+several packages or several scripts of one. `cargo check --workspace` passes for
+`x86_64-pc-windows-msvc` and `aarch64-apple-darwin`, and that is the only check of those
+targets: the Windows branch of `os_release` has not run.
+
+Two fixes went into the commit of 2026-08-27 on the way.
+
+- Its check missed the scripts that `bun run --filter`, `--workspaces`, `--parallel` and
+  `--sequential` start. Those are collected in `filter_run.rs` and `multi_run.rs` and never reach
+  the lookup that had the check, so `bun run --filter '*' build` ran on a bun outside
+  `engines.bun`. The check is now one function, `RunCommand::enforce_engines`, which the three
+  places call, and this commit adds `devEngines` to it. Eight tests for `engines.bun` with those
+  flags are in that commit.
+- Its install tests passed their output through `normalizeBunSnapshot`, which replaces
+  `Bun.version`. On a release build that is the bare version, so the expected line
+  `bun 1.4.4 is running` could not match there. The tests passed on the debug build only, where
+  `Bun.version` ends in `-debug`. They now replace the directory alone.
+
+Not in this patch: downloading a runtime for `"onFail": "download"`, a check of the `node` on
+`PATH` against a `runtime` entry for `node`, `bunx`, and the root package.json for a `bun run` in
+a workspace package. `bun run` makes bun the `node` of a script also when no `node` is installed,
+and only `--bun` (or `run.bun` in bunfig.toml) counts as bun being the runtime. The scripts that
+`bun publish`, `bun pm pack` and `bun pm version` run are not checked, for either field. The
+`packageManager` field of corepack (`"packageManager": "pnpm@9.1.0"`) is still not read. The
+shell completions do not list `--ignore-engines`.
+
+Rebase notes. 62 patches onto oven-sh/bun 3f3a9ff87c, which is 15 commits after the base of
+2026-10-31. One of them is oven-sh/bun#44833, Vitest compatibility for `bun test`: 582 files,
+among them a new `"vitest"` module, the failure of a test on its sequence and not on the reporter,
+new worker frames for `--parallel`, and `import.meta.glob`. Four patches are dropped because that
+pull request has what they added (see [Dropped](#dropped)): `expect.poll()`,
+`expect.addSnapshotSerializer()`, the async fake timers and `import.meta.glob()`. 14 of the other
+62 stopped the rebase:
+
+- `bun test --reporter=json`, 12 files. Upstream now keeps the failure of a test on its
+  `ExecutionSequence`, with the failures of earlier attempts, and reports an error outside of any
+  test to the JUnit reporter as a test case named `(unhandled error)`
+  (`CommandLineReporter::record_unhandled_error`). The patch had a slot of its own on the reporter
+  for such errors and a trailer on the `FileDone` frame of a worker. Both are gone. The JSON
+  reporter takes upstream's report: `TestCaseReport` has a flag, `unhandled`, which is on the
+  `TestDone` frame next to the column, and the reporter turns a flagged report into the `message`
+  of its file, so the document is what it was. The coordinator's stand-ins for a file that a
+  worker did not finish (`(worker crashed)`, `(aborted)`, `(interrupted)`) carry the flag too. The
+  texts for a timeout and for `.failing()` come from upstream's `TestFailure::from_result`.
+- `globalSetup`, 7 files. `build_worker_argv` was split by the patch into the flags every child
+  gets and the flags of a worker, and upstream added flags to both halves and a second return
+  value. `apply_environment` sets the time zone of the isolation state always, as upstream now
+  does.
+- `collectCoverageFrom`, 5 files. The converter of `CodeCoverage.rs` takes the source map from
+  its caller since this patch, and upstream's counts of compiled code (`bun test --aot
+--coverage`) read the saved map inside it. The compiled half asks the saved map itself now. The
+  coordinator has no list of crashed files any more, so it has a flag, `worker_crashed`.
+- `bun test --last-failed`, 3 files. A crashed worker is recorded in `account_crash`, where
+  `mark_crashed` was, and a file that fails to load and bails out is recorded before the bail.
+- `bun test --dry-run`, 6 files: lines next to new lines, the `Pending` arm of the JUnit
+  reporter in upstream's new `match`, and one arm for `ScopeMode::Fails`.
+- `performance.eventLoopUtilization()`: `perf_hooks.ts` no longer destructures `globalThis`.
+- Web Storage: `node_process.rs` (two functions side by side) and a types fixture that still had
+  the lines of the dropped `import.meta.glob`.
+- The rest are one or two lines each: the bytes loader (`bun.d.ts`, `hmr-module.ts`),
+  `globalName`, `legalComments` and `alias` (the destructuring list in `bundler/aot/options.rs`),
+  `--watch-path`, `testMatch` (docs), the HTML coverage reporter (an import).
+
+Three more things showed after the rebase. `internal/build_watcher.ts` of `Bun.build({ watch })`
+destructured `setTimeout` from `globalThis`, which the builtins bundler of upstream now refuses.
+The bare names are what it asks for, and they are the timers that fake timers do not replace.
+`collectCoverageFrom` builds a `ParseOptions`, which has a new field, `is_test_entry_point`. And
+`cargo fmt` wanted one `match` of the JSON reporter on more lines. Each fix is in the commit of
+its patch.
+
+The stack built on the third try, after those fixes. On the debug build the test files of the
+patches that stopped the rebase pass: `bun-test.test.ts` (274, with the dry run, the JSON reporter
+and `testMatch`), `parallel.test.ts` (58), `test-last-failed.test.ts` (8), `coverage.test.ts`
+(78), `global-setup.test.ts` (95), upstream's `junit.test.js` (36), `bytes-loader.test.ts` (6),
+`bundler_loader.test.ts` (73), `perf_hooks.test.ts` (29), `bun-build-watch.test.ts` (37),
+`storage.test.ts` (36) and its Web Platform Tests (22), `bundler_iife.test.ts` (59),
+`bundler_comments.test.ts` (76), `bun-build-api.test.ts` (98), `watch.test.ts` (29) and
+`hot.test.ts` (27). 41 more files of patches that merged without a conflict were run and pass
+whole, among them `bun-install.test.ts` (802), `bun-run.test.ts` (351), `semver.test.ts` (484),
+`streams.test.js` (753), `bun-pack.test.ts` (393), `filter-workspace.test.ts` (179),
+`msgpack.test.ts` (228), `bundler_edgecase.test.ts` (214), the shell builtins, `jsr`, the S3 copy
+and metadata files, the cursors of `Bun.SQL` and `valkey.test.ts`. What fails is a test of
+upstream that runs into its time limit on the debug build: 14 of 414 in
+`module-graph-isolation.test.ts` and 33 of 113 in `test-environment.test.ts`, which start debug
+processes, three `--compile` tests of `bundler/cli.test.ts`, and one test each in
+`bun-test.test.ts`, `bun-build-api.test.ts`, `bun-write.test.js`, `esbuild/default.test.ts` and
+`glob/scan.test.ts`. The three MySQL tests of `sql-debug.test.ts` need a login that the MariaDB of
+this machine refuses, and their PostgreSQL halves pass. A test file with the comment for the
+`happy-dom` environment was run by hand: upstream's DOM and the `localStorage` of this stack work
+in one file.
+The source lints pass on the release build (199), and on the debug build except for the two tests
+that need more than five seconds there. `bun-types.test.ts` passes (30), its bindgen test with the
+engine's generators taken from the build cache, which is what the workflow downloads.
+
+Files: `src/install_types/dev_engines.rs` (new), `src/install_types/lib.rs`,
+`src/install/engines.rs`, `src/install/lockfile/Package.rs`,
+`src/install/PackageManager/CommandLineArguments.rs`,
+`src/install/PackageManager/PackageManagerOptions.rs`, `src/resolver/package_json.rs`,
+`src/runtime/cli/run_command.rs`, `src/runtime/cli/filter_run.rs`, `src/runtime/cli/multi_run.rs`,
+`docs/pm/cli/install.mdx`, `docs/runtime/index.mdx`, `test/cli/install/bun-install.test.ts`,
+`test/cli/install/bun-run.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
@@ -8236,3 +8450,12 @@ test files of the guard. The guard commit: `src/runtime/shell/interpreter.rs`
 - 2026-09-02, zip in `Bun.Archive`: dropped on 2026-10-27. oven-sh/bun#46638 removes libarchive
   from bun, and the patch was libarchive's zip reader and writer behind `Bun.Archive`. Upstream's
   new `src/tar` reads and writes tar only, so zip would need a reader and a writer of its own.
+- 2026-09-08, `expect.poll()`: dropped on 2026-11-01. oven-sh/bun#44833, Vitest compatibility for
+  `bun test`, adds `expect.poll()` upstream, with the `interval` and `timeout` options.
+- 2026-09-12, `import.meta.glob()`: dropped on 2026-11-01. oven-sh/bun#44833 adds it upstream, in
+  `bun run`, `bun test`, `Bun.build` and the dev server.
+- 2026-09-22, `expect.addSnapshotSerializer()`: dropped on 2026-11-01. oven-sh/bun#44833 adds it
+  upstream, with both plugin interfaces of `pretty-format`.
+- 2026-10-23, async fake timers (`advanceTimersByTimeAsync()` and the other three): dropped on
+  2026-11-01. oven-sh/bun#44833, the pull request the patch took its shape from, landed with the
+  four functions and with the limit of `runAllTimers()`.
