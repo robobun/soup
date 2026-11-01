@@ -190,15 +190,18 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
             .as_deref()
     }
 
-    /// Before a script of `package_json` runs: stops when the running bun is outside the
-    /// `engines.bun` of that file.
-    pub(crate) fn enforce_engines(package_json: &PackageJSON) {
+    /// Before a script of `package_json` runs. `run_in_bun` (`--bun`) makes bun the runtime that `devEngines` names.
+    pub(crate) fn enforce_engines(package_json: &PackageJSON, run_in_bun: bool) {
+        let path = package_json.source.path.text;
         if let Some(&range) = package_json
             .engines
             .as_deref()
             .and_then(|engines| engines.get(b"bun"))
         {
-            bun_install::engines::enforce_bun_range(range, package_json.source.path.text);
+            bun_install::engines::enforce_bun_range(range, path);
+        }
+        if let Some(dev_engines) = package_json.dev_engines.as_deref() {
+            bun_install::engines::enforce_dev_engines(dev_engines, path, run_in_bun);
         }
     }
 
@@ -2428,7 +2431,7 @@ impl RunCommand {
                             "Found matching script `{}`",
                             bstr::BStr::new(script_content)
                         );
-                        Self::enforce_engines(package_json);
+                        Self::enforce_engines(package_json, force_using_bun);
                         Global::configure_allocator(core::Global::AllocatorConfiguration {
                             long_running: false,
                             ..Default::default()

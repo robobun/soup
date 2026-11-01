@@ -375,6 +375,57 @@ note: "engines" in /home/me/my-app/package.json sets the requirement
 
 The check uses the `major.minor.patch` of the running Bun, the value of `Bun.version`. In a workspace, the root `package.json` is checked, from whichever package `bun install` runs in. Only the project's own `package.json` is checked: the `engines` of a dependency are not, and the other entries of `engines` (`node`, `npm`) are ignored. A range that does not parse, such as `"latest"`, is an error too.
 
+To install anyway, pass `--ignore-engines`. It skips this check and the check of [`devEngines`](#devengines) for that command.
+
+```bash terminal icon="terminal"
+bun install --ignore-engines
+```
+
+### `devEngines`
+
+`engines` is about the people who install a package. [`devEngines`](https://docs.npmjs.com/cli/configuring-npm/package-json#devengines) is about the people who work on it: it names the package manager, the runtime, the operating system, the CPU and the libc that the project is developed with. npm checks it before `npm install` and `npm run`. Bun checks it in the same places as `engines.bun`: before a command installs, and before `bun run` runs a `package.json` script.
+
+```json package.json icon="file-json"
+{
+  "name": "my-app",
+  "devEngines": {
+    "packageManager": { "name": "bun", "version": ">=1.3.0" },
+    "runtime": [
+      { "name": "bun", "version": ">=1.3.0" },
+      { "name": "node", "version": ">=22" }
+    ],
+    "os": { "name": "linux", "onFail": "warn" }
+  }
+}
+```
+
+A project that names another package manager stops `bun install` before it writes a `bun.lock` next to the lockfile of that package manager:
+
+```txt
+error: this project requires pnpm >=9 as its package manager, but bun 1.3.2 is running
+note: "devEngines.packageManager" in /home/me/my-app/package.json sets the requirement
+```
+
+| Key              | What Bun compares it with                                                  |
+| ---------------- | -------------------------------------------------------------------------- |
+| `packageManager` | `bun`, and the version of the running Bun                                  |
+| `runtime`        | `bun`, and the version of the running Bun, for the entries that name `bun` |
+| `os`             | `process.platform`, and `os.release()` as the version                      |
+| `cpu`            | `process.arch`                                                             |
+| `libc`           | `glibc` or `musl`, on Linux                                                |
+
+Each key holds one requirement or an array of them, and one requirement that is met is enough. An empty array requires nothing. A requirement has three properties:
+
+- `name`, which is required.
+- `version`, a semver range. A value that is not a range is compared as text. For `os`, the range is compared with the first three numbers of `os.release()`, so the Linux release `6.8.0-85-generic` is inside `>=6`.
+- `onFail`, which says what happens when the key is not met. `"error"`, the default, stops the command with exit code 1 after every key is reported. `"warn"` prints the same message and goes on. `"ignore"` does nothing. `"download"` is read as `"error"`, as in npm: Bun does not download a runtime or a package manager. For an array, the `onFail` of the last requirement decides.
+
+Bun is a runtime and a package manager, and many projects use it to install for Node.js. It cannot tell which runtime the scripts of a project start, so a `runtime` that names only other runtimes is not checked. With an entry that names `bun`, the running Bun has to meet one of those entries. [`bun --bun run`](/runtime#--bun), or `bun = true` under `[run]` in `bunfig.toml`, is the exception: it makes Bun the runtime of every script, so there every entry counts, and a project whose `runtime` is `node` fails.
+
+A `cpu` and a `libc` have no version, so a requirement that gives one is not met. Bun knows the `libc` of Linux only: on other systems no `libc` requirement is met.
+
+A `devEngines` that is not an object, a key that is neither an object nor an array of objects, a requirement without a `name`, a `name`, `version` or `onFail` that is not a string, and an `onFail` that is none of the four values are errors, whatever `onFail` says. Keys and properties that Bun does not know are skipped. As with `engines`, only the project's own `package.json` is read, running a file with `bun ./file.ts` checks nothing, and `bun install --ignore-engines` skips the check.
+
 ---
 
 ## Configuration
@@ -658,7 +709,6 @@ Command lines written for npm, Yarn or pnpm keep working. `bun install`, `bun ci
 | `--loglevel=notice`, `--loglevel=http`, `--loglevel=info`      | Nothing: the default output                     |
 | `--no-audit`, `--no-fund`, `--no-update-notifier`              | Nothing: an install does none of these          |
 | `--legacy-peer-deps`                                           | Nothing: peers that conflict are not an error   |
-| `--ignore-engines`                                             | Nothing: `engines` is not checked               |
 | `--unsafe-perm`                                                | Nothing: scripts run as the current user        |
 | `--non-interactive`                                            | Nothing: an install asks no questions           |
 | `--prefer-frozen-lockfile`                                     | Nothing: the default                            |

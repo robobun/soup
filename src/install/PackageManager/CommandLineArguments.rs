@@ -138,6 +138,9 @@ const SHARED_TAIL_PARAMS: &[ParamType] = &[
         "--ignore-scripts                      Skip lifecycle scripts for all packages, including the project's package.json and trusted dependencies"
     ),
     clap::param!(
+        "--ignore-engines                      Skip the checks of \"engines\" and \"devEngines\" in the project's package.json"
+    ),
+    clap::param!(
         "--trust                               Add to trustedDependencies in the project's package.json and install the package(s)"
     ),
     clap::param!("-g, --global                          Install globally"),
@@ -431,8 +434,8 @@ const FOREIGN_FLAGS: &[(&[u8], ForeignFlag)] = &[
     (b"--fund=false", Satisfied),
     (b"--no-update-notifier", Satisfied),
     (b"--update-notifier=false", Satisfied),
-    // Bun only warns about conflicting peer dependencies, does not check `engines`, runs scripts as
-    // the current user, and never prompts.
+    // Bun only warns about conflicting peer dependencies, does not check the `engines` of a
+    // dependency, runs scripts as the current user, and never prompts.
     (b"--legacy-peer-deps", Satisfied),
     (b"--ignore-engines", Satisfied),
     (b"--unsafe-perm", Satisfied),
@@ -838,6 +841,7 @@ pub struct CommandLineArguments {
     pub(crate) offline: bool,
     pub(crate) prefer_offline: bool,
     pub(crate) ignore_scripts: bool,
+    pub(crate) ignore_engines: bool,
     pub(crate) trusted: bool,
     pub(crate) no_summary: bool,
     pub(crate) latest: bool,
@@ -1599,6 +1603,7 @@ Full documentation is available at <magenta>https://bun.com/docs/pm/cli/prune<r>
             Options::LogLevel::Default
         };
         cli.ignore_scripts = args.flag(b"--ignore-scripts");
+        cli.ignore_engines = args.flag(b"--ignore-engines");
         cli.trusted = args.flag(b"--trust");
         cli.no_summary = args.flag(b"--no-summary");
         cli.ca = args.options(b"--ca");
