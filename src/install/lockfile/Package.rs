@@ -2053,14 +2053,23 @@ impl Package<u64> {
         features: Features,
     ) -> crate::Result<()> {
         let parsed = Self::parse_json(source, log);
-        let bump = bun_alloc::Arena::new();
-        if let Some(range) = parsed
-            .root
-            .get(b"engines")
-            .and_then(|engines| engines.get(b"bun"))
-            .and_then(|bun| bun.as_string(&bump))
-        {
-            crate::engines::enforce_bun_range(range, path);
+        if pm.options.do_.check_engines() {
+            let bump = bun_alloc::Arena::new();
+            if let Some(range) = parsed
+                .root
+                .get(b"engines")
+                .and_then(|engines| engines.get(b"bun"))
+                .and_then(|bun| bun.as_string(&bump))
+            {
+                crate::engines::enforce_bun_range(range, path);
+            }
+            if let Some(dev_engines) = parsed.root.get(b"devEngines") {
+                crate::engines::enforce_dev_engines(
+                    &bun_install_types::dev_engines::DevEngines::parse(&dev_engines),
+                    path,
+                    false,
+                );
+            }
         }
         self.parse_with_json(lockfile, pm, log, source, parsed.root, resolver, features)
     }
