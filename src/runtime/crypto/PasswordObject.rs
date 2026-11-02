@@ -8,7 +8,9 @@ use bun_jsc::bindgen::{self, JsHeap, JsLocal, JsScope};
 use bun_jsc::{JSGlobalObject, JSValue, JsResult};
 use bun_jsc::{JSPromise, JSPromiseStrong};
 
-use crate::generated_bindgen::password_object::{PasswordHashAlgorithm, PasswordHashOptions};
+use crate::generated_bindgen::password_object::{
+    PasswordHashAlgorithm, PasswordHashOptions, PasswordSecret, PasswordVerifyAlgorithm,
+};
 
 // The argon2/bcrypt API-surface shim lives at `crypto::pwhash` (this dir);
 // the implementation is wired there, not here.
@@ -53,36 +55,48 @@ impl AlgorithmValue {
         }
     }
 
+    /// The second argument of `hash`, `hashSync` and `needsRehash`. An error names `function`.
     fn from_argument<'a>(
         heap: &JsHeap<'a>,
+        function: &str,
         algorithm: PasswordHashAlgorithm<'a>,
-    ) -> bindgen::Result<'a, AlgorithmValue> {
+    ) -> bindgen::Result<'a, (AlgorithmValue, Option<Sensitive>)> {
         match algorithm {
-            PasswordHashAlgorithm::Unspecified => Ok(AlgorithmValue::DEFAULT),
+            PasswordHashAlgorithm::Unspecified => Ok((AlgorithmValue::DEFAULT, None)),
             PasswordHashAlgorithm::Label(label) => {
-                Algorithm::from_label(heap, "hash", &label.to_utf8()).map(Self::with_defaults)
+                let algorithm = Algorithm::from_label(heap, function, &label.to_utf8())?;
+                Ok((Self::with_defaults(algorithm), None))
             }
-            PasswordHashAlgorithm::Options(options) => Self::from_options(heap, &options),
+            PasswordHashAlgorithm::Options(options) => {
+                let algorithm = Self::from_options(heap, function, &options)?;
+                if matches!(algorithm, AlgorithmValue::Bcrypt(_))
+                    && !matches!(options.secret, PasswordSecret::Absent)
+                {
+                    return Err(secret_for_bcrypt(heap));
+                }
+                Ok((algorithm, copy_secret(heap, &options.secret)?))
+            }
         }
     }
 
     fn from_options<'a>(
         heap: &JsHeap<'a>,
+        function: &str,
         options: &PasswordHashOptions<'a>,
     ) -> bindgen::Result<'a, AlgorithmValue> {
         let Some(label) = options.algorithm.filter(|label| !label.is_empty()) else {
             return Err(invalid_argument_type(
                 heap,
-                "hash",
+                function,
                 "options.algorithm",
                 "string",
             ));
         };
         let invalid = |message: &str| heap.invalid_arguments(format_args!("{message}"));
 
-        let algorithm = Algorithm::from_label(heap, "hash", label)?;
+        let algorithm = Algorithm::from_label(heap, function, label)?;
         if let Algorithm::Bcrypt = algorithm {
-            let Some(rounds) = cost(heap, options.cost, "cost")? else {
+            let Some(rounds) = cost(heap, function, options.cost, "cost")? else {
                 return Ok(Self::with_defaults(algorithm));
             };
             if rounds.fract() != 0.0 || !(4.0..=31.0).contains(&rounds) {
@@ -92,7 +106,7 @@ impl AlgorithmValue {
         }
 
         let mut argon = Argon2Params::DEFAULT;
-        if let Some(time_cost) = cost(heap, options.time_cost, "timeCost")? {
+        if let Some(time_cost) = cost(heap, function, options.time_cost, "timeCost")? {
             if time_cost < 1.0 || time_cost.is_nan() {
                 return Err(invalid("Time cost must be greater than 0"));
             }
@@ -103,7 +117,7 @@ impl AlgorithmValue {
             }
             argon.time_cost = time_cost as u32;
         }
-        if let Some(memory_cost) = cost(heap, options.memory_cost, "memoryCost")? {
+        if let Some(memory_cost) = cost(heap, function, options.memory_cost, "memoryCost")? {
             // argon2 requires `memoryCost >= 8 * parallelism`; Bun hard-codes `parallelism = 1` (see
             // `Argon2Params::to_params`), so the floor is 8.
             if memory_cost < 8.0 || memory_cost.is_nan() {
@@ -137,15 +151,41 @@ fn invalid_argument_type<'a>(
 }
 
 /// `None` for `undefined`, `null` and `""`.
-fn cost<'a>(heap: &JsHeap<'a>, value: JsLocal<'a>, name: &str) -> bindgen::Result<'a, Option<f64>> {
+fn cost<'a>(
+    heap: &JsHeap<'a>,
+    function: &str,
+    value: JsLocal<'a>,
+    name: &str,
+) -> bindgen::Result<'a, Option<f64>> {
     let value = value.to_js();
     if value.is_undefined_or_null() || (value.is_string() && !value.to_boolean()) {
         return Ok(None);
     }
     if !value.is_number() {
-        return Err(invalid_argument_type(heap, "hash", name, "number"));
+        return Err(invalid_argument_type(heap, function, name, "number"));
     }
     Ok(Some(value.as_number()))
+}
+
+fn copy_secret<'a>(
+    heap: &JsHeap<'a>,
+    secret: &PasswordSecret<'a>,
+) -> bindgen::Result<'a, Option<Sensitive>> {
+    let bytes = match secret {
+        PasswordSecret::Absent => return Ok(None),
+        PasswordSecret::Text(text) => text.to_owned_slice(),
+        PasswordSecret::Bytes(buffer) => buffer.with_bytes(heap, <[u8]>::to_vec),
+    };
+    if bytes.is_empty() {
+        return Err(heap.invalid_arguments(format_args!("secret must not be empty")));
+    }
+    Ok(Some(Sensitive::from(bytes)))
+}
+
+fn secret_for_bcrypt<'a>(heap: &JsHeap<'a>) -> bindgen::Error<'a> {
+    heap.invalid_arguments(format_args!(
+        "secret is not supported by bcrypt, only by argon2"
+    ))
 }
 
 impl Algorithm {
@@ -227,7 +267,11 @@ pub(crate) type HashError = crate::Error;
 
 impl PasswordObject {
     // This is purposely simple because nobody asked to make it more complicated
-    pub(crate) fn hash(password: &[u8], algorithm: AlgorithmValue) -> Result<Box<[u8]>, HashError> {
+    pub(crate) fn hash(
+        password: &[u8],
+        algorithm: AlgorithmValue,
+        secret: &[u8],
+    ) -> Result<Box<[u8]>, HashError> {
         match algorithm {
             AlgorithmValue::Argon2i(argon)
             | AlgorithmValue::Argon2d(argon)
@@ -243,6 +287,7 @@ impl PasswordObject {
                         _ => unreachable!(),
                     },
                     encoding: pwhash::Encoding::Phc,
+                    secret,
                 };
                 // warning: argon2's code may spin up threads if paralellism is set to > 0
                 // we don't expose this option
@@ -252,6 +297,7 @@ impl PasswordObject {
                 Ok(Box::<[u8]>::from(out_bytes))
             }
             AlgorithmValue::Bcrypt(cost) => {
+                debug_assert!(secret.is_empty(), "from_argument refuses it");
                 let mut outbuf = [0u8; 4096];
                 // bcrypt silently truncates passwords longer than 72 bytes
                 // we use SHA512 to hash the password if it's longer than 72 bytes
@@ -289,6 +335,7 @@ impl PasswordObject {
         password: &[u8],
         previous_hash: &[u8],
         algorithm: Option<Algorithm>,
+        secret: &[u8],
     ) -> Result<bool, HashError> {
         if previous_hash.is_empty() {
             return Ok(false);
@@ -299,23 +346,29 @@ impl PasswordObject {
             None => return Err(crate::Error::UnsupportedAlgorithm),
         };
 
-        Self::verify_with_algorithm(password, previous_hash, algo)
+        Self::verify_with_algorithm(password, previous_hash, algo, secret)
     }
 
     pub(crate) fn verify_with_algorithm(
         password: &[u8],
         previous_hash: &[u8],
         algorithm: Algorithm,
+        secret: &[u8],
     ) -> Result<bool, HashError> {
         match algorithm {
             Algorithm::Argon2id | Algorithm::Argon2d | Algorithm::Argon2i => {
-                match pwhash::argon2::str_verify(previous_hash, password, Default::default()) {
+                match pwhash::argon2::str_verify(
+                    previous_hash,
+                    password,
+                    pwhash::argon2::VerifyOptions { secret },
+                ) {
                     Ok(()) => Ok(true),
                     Err(crate::Error::PasswordVerificationFailed) => Ok(false),
                     Err(err) => Err(err),
                 }
             }
             Algorithm::Bcrypt => {
+                debug_assert!(secret.is_empty(), "verify and verify_sync refuse it");
                 let mut password_to_use = password;
                 let mut outbuf = [0u8; SHA512::DIGEST];
 
@@ -338,6 +391,25 @@ impl PasswordObject {
                     Err(crate::Error::PasswordVerificationFailed) => Ok(false),
                     Err(err) => Err(err),
                 }
+            }
+        }
+    }
+
+    /// Only the algorithm and the costs are compared. What has no form of a hash needs one.
+    pub(crate) fn needs_rehash(previous_hash: &[u8], wanted: AlgorithmValue) -> bool {
+        match wanted {
+            AlgorithmValue::Argon2i(argon)
+            | AlgorithmValue::Argon2d(argon)
+            | AlgorithmValue::Argon2id(argon) => {
+                let mode = match wanted {
+                    AlgorithmValue::Argon2i(_) => pwhash::argon2::Mode::Argon2i,
+                    AlgorithmValue::Argon2d(_) => pwhash::argon2::Mode::Argon2d,
+                    _ => pwhash::argon2::Mode::Argon2id,
+                };
+                pwhash::argon2::str_params(previous_hash) != Some((mode, argon.to_params()))
+            }
+            AlgorithmValue::Bcrypt(cost) => {
+                pwhash::bcrypt::str_rounds(previous_hash) != Some(u32::from(cost))
             }
         }
     }
@@ -374,7 +446,7 @@ impl fmt::Display for PascalToUpperUnderscoreCaseFormatter<'_> {
 // both into one `PasswordJob<Op>` / `PasswordResult<Op>` parameterised on a
 // `PasswordOp` carrying exactly those three axes.
 
-/// A copy of a password or a hash, zeroed before it is freed.
+/// A copy of a password, a hash or a secret, zeroed before it is freed.
 struct Sensitive(Box<[u8]>);
 
 impl From<Vec<u8>> for Sensitive {
@@ -410,12 +482,17 @@ pub(crate) trait PasswordOp: Send + 'static {
 
 pub(crate) struct HashOp {
     algorithm: AlgorithmValue,
+    secret: Option<Sensitive>,
 }
 impl PasswordOp for HashOp {
     type Value = Box<[u8]>;
     const ERR_VERB: &'static str = "hashing";
     fn compute(&self, password: &[u8]) -> Result<Box<[u8]>, HashError> {
-        PasswordObject::hash(password, self.algorithm)
+        PasswordObject::hash(
+            password,
+            self.algorithm,
+            self.secret.as_deref().unwrap_or(&[]),
+        )
     }
     fn to_js(value: Box<[u8]>, g: &JSGlobalObject) -> JSValue {
         // PHC / bcrypt output is ASCII.
@@ -427,12 +504,18 @@ impl PasswordOp for HashOp {
 pub(crate) struct VerifyOp {
     prev_hash: Sensitive,
     algorithm: Option<Algorithm>,
+    secret: Option<Sensitive>,
 }
 impl PasswordOp for VerifyOp {
     type Value = bool;
     const ERR_VERB: &'static str = "verification";
     fn compute(&self, password: &[u8]) -> Result<bool, HashError> {
-        PasswordObject::verify(password, &self.prev_hash, self.algorithm)
+        PasswordObject::verify(
+            password,
+            &self.prev_hash,
+            self.algorithm,
+            self.secret.as_deref().unwrap_or(&[]),
+        )
     }
     fn to_js(value: bool, _g: &JSGlobalObject) -> JSValue {
         JSValue::js_boolean(value)
@@ -531,12 +614,16 @@ pub(crate) fn hash<'a>(
     algorithm: PasswordHashAlgorithm<'a>,
 ) -> bindgen::Result<'a, JSValue> {
     let password = Sensitive::from(password);
-    let algorithm = AlgorithmValue::from_argument(&cx.heap, algorithm)?;
+    let (algorithm, secret) = AlgorithmValue::from_argument(&cx.heap, "hash", algorithm)?;
     if password.is_empty() {
         return Err(cx.heap.invalid_arguments(format_args!("{EMPTY_PASSWORD}")));
     }
 
-    Ok(schedule(&cx.js_thread(), password, HashOp { algorithm }))
+    Ok(schedule(
+        &cx.js_thread(),
+        password,
+        HashOp { algorithm, secret },
+    ))
 }
 
 pub(crate) fn hash_sync<'a>(
@@ -544,38 +631,79 @@ pub(crate) fn hash_sync<'a>(
     password: &[u8],
     algorithm: PasswordHashAlgorithm<'a>,
 ) -> bindgen::Result<'a, Box<[u8]>> {
-    let algorithm = AlgorithmValue::from_argument(heap, algorithm)?;
+    let (algorithm, secret) = AlgorithmValue::from_argument(heap, "hash", algorithm)?;
     if password.is_empty() {
         return Err(heap.invalid_arguments(format_args!("{EMPTY_PASSWORD}")));
     }
-    PasswordObject::hash(password, algorithm)
+    PasswordObject::hash(password, algorithm, secret.as_deref().unwrap_or(&[]))
         .map_err(|err| password_error(heap, &err, HashOp::ERR_VERB))
 }
 
+/// The third argument of `verify` and `verifySync`.
 fn verify_algorithm<'a>(
     heap: &JsHeap<'a>,
-    label: Option<&[u8]>,
-) -> bindgen::Result<'a, Option<Algorithm>> {
-    label
-        .map(|label| Algorithm::from_label(heap, "verify", label))
-        .transpose()
+    algorithm: PasswordVerifyAlgorithm<'a>,
+) -> bindgen::Result<'a, (Option<Algorithm>, Option<Sensitive>)> {
+    match algorithm {
+        PasswordVerifyAlgorithm::Unspecified => Ok((None, None)),
+        PasswordVerifyAlgorithm::Label(label) => {
+            Ok((Some(Algorithm::from_label(heap, "verify", label)?), None))
+        }
+        PasswordVerifyAlgorithm::Array(_)
+        | PasswordVerifyAlgorithm::Bytes(_)
+        | PasswordVerifyAlgorithm::Callback(_) => Err(invalid_argument_type(
+            heap,
+            "verify",
+            "algorithm",
+            "string or an object",
+        )),
+        PasswordVerifyAlgorithm::Options(options) => {
+            let algorithm = options
+                .algorithm
+                .map(|label| Algorithm::from_label(heap, "verify", label))
+                .transpose()?;
+            if matches!(algorithm, Some(Algorithm::Bcrypt))
+                && !matches!(options.secret, PasswordSecret::Absent)
+            {
+                return Err(secret_for_bcrypt(heap));
+            }
+            Ok((algorithm, copy_secret(heap, &options.secret)?))
+        }
+    }
+}
+
+/// A check without the secret would let a bcrypt hash that someone planted pass for a keyed one.
+fn refuse_secret_for_bcrypt_hash<'a>(
+    heap: &JsHeap<'a>,
+    hash: &[u8],
+    algorithm: Option<Algorithm>,
+    secret: Option<&Sensitive>,
+) -> bindgen::Result<'a, ()> {
+    if secret.is_some()
+        && algorithm.is_none()
+        && matches!(Algorithm::get(hash), Some(Algorithm::Bcrypt))
+    {
+        return Err(secret_for_bcrypt(heap));
+    }
+    Ok(())
 }
 
 pub(crate) fn verify<'a>(
     cx: &mut JsScope<'a>,
     password: Vec<u8>,
     prev_hash: Vec<u8>,
-    algorithm: Option<&'a [u8]>,
+    algorithm: PasswordVerifyAlgorithm<'a>,
 ) -> bindgen::Result<'a, JSValue> {
     let password = Sensitive::from(password);
     let prev_hash = Sensitive::from(prev_hash);
-    let algorithm = verify_algorithm(&cx.heap, algorithm)?;
+    let (algorithm, secret) = verify_algorithm(&cx.heap, algorithm)?;
     if prev_hash.is_empty() || password.is_empty() {
         return Ok(JSPromise::resolved_promise_value(
             cx.global(),
             JSValue::FALSE,
         ));
     }
+    refuse_secret_for_bcrypt_hash(&cx.heap, &prev_hash, algorithm, secret.as_ref())?;
 
     Ok(schedule(
         &cx.js_thread(),
@@ -583,6 +711,7 @@ pub(crate) fn verify<'a>(
         VerifyOp {
             prev_hash,
             algorithm,
+            secret,
         },
     ))
 }
@@ -591,14 +720,24 @@ pub(crate) fn verify_sync<'a>(
     heap: &JsHeap<'a>,
     password: &[u8],
     hash: &[u8],
-    algorithm: Option<&'a [u8]>,
+    algorithm: PasswordVerifyAlgorithm<'a>,
 ) -> bindgen::Result<'a, bool> {
-    let algorithm = verify_algorithm(heap, algorithm)?;
+    let (algorithm, secret) = verify_algorithm(heap, algorithm)?;
     if hash.is_empty() || password.is_empty() {
         return Ok(false);
     }
-    PasswordObject::verify(password, hash, algorithm)
+    refuse_secret_for_bcrypt_hash(heap, hash, algorithm, secret.as_ref())?;
+    PasswordObject::verify(password, hash, algorithm, secret.as_deref().unwrap_or(&[]))
         .map_err(|err| password_error(heap, &err, VerifyOp::ERR_VERB))
+}
+
+pub(crate) fn needs_rehash<'a>(
+    heap: &JsHeap<'a>,
+    hash: &[u8],
+    algorithm: PasswordHashAlgorithm<'a>,
+) -> bindgen::Result<'a, bool> {
+    let (wanted, _) = AlgorithmValue::from_argument(heap, "needsRehash", algorithm)?;
+    Ok(PasswordObject::needs_rehash(hash, wanted))
 }
 
 const UNKNOWN_PASSWORD_ALGORITHM_MESSAGE: &str = "unknown algorithm, expected one of: \"bcrypt\", \"argon2id\", \"argon2d\", \"argon2i\" (default is \"argon2id\")";

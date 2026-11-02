@@ -8442,6 +8442,157 @@ Files: `src/install_types/dev_engines.rs` (new), `src/install_types/lib.rs`,
 `docs/pm/cli/install.mdx`, `docs/runtime/index.mdx`, `test/cli/install/bun-install.test.ts`,
 `test/cli/install/bun-run.test.ts`.
 
+### 2026-11-02: `Bun.password.needsRehash()`, and a `secret` for argon2
+
+`Bun.password` hashes and verifies, and that was all of it. Two things that a login needs next
+were asked for in 2024 (oven-sh/bun#9119 and oven-sh/bun#9654), and neither has a pull request
+upstream. The source says why they were left out: "we don't support the other options right now,
+but can add them later if someone asks" on the costs of argon2, and "This is purposely simple
+because nobody asked to make it more complicated" on `hash`. Somebody asked.
+
+The first is a way to raise the costs of the hashes in a table. Costs that are safe today are too
+low some years from now, the default of `Bun.password.hash()` can move with them, and a password
+can only be hashed again while its owner logs in. PHP has `password_needs_rehash()` for that
+moment. Without it a program takes the PHC string apart by hand. The second is the secret of
+argon2, the secret value `K` of RFC 9106, which most people call a pepper: a key that the hash
+depends on and does not contain, so a copy of the table is not enough to test guesses against.
+`node-argon2` and `crypto.argon2()` take one. `Bun.password` always hashed with none.
+
+```ts
+const secret = process.env.PASSWORD_SECRET; // a string or a buffer, kept outside of the database
+if (!secret) throw new Error("PASSWORD_SECRET is not set");
+const options = {
+  algorithm: "argon2id",
+  memoryCost: 65536,
+  timeCost: 3,
+  secret,
+} as const;
+
+if (await Bun.password.verify(input, user.hash, { secret })) {
+  if (Bun.password.needsRehash(user.hash, options)) {
+    user.hash = await Bun.password.hash(input, options);
+  }
+  // the password is right
+}
+```
+
+The rules of `secret`:
+
+- `hash()` and `hashSync()` take it in the options of the three argon2 algorithms. A string is its
+  UTF-8 bytes, and a typed array, a `DataView`, an `ArrayBuffer` or a `SharedArrayBuffer` is the
+  bytes that it covers. `undefined` and `null` are no secret. An empty secret throws
+  `secret must not be empty`, as an empty password does.
+- `verify()` and `verifySync()` take it in their third argument. That argument was the name of an
+  algorithm. It is now that name, or an object with `algorithm` and `secret`, both optional. A hash
+  with a secret verifies with that secret only, and a hash without one verifies without one only.
+- bcrypt has no secret. `hash()` throws `secret is not supported by bcrypt, only by argon2` for
+  bcrypt with a secret, and so does `verify()`, when the options name bcrypt and when the hash is a
+  bcrypt hash. The first draft verified a bcrypt hash without the secret, so that one call could
+  take both kinds of hash of a table that moves to argon2. The review of the diff (below) called
+  that a downgrade: whoever can write a bcrypt hash into the table logs in without the secret. A
+  program with both kinds of hash has to say so itself, and the docs show how.
+- The secret is not in the hash and nothing in the hash says that there is one. The string has the
+  form and the length that it had.
+
+The rules of `needsRehash(hash, options)`:
+
+- The second argument is the second argument of `hash()`, with the same default and the same
+  errors: nothing, the name of an algorithm, or the options.
+- It is `true` when the hash is of another algorithm, and when a cost is another, higher or lower:
+  `m`, `t` and `p` of argon2 against `memoryCost`, `timeCost` and the 1 that `hash()` always uses
+  for the parallelism, and the cost of bcrypt against `cost`. It is `false` for every hash that
+  `hash()` returns for the same options.
+- It is `true` for a string that does not have the form of a hash. It reads the forms that
+  `verify()` reads with no algorithm named: argon2 with `v=19` or with no version, `$2a$`, `$2b$`,
+  `$2x$` and `$2y$`, and bcrypt in the PHC format. `$Argon2id$`, a spelling that rust-argon2
+  decodes and that `verify()` takes only when it is told the algorithm, is not one of them, so
+  such a hash gets a new one.
+- It computes no hash, so it is synchronous, and a cost of four billion in the string costs
+  nothing. It does not decode the salt or the digest, and it cannot tell which secret a hash has.
+
+What changes for a program that does not use either. This is the list to read before a
+cherry-pick:
+
+- An options object that had a `secret` key did nothing with it. It now makes a hash with that
+  secret, and bcrypt with that key throws.
+- The third argument of `verify()` took a string and threw a `TypeError` for the rest. A plain
+  object is now the options, so `verify(password, hash, {})` verifies. An array, a buffer, a
+  function and a primitive still throw, with one message:
+  `Expected algorithm to be a string or an object for 'verify'.` A buffer there is a secret in the
+  wrong place, and a function is the callback of `bcrypt.compare()`. `verify.length` is 2 as it
+  was. A `String` object is still a name.
+- One assertion of the existing test is gone: `verify(placeholder, "$", { toString() { .. } })`
+  was expected to throw because an object is not a name. It still threw, but because `"$"` is not
+  a hash. The new test for the third argument has the object with a real hash.
+- Nothing else. Without a secret the code passes an empty slice where it had an empty slice. The
+  job of `hash()` and of `verify()` holds one more `Option<Box<[u8]>>`, and a call with an options
+  object reads one more property.
+
+The secret goes to rust-argon2 as `Config::secret` for a hash and through `verify_encoded_ext` for
+a verification, which is the function that `verify_encoded` already called with an empty secret.
+No dependency is added. `hash()` and `verify()` run on another thread, so they copy the secret as
+they copy the password: into memory that is zeroed before it is freed. `needsRehash` reads the
+costs with two small parsers in `pwhash.rs`, next to the decoders that they have to agree with,
+because rust-argon2 keeps its decoder private.
+
+A review of the diff before the commit, in four passes with different questions, found these.
+Each is fixed and has a test:
+
+- `verify()` with a secret and a bcrypt hash: see above.
+- `verify(password, hash, new String("bcrypt"))` read the `String` object as empty options, where
+  upstream reads it as the name.
+- A buffer or a function as the third argument of `verify()` was read as empty options too. The
+  call returned a promise, and the callback of a program that was ported from `bcrypt` never ran.
+- `needsRehash` was `false` for a bcrypt hash in the PHC format with more `$` segments behind it,
+  which `verify()` refuses.
+- A string secret that is not ASCII and is longer than 128 bytes left its UTF-8 in freed memory:
+  the binding converted it into a buffer of its own before the copy. A scan of the memory of the
+  process after the calls now finds no copy on the heap, of a string secret or of a buffer.
+- The error for a wrong type named a type of the schema, as in
+  `PasswordVerifyOptions must be an object`. The docs example read the secret from an environment
+  variable and hashed with no secret when the variable was not set.
+
+The review also ran the first draft of `needsRehash` against a model of the two decoders on 22
+million strings and on 155,000 mutations of real hashes, with no crash and no report of the
+sanitizer, and compared the third argument of `verify()` with bun 1.4.3 on 686 calls. The
+differences that it found and that are left are in the list of what is not done. The same
+programs ran again on a release build of the patch: 900,000 strings against the model, where the
+patch now differs only by refusing more, and 160,000 mutations, where no hash that `verify()`
+takes with no algorithm named needs a new hash for its own options.
+
+Tests: 21 new ones in `password.test.ts`, 98 pass on the debug build with the 77 that were there.
+All 21 fail on the release build of upstream. On a release build of the patch the file passes
+whole (106), with the two leak tests and the default costs that a debug build skips. The three
+stored hashes with a secret were checked against an implementation that shares no code with this
+one: Node.js 26.3.0 computes argon2 with OpenSSL, and `crypto.argon2Sync()` there gives each tag
+from its salt with the secret, and another tag without it. A second test does the same comparison
+with Bun's own `crypto.argon2Sync()` for a fresh hash. The tests pin the message and the code of
+every error, and that `verify()` throws the errors of its arguments before it returns a promise.
+
+Other checks. A loop of 360,000 synchronous calls and 160,000 jobs with secrets of 4 KiB grows
+the resident memory of a release build by 0.2 MB. An executable of `bun build --compile --aot`
+answers 18 calls, six of them errors, as the interpreter does. Each code block of the docs ran as
+it is written. `bun-types.test.ts` passes (30), the source lints pass on the release build of
+upstream (199), and `argon2.test.ts` of `node:crypto` and `bindgen.test.ts` pass on the debug
+build (280).
+
+Not in this patch: the associated data of argon2 and a choice of parallelism, which nobody asked
+for. `needsRehash` does not apply the limits that `verify()` has for the costs in a hash (`m` up to
+4 GiB, `t` up to 65536): `hash()` makes such hashes today and oven-sh/bun#33865 is the upstream
+change for that. It says `false` for a string with the form of a hash whose salt or digest does
+not decode. A `Map` or a `Date` as the third argument of `verify()` is still read as options with
+nothing in them. The types do not list `null` and `DataView` for `secret`, as they do not for the
+password. There is no way to find the hashes that were made with an old secret: a program that
+changes its secret keeps that in a column of its own.
+
+Rebase notes. 63 patches onto oven-sh/bun 271b65ec60, which is one commit after the base of
+2026-11-01 (the Prisma guides of the docs). No conflict.
+
+Files: `src/runtime/crypto/PasswordObject.rs`, `src/runtime/crypto/PasswordObject.bind.ts`,
+`src/runtime/crypto/pwhash.rs`, `packages/bun-types/bun.d.ts` (`Password.Argon2Algorithm.secret`,
+`Password.VerifyOptions`, `needsRehash`), `docs/runtime/hashing.mdx`,
+`test/js/bun/util/password.test.ts`, `test/integration/bun-types/fixture/hashing.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
