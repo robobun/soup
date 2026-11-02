@@ -5147,6 +5147,16 @@ declare module "bun" {
        * longer hash time.
        */
       timeCost?: number;
+      /**
+       * A secret key for the hash, also called a pepper. The hash depends on
+       * the secret and does not contain it, so {@link Bun.password.verify}
+       * needs the same secret. Keep it outside of the database, and make it
+       * long and random: 32 random bytes, for example.
+       *
+       * A string is used as its UTF-8 bytes. `undefined` is no secret. An
+       * empty secret throws.
+       */
+      secret?: Bun.StringOrBuffer | undefined;
     }
 
     interface BCryptAlgorithm {
@@ -5161,6 +5171,23 @@ declare module "bun" {
     }
 
     type AlgorithmLabel = (BCryptAlgorithm | Argon2Algorithm)["algorithm"];
+
+    interface VerifyOptions {
+      /**
+       * If not specified, the algorithm is inferred from the hash.
+       */
+      algorithm?: AlgorithmLabel | undefined;
+      /**
+       * The secret that the argon2 hash was made with. A hash that was made
+       * with a secret verifies only with that secret. A hash that was made
+       * without a secret verifies only without one.
+       *
+       * bcrypt has no secret: {@link Bun.password.verify} throws if the hash
+       * is a bcrypt hash. A string is used as its UTF-8 bytes. `undefined` is
+       * no secret. An empty secret throws.
+       */
+      secret?: Bun.StringOrBuffer | undefined;
+    }
   }
 
   /**
@@ -5230,8 +5257,11 @@ declare module "bun" {
        *
        * If specified and the algorithm does not match the hash, this function
        * throws an error.
+       *
+       * An object names the algorithm, carries the `secret` of an argon2
+       * hash, or both.
        */
-      algorithm?: Password.AlgorithmLabel,
+      algorithm?: Password.AlgorithmLabel | Password.VerifyOptions,
     ): Promise<boolean>;
     /**
      * Asynchronously hash a password using argon2 or bcrypt. The default is argon2.
@@ -5314,8 +5344,11 @@ declare module "bun" {
       hash: Bun.StringOrBuffer,
       /**
        * If not specified, the algorithm is inferred from the hash.
+       *
+       * An object names the algorithm, carries the `secret` of an argon2
+       * hash, or both.
        */
-      algorithm?: Password.AlgorithmLabel,
+      algorithm?: Password.AlgorithmLabel | Password.VerifyOptions,
     ): boolean;
 
     /**
@@ -5365,6 +5398,47 @@ declare module "bun" {
        */
       algorithm?: Password.AlgorithmLabel | Password.Argon2Algorithm | Password.BCryptAlgorithm,
     ): string;
+
+    /**
+     * Check whether a hash was made with the algorithm and the costs that
+     * {@link Bun.password.hash} uses now. Call it after
+     * {@link Bun.password.verify} returns `true`, and store a new hash of the
+     * password when it returns `true`.
+     *
+     * It compares the algorithm and the costs that the hash records:
+     * `memoryCost`, `timeCost` and the parallelism for argon2 (`hash` always
+     * uses a parallelism of 1), and `cost` for bcrypt. It hashes nothing. It
+     * does not decode the salt or the digest, and it cannot tell which
+     * `secret` a hash was made with.
+     *
+     * @returns `true` if the hash is of another algorithm, if a cost
+     * differs, or if the string does not have the form of a hash
+     *
+     * @example
+     * ```ts
+     * import {password} from "bun";
+     *
+     * const options = { algorithm: "argon2id", memoryCost: 65536, timeCost: 3 } as const;
+     *
+     * if (await password.verify(input, user.hash)) {
+     *   if (password.needsRehash(user.hash, options)) {
+     *     user.hash = await password.hash(input, options);
+     *   }
+     * }
+     * ```
+     */
+    needsRehash(
+      /**
+       * Previously hashed password.
+       */
+      hash: Bun.StringOrBuffer,
+      /**
+       * The second argument that {@link Bun.password.hash} is called with.
+       *
+       * @default "argon2id"
+       */
+      algorithm?: Password.AlgorithmLabel | Password.Argon2Algorithm | Password.BCryptAlgorithm,
+    ): boolean;
   };
 
   /**
