@@ -132,6 +132,81 @@ The format is composed of:
 - `salt`: `$xXnlSvPh4ym5KYmxKAuuHVlDvy2QGHBNuI6bJJrRDOs`
 - `hash`: `$2YY6M48XmHn+s5NoBaL+ficzXajq2Yj8wut3r0vnrwI`
 
+### Secret
+
+The `argon2` algorithms accept a `secret`, also called a pepper. The hash depends on the secret and does not contain it. An attacker who copies your hashes cannot test guesses against them without the secret.
+
+Keep the secret outside of the database, for example in an environment variable or in a secrets manager. Use a long random value, such as 32 random bytes.
+
+```ts
+const password = "super-secure-pa$$word";
+
+const secret = process.env.PASSWORD_SECRET; // a string or a buffer
+if (!secret) throw new Error("PASSWORD_SECRET is not set");
+
+const hash = await Bun.password.hash(password, {
+  algorithm: "argon2id",
+  secret,
+});
+
+await Bun.password.verify(password, hash, { secret }); // => true
+await Bun.password.verify(password, hash); // => false
+```
+
+Pass the same secret to `verify`. The third argument of `verify` is the name of an algorithm, or an object with an `algorithm`, a `secret`, or both.
+
+- Bun uses a string secret as its UTF-8 bytes.
+- `undefined` and `null` mean no secret, and `hash` then makes a hash without one. Check that your secret is set, as the example does. An empty secret throws.
+- `bcrypt` has no secret. `hash` and `verify` throw when you pass a secret and the algorithm or the hash is `bcrypt`.
+- A hash does not record whether it has a secret. A hash that you made without a secret verifies only without one.
+
+To add a secret to a table of hashes that have none, verify with the secret first. If that fails, verify without the secret, and store a new hash when the old hash matches.
+
+```ts
+const secret = process.env.PASSWORD_SECRET;
+if (!secret) throw new Error("PASSWORD_SECRET is not set");
+const options = { algorithm: "argon2id", secret } as const;
+
+async function login(user: { hash: string }, password: string) {
+  const isBcrypt = user.hash.startsWith("$2");
+  if (!isBcrypt && (await Bun.password.verify(password, user.hash, { secret }))) {
+    return true;
+  }
+  // A hash from before the secret: bcrypt, or argon2 without a secret.
+  if (await Bun.password.verify(password, user.hash)) {
+    user.hash = await Bun.password.hash(password, options);
+    return true;
+  }
+  return false;
+}
+```
+
+Remove the second `verify` when every hash has the secret. While your code calls it, a hash without the secret is enough to log in.
+
+### Rehashing
+
+Costs that are safe today become too low over time, and you can only hash a password again when its owner logs in. `Bun.password.needsRehash` tells you whether a hash has the algorithm and the costs that you use now. Call `needsRehash` after `verify` returns `true`, and store a new hash when `needsRehash` returns `true`.
+
+```ts
+const options = { algorithm: "argon2id", memoryCost: 65536, timeCost: 3 } as const;
+
+async function login(user: { hash: string }, password: string) {
+  if (!(await Bun.password.verify(password, user.hash))) return false;
+  if (Bun.password.needsRehash(user.hash, options)) {
+    user.hash = await Bun.password.hash(password, options);
+  }
+  return true;
+}
+```
+
+The second argument of `needsRehash` is the second argument of `hash`, with the same default. `needsRehash` returns `true` when:
+
+- the hash has another algorithm, for example a `bcrypt` hash or an `argon2i` hash when the options name `argon2id`.
+- a cost is different, higher or lower: `memoryCost` or `timeCost` for `argon2`, `cost` for `bcrypt`. `Bun.password.hash` uses a parallelism of 1 (`p=1`), so an `argon2` hash from a library that used another parallelism is different too.
+- the string does not have the form of a hash.
+
+`needsRehash` reads the costs from the hash and computes nothing, so it is synchronous. It does not decode the salt or the digest. It cannot tell which `secret` a hash has, because the hash does not contain the secret.
+
 ---
 
 ## `Bun.hash`

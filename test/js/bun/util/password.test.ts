@@ -1,6 +1,7 @@
 import { password } from "bun";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isASAN, isDebug, isLinux } from "harness";
+import { argon2Sync } from "node:crypto";
 
 const placeholder = "hey";
 
@@ -284,14 +285,6 @@ describe("verify", () => {
         expect(() => verify(placeholder, "$", "scrpyt")).toThrow();
         // @ts-expect-error
         expect(() => verify(placeholder, "$", 123)).toThrow();
-        expect(() =>
-          // @ts-expect-error
-          verify(placeholder, "$", {
-            toString() {
-              return "scrypt";
-            },
-          }),
-        ).toThrow();
       });
 
       test("a password or a hash that is neither a string nor bytes throws", () => {
@@ -686,4 +679,537 @@ test("verifySync reads the password buffer only after every argument has been co
   };
   expect(password.verifySync(passwordBytes, hashObject as any)).toBeFalse();
   expect(passwordBytes.byteLength).toBe(0);
+});
+
+/** What `call` throws before it returns. A promise that it returns and that rejects is not that. */
+function thrownBy(call: () => unknown) {
+  try {
+    call();
+  } catch (error) {
+    return error;
+  }
+}
+
+const invalidArgument = (message: string | RegExp) =>
+  expect.objectContaining({
+    name: "TypeError",
+    code: "ERR_INVALID_ARG_TYPE",
+    message: typeof message === "string" ? message : expect.stringMatching(message),
+  });
+
+describe("secret", () => {
+  // The smallest costs, so that a debug build hashes in milliseconds.
+  const fast = { algorithm: "argon2id", memoryCost: 8, timeCost: 1 } as const;
+  const secret = "a pepper that is kept out of the database";
+  const noSecretForBcrypt = invalidArgument("secret is not supported by bcrypt, only by argon2");
+
+  for (const algorithm of ["argon2id", "argon2i", "argon2d"] as const) {
+    test.concurrent(`an ${algorithm} hash verifies with its secret and with no other`, async () => {
+      const options = { algorithm, memoryCost: 8, timeCost: 1, secret };
+      for (const hashed of [await password.hash("hunter2", options), password.hashSync("hunter2", options)]) {
+        // The secret is a key. It is not in the string, which is as long as one without a secret.
+        expect(hashed).toMatch(
+          new RegExp(`^\\$${algorithm}\\$v=19\\$m=8,t=1,p=1\\$[A-Za-z0-9+/]{43}\\$[A-Za-z0-9+/]{43}$`),
+        );
+        expect({
+          secret: await password.verify("hunter2", hashed, { secret }),
+          secretSync: password.verifySync("hunter2", hashed, { secret }),
+          secretAsBytes: await password.verify("hunter2", hashed, { secret: Buffer.from(secret) }),
+          secretAndAlgorithm: password.verifySync("hunter2", hashed, { algorithm, secret }),
+          otherPassword: await password.verify("hunter3", hashed, { secret }),
+          otherSecret: await password.verify("hunter2", hashed, { secret: secret + "!" }),
+          otherSecretSync: password.verifySync("hunter2", hashed, { secret: secret + "!" }),
+          noSecret: await password.verify("hunter2", hashed),
+          noSecretSync: password.verifySync("hunter2", hashed),
+          noSecretAndAlgorithm: await password.verify("hunter2", hashed, algorithm),
+          emptyOptions: password.verifySync("hunter2", hashed, {}),
+        }).toEqual({
+          secret: true,
+          secretSync: true,
+          secretAsBytes: true,
+          secretAndAlgorithm: true,
+          otherPassword: false,
+          otherSecret: false,
+          otherSecretSync: false,
+          noSecret: false,
+          noSecretSync: false,
+          noSecretAndAlgorithm: false,
+          emptyOptions: false,
+        });
+      }
+    });
+  }
+
+  test("is the secret of crypto.argon2Sync()", () => {
+    const hashed = password.hashSync("hunter2", { ...fast, secret });
+    const [salt, tag] = hashed.split("$").slice(4);
+    const parameters = {
+      message: "hunter2",
+      nonce: Buffer.from(salt, "base64"),
+      parallelism: 1,
+      tagLength: 32,
+      memory: 8,
+      passes: 1,
+    };
+    const tagOf = (secret?: string) =>
+      argon2Sync("argon2id", { ...parameters, secret })
+        .toString("base64")
+        .replaceAll("=", "");
+    expect(tagOf(secret)).toBe(tag);
+    expect(tagOf()).not.toBe(tag);
+  });
+
+  test("verifies stored hashes that were made with a secret", () => {
+    // Made with the costs of `fast` and with `secret`. Node.js 26.3.0, which computes argon2 with OpenSSL, gives the
+    // tag of each from its salt and `secret`, and another tag without `secret`.
+    for (const hashed of [
+      "$argon2id$v=19$m=8,t=1,p=1$YWhmtDVTMK1IacMNLK4awBTzkPgpLbYkVb0C1XToWZ4$rfQTKq9sgl0ofzjdIi71VTqBlSKO9LJ/BSo3OIxEj94",
+      "$argon2i$v=19$m=8,t=1,p=1$NQuq18TF9XvH2UshK3X2HvdbyWPRI77+2ifHmfcpLMQ$Gh0BrhHdAXXGiRDTKWrvuMatty+vXU7HOkN7RMGwwLQ",
+      "$argon2d$v=19$m=8,t=1,p=1$ahGjakl6WbgKsvF0I3ZMMPHJ/UodvzxYfiGAwVRedhE$L1bjBv9ZJhBYVb5n3vkmMTZ+fnSOxnYeyGURXTzm5P4",
+    ]) {
+      expect(password.verifySync("hunter2", hashed, { secret })).toBeTrue();
+      expect(password.verifySync("hunter2", hashed)).toBeFalse();
+    }
+  });
+
+  test("a string is its UTF-8 bytes, and a view is the bytes it covers", () => {
+    // A Latin-1 string, a UTF-16 string, and one that is longer than the buffer a short string is converted into.
+    const pepper = "p\u00e9pper \u{1f336}";
+    for (const text of ["p\u00e9pper", pepper, Array.from({ length: 40 }, () => pepper).join("")]) {
+      const bytes = new TextEncoder().encode(text).slice();
+      const padded = new Uint8Array(bytes.length + 4);
+      padded.set(bytes, 2);
+      const shared = new Uint8Array(new SharedArrayBuffer(bytes.length));
+      shared.set(bytes);
+
+      const hashed = password.hashSync("hunter2", { ...fast, secret: text });
+      expect({
+        typedArray: password.verifySync("hunter2", hashed, { secret: bytes }),
+        arrayBuffer: password.verifySync("hunter2", hashed, { secret: bytes.buffer }),
+        subarray: password.verifySync("hunter2", hashed, { secret: padded.subarray(2, 2 + bytes.length) }),
+        shared: password.verifySync("hunter2", hashed, { secret: shared }),
+        stringObject: password.verifySync("hunter2", hashed, { secret: new String(text) as unknown as string }),
+        bufferOfSubarray: password.verifySync("hunter2", hashed, { secret: padded }),
+        latin1: password.verifySync("hunter2", hashed, { secret: Buffer.from(text, "latin1") }),
+      }).toEqual({
+        typedArray: true,
+        arrayBuffer: true,
+        subarray: true,
+        shared: true,
+        stringObject: true,
+        bufferOfSubarray: false,
+        latin1: false,
+      });
+      expect(
+        password.verifySync("hunter2", password.hashSync("hunter2", { ...fast, secret: bytes }), { secret: text }),
+      ).toBeTrue();
+    }
+
+    // Bytes that are not UTF-8, as a key from a key management service is.
+    const binary = new Uint8Array([0xff, 0x00, 0xfe, 0x80]);
+    const keyed = password.hashSync("hunter2", { ...fast, secret: binary });
+    expect(password.verifySync("hunter2", keyed, { secret: binary })).toBeTrue();
+    expect(password.verifySync("hunter2", keyed, { secret: binary.subarray(0, 3) })).toBeFalse();
+    expect(password.verifySync("hunter2", keyed, { secret: Buffer.from(binary).toString("latin1") })).toBeFalse();
+  });
+
+  test("hash() and verify() keep a copy of the secret", async () => {
+    const key = () => new Uint8Array(32).fill(7);
+
+    const overwritten = key();
+    const hashing = password.hash("hunter2", { ...fast, secret: overwritten });
+    overwritten.fill(8);
+    const hashed = await hashing;
+    expect(password.verifySync("hunter2", hashed, { secret: key() })).toBeTrue();
+    expect(password.verifySync("hunter2", hashed, { secret: overwritten })).toBeFalse();
+
+    const detached = key();
+    const verifying = password.verify("hunter2", hashed, { secret: detached });
+    structuredClone(detached.buffer, { transfer: [detached.buffer] });
+    expect(detached.byteLength).toBe(0);
+    expect(await verifying).toBeTrue();
+  });
+
+  test("undefined and null are no secret", () => {
+    const hashed = password.hashSync("hunter2", { ...fast, secret: undefined });
+    expect({
+      none: password.verifySync("hunter2", hashed),
+      undefined: password.verifySync("hunter2", hashed, { secret: undefined }),
+      null: password.verifySync("hunter2", hashed, { secret: null! }),
+      hashedWithNull: password.verifySync("hunter2", password.hashSync("hunter2", { ...fast, secret: null! })),
+      algorithm: password.verifySync("hunter2", hashed, { algorithm: "argon2id" }),
+      undefinedAlgorithm: password.verifySync("hunter2", hashed, { algorithm: undefined }),
+      secret: password.verifySync("hunter2", hashed, { secret }),
+    }).toEqual({
+      none: true,
+      undefined: true,
+      null: true,
+      hashedWithNull: true,
+      algorithm: true,
+      undefinedAlgorithm: true,
+      secret: false,
+    });
+  });
+
+  test("an empty secret throws", () => {
+    const hashed = password.hashSync("hunter2", fast);
+    const detached = new Uint8Array(32).fill(7);
+    structuredClone(detached.buffer, { transfer: [detached.buffer] });
+    const empty = invalidArgument("secret must not be empty");
+    for (const secret of ["", new Uint8Array(0), new ArrayBuffer(0), detached]) {
+      expect(thrownBy(() => password.hash("hunter2", { ...fast, secret }))).toEqual(empty);
+      expect(thrownBy(() => password.hashSync("hunter2", { ...fast, secret }))).toEqual(empty);
+      expect(thrownBy(() => password.verify("hunter2", hashed, { secret }))).toEqual(empty);
+      expect(thrownBy(() => password.verifySync("hunter2", hashed, { secret }))).toEqual(empty);
+      expect(thrownBy(() => password.needsRehash(hashed, { ...fast, secret }))).toEqual(empty);
+    }
+  });
+
+  test("a secret that is not a string or a buffer throws", () => {
+    const hashed = password.hashSync("hunter2", fast);
+    const wrongType = invalidArgument("Expected options.secret to be a string, ArrayBuffer or ArrayBufferView");
+    for (const secret of [123, 1n, true, false, {}, [1, 2, 3], () => {}, Symbol("secret"), new Blob(["x"])] as any[]) {
+      expect(thrownBy(() => password.hash("hunter2", { ...fast, secret }))).toEqual(wrongType);
+      expect(thrownBy(() => password.hashSync("hunter2", { ...fast, secret }))).toEqual(wrongType);
+      expect(thrownBy(() => password.verify("hunter2", hashed, { secret }))).toEqual(wrongType);
+      expect(thrownBy(() => password.verifySync("hunter2", hashed, { secret }))).toEqual(wrongType);
+      expect(thrownBy(() => password.needsRehash(hashed, { ...fast, secret }))).toEqual(wrongType);
+    }
+  });
+
+  test("bcrypt has no secret: hash(), verify() and needsRehash() throw", async () => {
+    const cost4 = { algorithm: "bcrypt", cost: 4 } as const;
+    const crypt = password.hashSync("hunter2", cost4);
+    // The salt and the digest of a "$2b$" hash are base64 in an alphabet of bcrypt. The PHC format has the usual one.
+    const bcryptAlphabet = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const base64 = (text: string) => text.replace(/./g, character => base64Alphabet[bcryptAlphabet.indexOf(character)]);
+    const phc = `$bcrypt$r=4$${base64(crypt.slice(7, 29))}$${base64(crypt.slice(29))}`;
+
+    // @ts-expect-error
+    expect(thrownBy(() => password.hash("hunter2", { algorithm: "bcrypt", cost: 4, secret }))).toEqual(
+      noSecretForBcrypt,
+    );
+    // @ts-expect-error
+    expect(thrownBy(() => password.hashSync("hunter2", { algorithm: "bcrypt", cost: 4, secret }))).toEqual(
+      noSecretForBcrypt,
+    );
+    // @ts-expect-error
+    expect(thrownBy(() => password.needsRehash(crypt, { algorithm: "bcrypt", cost: 4, secret }))).toEqual(
+      noSecretForBcrypt,
+    );
+    // @ts-expect-error
+    expect(thrownBy(() => password.hashSync("hunter2", { algorithm: "bcrypt", secret: "" }))).toEqual(
+      noSecretForBcrypt,
+    );
+
+    // A hash that says it is bcrypt was not made with the secret. verify() does not fall back to a check without it.
+    for (const hashed of [crypt, crypt.replace("$2b$", "$2a$"), crypt.replace("$2b$", "$2y$"), phc]) {
+      expect(password.verifySync("hunter2", hashed)).toBeTrue();
+      expect(thrownBy(() => password.verify("hunter2", hashed, { secret }))).toEqual(noSecretForBcrypt);
+      expect(thrownBy(() => password.verifySync("hunter2", hashed, { secret }))).toEqual(noSecretForBcrypt);
+      expect(thrownBy(() => password.verifySync("hunter2", hashed, { algorithm: "bcrypt", secret }))).toEqual(
+        noSecretForBcrypt,
+      );
+      const asArgon2 = { name: "Error", code: "PASSWORD_INVALID_ENCODING" };
+      expect(() => password.verifySync("hunter2", hashed, { algorithm: "argon2id", secret })).toThrow(
+        expect.objectContaining(asArgon2),
+      );
+      await expect(password.verify("hunter2", hashed, { algorithm: "argon2id", secret })).rejects.toMatchObject(
+        asArgon2,
+      );
+    }
+
+    // The empty values that are false with no secret are false with one.
+    expect(await password.verify("", crypt, { secret })).toBeFalse();
+    expect(password.verifySync("hunter2", "", { secret })).toBeFalse();
+    expect(thrownBy(() => password.verifySync("", crypt, { algorithm: "bcrypt", secret }))).toEqual(noSecretForBcrypt);
+  });
+
+  test("the third argument of verify() is the name of an algorithm or the options", async () => {
+    const hashed = password.hashSync("hunter2", fast);
+    const notTheOptions = invalidArgument("Expected algorithm to be a string or an object for 'verify'.");
+    const unknownAlgorithm = invalidArgument(/^Expected algorithm to be a unknown algorithm, .* for 'verify'\.$/);
+    for (const verify of [password.verify, password.verifySync]) {
+      expect(verify.length).toBe(2);
+
+      // A String object is a name, as it was before the options.
+      expect(await verify("hunter2", hashed, new String("argon2id") as any)).toBeTrue();
+      expect(thrownBy(() => verify("hunter2", hashed, new String("scrypt") as any))).toEqual(unknownAlgorithm);
+      // bcrypt does not read an argon2 hash, under either spelling of the argument.
+      expect(await verify("hunter2", hashed, "bcrypt")).toBeFalse();
+      expect(await verify("hunter2", hashed, new String("bcrypt") as any)).toBeFalse();
+      expect(await verify("hunter2", hashed, { algorithm: "bcrypt" })).toBeFalse();
+      // @ts-expect-error
+      expect(thrownBy(() => verify("hunter2", hashed, { algorithm: "scrypt" }))).toEqual(unknownAlgorithm);
+      // @ts-expect-error
+      expect(thrownBy(() => verify("hunter2", hashed, { algorithm: 123 }))).toEqual(
+        invalidArgument("options.algorithm must be a string"),
+      );
+
+      // A plain object is the options. It is not converted to a name.
+      const notAName = { toString: () => "bcrypt" };
+      // @ts-expect-error
+      expect(await verify("hunter2", hashed, notAName)).toBeTrue();
+
+      // A secret in the place of the options, the callback of bcrypt.compare(), and what was never taken.
+      for (const argument of [Buffer.from(secret), new ArrayBuffer(8), () => {}, [], ["argon2id"], 123, 1n, true]) {
+        expect(thrownBy(() => verify("hunter2", hashed, argument as any))).toEqual(notTheOptions);
+      }
+    }
+  });
+});
+
+describe("needsRehash", () => {
+  // The two hashes of the documentation. Nothing is hashed here: only the algorithm and the costs of a string are read.
+  const argon2id =
+    "$argon2id$v=19$m=65536,t=2,p=1$tFq+9AVr1bfPxQdh6E8DQRhEXg/M/SqYCNu6gVdRRNs$GzJ8PuBi+K+BVojzPfS5mjnC8OpLGtv8KJqF99eP6a4";
+  const bcrypt = "$2b$10$Lyj9kHYZtiyfxh2G60TEfeqs7xkkGiEFFDi3iJGc50ZG/XJ1sxIFi";
+
+  test("is false for a hash of the algorithm and the costs", () => {
+    expect({
+      default: password.needsRehash(argon2id),
+      undefined: password.needsRehash(argon2id, undefined),
+      label: password.needsRehash(argon2id, "argon2id"),
+      defaultCosts: password.needsRehash(argon2id, { algorithm: "argon2id" }),
+      costs: password.needsRehash(argon2id, { algorithm: "argon2id", memoryCost: 65536, timeCost: 2 }),
+      buffer: password.needsRehash(Buffer.from(argon2id)),
+      argon2i: password.needsRehash(argon2id.replace("$argon2id$", "$argon2i$"), "argon2i"),
+      argon2d: password.needsRehash(argon2id.replace("$argon2id$", "$argon2d$"), "argon2d"),
+      bcrypt: password.needsRehash(bcrypt, "bcrypt"),
+      bcryptCost: password.needsRehash(bcrypt, { algorithm: "bcrypt", cost: 10 }),
+      bcryptBuffer: password.needsRehash(new TextEncoder().encode(bcrypt), "bcrypt"),
+    }).toEqual({
+      default: false,
+      undefined: false,
+      label: false,
+      defaultCosts: false,
+      costs: false,
+      buffer: false,
+      argon2i: false,
+      argon2d: false,
+      bcrypt: false,
+      bcryptCost: false,
+      bcryptBuffer: false,
+    });
+  });
+
+  test("is true for a hash of other costs, higher or lower", () => {
+    expect({
+      memoryCost: password.needsRehash(argon2id, { algorithm: "argon2id", memoryCost: 131072 }),
+      lowerMemoryCost: password.needsRehash(argon2id, { algorithm: "argon2id", memoryCost: 32768 }),
+      timeCost: password.needsRehash(argon2id, { algorithm: "argon2id", timeCost: 3 }),
+      lowerTimeCost: password.needsRehash(argon2id, { algorithm: "argon2id", timeCost: 1 }),
+      // hash() always makes one lane. Other libraries make four.
+      parallelism: password.needsRehash(argon2id.replace(",p=1$", ",p=4$")),
+      bcryptCost: password.needsRehash(bcrypt, { algorithm: "bcrypt", cost: 12 }),
+      lowerBcryptCost: password.needsRehash(bcrypt, { algorithm: "bcrypt", cost: 4 }),
+    }).toEqual({
+      memoryCost: true,
+      lowerMemoryCost: true,
+      timeCost: true,
+      lowerTimeCost: true,
+      parallelism: true,
+      bcryptCost: true,
+      lowerBcryptCost: true,
+    });
+  });
+
+  test("is true for a hash of another algorithm", () => {
+    expect({
+      argon2idAsArgon2i: password.needsRehash(argon2id, "argon2i"),
+      argon2idAsArgon2d: password.needsRehash(argon2id, "argon2d"),
+      argon2idAsBcrypt: password.needsRehash(argon2id, "bcrypt"),
+      argon2iAsArgon2id: password.needsRehash(argon2id.replace("$argon2id$", "$argon2i$")),
+      argon2dAsArgon2id: password.needsRehash(argon2id.replace("$argon2id$", "$argon2d$")),
+      bcryptAsArgon2id: password.needsRehash(bcrypt),
+      bcryptAsArgon2i: password.needsRehash(bcrypt, { algorithm: "argon2i", memoryCost: 8, timeCost: 1 }),
+    }).toEqual({
+      argon2idAsArgon2i: true,
+      argon2idAsArgon2d: true,
+      argon2idAsBcrypt: true,
+      argon2iAsArgon2id: true,
+      argon2dAsArgon2id: true,
+      bcryptAsArgon2id: true,
+      bcryptAsArgon2i: true,
+    });
+  });
+
+  test("reads the other forms of a hash that verify() reads", () => {
+    const fast = { algorithm: "argon2id", memoryCost: 8, timeCost: 1 } as const;
+    const cost4 = { algorithm: "bcrypt", cost: 4 } as const;
+    const argon2 = password.hashSync("hunter2", fast);
+    const crypt = password.hashSync("hunter2", cost4);
+    // The salt and the digest of a "$2b$" hash are base64 in an alphabet of bcrypt. The PHC format has the usual one.
+    const bcryptAlphabet = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const base64 = (text: string) => text.replace(/./g, character => base64Alphabet[bcryptAlphabet.indexOf(character)]);
+    const forms = {
+      // verify() takes an argon2 hash that has no version for version 19.
+      unversioned: argon2.replace("$v=19$", "$"),
+      "2a": crypt.replace("$2b$", "$2a$"),
+      "2x": crypt.replace("$2b$", "$2x$"),
+      "2y": crypt.replace("$2b$", "$2y$"),
+      phc: `$bcrypt$r=4$${base64(crypt.slice(7, 29))}$${base64(crypt.slice(29))}`,
+    };
+    expect(forms.unversioned).toStartWith("$argon2id$m=8,t=1,p=1$");
+
+    for (const [form, hashed] of Object.entries(forms)) {
+      const [same, other] = form === "unversioned" ? [fast, { ...fast, timeCost: 2 }] : [cost4, { ...cost4, cost: 5 }];
+      expect({
+        form,
+        verifies: password.verifySync("hunter2", hashed),
+        needsRehash: password.needsRehash(hashed, same),
+        needsRehashForOtherCost: password.needsRehash(hashed, other),
+      }).toEqual({ form, verifies: true, needsRehash: false, needsRehashForOtherCost: true });
+    }
+
+    // verify() reads this spelling only when it is told the algorithm, so it is not a form to keep.
+    const capitalized = argon2.replace("$argon2id$", "$Argon2id$");
+    expect(password.verifySync("hunter2", capitalized, "argon2id")).toBeTrue();
+    expect(() => password.verifySync("hunter2", capitalized)).toThrow(
+      expect.objectContaining({ name: "Error", code: "PASSWORD_UNSUPPORTED_ALGORITHM" }),
+    );
+    expect(password.needsRehash(capitalized, fast)).toBeTrue();
+  });
+
+  test("is true for a string that does not have the form of a hash", () => {
+    const strings = [
+      "",
+      "$",
+      "hunter2",
+      "$argon2id$",
+      "argon2id$v=19$m=65536,t=2,p=1$c2FsdHNhbHQ$dGFn",
+      "$argon2id$v=19$m=65536,t=2,p=1",
+      "$argon2id$v=19$m=65536,t=2,p=1$",
+      "$argon2id$v=19$m=65536,t=2,p=1$c2FsdHNhbHQ",
+      "$argon2id$v=19$m=65536,t=2,p=1$c2FsdHNhbHQ$",
+      "$argon2id$v=19$m=65536,t=2,p=1$$dGFn",
+      argon2id + "$",
+      argon2id.replace("$v=19$", "$v=16$"),
+      argon2id.replace("$v=19$", "$v=19$v=19$"),
+      argon2id.replace("$argon2id$", "$argon2$"),
+      argon2id.replace("$argon2id$", "$ARGON2ID$"),
+      argon2id.replace("$tFq+", "$tFq\u00e9"),
+      argon2id.replace("m=65536", "m=65536x"),
+      argon2id.replace("m=65536", "m=-65536"),
+      argon2id.replace("m=65536", "m=4294967296"),
+      argon2id.replace("m=65536", "m="),
+      argon2id.replace("m=65536,t=2", "t=2,m=65536"),
+      argon2id.replace(",p=1$", "$"),
+      argon2id.replace(",p=1$", ",p=1,keyid=a2V5$"),
+      "$scrypt$ln=16,r=8,p=1$aM15713r3Xsvxbi31lqr1Q$nFNh2CVHVjNldFVKDHDlm4CbdRSCdEBsjjJxD+iCs5E",
+      bcrypt.slice(0, -1),
+      bcrypt + "i",
+      // 60 bytes, as a hash of bcrypt has, and not ASCII.
+      bcrypt.slice(0, -2) + "\u00e9",
+      bcrypt.replace("$2b$", "$2c$"),
+      bcrypt.replace("$2b$", "$2$b"),
+      bcrypt.replace("$10$", "$1x$"),
+      bcrypt.replace("$10$", "$100"),
+      "$bcrypt$r=10$",
+      "$bcrypt$r=10$il0DMPmSpDzvybeM5c19EA",
+      "$bcrypt$r=10$$1QW+zMrO4HHCdWf1H+C9YdvK31hhTKw",
+      "$bcrypt$r=10$il0DMPmSpDzvybeM5c19EA$1QW+zMrO4HHCdWf1H+C9YdvK31hhTKw$",
+      "$bcrypt$r=10$il0DMPmSpDzvybeM5c19EA$1QW+zMrO4HHCdWf1H+C9YdvK31hhTKw$1QW+",
+      "$bcrypt$r=x$il0DMPmSpDzvybeM5c19EA$1QW+zMrO4HHCdWf1H+C9YdvK31hhTKw",
+      "$bcrypt$r=256$il0DMPmSpDzvybeM5c19EA$1QW+zMrO4HHCdWf1H+C9YdvK31hhTKw",
+    ];
+    expect(strings.filter(string => !password.needsRehash(string))).toEqual([]);
+    expect(strings.filter(string => !password.needsRehash(string, "bcrypt"))).toEqual([]);
+  });
+
+  test("reads the costs of a hash and computes nothing", () => {
+    // A hash of these costs takes hours and four terabytes to verify.
+    const costly = argon2id.replace("m=65536,t=2", "m=4294967295,t=4294967295");
+    const options = { algorithm: "argon2id", memoryCost: 4294967295, timeCost: 4294967295 } as const;
+    expect(password.needsRehash(costly, options)).toBeFalse();
+    expect(password.needsRehash(costly)).toBeTrue();
+    expect(password.needsRehash(argon2id, options)).toBeTrue();
+    expect(password.needsRehash(bcrypt.replace("$10$", "$31$"), { algorithm: "bcrypt", cost: 31 })).toBeFalse();
+  });
+
+  test("takes the second argument of hash()", () => {
+    expect(password.needsRehash.length).toBe(1);
+    const hashIsRequired = invalidArgument("hash must be a string, ArrayBuffer or ArrayBufferView");
+    // @ts-expect-error
+    expect(thrownBy(() => password.needsRehash())).toEqual(hashIsRequired);
+    // @ts-expect-error
+    expect(thrownBy(() => password.needsRehash(undefined, "bcrypt"))).toEqual(hashIsRequired);
+    // @ts-expect-error
+    expect(thrownBy(() => password.needsRehash(123))).toEqual(hashIsRequired);
+    // @ts-expect-error
+    expect(thrownBy(() => password.needsRehash(argon2id, "scrypt"))).toEqual(
+      invalidArgument(/^Expected algorithm to be a unknown algorithm, .* for 'needsRehash'\.$/),
+    );
+    // @ts-expect-error
+    expect(thrownBy(() => password.needsRehash(argon2id, {}))).toEqual(
+      invalidArgument("Expected options.algorithm to be a string for 'needsRehash'."),
+    );
+    // @ts-expect-error
+    expect(thrownBy(() => password.needsRehash(argon2id, { algorithm: "argon2id", timeCost: "2" }))).toEqual(
+      invalidArgument("Expected timeCost to be a number for 'needsRehash'."),
+    );
+    expect(thrownBy(() => password.needsRehash(argon2id, { algorithm: "argon2id", memoryCost: 4 }))).toEqual(
+      invalidArgument("Memory cost must be at least 8"),
+    );
+    expect(thrownBy(() => password.needsRehash(argon2id, { algorithm: "argon2id", timeCost: 0 }))).toEqual(
+      invalidArgument("Time cost must be greater than 0"),
+    );
+    expect(thrownBy(() => password.needsRehash(bcrypt, { algorithm: "bcrypt", cost: 32 }))).toEqual(
+      invalidArgument("Rounds must be an integer between 4 and 31"),
+    );
+
+    // A hash does not hold its secret, so a secret makes no difference.
+    expect(password.needsRehash(argon2id, { algorithm: "argon2id", secret: "pepper" })).toBeFalse();
+    expect(password.needsRehash(argon2id, { algorithm: "argon2id", timeCost: 3, secret: "pepper" })).toBeTrue();
+  });
+
+  test("is false for what hash() and hashSync() return", async () => {
+    const all = [
+      { algorithm: "argon2id", memoryCost: 8, timeCost: 1 },
+      { algorithm: "argon2i", memoryCost: 16, timeCost: 2 },
+      { algorithm: "argon2d", memoryCost: 24, timeCost: 3 },
+      { algorithm: "argon2id", memoryCost: 8, timeCost: 1, secret: "pepper" },
+      { algorithm: "bcrypt", cost: 4 },
+      { algorithm: "bcrypt", cost: 5 },
+    ] as const;
+    const hashes = await Promise.all(all.map(options => password.hash("hunter2", options)));
+    hashes.push(...all.map(options => password.hashSync("hunter2", options)));
+    // Each hash against each of the options: only its own, and the one that differs in the secret, need no new hash.
+    expect(hashes.map(hash => all.map(options => (password.needsRehash(hash, options) ? "x" : ".")).join(""))).toEqual([
+      ".xx.xx",
+      "x.xxxx",
+      "xx.xxx",
+      ".xx.xx",
+      "xxxx.x",
+      "xxxxx.",
+      ".xx.xx",
+      "x.xxxx",
+      "xx.xxx",
+      ".xx.xx",
+      "xxxx.x",
+      "xxxxx.",
+    ]);
+  });
+
+  test("after verify(), tells when to store a new hash", async () => {
+    const old = { algorithm: "bcrypt", cost: 4 } as const;
+    const current = { algorithm: "argon2id", memoryCost: 8, timeCost: 2 } as const;
+    let stored = await password.hash("hunter2", old);
+
+    async function login(input: string) {
+      if (!(await password.verify(input, stored))) return false;
+      if (password.needsRehash(stored, current)) stored = await password.hash(input, current);
+      return true;
+    }
+
+    expect(await login("hunter3")).toBeFalse();
+    expect(stored).toStartWith("$2b$04$");
+    expect(await login("hunter2")).toBeTrue();
+    expect(stored).toStartWith("$argon2id$v=19$m=8,t=2,p=1$");
+    const rehashed = stored;
+    expect(await login("hunter2")).toBeTrue();
+    expect(stored).toBe(rehashed);
+  });
 });

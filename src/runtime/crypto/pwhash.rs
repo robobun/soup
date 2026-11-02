@@ -68,7 +68,7 @@ pub(crate) mod argon2 {
     }
 
     /// Argon2 parameters — only the fields Bun touches.
-    #[derive(Copy, Clone)]
+    #[derive(Copy, Clone, Eq, PartialEq)]
     pub(crate) struct Params {
         /// Time cost (iterations).
         pub(crate) t: u32,
@@ -86,15 +86,20 @@ pub(crate) mod argon2 {
 
     /// Options for `str_hash`.
     #[derive(Copy, Clone)]
-    pub(crate) struct HashOptions {
+    pub(crate) struct HashOptions<'a> {
         pub params: Params,
         pub mode: Mode,
         pub encoding: Encoding,
+        /// Empty for none.
+        pub secret: &'a [u8],
     }
 
     /// Options for `str_verify`.
     #[derive(Copy, Clone, Default)]
-    pub(crate) struct VerifyOptions;
+    pub(crate) struct VerifyOptions<'a> {
+        /// The one the hash was made with. Empty for none.
+        pub secret: &'a [u8],
+    }
 
     fn map_err(e: &vendor::Error) -> Error {
         use vendor::Error as E;
@@ -128,7 +133,7 @@ pub(crate) mod argon2 {
     /// subslice.
     pub(crate) fn str_hash<'a>(
         password: &[u8],
-        options: HashOptions,
+        options: HashOptions<'_>,
         out: &'a mut [u8],
     ) -> Result<&'a [u8], Error> {
         if options.encoding != Encoding::Phc {
@@ -140,7 +145,7 @@ pub(crate) mod argon2 {
 
         let config = vendor::Config {
             ad: &[],
-            secret: &[],
+            secret: options.secret,
             hash_length: DEFAULT_HASH_LEN,
             lanes: options.params.p,
             mem_cost: options.params.m,
@@ -168,7 +173,7 @@ pub(crate) mod argon2 {
     pub(crate) fn str_verify(
         encoded_hash: &[u8],
         password: &[u8],
-        _options: VerifyOptions,
+        options: VerifyOptions<'_>,
     ) -> Result<(), Error> {
         // PHC strings are 7-bit ASCII; reject non-ASCII input as a decode
         // failure.
@@ -249,13 +254,58 @@ pub(crate) mod argon2 {
             }
         }
 
-        match vendor::verify_encoded(&normalised, password) {
+        match vendor::verify_encoded_ext(&normalised, password, options.secret, &[]) {
             Ok(true) => Ok(()),
             // `rust-argon2` constant-time compares and returns `Ok(false)` on
             // mismatch; surface this as `PasswordVerificationFailed`.
             Ok(false) => Err(crate::Error::PasswordVerificationFailed),
             Err(e) => Err(map_err(&e)),
         }
+    }
+
+    /// The variant and costs of an encoded hash, or `None`. The salt and the tag are not decoded.
+    pub(crate) fn str_params(encoded_hash: &[u8]) -> Option<(Mode, Params)> {
+        fn cost(pair: &[u8], name: &[u8]) -> Option<u32> {
+            // `str::parse`, as rust-argon2's `decode_u32`.
+            core::str::from_utf8(pair.strip_prefix(name)?)
+                .ok()?
+                .parse()
+                .ok()
+        }
+
+        if !encoded_hash.is_ascii() {
+            return None;
+        }
+        let mut segments = strings::split(encoded_hash, b"$");
+        if !segments.next()?.is_empty() {
+            return None;
+        }
+        // Not `Argon2id`, which rust-argon2 decodes and `Algorithm::get` does not take for a hash.
+        let mode = match segments.next()? {
+            b"argon2d" => Mode::Argon2d,
+            b"argon2i" => Mode::Argon2i,
+            b"argon2id" => Mode::Argon2id,
+            _ => return None,
+        };
+        let mut costs = segments.next()?;
+        // `str_verify` takes a missing version for 19.
+        if let Some(version) = costs.strip_prefix(b"v=") {
+            if version != b"19" {
+                return None;
+            }
+            costs = segments.next()?;
+        }
+        let mut costs = strings::split(costs, b",");
+        let m = cost(costs.next()?, b"m=")?;
+        let t = cost(costs.next()?, b"t=")?;
+        let p = cost(costs.next()?, b"p=")?;
+        let salt = segments.next()?;
+        let tag = segments.next()?;
+        if costs.next().is_some() || segments.next().is_some() || salt.is_empty() || tag.is_empty()
+        {
+            return None;
+        }
+        Some((mode, Params { t, m, p }))
     }
 }
 
@@ -458,5 +508,34 @@ pub(crate) mod bcrypt {
         } else {
             Err(crate::Error::PasswordVerificationFailed)
         }
+    }
+
+    /// The cost of an encoded hash, or `None`. The salt and the digest are not decoded.
+    pub(crate) fn str_rounds(encoded_hash: &[u8]) -> Option<u32> {
+        if !encoded_hash.is_ascii() {
+            return None;
+        }
+        if encoded_hash.starts_with(b"$2") {
+            // The checks of the crate's `split_hash`, up to the cost.
+            if encoded_hash.len() != HASH_LENGTH
+                || !matches!(encoded_hash[2], b'a' | b'b' | b'x' | b'y')
+                || encoded_hash[3] != b'$'
+                || encoded_hash[6] != b'$'
+            {
+                return None;
+            }
+            return core::str::from_utf8(&encoded_hash[4..6]).ok()?.parse().ok();
+        }
+
+        // `$bcrypt$r=N$<salt>$<hash>`, as `verify_phc` reads it.
+        let rest = encoded_hash.strip_prefix(b"$bcrypt$r=")?;
+        let (rounds, rest) = strings::split_once_char(rest, b'$')?;
+        let (salt, hash) = strings::split_once_char(rest, b'$')?;
+        if salt.is_empty() || hash.is_empty() || strings::contains_char(hash, b'$') {
+            return None;
+        }
+        bun_core::fmt::parse_unsigned::<u8>(rounds, 10)
+            .ok()
+            .map(u32::from)
     }
 }
