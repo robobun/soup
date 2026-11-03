@@ -7,6 +7,7 @@
     "@swc/core": "^1.2.133",
     "benchmark": "^2.1.4",
     "braces": "^3.0.2",
+    "change-case": "5.4.4",
     "cli-truncate": "^5.1.1",
     "color": "^4.2.3",
     "esbuild": "^0.14.12",

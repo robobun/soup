@@ -990,6 +990,210 @@ declare module "bun" {
    */
   function stripANSI(input: string): string;
 
+  /**
+   * Convert a string to `camelCase`: the first word in lowercase, every other word with its
+   * first letter in uppercase and the rest in lowercase, and nothing between the words.
+   *
+   * The string is split into words first. A word is a run of letters and ASCII digits (`0` to
+   * `9`). A word also ends before an uppercase letter that follows a lowercase letter or a digit
+   * (`fooBar` is `foo` and `Bar`), and before the last uppercase letter of a run when a
+   * lowercase letter follows it (`XMLHttp` is `XML` and `Http`). Every other character separates
+   * words and is not in the result.
+   *
+   * A word after the first that starts with a digit gets `_` before it, so that the digits of
+   * two words do not run together. `camelCase(name).replaceAll("_", "")` joins them.
+   *
+   * Letters of other scripts are letters too, and they get the case that `toLowerCase()` and
+   * `toUpperCase()` give. The locale is never read, so the result does not depend on it. A
+   * combining mark is not a letter: it separates words and is not in the result, which cuts
+   * apart decomposed text and the words of scripts that write vowels as marks, such as
+   * Devanagari and Thai. A digit of another script separates words too. The first letter of a
+   * word is one UTF-16 code unit, so a first letter outside of the Basic Multilingual Plane
+   * keeps its case.
+   *
+   * The result is the one that `camelCase()` of the `change-case` package (version 5) gives with
+   * `locale: false`. A value that is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in camel case
+   *
+   * @example
+   * ```ts
+   * import { camelCase } from "bun";
+   *
+   * camelCase("two words"); // "twoWords"
+   * camelCase("created_at"); // "createdAt"
+   * camelCase("XMLHttpRequest"); // "xmlHttpRequest"
+   * camelCase("version 1.2.10"); // "version_1_2_10"
+   * ```
+   */
+  function camelCase(input: string): string;
+
+  /**
+   * Convert a string to `Capital Case`: every word with its first letter in uppercase and the
+   * rest in lowercase, and a space between the words.
+   *
+   * The words are found the way {@link camelCase} finds them. The result is the one that
+   * `capitalCase()` of the `change-case` package (version 5) gives with `locale: false`. A value
+   * that is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in capital case
+   *
+   * @example
+   * ```ts
+   * import { capitalCase } from "bun";
+   *
+   * capitalCase("two words"); // "Two Words"
+   * capitalCase("created_at"); // "Created At"
+   * capitalCase("XMLHttpRequest"); // "Xml Http Request"
+   * ```
+   */
+  function capitalCase(input: string): string;
+
+  /**
+   * Convert a string to `CONSTANT_CASE`: every word in uppercase, and `_` between the words.
+   *
+   * The words are found the way {@link camelCase} finds them. The result is the one that
+   * `constantCase()` of the `change-case` package (version 5) gives with `locale: false`. A value
+   * that is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in constant case
+   *
+   * @example
+   * ```ts
+   * import { constantCase } from "bun";
+   *
+   * constantCase("two words"); // "TWO_WORDS"
+   * constantCase("maxRetryCount"); // "MAX_RETRY_COUNT"
+   * constantCase("straße"); // "STRASSE"
+   * ```
+   */
+  function constantCase(input: string): string;
+
+  /**
+   * Convert a string to `dot.case`: every word in lowercase, and `.` between the words.
+   *
+   * The words are found the way {@link camelCase} finds them. The result is the one that
+   * `dotCase()` of the `change-case` package (version 5) gives with `locale: false`. A value that
+   * is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in dot case
+   *
+   * @example
+   * ```ts
+   * import { dotCase } from "bun";
+   *
+   * dotCase("two words"); // "two.words"
+   * dotCase("serverHostName"); // "server.host.name"
+   * ```
+   */
+  function dotCase(input: string): string;
+
+  /**
+   * Convert a string to `kebab-case`: every word in lowercase, and `-` between the words.
+   *
+   * The words are found the way {@link camelCase} finds them. The result is the one that
+   * `kebabCase()` of the `change-case` package (version 5) gives with `locale: false`. A value
+   * that is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in kebab case
+   *
+   * @example
+   * ```ts
+   * import { kebabCase } from "bun";
+   *
+   * kebabCase("two words"); // "two-words"
+   * kebabCase("backgroundColor"); // "background-color"
+   * kebabCase("XMLHttpRequest"); // "xml-http-request"
+   * ```
+   */
+  function kebabCase(input: string): string;
+
+  /**
+   * Convert a string to `PascalCase`: every word with its first letter in uppercase and the
+   * rest in lowercase, and nothing between the words.
+   *
+   * The words are found the way {@link camelCase} finds them, and a word after the first that
+   * starts with a digit gets `_` before it. `pascalCase(name).replaceAll("_", "")` joins the
+   * digits. The result is the one that `pascalCase()` of the `change-case` package (version 5)
+   * gives with `locale: false`. A value that is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in pascal case
+   *
+   * @example
+   * ```ts
+   * import { pascalCase } from "bun";
+   *
+   * pascalCase("two words"); // "TwoWords"
+   * pascalCase("user_profile"); // "UserProfile"
+   * pascalCase("version 1.2.10"); // "Version_1_2_10"
+   * ```
+   */
+  function pascalCase(input: string): string;
+
+  /**
+   * Convert a string to `snake_case`: every word in lowercase, and `_` between the words.
+   *
+   * The words are found the way {@link camelCase} finds them. The result is the one that
+   * `snakeCase()` of the `change-case` package (version 5) gives with `locale: false`. A value
+   * that is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in snake case
+   *
+   * @example
+   * ```ts
+   * import { snakeCase } from "bun";
+   *
+   * snakeCase("two words"); // "two_words"
+   * snakeCase("createdAt"); // "created_at"
+   * snakeCase("XMLHttpRequest"); // "xml_http_request"
+   * ```
+   */
+  function snakeCase(input: string): string;
+
+  /**
+   * Convert a string to `Train-Case`: every word with its first letter in uppercase and the
+   * rest in lowercase, and `-` between the words.
+   *
+   * The words are found the way {@link camelCase} finds them. The result is the one that
+   * `trainCase()` of the `change-case` package (version 5) gives with `locale: false`. A value
+   * that is not a string is converted to a string first.
+   *
+   * @category Utilities
+   *
+   * @param input The string to convert
+   * @returns `input` in train case
+   *
+   * @example
+   * ```ts
+   * import { trainCase } from "bun";
+   *
+   * trainCase("two words"); // "Two-Words"
+   * trainCase("contentType"); // "Content-Type"
+   * ```
+   */
+  function trainCase(input: string): string;
+
   interface SliceAnsiOptions {
     /**
      * If set, and content was cut at either edge of the requested range,
