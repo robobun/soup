@@ -3904,6 +3904,14 @@ test("ModuleGraph isolation: every property of Bun is classified", () => {
     Image: "job",
     secrets: "job",
     resolve: "pure",
+    camelCase: "pure",
+    capitalCase: "pure",
+    constantCase: "pure",
+    dotCase: "pure",
+    kebabCase: "pure",
+    pascalCase: "pure",
+    snakeCase: "pure",
+    trainCase: "pure",
     // Process-wide by design.
     cron: "host", // registers with the operating system's scheduler
     plugin: "host",

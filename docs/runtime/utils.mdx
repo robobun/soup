@@ -476,6 +476,150 @@ namespace Bun {
 
 ---
 
+## Case conversion
+
+<Note>~8-38x faster `change-case` alternative</Note>
+
+`Bun.camelCase(input: string): string`
+
+`Bun.capitalCase()`, `Bun.constantCase()`, `Bun.dotCase()`, `Bun.kebabCase()`, `Bun.pascalCase()`, `Bun.snakeCase()` and `Bun.trainCase()` have the same signature.
+
+Each function splits a string into words and joins the words in one naming convention.
+
+| Function             | `"two words"` becomes |
+| -------------------- | --------------------- |
+| `Bun.camelCase()`    | `twoWords`            |
+| `Bun.capitalCase()`  | `Two Words`           |
+| `Bun.constantCase()` | `TWO_WORDS`           |
+| `Bun.dotCase()`      | `two.words`           |
+| `Bun.kebabCase()`    | `two-words`           |
+| `Bun.pascalCase()`   | `TwoWords`            |
+| `Bun.snakeCase()`    | `two_words`           |
+| `Bun.trainCase()`    | `Two-Words`           |
+
+```ts
+import { camelCase, kebabCase, snakeCase } from "bun";
+
+snakeCase("createdAt"); // => "created_at"
+camelCase("created_at"); // => "createdAt"
+kebabCase("XMLHttpRequest"); // => "xml-http-request"
+Bun.constantCase("maxRetryCount"); // => "MAX_RETRY_COUNT"
+
+// The keys of a JSON document, in the convention of your code
+const body = { user_id: 1, created_at: "2026-11-03" };
+Object.fromEntries(Object.entries(body).map(([key, value]) => [camelCase(key), value]));
+// => { userId: 1, createdAt: "2026-11-03" }
+```
+
+To rename the columns of a database, use the [`transform`](/runtime/sql#column-name-transforms) option of `Bun.SQL`. Its presets have the rules of postgres.js, which are other rules: `SQL.toCamel("address_line_1")` is `"addressLine1"`.
+
+Bun finds the words with these rules:
+
+- A word is a run of letters and ASCII digits (`0` to `9`). Every other character separates words and is not in the result. `"foo-bar.baz"` has three words.
+- A word ends before an uppercase letter that follows a lowercase letter or a digit. `fooBar` is `foo` and `Bar`.
+- In a run of uppercase letters, the last one starts a word when a lowercase letter follows it. `XMLHttp` is `XML` and `Http`.
+- A digit stays with the letters before it. `utf8Decode` is `utf8` and `Decode`.
+
+Bun then writes each word in lowercase, in uppercase, or with its first letter in uppercase and the rest in lowercase. An acronym does not keep its capitals:
+
+```ts
+Bun.camelCase("innerHTML"); // => "innerHtml"
+Bun.pascalCase("HTMLElement"); // => "HtmlElement"
+```
+
+`Bun.camelCase()` and `Bun.pascalCase()` put `_` before a word that starts with a digit, unless it is the first word. The digits of two words then stay apart. Remove the `_` to join them:
+
+```ts
+Bun.camelCase("version 1.2.10"); // => "version_1_2_10"
+Bun.camelCase("address_line_1"); // => "addressLine_1"
+Bun.camelCase("address_line_1").replaceAll("_", ""); // => "addressLine1"
+Bun.pascalCase("top 10 list"); // => "Top_10List"
+```
+
+The functions are not inverses of each other, and a second call can give another result:
+
+```ts
+Bun.snakeCase(Bun.camelCase("r_g_b")); // => "r_gb"
+Bun.camelCase(Bun.snakeCase("userID")); // => "userId"
+Bun.constantCase("base64url"); // => "BASE64URL"
+Bun.constantCase("BASE64URL"); // => "BASE64_URL"
+```
+
+Letters of other scripts are letters too. Bun maps them as `toLowerCase()` and `toUpperCase()` do, with the full Unicode mappings. The functions don't read the locale, so the result doesn't depend on it.
+
+```ts
+Bun.snakeCase("приветМир"); // => "привет_мир"
+Bun.constantCase("straße"); // => "STRASSE"
+Bun.kebabCase("ΟΔΟΣ"); // => "οδος"
+```
+
+On macOS, Bun maps letters with the ICU library of the system. A letter that a recent version of Unicode added can keep its case on an older macOS.
+
+Three kinds of characters are not what they look like to these functions:
+
+- A combining mark is not a letter. It separates words and is not in the result. The accents of decomposed text are combining marks, and so are the vowel signs and viramas of Devanagari, Bengali, Tamil and Thai, and the points of Arabic and Hebrew. The functions cut the words of those scripts apart. For an accent, normalize the text first. That helps only where Unicode has the letter and its accent as one character.
+- A digit of another script, such as `２` or `٢`, is not a digit. It separates words and is not in the result.
+- The first letter of a word is one UTF-16 code unit. A first letter outside of the Basic Multilingual Plane, such as a letter of Adlam or Deseret, keeps its case where a function writes the first letter in uppercase.
+
+```ts
+const decomposed = "cafe\u0301 au lait"; // "e" followed by U+0301
+
+Bun.snakeCase(decomposed); // => "cafe_au_lait"
+Bun.snakeCase(decomposed.normalize("NFC")); // => "café_au_lait"
+Bun.snakeCase("हिन्दी"); // => "ह_न_द"
+Bun.snakeCase("売上２０２４"); // => "売上"
+```
+
+Each function returns what the function of the same name in the [`change-case`](https://www.npmjs.com/package/change-case) npm package (version 5) returns with `{ locale: false }`. Without that option, the package maps letters with `toLocaleLowerCase()` and `toLocaleUpperCase()`, which use the default locale of the runtime. Bun has no counterpart of the other options of `change-case`, and none of its `noCase`, `pathCase`, `sentenceCase` and `pascalSnakeCase`. Bun converts non-string types to a string first. When the result equals the input, Bun returns the input string.
+
+The benchmark compares the functions with the package on the same build of Bun. The package runs with `{ locale: false }`.
+
+```bash terminal icon="terminal"
+bun bench/snippets/change-case.mjs
+```
+
+```txt
+cpu: AMD EPYC
+runtime: bun 1.4.4 (x64-linux)
+
+Bun.camelCase 9 chars         36.53 ns/iter  36.70 ns
+Bun.snakeCase same            14.60 ns/iter  14.98 ns
+Bun.snakeCase same utf16      28.35 ns/iter  28.90 ns
+Bun.snakeCase 19 chars        59.12 ns/iter  59.60 ns
+Bun.constantCase latin1       59.11 ns/iter  60.24 ns
+Bun.snakeCase greek          156.38 ns/iter 165.74 ns
+Bun.kebabCase utf16           60.90 ns/iter  62.07 ns
+Bun.camelCase 1 KB             1.88 µs/iter   1.91 µs
+Bun.snakeCase 1 KB same      971.58 ns/iter 985.15 ns
+Bun.snakeCase 1KB same u16     1.92 µs/iter   1.94 µs
+Bun.pascalCase 1 KB greek      6.84 µs/iter   6.92 µs
+Bun.snakeCase 16 KB           34.70 µs/iter  34.59 µs
+```
+
+```bash terminal icon="terminal"
+FORCE_NPM=1 bun bench/snippets/change-case.mjs
+```
+
+```txt
+cpu: AMD EPYC
+runtime: bun 1.4.4 (x64-linux)
+
+npm camelCase 9 chars        665.19 ns/iter 666.17 ns
+npm snakeCase same           554.18 ns/iter 573.23 ns
+npm snakeCase same utf16     581.59 ns/iter 585.21 ns
+npm snakeCase 19 chars         1.34 µs/iter   1.41 µs
+npm constantCase latin1      973.57 ns/iter 988.42 ns
+npm snakeCase greek            1.47 µs/iter   1.55 µs
+npm kebabCase utf16            1.06 µs/iter   1.07 µs
+npm camelCase 1 KB            40.58 µs/iter  40.77 µs
+npm snakeCase 1 KB same       22.40 µs/iter  22.98 µs
+npm snakeCase 1KB same u16    29.71 µs/iter  31.21 µs
+npm pascalCase 1 KB greek     53.70 µs/iter  55.98 µs
+npm snakeCase 16 KB          426.96 µs/iter 433.14 µs
+```
+
+---
+
 ## `Bun.fileURLToPath()`
 
 Converts a `file://` URL to an absolute path.
