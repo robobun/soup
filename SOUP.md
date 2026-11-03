@@ -8593,6 +8593,262 @@ Files: `src/runtime/crypto/PasswordObject.rs`, `src/runtime/crypto/PasswordObjec
 `Password.VerifyOptions`, `needsRehash`), `docs/runtime/hashing.mdx`,
 `test/js/bun/util/password.test.ts`, `test/integration/bun-types/fixture/hashing.ts`.
 
+### 2026-11-03: `Bun.camelCase()` and seven more case functions
+
+oven-sh/bun#15087 is a tracking issue of 2024, opened by the project lead: eight functions on the
+`Bun` object that write a name in another convention, "like `change-case`". It is still open. A
+contributor's pull request (oven-sh/bun#15097) closed with its Unicode handling unfinished. Ciro
+Spaciari wrote it twice in one day, in Zig (oven-sh/bun#26772) and in C++ (oven-sh/bun#26773), and
+closed both four months later with no review, when the tree moved to Rust. The issue gave the
+column names of SQL clients as its reason. `Bun.SQL` renames columns now, in JavaScript and with
+the rules of postgres.js (oven-sh/bun#45304), so nothing native calls these functions. What is
+left is the request for the names, and the package behind them has 45 million downloads a week.
+
+```ts
+import { camelCase, snakeCase } from "bun";
+
+snakeCase("createdAt"); // "created_at"
+camelCase("created_at"); // "createdAt"
+Bun.pascalCase("user_profile"); // "UserProfile"
+Bun.kebabCase("XMLHttpRequest"); // "xml-http-request"
+Bun.constantCase("maxRetryCount"); // "MAX_RETRY_COUNT"
+Bun.capitalCase("two words"); // "Two Words"
+Bun.dotCase("two words"); // "two.words"
+Bun.trainCase("contentType"); // "Content-Type"
+```
+
+The contract is one sentence: each function returns what the function of the same name in
+change-case 5.4.4 returns with `{ locale: false }`, for every string. A program can change its
+import from `"change-case"` to `"bun"` and get the same names. These are the rules of the
+package, and so the rules here:
+
+- A word is a run of letters (`\p{L}`) and ASCII digits. Every other character separates words
+  and is not in the result.
+- A word ends before an uppercase letter that follows a lowercase letter or a digit (`fooBar`,
+  `v2Beta`), and before the last uppercase letter of a run when a lowercase letter follows it
+  (`XMLHttp` is `XML` and `Http`).
+- The case of a word is what `toLowerCase()` and `toUpperCase()` give, with the full mappings:
+  the uppercase of `ß` is `SS`, and a sigma at the end of a word is lowered to `ς`. The rest of a
+  capital word is lowercase, so `innerHTML` becomes `innerHtml`.
+- `camelCase` and `pascalCase` put `_` before a word that starts with a digit and is not the
+  first: `version 1.2.10` is `version_1_2_10`, not `version1210`.
+
+Where Bun differs from the package:
+
+- The locale is never read. With no `locale` option the package maps with `toLocaleLowerCase()`
+  and `toLocaleUpperCase()`, which use the default locale of the runtime. In Bun on Linux that
+  locale is `en-US` whatever `LANG` and `LC_ALL` say, so there the package gives the same result
+  with and without the option, and only slower.
+- There are no options: `delimiter`, `locale`, `split`, `prefixCharacters`, `suffixCharacters`,
+  `mergeAmbiguousCharacters` and `separateNumbers` have no counterpart, and a second argument is
+  ignored, as `Array.prototype.map` needs it to be. The four other functions of the package
+  (`noCase`, `pathCase`, `sentenceCase`, `pascalSnakeCase`) and `split()` are not there. The
+  issue lists eight names, and each further name is one row, one constant and one declaration
+  when somebody asks.
+- A value that is not a string is converted with `ToString`, as `Bun.stripANSI` and
+  `Bun.escapeHTML` do it, so `Bun.snakeCase(12.5)` is `"12_5"` and a symbol throws. The package
+  throws a `TypeError` for a number, because it calls `input.slice`.
+
+Three rules of the package are kept because the contract is the package, and each one is a
+decision to make before these names are in a release of bun. The docs and the declarations state
+all three.
+
+- The `_` before a digit. `Bun.camelCase("address_line_1")` is `"addressLine_1"`. lodash and
+  `SQL.toCamel` of this tree give `"addressLine1"`. The rule has a use: `snakeCase` gives
+  `address_line_1` back, where `SQL.fromCamel("addressLine1")` gives `address_line1`.
+  `.replaceAll("_", "")` after `camelCase` gives the other form.
+- A combining mark is not a letter, so it separates words and is not in the result. For
+  decomposed text that loses the accents. For scripts that write vowels or points as marks it
+  cuts every word apart: `Bun.snakeCase("हिन्दी")` is `"ह_न_द"`, and the same happens to Bengali,
+  Tamil, Thai and pointed Arabic and Hebrew. lodash keeps the marks. The one mark that stays in a
+  word is U+0345, which the `i` flag of the package's expression lets through. A rule that keeps
+  a mark with the letter before it would be a difference from the package for every string with
+  a mark, and no other.
+- The first letter of a capital word is one UTF-16 unit, so a first letter outside of the Basic
+  Multilingual Plane (Adlam, Deseret, Osage and six more scripts) keeps its case. The package
+  has an open pull request that reads a whole code point there (blakeembrey/change-case#373).
+
+The shape came out of a design review before any code. It compared six ways to do this, from the
+package's own regular expressions as a JavaScript builtin to a port of the Zig pull request, and
+picked one C++ file next to `stripANSI.cpp`, where the five other string functions of the `Bun`
+object are. `src/jsc/bindings/caseChange.cpp` reads the Latin-1 or UTF-16 units of the string in
+place:
+
+- An 8-bit string is read twice, through 256-entry tables, and ICU is not called. The first pass
+  gives the length of the result and tells whether the result is the input. If it is, the input
+  is returned and no string is made. If not, the second pass fills one string of exactly that
+  length, 8-bit unless the uppercase of `µ` or `ÿ` takes it out of Latin-1.
+- A 16-bit string is read once, into a buffer that is on the stack up to 256 units. A word with
+  a unit above U+00FF goes to `u_strToLower` and `u_strToUpper` with the root locale, which are
+  the two functions behind `toLowerCase()` and `toUpperCase()`, on exactly the units that the
+  package passes to those methods. The result is 8-bit when every unit fits.
+
+The review also found what would have been a bug in the first draft. The draft took the class of
+a character (letter, uppercase, lowercase) from ICU's `u_charType`. Upstream main links ICU 79.1,
+which has Unicode 18, since oven-sh/bun#47281, and the `\p{L}` of JavaScriptCore's regular
+expressions is still Unicode 17. In one binary the two disagree on 12,500 code points (158,172
+letters against 145,672), U+A7DD among them, and on macOS the ICU is the one of the system. So
+the classes are a generated table of 8,041 bytes, `caseChangeTables.h`, that
+`scripts/generate-casechange-tables.mjs` takes from the regular expression engine itself: the
+engine is what the package reads, on every platform. The script gives the same bytes on the debug
+build of this tree, on bun 1.4.3 and on Node.js 26.3. When a WebKit upgrade changes the engine's
+tables, the test "every code point" fails and says to run the script again. The case of a letter
+still comes from ICU, as it does for the package, so on an older macOS a letter that a recent
+Unicode added can keep its case.
+
+The two old C++ and Zig versions are the base of the design, and the commit credits their
+author: the layer, one template over the two encodings, the word iterator and the style of a
+function as data are from oven-sh/bun#26773. Their kernel is not: it took the class of a
+character from two binary properties of ICU and mapped one code point at a time, so a CJK
+character before an uppercase letter split a word, a combining mark stayed in one, and `ß` had no
+`SS`. Their tests imported `change-case` without pinning it. This patch pins 5.4.4 in
+`test/package.json` and `bench/package.json`, as `strip-ansi` is pinned there.
+
+What the native code buys is the time of a call, and nothing else. The same eight functions are
+five statements of JavaScript with the regular expressions of the package
+(`bench/snippets/change-case.mjs` has them as a baseline), and as a builtin behind the same eight
+rows they would give the same results with no table and no generator. That is the fallback if the
+kernel is not wanted.
+
+For programs that do not call the functions the commit adds data: eight rows in the table of the
+`Bun` object. The eight names are also in the list of the ahead-of-time compiler
+(`textTransformation`, the signature of `Bun.escapeHTML`) and are one feature, `CaseChange`, for
+`--trim`, with a program in `test/bundler/trim-by-use`. An executable that names one of them
+keeps the code and prints what plain Bun prints. An executable that names none has the code
+removed, and a call through a computed name throws the error of a removed feature.
+
+The commit was built and tested alone on oven-sh/bun 3bf1a06469, and every number below is from
+trimmable release builds of that commit without and with this one, on x64 Linux (AMD EPYC). On
+upstream it picks with one conflict, `SOUP.md`, which upstream does not have.
+
+| Input of `bench/snippets/change-case.mjs` | `Bun`   | change-case on the same bun | plain JavaScript | change-case on Node.js 26.3 |
+| ----------------------------------------- | ------- | --------------------------- | ---------------- | --------------------------- |
+| `camelCase`, 9 characters                 | 37 ns   | 665 ns                      | 260 ns           | 657 ns                      |
+| 10 characters, result is the input        | 15 ns   | 554 ns                      | 150 ns           | 623 ns                      |
+| the same as a 16-bit string               | 28 ns   | 582 ns                      | 344 ns           | 616 ns                      |
+| 19 characters                             | 59 ns   | 1,340 ns                    | 885 ns           | 1,130 ns                    |
+| 14 characters of Latin-1 with `ß`         | 59 ns   | 974 ns                      | 678 ns           | 1,020 ns                    |
+| 21 characters of Greek                    | 156 ns  | 1,470 ns                    | 952 ns           | 1,690 ns                    |
+| 1 KB                                      | 1.88 µs | 40.6 µs                     | 33.8 µs          | 18.9 µs                     |
+| 1 KB, result is the input                 | 0.97 µs | 22.4 µs                     | 20.9 µs          | 14.5 µs                     |
+| 1 KB of Greek                             | 6.84 µs | 53.7 µs                     | 49.5 µs          | 41.2 µs                     |
+| 16 KB                                     | 34.7 µs | 427 µs                      | 414 µs           | 384 µs                      |
+
+- The package runs with `{ locale: false }`. That is 8 to 38 times the time of the function, and
+  plain JavaScript is 6 to 21 times. With no options the package is slower on Bun than on
+  Node.js, 1,070 ns for the first row, because a call of `toLocaleLowerCase()` with no argument
+  is slow in JavaScriptCore.
+- Five interleaved rounds of `camelCase("two words")` in a loop: 33 ns, against 506 ns for the
+  package on the same binary and 575 ns on Node.js. Two runs of the same function differ by 3
+  percent or less in a round, and by 10 percent over the rounds.
+- Instructions on the main thread for one call, less the empty loop: 800 against 7,158 for two
+  words, 429 against 6,249 when the result is the input, 3,895 against 17,359 for the Greek, and
+  58,107 against 460,458 for 1 KB. `perf` is not in this container, so a 60-line program around
+  `perf_event_open` counted them.
+- Allocations, counted with breakpoints over 10,000 calls: 1 for a result that is new and 0 for
+  one that is the input, in both encodings. ICU: 0 calls for an 8-bit string and for a 16-bit
+  string of Latin-1 text, 1 call for a Greek word in `snakeCase` and 2 in `capitalCase`.
+  `u_charType`: 0.
+- 10,000 inputs that are already in the convention add 1 live string to the heap. With the
+  package they add 27,017.
+- The binary grows by 16,384 bytes: 10,240 of code and 9,536 of read-only data, of which the
+  class table is 8,041, the Latin-1 tables are 768 and the table of the `Bun` object is 328 (117
+  to 125 rows, index 280 to 282 entries). There is no new static initializer. In this fork the
+  table of the `Bun` object costs 980 bytes more, because 131 rows are over the 128 where its
+  index doubles. Starting `bun file.js` takes 4,254,261 and 4,259,439 instructions, a difference
+  of 5,178 that is smaller than the 17,545 between two runs of one binary.
+
+Tests: 166 in `caseChange.test.ts`. 138 are known answers, each through the 8-bit and the 16-bit
+path: the words, the digits, Latin-1, Greek, Cyrillic, Turkish, the ligatures, CJK, Devanagari,
+Thai, pointed Arabic, decomposed text, characters outside of the Basic Multilingual Plane and
+surrogates alone. The rest compare with the package (a fixed set of 4,000 random strings, inputs
+longer than the buffer on the stack, and every one of the 1,114,112 code points in three places
+of a word, as one call for 4,096 code points, in 1.0 s on a release build) and pin the arguments,
+the width of the result, a child process for each of four locales, the longest result in each
+encoding to the character, and, in a process of its own, that 10,000 results that are their
+inputs add no string cell. A debug build runs the package a hundred times slower, so there the
+random strings are 300 and the code points are 5,888 from thirteen ranges. On the release build
+of bun 1.4.3, 163 of the 166 fail, and the 3 that pass do not call the functions. Outside of the
+tree the same comparison ran on a release build for every code point in six places of a word
+with two separators, and for 6.4 million calls on 400,000 random strings in both encodings, with
+no difference. The 62 results that the docs and the declarations show were run.
+
+On upstream with this commit alone, on the release build: `caseChange.test.ts` (166), the
+classification of the properties of `Bun`, `BunObject.test.ts` (5), `test/internal/trim` (1,026),
+`test/internal/builtins-table` (133), the source lints (196), `stripANSI.test.ts` and
+`escapeHTML.test.js` (308), and the `case-change` program of `test/bundler/trim-by-use`.
+`bun-types.test.ts` passes (30). On the debug build of the stack the file passes with
+`BUN_JSC_validateExceptionChecks=1`.
+
+A review of the diff before the commit found no wrong result: its own runs were every code
+point in 19 places of a word, 17.6 million random calls and the sanitizer. It found these, and
+each is fixed:
+
+- The commit did not pick onto upstream. Five insertions sat next to lines of the patch for
+  `Bun.unescapeHTML`: a row of the table of the `Bun` object, the list of the classification
+  test, a row and a section of the docs, and the end of a types fixture. They are on upstream
+  lines now, and the fixture is a file of its own.
+- Nothing had been built on upstream alone, and the size of the table was the size in this fork.
+- No program of `test/bundler/trim-by-use` called the new feature.
+- The benchmark ran the package with no options, which is its slow path on JavaScriptCore, and
+  the first version of this entry said 11 to 50 times. Its row "1 KB same" was not the same
+  string: 1,026 characters in and 1,025 out.
+- No test could fail if the locale were read. With `nullptr` for the locale of the ICU call,
+  the four new tests fail (`tıtle`, `ΑΛΦΑ`), and the 157 tests of the first version passed.
+- The test of the limit had one size. The longest result is now pinned to the character: the
+  limit of a string for an 8-bit input, and half of it for a 16-bit input, whose result goes
+  through a `Vector`. The buffer grew by half at a time, as a `Vector` does, and such a step
+  fails when it passes the limit of a `Vector`, which is well before the result does. It now
+  grows to the exact size at that point.
+- The docs said "the same on every machine", "letters of every script count" and "a string that
+  is already in the convention is returned as it is". The first is not so on macOS, the second
+  hid the rule for marks, and the third is not what `innerHTML` and `a_b_c` get.
+- One test of this file passed on a bun without the functions: eight `undefined` imports are
+  equal to eight `undefined` properties.
+
+What is not done, and what was not run:
+
+- macOS and Windows were not built. The two ICU functions are declared by hand where the SDK has
+  no `<unicode/ustring.h>`, the way `bun_icu_normalize.cpp` does it for another header.
+- A 16-bit string whose result is longer than 1,073,741,823 units is refused with an out of
+  memory error, because its result goes through a `Vector`. The limit of a string is twice that.
+- The words of a long string are found at about 1 ns for a character and a pass. No SIMD.
+- A call of `toLocaleLowerCase()` with no argument derives the locale again every time in
+  JavaScriptCore. That is why the package is slower on Bun than on Node.js with no options. It
+  is not part of this patch.
+
+Rebase notes. 64 patches onto oven-sh/bun 3bf1a06469, which is 10 commits after the base of
+2026-11-02. One patch stopped the rebase: `legalComments`, in
+`generateCompileResultForCssChunk.rs` and `css/printer.rs`, where upstream's CSS layer fixes
+(oven-sh/bun#47797, oven-sh/bun#47810) added an `indent` to the printer options next to the
+`license_comments` of the patch. Both stay. `bundler_comments.test.ts` (76), upstream's
+`esbuild/css.test.ts` (104) and `password.test.ts` (102, next to upstream's new checks of the
+arguments of `hash()` and `verify()`) pass on the debug build.
+
+Two more things showed on the way, in older patches.
+
+- `BunObject.test.ts` has a test of oven-sh/bun#46021 that copies every property of `Bun` under
+  exception check validation, and it failed on the debug build: the builders of `Bun.JWT` and
+  `Bun.Queue` returned with a throw scope that nobody checked. Upstream's builders for `$` and
+  `Bun.sql` go through `checkedBunObjectValue` since that pull request, and now these two do.
+  The fix is in the commits of the two patches. `jwt.test.ts` (87) and `queue.test.ts` (50) pass.
+- A release build of the whole stack with `--trimmable=true` does not link: the trim link stops
+  at `GuardWithoutReference` for `exec_fuzzilli` in `bun_runtime::cli::command::start`. Upstream
+  links, and upstream with this commit links, so one of the patches that add a command is the
+  cause. It is not found yet. `bun build --compile --trim` needs such a build, and the plain
+  release build of the stack is not affected.
+
+Files: `src/jsc/bindings/caseChange.cpp` (new), `src/jsc/bindings/caseChange.h` (new),
+`src/jsc/bindings/caseChangeTables.h` (new, generated), `scripts/generate-casechange-tables.mjs`
+(new), `src/jsc/bindings/BunObject.cpp`, `src/codegen/builtins/host/globals.builtins.ts`,
+`src/codegen/builtins/host/features-bun.builtins.ts`, `src/trim/features/bun.def`,
+`packages/bun-types/bun.d.ts`, `docs/runtime/utils.mdx`, `docs/runtime/bun-apis.mdx`,
+`bench/snippets/change-case.mjs` (new), `bench/package.json`, `bench/bun.lock`,
+`test/js/bun/util/caseChange.test.ts` (new), `test/bundler/trim-by-use/programs/case-change.ts`
+(new), `test/integration/bun-types/fixture/case-change.ts` (new), `test/package.json`,
+`test/bun.lock`, `test/js/bun/module-graph/module-graph-isolation.test.ts`,
+`test/internal/trim/features.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

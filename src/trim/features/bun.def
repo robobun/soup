@@ -50,6 +50,8 @@ feature Ansi "Bun.sliceAnsi and Bun.wrapAnsi"
 
 feature EscapeHtml "Bun.escapeHTML"
 
+feature CaseChange "Bun.camelCase, Bun.capitalCase, Bun.constantCase, Bun.dotCase, Bun.kebabCase, Bun.pascalCase, Bun.snakeCase and Bun.trainCase"
+
 feature Hash "Bun.hash"
 
 feature Uuid "Bun.randomUUIDv5 and Bun.randomUUIDv7"
