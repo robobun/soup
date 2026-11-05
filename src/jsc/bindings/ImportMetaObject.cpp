@@ -40,6 +40,7 @@
 
 #include "JSDOMURL.h"
 #include <JavaScriptCore/JSNativeStdFunction.h>
+#include <JavaScriptCore/CustomGetterSetter.h>
 #include <JavaScriptCore/LazyProperty.h>
 #include <JavaScriptCore/LazyPropertyInlines.h>
 #include <JavaScriptCore/VMTrapsInlines.h>
@@ -701,6 +702,70 @@ JSC_DEFINE_CUSTOM_GETTER(jsImportMetaObjectGetter_main, (JSGlobalObject * lexica
     return JSValue::encode(jsBoolean(isMain));
 }
 
+// `import.meta.hot` in the VM that `bun --hot` reloads. The object, its `data` and the callbacks of
+// `dispose()` are in src/js/internal/hot.ts, which the first read of the property loads.
+
+extern "C" bool Bun__VirtualMachine__hasImportMetaHot(void* bunVM);
+extern "C" bool Bun__VirtualMachine__moduleHasImportMetaHot(void* bunVM, const BunString* path);
+extern "C" void Bun__VirtualMachine__importMetaHotDisposed(void* bunVM, uint32_t hotReloadCounter);
+extern "C" void Bun__logUnhandledException(JSC::EncodedJSValue exception);
+
+// For internal/hot: what a dispose callback threw. It is printed and the reload goes on.
+JSC_DEFINE_HOST_FUNCTION(jsImportMetaHotReportError, (JSC::JSGlobalObject*, JSC::CallFrame* callFrame))
+{
+    Bun__logUnhandledException(JSValue::encode(callFrame->argument(0)));
+    return JSValue::encode(jsUndefined());
+}
+
+// The promises that the dispose callbacks returned have settled. The reload that they held up goes
+// on from a task, which is where a reload that the watcher posts runs. The counter names that
+// reload: the run loop goes on without promises that nothing is left to settle, and one of those
+// can settle while a later reload waits for its own.
+static JSObject* createImportMetaHotDisposed(VM& vm, Zig::GlobalObject* globalObject, uint32_t hotReloadCounter)
+{
+    return JSNativeStdFunction::create(vm, globalObject, 0, String(), [hotReloadCounter](JSGlobalObject* globalObject, CallFrame*) -> EncodedJSValue {
+        auto* defaultGlobal = defaultGlobalObject(globalObject);
+        defaultGlobal->scriptExecutionContext()->postTask([bunVM = defaultGlobal->bunVM(), hotReloadCounter](WebCore::ScriptExecutionContext&) {
+            Bun__VirtualMachine__importMetaHotDisposed(bunVM, hotReloadCounter);
+        });
+        return JSValue::encode(jsUndefined());
+    });
+}
+
+static JSValue callImportMetaHot(Zig::GlobalObject* globalObject, JSObject* hot, ASCIILiteral name, JSValue argument)
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue function = hot->get(globalObject, Identifier::fromString(vm, name));
+    RETURN_IF_EXCEPTION(scope, {});
+    MarkedArgumentBuffer arguments;
+    arguments.append(argument);
+    JSValue result = JSC::profiledCall(globalObject, ProfilingReason::API, function, JSC::getCallData(function), jsUndefined(), arguments);
+    RETURN_IF_EXCEPTION(scope, {});
+    return result;
+}
+
+JSC_DEFINE_CUSTOM_GETTER(jsImportMetaObjectGetter_hot, (JSGlobalObject*, JSC::EncodedJSValue thisValue, PropertyName))
+{
+    ImportMetaObject* thisObject = dynamicDowncast<ImportMetaObject>(JSValue::decode(thisValue));
+    if (!thisObject) [[unlikely]]
+        return JSValue::encode(jsUndefined());
+
+    auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(thisObject->globalObject());
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    String path = thisObject->pathProperty.getInitializedOnMainThread(thisObject)->value(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    // The transpiler folds the expression in the modules that this turns away.
+    if (auto pathString = Bun::toString(path); !Bun__VirtualMachine__moduleHasImportMetaHot(globalObject->bunVM(), &pathString))
+        return JSValue::encode(jsUndefined());
+
+    JSValue hot = Bun::DeclaredModuleLoad::requireForCommandLine(globalObject, Bun::InternalModuleRegistry::Field::InternalHot);
+    RETURN_IF_EXCEPTION(scope, {});
+    // One object per module for the life of the process, by the URL: a reload makes a new `import.meta`.
+    RELEASE_AND_RETURN(scope, JSValue::encode(callImportMetaHot(globalObject, hot.getObject(), "contextFor"_s, thisObject->urlProperty.getInitializedOnMainThread(thisObject))));
+}
+
 static const HashTableValue ImportMetaObjectPrototypeValues[] = {
     { "dir"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | PropertyAttribute::DontDelete), NoIntrinsic, { HashTableValue::GetterSetterType, jsImportMetaObjectGetter_dir, 0 } },
     { "dirname"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | PropertyAttribute::DontDelete), NoIntrinsic, { HashTableValue::GetterSetterType, jsImportMetaObjectGetter_dir, 0 } },
@@ -763,6 +828,13 @@ public:
             Bun::reifyStaticPropertyTable(vm, ImportMetaObject::info(), ImportMetaObjectBakePrototypeValues, *this);
         } else {
             Bun::reifyStaticPropertyTable(vm, ImportMetaObject::info(), ImportMetaObjectPrototypeValues, *this);
+            // Elsewhere the property does not exist, which is what the transpiler makes of the expression there.
+            // A ShadowRealm is another global of the same VM, and a reload does not run what it registers.
+            if (auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(this->globalObject()); globalObject->isThreadLocalDefaultGlobalObject && Bun__VirtualMachine__hasImportMetaHot(globalObject->bunVM())) {
+                this->putDirectCustomAccessor(vm, Identifier::fromString(vm, "hot"_s),
+                    JSC::CustomGetterSetter::create(vm, jsImportMetaObjectGetter_hot, nullptr),
+                    JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DontDelete);
+            }
         }
         Bun::putToStringTagWithoutTransition(vm, this, info());
     }
@@ -909,4 +981,31 @@ JSValue ImportMetaObject::getPrototype(JSObject* object, JSC::JSGlobalObject* gl
 
 const JSC::ClassInfo ImportMetaObject::s_info = { "ImportMeta"_s, &Base::s_info, nullptr, nullptr,
     CREATE_METHOD_TABLE(ImportMetaObject) };
+
+// Whether a module has read `import.meta.hot`: a reload then has `dispose()` callbacks to ask for.
+extern "C" [[ZIG_EXPORT(nothrow)]] bool Bun__ImportMetaHot__isLoaded(JSC::JSGlobalObject* globalObject)
+{
+    return defaultGlobalObject(globalObject)->internalModuleRegistry()->internalField(Bun::InternalModuleRegistry::Field::InternalHot).get().isObject();
+}
+
+// The reload of `bun --hot`, before it lets go of the modules: runs the `dispose()` callbacks.
+// Returns true when they returned promises that are pending: `Bun__VirtualMachine__importMetaHotDisposed`
+// is called with `hotReloadCounter` when those have settled.
+extern "C" [[ZIG_EXPORT(zero_is_throw)]] JSC::EncodedJSValue Bun__ImportMetaHot__runDispose(JSC::JSGlobalObject* jsGlobalObject, uint32_t hotReloadCounter)
+{
+    auto* globalObject = defaultGlobalObject(jsGlobalObject);
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue hot = globalObject->internalModuleRegistry()->internalField(Bun::InternalModuleRegistry::Field::InternalHot).get();
+    auto* reportError = JSFunction::create(vm, globalObject, 1, String(), jsImportMetaHotReportError, ImplementationVisibility::Private);
+    JSValue disposing = callImportMetaHot(globalObject, hot.getObject(), "runDispose"_s, reportError);
+    RETURN_IF_EXCEPTION(scope, {});
+    auto* promise = dynamicDowncast<JSPromise>(disposing);
+    if (!promise || promise->status() != JSPromise::Status::Pending)
+        return JSValue::encode(jsBoolean(false));
+    auto* disposed = createImportMetaHotDisposed(vm, globalObject, hotReloadCounter);
+    promise->performPromiseThen(vm, globalObject, disposed, disposed, jsUndefined());
+    RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(jsBoolean(true));
+}
 }

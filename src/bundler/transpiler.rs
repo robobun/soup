@@ -1481,6 +1481,10 @@ impl<'a> Transpiler<'a> {
                 opts.features.code_coverage = self.options.code_coverage;
 
                 opts.features.commonjs_at_runtime = this_parse.allow_commonjs;
+                // An entry point that is evaluated from a string has no CommonJS wrapper to take its `import.meta` from.
+                opts.features.runtime_hot = self
+                    .options
+                    .has_import_meta_hot(&source.path, this_parse.remove_cjs_module_wrapper);
 
                 opts.features.inlining = self.options.inlining;
                 opts.features.auto_import_jsx = self.options.auto_import_jsx;

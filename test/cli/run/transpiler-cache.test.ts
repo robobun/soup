@@ -344,6 +344,56 @@ describe("transpiler cache", () => {
     expect(newCacheCount()).toBe(0); // cache hit, order doesn't matter
   });
 
+  // `bun --hot` leaves `import.meta.hot` to the runtime and every other run folds it to `undefined`.
+  // The two have one features hash, and an entry says what its parse did with the expression.
+  test("--hot and plain runs share an entry unless the file has import.meta.hot", () => {
+    const filler = "\n//" + Buffer.alloc((50 * 1024 * 1.5) | 0, "/").toString();
+    const run = (extra: string[], file: string) => {
+      const result = Bun.spawnSync({ cmd: [bunExe(), ...extra, file], cwd: temp_dir, env });
+      if (!result.success) throw new Error(result.stderr.toString());
+      return result.stdout.toString().trim();
+    };
+    // An entry is named by the hash of its source. One that does not fit is deleted and written again. The
+    // file system can give the new file the inode of the old one, so the change time is what shows a write.
+    const entries = () =>
+      Object.fromEntries(
+        readdirSync(cache_dir).map(name => {
+          const path = join(cache_dir, name);
+          const changed = String(statSync(path, { bigint: true }).ctimeNs);
+          return [name, { changed, bytes: Bun.hash(readFileSync(path)) }];
+        }),
+      );
+    const bytes = (all: ReturnType<typeof entries>) =>
+      Object.fromEntries(Object.entries(all).map(([name, entry]) => [name, entry.bytes]));
+
+    // The same text either way, also for a file that reads something else of import.meta.
+    writeFileSync(join(temp_dir, "plain.js"), `console.log("plain"); process.exit(0);` + filler);
+    writeFileSync(join(temp_dir, "url.js"), `console.log(typeof import.meta.url); process.exit(0);` + filler);
+    expect([run([], "plain.js"), run([], "url.js")]).toEqual(["plain", "string"]);
+    expect(newCacheCount()).toBe(2);
+    const shared = entries();
+    expect([run(["--hot"], "plain.js"), run(["--hot"], "url.js")]).toEqual(["plain", "string"]);
+    expect(entries()).toEqual(shared);
+    expect([run([], "plain.js"), run([], "url.js")]).toEqual(["plain", "string"]);
+    expect(entries()).toEqual(shared);
+
+    // A file with the expression, however it is written, is transpiled again when the mode changes.
+    writeFileSync(join(temp_dir, "hot.js"), `console.log(typeof import\n  .meta.hot); process.exit(0);` + filler);
+    expect(run([], "hot.js")).toBe("undefined");
+    expect(newCacheCount()).toBe(1);
+    const folded = entries();
+    expect(run(["--hot"], "hot.js")).toBe("object");
+    expect(newCacheCount()).toBe(0);
+    const kept = entries();
+    expect(kept).toMatchObject(shared);
+    expect(bytes(kept)).not.toEqual(bytes(folded));
+    expect(run(["--hot"], "hot.js")).toBe("object");
+    expect(entries()).toEqual(kept);
+    expect(run([], "hot.js")).toBe("undefined");
+    expect(bytes(entries())).toEqual(bytes(folded));
+    expect(run([], "hot.js")).toBe("undefined");
+  });
+
   // A define replaces an identifier at parse time, so the define table is part
   // of the cache key. The cache is shared by every project of the user, and
   // keyed by source bytes, so two projects with the same file must not see

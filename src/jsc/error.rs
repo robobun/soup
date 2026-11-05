@@ -30,6 +30,8 @@ pub enum Error {
     InvalidInputHash,
     #[error("MismatchedFeatureHash")]
     MismatchedFeatureHash,
+    #[error("MismatchedImportMetaHot")]
+    MismatchedImportMetaHot,
     #[error("WriteError")]
     WriteError,
     #[error("TranspilerJobGenerationMismatch")]
@@ -105,6 +107,7 @@ impl Error {
             Self::CacheDisabled => "CacheDisabled",
             Self::InvalidInputHash => "InvalidInputHash",
             Self::MismatchedFeatureHash => "MismatchedFeatureHash",
+            Self::MismatchedImportMetaHot => "MismatchedImportMetaHot",
             Self::WriteError => "WriteError",
             Self::TranspilerJobGenerationMismatch => "TranspilerJobGenerationMismatch",
             Self::ParseError => "ParseError",

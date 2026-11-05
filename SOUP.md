@@ -8849,6 +8849,338 @@ Files: `src/jsc/bindings/caseChange.cpp` (new), `src/jsc/bindings/caseChange.h` 
 `test/bun.lock`, `test/js/bun/module-graph/module-graph-isolation.test.ts`,
 `test/internal/trim/features.test.ts`.
 
+### 2026-11-05: `import.meta.hot` in `bun --hot`
+
+`bun --hot` evaluates every file again in the process that is running. So what a module started at
+its top level is still there after a save: the interval, the listener, the child process, the file
+watcher. The first example in the docs of `--hot` is a `setInterval` that every reload leaves
+behind. The same page says that "Support for Vite's `import.meta.hot` is planned, to enable better
+lifecycle management for hot reloading". oven-sh/bun#7337 (2023, 28 thumbs up) asks for a way to
+run code before a reload, for `--watch` and for `--hot`. The `--watch` half has an answer since
+oven-sh/bun#34660: the handlers of the kill signal run before the restart. The `--hot` half has
+none, and oven-sh/bun#8963 ("Timers are not canceled after `--hot` reload") is the same request
+from the other side. Under `--hot` the expression was `undefined`, because the transpiler folds it
+away everywhere but in the dev server.
+
+The feature is not new as a pull request. oven-sh/bun#32856 has been open upstream since June with
+this contract. Its review in August ended with "The shape holds up [...] It should land, after the
+items below", the items were answered the same day, and a project outside of Bun wrote that its
+dev reload runs on the contract. Then main moved. The pull request conflicts since 2026-09-08, and
+of its 70 hunks 25 no longer apply as they are written. This patch is that contract on today's
+main, with its 13 tests, built another way.
+
+```ts
+// bun --hot server.ts
+import { watch } from "node:fs";
+
+// `data` is one object per module, and it outlives every reload.
+const state = (import.meta.hot.data.state ??= { reloads: 0 });
+console.log(`reloaded ${state.reloads++} times`);
+
+// What this copy of the module starts is still running when the next copy starts its own.
+const watcher = watch("./uploads", (event, file) => console.log(event, file));
+const child = Bun.spawn(["bun", "worker.ts"], { stdout: "inherit" });
+
+// Runs on a save, before any module is evaluated again. The reload waits for the promise.
+import.meta.hot.dispose(async () => {
+  watcher.close();
+  child.kill();
+  await child.exited;
+});
+```
+
+What the object has, under `bun --hot`:
+
+- `data`, an object that is kept for the module (by its URL, so a `?query` has its own) for the life
+  of the process. A change to it and an assignment to it are both kept.
+- `dispose(callback)`. Every callback registered since the last reload runs at the next one, in
+  the order of the calls, so a module's run before those of the modules that import it. Each gets
+  the `data` that its module has at that time. They all run before any module is evaluated again,
+  also the ones of a module that the new code no longer imports. When callbacks return promises,
+  the reload waits until all of them have settled. What is saved during that wait is part of the
+  reload that waits: there is one reload, of the files as they are when the wait is over. During
+  the wait the event loop runs as usual, also after an uncaught error.
+- `accept()`, `decline()`, `on()`, `off()`, `prune()`, `invalidate()` and `send()`, which do
+  nothing. They decide which modules an update replaces, tell of an update, or talk to a dev
+  server. Here every module is replaced and there is no server, so code that was written for Vite
+  or for Bun's dev server loads.
+- An error that a dispose callback throws, and the reason of a promise that it returned and that
+  rejects, are printed the way an error in a module is printed. The callbacks after it still run
+  and the reload happens. The error is not an uncaught exception of the program:
+  `process.on("uncaughtException")` does not see it, and the timers of the next run go on.
+- The methods check `this` (`ERR_INVALID_THIS`), and `dispose` checks its argument
+  (`ERR_INVALID_ARG_TYPE`).
+
+Where it is: in your modules that a reload of `bun --hot <entry>` evaluates again, ES modules and
+CommonJS files. Where it is not, and stays `undefined` with the calls removed by the transpiler,
+as before:
+
+- Without `--hot`, under `--watch`, in `bun test` (also `bun test --hot`), in `bun build` and
+  `Bun.Transpiler`, in a compiled executable, in a `Worker`, and in a macro.
+- In a package in `node_modules`. A published package uses `if (import.meta.hot)` to ask whether
+  a dev server drives it: `spiceflow` and `vike-server` take another path when it is true. A
+  package that is linked, or a workspace package, resolves to a path outside of `node_modules`
+  and is one of your modules.
+- In the entry point of `bun --hot -e` and of a script from standard input, which has no module
+  wrapper that could hold an `import.meta`.
+
+Three things follow from "every file is evaluated again" and are in the docs:
+
+- A `--preload` script is evaluated once, so its dispose callback runs at the first reload and
+  never again, unless the entry point imports the script too.
+- `Bun.serve()`, `Bun.SQL` and `Bun.cron` already carry their state across a reload, and need no
+  callback. A program that wants a new server for each reload stops the old one in `dispose()`,
+  which frees the port at once.
+- There is no timeout. A promise that never settles holds up the reload for as long as something
+  else keeps the event loop alive. When nothing is left that could settle it, the reload goes on.
+
+How it is built. A design review before the code compared six shapes, among them the pull request
+as it is, a new node in the parser, and a Rust class with a phase machine in `reload()`. It picked
+the smallest one. A review of the first version of this commit then changed how the reload waits
+(below).
+
+- The parser. `fold.rs` turns `import.meta.hot` into a constant in one arm. That arm now returns
+  nothing when `Features::runtime_hot` is set, so the expression stays a property access. No
+  other line of the parser changes, and there is no new node.
+- One predicate. `BundleOptions::has_import_meta_hot(path, is_eval_entry_point)` says whether a
+  module has the object. The transpiler asks it before a parse, and the property asks it before
+  it answers, so the two cannot disagree about a module. It is false unless `runtime_hot` is set.
+  `Run::start` sets that on the transpiler of the VM that `--hot` reloads, when there is an entry
+  point and the program is not a compiled executable. A worker, `bun test --hot`, `bun bake` and
+  the bundler have transpilers of their own and never see it.
+- The object. The `ImportMeta` prototype of the main global of that VM gets one accessor, `hot`.
+  It asks `src/js/internal/hot.ts` for the context of the module's URL. All state is in that
+  module: a `Map` from URL to context, and the list of dispose callbacks. The pull request kept
+  the state in C++: a lazy property on every `import.meta` cell, which on today's main takes the
+  cell from 80 to 96 bytes for every module of every program, and three members on every global
+  object. Here a program that does not read the property allocates nothing.
+- The reload. `VirtualMachine::reload()` calls the dispose callbacks where it is, in the task that
+  the file watcher posts, after it has cleared the terminal and before it lets go of the modules.
+  When no callback returned a promise that is pending, the reload goes on in the same call, as it
+  always did. Otherwise it returns, and the event loop runs as on any other turn. A reaction on
+  the promise posts a task that does the second half of the reload. The run loop calls the same
+  second half when the event loop has nothing left to wait for. The task carries the number of
+  its reload, because a promise that the run loop went on without can settle later, while the
+  next reload waits for its own. A save during the wait is dropped, because the second half
+  reads every file again. The pull request parked the promise behind the
+  `hot_reload_deferred` flag of the run loop instead. The design review found two faults in that
+  on today's main: the loop that looks at the flag would spin, and after a run that threw, a
+  dispose callback that waits for a timer would wait forever, because an uncaught error stops the
+  timers of a `--hot` run until the next reload. Here the reload takes the failure off the VM
+  before it calls the callbacks, so the timers run again while it waits, and its second half
+  cancels what is left of the timers of the failed run, as it always did. A timer that a
+  callback started and did not wait for is one of those. An uncaught error during the wait does
+  not stop the event loop either: the callbacks are ending that run.
+- The transpiler cache. A file with the expression has two outputs now. Both kinds of parse have
+  the same features hash on purpose, so a file without the expression keeps one entry for both.
+  What the parse did with the expression (absent, folded, kept) is in two spare bits of the byte
+  that holds the module type, and an entry of the other kind is a miss that is written again. The
+  version of the cache goes from 51 to 52, as `REVIEW.md` asks of every change to what an entry
+  holds. The layout of an entry is the same, so no test that patches bytes at fixed offsets moves.
+
+What a program pays that does not use it. All numbers are from release builds of oven-sh/bun
+b1007f1177 without and with this commit alone, on x64 Linux.
+
+- Without `--hot`, a parse tests one `bool` more and stores one byte for the cache, and the
+  prototype of `import.meta` asks once whether its VM is the one that `--hot` reloads. 48 files
+  with the expression in 16 forms, as ES modules, TypeScript and CommonJS, give the same bytes on
+  both builds: the output of `bun build --no-bundle`, the output of `Bun.Transpiler`, and what
+  the program prints (144 outputs). Loading 2,000 modules with the cache off takes 320.14 and
+  320.25 million instructions, the smallest of five runs each: 57 more for a module, of about
+  160,000. Five runs of one binary differ by 120 and more for a module, so this is below the
+  noise.
+- The number of `ImportMeta` cells after 2,000 imports is 2 and 2 without `--hot`, also when every
+  module calls `import.meta.hot.dispose()`, and 2 and 2 under `--hot` for modules without the
+  expression. A module that reads the property under `--hot` has its cell and one context.
+- Under `--hot`, a reload of a program that never reads the property tests one `bool` more. A
+  reload of a one-file program takes 1.27 to 1.35 million instructions without the commit and
+  1.28 to 1.31 with it (three rounds of 1,000 reloads each, all threads). With one dispose
+  callback it takes 1.43 to 1.47. The time from a save to the first line of the new run has a
+  median of 1.3 to 2.2 ms without the commit, 1.6 to 2.0 ms with it, and 1.5 to 1.8 ms with a
+  dispose callback (three interleaved rounds of 201 reloads). Rounds of one build differ by up
+  to 0.8 ms.
+- A wait of two seconds for a dispose callback takes 1 to 2 of 200 clock ticks of processor time,
+  also after a run that threw.
+- The executable grows by 4,096 bytes (140,478,752 to 140,482,848): 4,608 of code and 2,437 for
+  the text of the internal module. One host function, one native closure, one getter, two C++
+  exports and three Rust exports. `VirtualMachine` has two more bytes, `BundleOptions`, the
+  parser and its features have one more `bool` each, and the record of a parse for the cache has
+  one more byte.
+
+Tests. 26 in a block of `test/cli/hot/hot.test.ts`. 13 are the tests of the pull request as they
+are. 13 are new:
+
+- CommonJS, a pair of `?query` URLs, and the property read through an alias, a destructuring, a
+  computed name, `in` and an optional chain.
+- After a run that threw, a dispose callback that waits for a loop of that run, which a timer
+  wakes.
+- An uncaught error during the wait, which does not end it.
+- A callback that drains the microtasks, as `server.stop(true)` does, after one that returned a
+  promise.
+- A save during the wait.
+- A promise that nothing is left to settle, and a `beforeExit` listener that keeps the event loop
+  alive. In both, the reloads go on.
+- A promise that settles only after its reload went on without it, while the next reload waits
+  for a promise of its own.
+- A package in `node_modules`.
+- Every place where the property is `undefined`, each read in five ways and called once without
+  a guard: without `--hot`, `--watch`, `--hot -e`, standard input, `bun test --hot`, a `Worker`,
+  a macro, a `ShadowRealm` and an entry point in `node_modules`. The module that used the macro
+  and the realm still has its object.
+- A compiled executable that runs with `--hot` in `BUN_OPTIONS` (release builds only).
+- The terminal is cleared before the callbacks run, so what they print stays on the screen.
+
+One more in `test/cli/run/transpiler-cache.test.ts` follows the change time and the bytes of the
+entries of three files through plain and `--hot` runs. On the release build of upstream without
+the commit, 22 of the 26 and the cache test fail. Of the 4 that pass, two say what does not
+change, and two say that a reload still happens where a wait could stop it.
+
+On upstream with this commit alone, on the release build: `hot.test.ts` (51 pass, with the 26),
+the three watch files (21), `transpiler-cache.test.ts` (35), the source lints (194),
+`test/internal/builtins-table` (133), `test/internal/trim` (1,026) and `bun-types.test.ts` (30).
+A release build with `--trimmable=true`, which is what CI builds, links. With it,
+`bun build --compile --trim` gives an executable that prints what plain Bun prints and that
+refuses `--hot`, as before, and the 26 tests pass.
+
+On the debug build of the stack, which has the sanitizer: `hot.test.ts` (52), the four watch
+files (35), `transpiler-cache.test.ts` (35), the hot reloading tests of the dev server and the two
+`import.meta` files beside them (19), `minify/ImportMetaHotTreeShaking`, `import-meta.test.js`
+(34), the source lints (198) and `test/internal/trim` (1,026). One test of the last, a graph of
+200,000 nodes, needs more than the 5 seconds that a test has on this build when the machine is
+busy. A program with every member, a CommonJS dependency, callbacks that throw and promises that
+reject runs three reloads under `BUN_JSC_validateExceptionChecks=1`. The code blocks that the
+docs gained were run, and so was each row of the table that says where the object exists.
+
+The first version of this commit was a different patch. It had `bun:beforeUpdate` and
+`bun:afterUpdate` events, it gave the object to packages too, and it waited for the promises in
+place, from the run loop, with the loop that `bun test` uses to wait for a promise. A review of
+that diff found these, and each is changed:
+
+- With a `beforeExit` listener that keeps the event loop alive, the reloads stopped for good after
+  the first one. The review wrote the continuation above as a prototype, and this commit has it.
+  A reload is not handed to the run loop any more, and nothing waits in place.
+- Two published packages change what they do when `import.meta.hot` is true, so packages keep the
+  fold.
+- The property and the parse disagreed in four places: the entry point of `--hot -e` had the
+  property where the parse had folded the expression, a `ShadowRealm` and a macro got an object
+  that no reload would ever call, and a compiled executable that ran with `--hot` crashed on the
+  first read. The one predicate and the test of every place are the answer.
+- An exception from the call of the callbacks was not taken before the next call into the engine.
+- The events were a contract that nobody had asked for and that the review of the pull request
+  had not seen. `on()` and `off()` do nothing again, as in the pull request.
+- The first version kept the version of the cache, with a fourth state of the two bits for
+  entries of older builds. `REVIEW.md` says that a change to what an entry holds changes the
+  version. It is 52 now and the fourth state is gone.
+- The example in the docs closed a `Bun.SQL` pool in `dispose()`. Bun carries the pool over a
+  reload, so that example made every reload connect again. The docs now say what Bun carries.
+- The builtin called `Map.prototype.get` and `Array.prototype.push`, which a program can replace.
+
+One more fault showed after that review, in the continuation itself. The run loop goes on without
+a promise that nothing is left to settle. When a later generation settled such a promise, its
+task ended the wait of the reload that was waiting at that time, and the next modules ran while
+the callbacks of that reload were still at work. The task now carries the number of its reload,
+and a test holds it: on the build before the change the test fails.
+
+A second review, of the rework, ran probes against the built binaries in six areas: the wait, the
+engine, the agreement of the parse and the property, the cache, the tests and the docs. It found
+three faults in the wait, and each is fixed with a test:
+
+- A dispose callback can drain the microtasks: `server.stop(true)` does it when it closes a
+  connection. The promise of an earlier callback then settled inside the call, before the builtin
+  had made the promise that it counts the others with. The builtin threw a `TypeError` of its
+  own, which counted as an uncaught error of the run and stopped the timers of the next one.
+- After a run that threw, a callback that waited for a loop of that run never ended when the loop
+  was parked on a timer, because the reload cancelled the timers of the failed run before it
+  called the callbacks. With a server that kept the event loop alive, no later save was loaded.
+  The timers now run again during the wait, and the second half cancels what is left of them.
+- An uncaught error during the wait ended the wait and cancelled the timers that the callbacks
+  waited for.
+
+The same review found that the cache test could not fail. An entry that does not fit is deleted
+and written again, and the file system gives the new file the inode of the old one. The test
+compares the change time now. Three sentences of the docs were not the whole truth and are
+corrected: the order of the callbacks holds for static imports, the types do not declare three
+of the methods, and `--preserve-symlinks` makes a linked package a package. The test of the
+places without the object could not tell a folded expression from one that is kept and reads
+`undefined`. It calls `dispose()` without a guard now, and says that a `ShadowRealm` keeps the
+call.
+
+What is not done, and what was not run:
+
+- There are no events. Vite emits `vite:beforeFullReload` before a reload of the page, which is
+  what a reload of `--hot` is nearest to. A listener for it is never called here.
+- Nothing is printed while a reload waits. A promise that never settles in a program that keeps
+  its event loop alive looks like a reload that did not happen.
+- During the wait the old modules still run, and what they import in that time is evaluated
+  before the reload, not by it.
+- `"hot" in import.meta` is true in every module of the program under `--hot`, also where the
+  value is `undefined`, because the accessor is on the prototype that the modules share.
+- In a `ShadowRealm` under `--hot` the value is `undefined` and the call is not removed, so a
+  module that calls `import.meta.hot.dispose()` without a guard throws there. The two places that
+  start a parse know the global that asked, so the fold is possible. It needs one more field in
+  `ParseOptions`, which every place that fills the struct has to name, and one of those is a file
+  of an older patch of this stack.
+- A CommonJS file that goes through a `module._compile` hook (what `pirates` installs for
+  `@babel/register`) or a custom `Module.wrapper` has no `import.meta` in Bun: `import.meta.path`
+  throws a `ReferenceError` there on upstream too. `import.meta.hot` was the exception, because
+  the transpiler removed it. Under `--hot` it now throws like the rest, also behind
+  `if (import.meta.hot)`.
+- A package that auto-install loads from the install cache, in a program with no `node_modules`
+  directory, counts as one of the program's modules. The predicate knows a package by
+  `node_modules` in its path.
+- A module that a macro of the entry point loads first is parsed for the macro, so its
+  `dispose()` calls are removed in that generation. A function that is called as a macro after
+  its module was loaded for the program reads `undefined`, and a call without a guard throws.
+- The parse asks the predicate with the path of the source, and the property asks with
+  `import.meta.path`. The two strings differ for a plugin module with a relative key, for an id
+  with a query and for a `blob:` URL of a file, and when only one of them names `node_modules`
+  the parse and the property disagree. A bit that travels from the parse to the module's
+  `import.meta` would end this and the two cases of macros.
+- On Windows the tests save a file in place, as the tests of the pull request did, because a
+  rename there has a moment without the file. A save in place can give two events, and so two
+  reloads. With that branch forced on Linux, one test (the server that `dispose()` stops) failed
+  4 times in 600 runs.
+- The restart that this stack does under `--hot` when a loaded `.env` file changes (the patch of
+  2026-08-23) replaces the process and calls no dispose callback.
+- A context is never removed. A program that imports an unbounded number of URLs, such as a new
+  `?query` for each request, and reads the property in each of them keeps one small object for
+  each. Without the property such a program keeps its modules in the registry until the next
+  reload, and no longer.
+- macOS and Windows were not built. The Rust of the first version was type-checked for all
+  twelve targets, and the rework has no line that depends on the platform.
+- Without `--hot`, naming a method without calling it (`register(import.meta.hot.dispose)`) makes
+  the transpiler remove the next call in the file. That is upstream's, and oven-sh/bun#36875 is
+  open for it. Two more open pull requests are near: oven-sh/bun#30912 rewrites the note in the
+  docs that this commit replaces, and oven-sh/bun#47525 changes what the loop of `--hot` and
+  `--watch` does before it sleeps.
+
+Whether this should go to oven-sh/bun#32856 as its next revision is upstream's call. The review
+of the first version said that it should. soup does not push to oven-sh/bun.
+
+Rebase notes. 65 patches onto oven-sh/bun b1007f1177, which is 9 commits after the base of
+2026-11-03. One patch stopped the rebase: `redis.multi()`, in `js_valkey.rs`, where
+oven-sh/bun#47944 replaced the `BackRef` that its scope guards held with `self`. The two guards of
+the patch do the same now. `connection-failures.test.ts` (79) and the transaction tests of
+`valkey.test.ts` (19) pass on the debug build. Nothing was dropped.
+
+The release build of the whole stack with `--trimmable=true` still does not link, and more of
+the cause is known. `exec_fuzzilli` returns a constant in a build without fuzzilli. In the build
+of the stack the compiler removes the call of it, which the trim link looks for, and the link
+stops at `GuardWithoutReference`. With the value behind `core::hint::black_box` that stop is gone,
+and two more show: `FeatureBelowMinimum` for `Repl` (0.06 of the 0.08 MB that a feature has to
+remove) and for `RuntimeTranspiler` (0.53 of 0.70 MB), whose entry point the linker has folded
+with other code. None of the three is fixed. Upstream with this commit alone links.
+
+Files: `src/js/internal/hot.ts` (new), `src/jsc/bindings/ImportMetaObject.cpp`,
+`src/jsc/VirtualMachine.rs`, `src/jsc/virtual_machine_exports.rs`,
+`src/jsc/RuntimeTranspilerCache.rs`, `src/jsc/error.rs`, `src/ast/transpiler_cache.rs`,
+`src/bundler/options.rs`, `src/bundler/aot/options.rs`, `src/bundler/transpiler.rs`,
+`src/js_parser/fold.rs`, `src/js_parser/p.rs`, `src/js_parser/parser.rs`,
+`src/js_parser/parse/parse_entry.rs`, `src/runtime/cli/run_command.rs`,
+`packages/bun-types/devserver.d.ts`, `docs/runtime/watch-mode.mdx`,
+`docs/bundler/hot-reloading.mdx`, `test/cli/hot/hot.test.ts`,
+`test/cli/run/transpiler-cache.test.ts`, `test/integration/bun-types/fixture/index.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

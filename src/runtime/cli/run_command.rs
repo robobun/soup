@@ -1573,6 +1573,10 @@ impl Run<'_> {
                             entry,
                         )
                     }
+                    // What a reload evaluates again gets `import.meta.hot`: the modules of an entry point.
+                    // A compiled executable has the expression folded in already.
+                    vm.transpiler.options.runtime_hot =
+                        entry.is_some() && vm.standalone_module_graph.is_none();
                     // `bun bake` (no entry module) starts again when `bake.config.ts` changes: the kill signal's JS handlers run first, as in watch mode.
                     if entry.is_none() {
                         bun_jsc::posix_signal_handle::set_watch_kill_signal(
@@ -1695,15 +1699,25 @@ impl Run<'_> {
         if vm.is_watcher_enabled() {
             vm.report_exception_in_hot_reloaded_module_if_needed();
             loop {
-                while vm.is_event_loop_alive() {
+                while vm.is_hot_event_loop_alive() {
                     // After an unhandled error, only immediates keep the loop alive.
                     vm.timers_ran_after_error |= vm.unhandled_error_counter > 0;
                     vm.tick();
                     vm.report_exception_in_hot_reloaded_module_if_needed();
                     vm.auto_tick_active();
                 }
+                // Nothing is left that could settle what a reload's `dispose()` callbacks wait for.
+                if vm.finish_reload_after_dispose() {
+                    // Not started by a task: run its microtasks before the loop is looked at again.
+                    vm.tick();
+                    continue;
+                }
                 vm.on_before_exit();
                 vm.report_exception_in_hot_reloaded_module_if_needed();
+                // That can have started a reload that waits for its `dispose()` callbacks.
+                if vm.is_hot_reload_disposing() {
+                    continue;
+                }
                 // SAFETY: `event_loop` is a self-pointer into this VM; uniquely
                 // accessed here. Watcher arm keeps the process alive across
                 // reloads.

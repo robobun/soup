@@ -9,7 +9,7 @@ Hot Module Replacement (HMR) updates modules in a running application without a 
 
 ## `import.meta.hot` API Reference
 
-Bun implements a client-side HMR API modeled after [Vite's `import.meta.hot` API](https://vite.dev/guide/api-hmr). You can check for it with `if (import.meta.hot)`, which tree-shakes it in production.
+Bun implements a client-side HMR API modeled after [Vite's `import.meta.hot` API](https://vite.dev/guide/api-hmr). You can check for it with `if (import.meta.hot)`, which tree-shakes it in production. Server-side code run with `bun --hot` has a part of the same API: see [`import.meta.hot` in watch mode](/runtime/watch-mode#import-meta-hot).
 
 ```ts title="index.ts" icon="/icons/typescript.svg"
 if (import.meta.hot) {

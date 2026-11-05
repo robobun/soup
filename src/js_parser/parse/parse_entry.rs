@@ -271,6 +271,7 @@ impl<'a> Options<'a> {
                 react_compiler: f.react_compiler,
                 react_compiler_parse_test_pragmas: f.react_compiler_parse_test_pragmas,
                 hot_module_reloading: f.hot_module_reloading,
+                runtime_hot: f.runtime_hot,
                 server_components: f.server_components,
                 is_macro_runtime: f.is_macro_runtime,
                 top_level_await: f.top_level_await,
@@ -2579,6 +2580,10 @@ impl<'a> Parser<'a> {
                     cache.exports_kind = exports_kind;
                     cache.uses_test_api = uses_test_api;
                     cache.imports_vitest = imports_vitest;
+                    cache.import_meta_hot = js_ast::ImportMetaHotUse::of_parse(
+                        p.names_import_meta_hot,
+                        p.options.features.runtime_hot,
+                    );
                 }
             }
         }

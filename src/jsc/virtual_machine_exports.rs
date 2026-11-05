@@ -26,6 +26,33 @@ pub fn script_execution_status(this: &VirtualMachine) -> i32 {
     this.script_execution_status() as i32
 }
 
+/// Whether the `ImportMeta` prototype of this VM has `hot`.
+// HOST_EXPORT(Bun__VirtualMachine__hasImportMetaHot, c)
+pub fn has_import_meta_hot(this: &VirtualMachine) -> bool {
+    this.transpiler.options.runtime_hot
+}
+
+/// Whether the module at `path` has `import.meta.hot`: what the transpiler asked of the same options.
+// HOST_EXPORT(Bun__VirtualMachine__moduleHasImportMetaHot, c)
+pub fn module_has_import_meta_hot(this: &VirtualMachine, path: &BunString) -> bool {
+    let path = path.to_utf8();
+    let is_eval_entry_point = (this.module_loader.eval_source.as_deref())
+        .is_some_and(|source| source.path.text == &*path);
+    (this.transpiler.options)
+        .has_import_meta_hot(&bun_paths::fs::Path::init(&path), is_eval_entry_point)
+}
+
+/// The promises that the `dispose()` callbacks of `import.meta.hot` returned have settled. They
+/// are those of the reload that started at `hot_reload_counter`.
+// HOST_EXPORT(Bun__VirtualMachine__importMetaHotDisposed, c)
+pub fn import_meta_hot_disposed(this: &mut VirtualMachine, hot_reload_counter: u32) {
+    // The run loop goes on without promises that nothing is left to settle. When one of them
+    // settles after all, a later reload can be waiting for its own.
+    if this.hot_reload_counter == hot_reload_counter {
+        this.finish_reload_after_dispose();
+    }
+}
+
 // HOST_EXPORT(Bun__getVM, c)
 pub fn get_vm() -> *mut VirtualMachine {
     VirtualMachine::get_mut_ptr()
