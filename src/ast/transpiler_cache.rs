@@ -13,6 +13,48 @@
 use crate::{ExportsKind, Source};
 use core::ptr::NonNull;
 
+/// What the parse behind a cache entry did with `import.meta.hot`. A parse for `bun --hot` leaves
+/// the expression alone and every other parse folds it to `undefined`, so the output of one is not
+/// the output of the other. Both have the same features hash: the entry of a file without the
+/// expression serves both.
+#[repr(u8)]
+#[derive(Copy, Clone, PartialEq, Eq, Default)]
+pub enum ImportMetaHotUse {
+    /// The source does not have the expression.
+    #[default]
+    Absent = 0,
+    Folded = 1,
+    Kept = 2,
+}
+
+impl ImportMetaHotUse {
+    pub fn of_parse(names_import_meta_hot: bool, runtime_hot: bool) -> Self {
+        match (names_import_meta_hot, runtime_hot) {
+            (false, _) => Self::Absent,
+            (true, false) => Self::Folded,
+            (true, true) => Self::Kept,
+        }
+    }
+
+    /// Whether a parse with this `runtime_hot` prints what the entry holds.
+    pub fn fits(self, runtime_hot: bool) -> bool {
+        match self {
+            Self::Absent => true,
+            Self::Folded => !runtime_hot,
+            Self::Kept => runtime_hot,
+        }
+    }
+
+    pub fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Absent),
+            1 => Some(Self::Folded),
+            2 => Some(Self::Kept),
+            _ => None,
+        }
+    }
+}
+
 pub struct RuntimeTranspilerCache {
     pub input_hash: Option<u64>,
     pub input_byte_length: Option<u64>,
@@ -26,6 +68,7 @@ pub struct RuntimeTranspilerCache {
     /// Set by the parser, or by `get()` when the entry it found has `vitest_features_hash`.
     pub imports_vitest: bool,
     pub exports_kind: ExportsKind,
+    pub import_meta_hot: ImportMetaHotUse,
     /// Set by `put()` / `get()` when a cache hit returns transpiled output.
     /// Bundler/parser only store/read the bytes; T6 owns the string wrapper
     /// when surfacing to JS.
@@ -50,6 +93,7 @@ impl Default for RuntimeTranspilerCache {
             uses_test_api: false,
             imports_vitest: false,
             exports_kind: ExportsKind::None,
+            import_meta_hot: ImportMetaHotUse::Absent,
             output_code: None,
             entry: None,
             r#impl: None,

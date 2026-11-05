@@ -1372,6 +1372,8 @@ pub struct BundleOptions<'a> {
     pub(crate) mark_builtins_as_external: bool,
     pub server_components: bool,
     pub hot_module_reloading: bool,
+    /// The transpiler of the VM that `bun --hot` reloads. See `has_import_meta_hot`.
+    pub runtime_hot: bool,
     pub react_fast_refresh: bool,
     pub react_compiler: bun_ast::runtime::ReactCompilerMode,
     pub react_compiler_parse_test_pragmas: bool,
@@ -1609,6 +1611,20 @@ impl<'a> BundleOptions<'a> {
         }
     }
 
+    /// Whether the module at `path` has `import.meta.hot`. The parser asks for the expression and
+    /// the ImportMeta prototype for the property, so the two agree. A package keeps the fold: its
+    /// `if (import.meta.hot)` has meant "a dev server is driving me" so far.
+    pub fn has_import_meta_hot(
+        &self,
+        path: &bun_paths::fs::Path<'_>,
+        is_eval_entry_point: bool,
+    ) -> bool {
+        self.runtime_hot
+            && !is_eval_entry_point
+            && self.target != Target::BunMacro
+            && !path.is_node_module()
+    }
+
     /// Per-worker deep clone — replaces the prior bitwise
     /// `ptr::copy_nonoverlapping` of the parent `Transpiler` (which aliased
     /// every `Box`/`Vec` in here between parent and worker; reassigning any of
@@ -1649,6 +1665,7 @@ impl<'a> BundleOptions<'a> {
             mark_builtins_as_external: self.mark_builtins_as_external,
             server_components: self.server_components,
             hot_module_reloading: self.hot_module_reloading,
+            runtime_hot: self.runtime_hot,
             react_fast_refresh: self.react_fast_refresh,
             react_compiler: self.react_compiler,
             react_compiler_parse_test_pragmas: self.react_compiler_parse_test_pragmas,
@@ -1925,6 +1942,7 @@ impl<'a> BundleOptions<'a> {
             mark_builtins_as_external: false,
             server_components: false,
             hot_module_reloading: false,
+            runtime_hot: false,
             react_fast_refresh: false,
             react_compiler: bun_ast::runtime::ReactCompilerMode::Disabled,
             react_compiler_parse_test_pragmas: false,

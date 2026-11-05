@@ -597,6 +597,11 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     }
 
                     if name == b"hot" {
+                        p.names_import_meta_hot = true;
+                        // The runtime of `bun --hot` answers the property.
+                        if p.options.features.runtime_hot {
+                            return None;
+                        }
                         return Some(Expr {
                             data: js_ast::ExprData::ESpecial(
                                 if p.options.features.hot_module_reloading {

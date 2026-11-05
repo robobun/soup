@@ -348,6 +348,11 @@ pub struct VirtualMachine {
     pending_internal_promise: crate::strong::Optional,
     pub pending_internal_promise_reported_at: u32,
     pub hot_reload_deferred: bool,
+    /// A reload is between the `dispose()` callbacks of `import.meta.hot` and its second half,
+    /// which waits until the promises that they returned have settled.
+    hot_reload_disposing: bool,
+    /// What that second half cancels because the run had failed before the reload.
+    hot_run_failed_before_dispose: CancelHotRunTimers,
     pub entry_point_result: EntryPointResult,
 
     pub on_unhandled_rejection: OnUnhandledRejection,
@@ -2994,7 +2999,7 @@ pub struct TimersLeft {
 }
 
 /// Which of its timers a `--hot` run takes with it.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CancelHotRunTimers {
     None,
     /// A `setTimeout` may be the next step of an earlier run's loop.
@@ -5079,6 +5084,12 @@ impl VirtualMachine {
                 crate::js_promise::Status::Fulfilled => {}
             }
         }
+        // A reload that waits for `dispose()` promises reads every file again when it goes on,
+        // so it has this change too.
+        if self.hot_reload_disposing {
+            self.hot_reload_deferred = false;
+            return;
+        }
         self.hot_reload_deferred = false;
 
         bun_core::debug!("Reloading...");
@@ -5092,6 +5103,19 @@ impl VirtualMachine {
             bun_core::Output::enable_buffering();
         }
 
+        if self.transpiler.options.runtime_hot && self.dispose_import_meta_hot() {
+            return;
+        }
+        self.load_entry_point_again();
+    }
+
+    /// The second half of a hot reload: lets go of the modules and evaluates the entry point again.
+    fn load_entry_point_again(&mut self) {
+        self.hot_reload_disposing = false;
+        let failed_before_dispose = core::mem::replace(
+            &mut self.hot_run_failed_before_dispose,
+            CancelHotRunTimers::None,
+        );
         if let Some(hooks) = runtime_hooks() {
             // The hook walks the VM's cron-job list and detaches each job from
             // the old global so the new global can re-register them post-reload.
@@ -5100,20 +5124,8 @@ impl VirtualMachine {
         // `JSGlobalObject::reload` drains microtasks + collects async + clears
         // the JSC module loader registry.
         self.global().reload().expect("Failed to reload");
-        // An unhandled error stops all timers. The next run starts them again, without those of the failed run.
-        // libuv fires timers on Windows, error or not.
-        let timers_ran = core::mem::take(&mut self.timers_ran_after_error) || cfg!(windows);
-        let cancel = if core::mem::take(&mut self.unhandled_error_counter) == 0 {
-            CancelHotRunTimers::None
-        } else {
-            self.hot_run_failed = true;
-            self.exit_handler.exit_code = 0;
-            if timers_ran {
-                CancelHotRunTimers::Intervals
-            } else {
-                CancelHotRunTimers::All
-            }
-        };
+        // What failed while the reload waited for `dispose()` callbacks counts too.
+        let cancel = self.take_hot_run_failure().max(failed_before_dispose);
         if let Some(hooks) = runtime_hooks() {
             // SAFETY: live per-thread VM on the JS thread; `runtime_state` stays installed.
             unsafe { (hooks.end_hot_run_timers)(core::ptr::from_mut(self), cancel) };
@@ -5126,6 +5138,72 @@ impl VirtualMachine {
         if let Err(err) = self.reload_entry_point(main.as_ref().map(|main| main.slice())) {
             self.reject_failed_reload(err);
         }
+    }
+
+    /// An unhandled error stops all timers. The next run starts them again, without those of the failed run.
+    /// This takes the failure off the VM and says which timers those are.
+    fn take_hot_run_failure(&mut self) -> CancelHotRunTimers {
+        // libuv fires timers on Windows, error or not.
+        let timers_ran = core::mem::take(&mut self.timers_ran_after_error) || cfg!(windows);
+        if core::mem::take(&mut self.unhandled_error_counter) == 0 {
+            return CancelHotRunTimers::None;
+        }
+        self.hot_run_failed = true;
+        self.exit_handler.exit_code = 0;
+        if timers_ran {
+            CancelHotRunTimers::Intervals
+        } else {
+            CancelHotRunTimers::All
+        }
+    }
+
+    /// Runs the `dispose()` callbacks of `import.meta.hot`, before a reload lets go of the modules.
+    /// True when they returned promises that are pending: the reload goes on from
+    /// `finish_reload_after_dispose`, and until then the event loop runs as it always does.
+    #[cold]
+    fn dispose_import_meta_hot(&mut self) -> bool {
+        let global = self.global();
+        if !crate::cpp::Bun__ImportMetaHot__isLoaded(global) {
+            return false;
+        }
+        // The timers run again from here on: a callback can wait for one, or for a loop of the
+        // failed run that one wakes. The second half cancels what is left of them. A callback can
+        // also run the event loop, and the reload of the next change then returns at once.
+        self.hot_run_failed_before_dispose = self.take_hot_run_failure();
+        self.hot_reload_disposing = true;
+        match crate::cpp::Bun__ImportMetaHot__runDispose(global, self.hot_reload_counter) {
+            Ok(pending) => pending == JSValue::TRUE,
+            Err(err) => {
+                let exception = global.take_exception(err);
+                self.run_error_handler(exception, None);
+                false
+            }
+        }
+    }
+
+    pub fn is_hot_reload_disposing(&self) -> bool {
+        self.hot_reload_disposing
+    }
+
+    /// `is_event_loop_alive` for the run loop of `--hot`. An unhandled error stops the event loop
+    /// of a run, but not of a reload that waits for `dispose()` callbacks: they are ending that run.
+    pub fn is_hot_event_loop_alive(&self) -> bool {
+        if self.hot_reload_disposing {
+            self.is_event_loop_alive_despite_errors()
+        } else {
+            self.is_event_loop_alive()
+        }
+    }
+
+    /// The promises that the `dispose()` callbacks returned have settled, or nothing is left that
+    /// could settle them. False when no reload waits for them.
+    pub fn finish_reload_after_dispose(&mut self) -> bool {
+        if !self.hot_reload_disposing {
+            return false;
+        }
+        self.hot_reload_deferred = false;
+        self.load_entry_point_again();
+        true
     }
 
     /// Sets the entry promise to a rejected promise when `reload_entry_point` fails without returning one.
