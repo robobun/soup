@@ -29,7 +29,16 @@ interface ImportMeta {
    * The check is usually unnecessary: Bun dead-code-eliminates calls to the
    * HMR APIs in production builds.
    *
+   * The object exists in two places:
+   * - In the dev server of Bun's bundler, which has the whole API.
+   * - In your modules under `bun --hot`, where a reload evaluates every
+   *   module again. There `data` is kept per module and `dispose()`
+   *   callbacks run before each reload. `accept()`, `decline()`, `on()`
+   *   and `off()` do nothing, because every module is replaced. A package
+   *   in `node_modules` and a `Worker` have no `import.meta.hot`.
+   *
    * https://bun.com/docs/bundler/hmr
+   * https://bun.com/docs/runtime/watch-mode#import-meta-hot
    */
   hot: {
     /**
@@ -46,6 +55,9 @@ interface ImportMeta {
      *
      * In production, `data` is inlined to `{}`, which lets Bun minify
      * `{}.prop ??= value` to `value`.
+     *
+     * Under `bun --hot`, `data` is kept per module across reloads. A change
+     * to the object and an assignment to `data` are both kept.
      */
     data: any;
 
@@ -131,6 +143,12 @@ interface ImportMeta {
      *
      * Returning a promise delays module replacement until the module is
      * disposed. All dispose callbacks are called in parallel.
+     *
+     * Under `bun --hot`, every callback registered since the last reload
+     * runs at the next one, before any module is evaluated again, whether
+     * or not the module that registered it is evaluated again (a
+     * `--preload` script, for example, is evaluated once). The reload waits
+     * until the returned promises have settled.
      */
     dispose(cb: (data: any) => void | Promise<void>): void;
 
@@ -166,6 +184,8 @@ interface ImportMeta {
      *
      * For Vite compatibility, event names also accept the `vite:` prefix in
      * place of `bun:`.
+     *
+     * Under `bun --hot` this does nothing: no event is emitted there.
      *
      * https://bun.com/docs/bundler/hmr#import-meta-hot-on-and-off
      * @param event Event name, such as `"bun:beforeUpdate"`

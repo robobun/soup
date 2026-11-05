@@ -1,6 +1,6 @@
 import { spawn } from "bun";
 import { dlopen } from "bun:ffi";
-import { beforeEach, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import {
   copyFileSync,
   cpSync,
@@ -787,6 +787,1092 @@ ${Buffer.alloc(counter * 2, " ").toString()}throw new Error(${counter});`,
   },
   longTimeout,
 );
+
+describe("import.meta.hot", () => {
+  interface GenerationOptions {
+    /** Contents of `entry` for generations 1, 2, ...; by default `files[entry]` is saved again each time. */
+    sources?: string[];
+    /** Arguments placed before the entry point, e.g. `--preload`. */
+    args?: string[];
+    /** Runs after a generation printed its line and before the save that starts the next one. */
+    afterGeneration?: (line: Record<string, unknown>) => Promise<void>;
+  }
+
+  /**
+   * Writes `files` into the test cwd, runs `bun --hot` on `entry`, and after
+   * every JSON line the fixture prints to stdout saves `entry` to trigger the
+   * next reload, until `generations` lines have been collected.
+   */
+  async function collectGenerations(
+    entry: string,
+    files: Record<string, string>,
+    generations: number,
+    { sources, args = [], afterGeneration }: GenerationOptions = {},
+  ) {
+    const root = join(cwd, entry);
+    const sourceFor = (generation: number) =>
+      sources ? sources[generation - 1] : `${files[entry]}\n// generation ${generation}\n`;
+    for (const [name, contents] of Object.entries(files)) {
+      mkdirSync(join(cwd, name, ".."), { recursive: true });
+      writeFileSync(join(cwd, name), contents);
+    }
+    writeFileSync(root, sourceFor(1));
+    // A rename, so that the child never reads half of a save. On Windows a save is one write.
+    const save = isWindows ? writeFileSync : writeHotFileAtomicSync;
+
+    await using runner = spawn({
+      cmd: [bunExe(), "--hot", "--no-clear-screen", ...args, root],
+      env: bunEnv,
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+
+    let stderr = "";
+    const stderrDone = (async () => {
+      for await (const chunk of runner.stderr) stderr += new TextDecoder().decode(chunk);
+    })().catch(() => {});
+
+    const lines: Record<string, unknown>[] = [];
+    let buf = "";
+    outer: for await (const chunk of runner.stdout) {
+      buf += new TextDecoder().decode(chunk);
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("{")) continue;
+        const parsed = JSON.parse(line);
+        lines.push(parsed);
+        await afterGeneration?.(parsed);
+        if (lines.length >= generations) break outer;
+        save(root, sourceFor(lines.length + 1));
+      }
+    }
+
+    const finished = lines.length >= generations;
+    if (finished) runner.kill();
+    await runner.exited;
+    await stderrDone;
+    if (!finished) {
+      throw new Error(
+        `bun --hot ended after ${lines.length} of ${generations} generations` +
+          ` (exit code ${runner.exitCode}, signal ${runner.signalCode})\n` +
+          `stdout lines: ${JSON.stringify(lines)}\nstderr: ${stderr}`,
+      );
+    }
+    return { lines, stderr };
+  }
+
+  const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+  it("is undefined and unguarded calls are no-ops without --hot", async () => {
+    await using proc = spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+          if (import.meta.hot !== undefined) throw new Error("expected undefined, got " + typeof import.meta.hot);
+          if (typeof import.meta.hot?.dispose !== "undefined") throw new Error("optional chain");
+          // Unguarded calls to the HMR API must not throw at runtime; outside
+          // --hot the transpiler folds these away.
+          import.meta.hot.dispose(() => { throw new Error("should not run"); });
+          import.meta.hot.accept();
+          import.meta.hot.on("bun:beforeUpdate", () => {});
+          const state = (import.meta.hot.data.state ??= { reloads: 0 });
+          console.log(JSON.stringify({ ok: true, reloads: state.reloads }));
+        `,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: '{"ok":true,"reloads":0}\n', stderr: "", exitCode: 0 });
+  });
+
+  it(
+    "runs dispose callbacks and persists data across reloads",
+    async () => {
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const listener = () => {};
+        process.on("beforeExit", listener);
+        const iv = setInterval(() => {}, 1_000_000);
+
+        const hot = import.meta.hot;
+        if (typeof hot !== "object" || hot === null) {
+          console.log(JSON.stringify({ gen, error: "hot is " + typeof hot }));
+          process.exit(1);
+        }
+        const prevGen = hot.data.prevGen;
+        hot.data.prevGen = gen;
+        const intervals = globalThis.__intervals ??= new Set();
+        intervals.add(iv);
+        hot.dispose((data) => {
+          clearInterval(iv);
+          intervals.delete(iv);
+          process.off("beforeExit", listener);
+          globalThis.__disposed = { gen, data: { ...data } };
+        });
+
+        const noopNames = ["accept", "decline", "on", "off", "prune", "invalidate", "send"];
+        console.log(JSON.stringify({
+          gen,
+          tag: Object.prototype.toString.call(hot),
+          sameObject: hot === import.meta.hot,
+          keys: Object.keys(hot),
+          protoKeys: Object.getOwnPropertyNames(Object.getPrototypeOf(hot)).sort(),
+          prevGen: prevGen ?? null,
+          listenerCount: process.listenerCount("beforeExit"),
+          liveIntervals: intervals.size,
+          disposed: globalThis.__disposed ?? null,
+          noops: noopNames.filter(n => typeof hot[n] === "function" && hot[n]() === undefined),
+        }));
+      `;
+      const { lines } = await collectGenerations("import-meta-hot-app.ts", { "import-meta-hot-app.ts": source }, 3);
+
+      const shape = {
+        tag: "[object ImportMetaHot]",
+        sameObject: true,
+        keys: [],
+        protoKeys: ["accept", "data", "decline", "dispose", "invalidate", "off", "on", "prune", "send"],
+        listenerCount: 1,
+        liveIntervals: 1,
+        noops: ["accept", "decline", "on", "off", "prune", "invalidate", "send"],
+      };
+      expect(lines).toEqual([
+        { ...shape, gen: 1, prevGen: null, disposed: null },
+        { ...shape, gen: 2, prevGen: 1, disposed: { gen: 1, data: { prevGen: 1 } } },
+        { ...shape, gen: 3, prevGen: 2, disposed: { gen: 2, data: { prevGen: 2 } } },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "data can be reassigned and dispose receives the module's current data",
+    async () => {
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const hot = import.meta.hot;
+        const before = { ...hot.data };
+        // Registered before the reassignment below: dispose must still be
+        // handed whatever data is current when the reload happens.
+        hot.dispose((data) => {
+          globalThis.__disposeGot = { ...data };
+        });
+        if (gen === 1) {
+          hot.data = { created: 1 };
+        } else {
+          hot.data.mutatedBy = gen;
+        }
+        console.log(JSON.stringify({
+          gen,
+          before,
+          after: { ...hot.data },
+          disposeGot: globalThis.__disposeGot ?? null,
+        }));
+      `;
+      const { lines } = await collectGenerations("import-meta-hot-data.ts", { "import-meta-hot-data.ts": source }, 3);
+      expect(lines).toEqual([
+        { gen: 1, before: {}, after: { created: 1 }, disposeGot: null },
+        { gen: 2, before: { created: 1 }, after: { created: 1, mutatedBy: 2 }, disposeGot: { created: 1 } },
+        {
+          gen: 3,
+          before: { created: 1, mutatedBy: 2 },
+          after: { created: 1, mutatedBy: 3 },
+          disposeGot: { created: 1, mutatedBy: 2 },
+        },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "keeps data and dispose per module and runs dispose in registration order",
+    async () => {
+      // Each module stamps its own data and records which data its dispose
+      // callback was handed. The dependency is never edited; it is
+      // re-evaluated because the entry changed (via the async transpiler path).
+      const entry = `
+        import { depData, depSeen } from "./import-meta-hot-dep.ts";
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const data = import.meta.hot.data;
+        const entrySeen = { who: data.who ?? null, gen: data.gen ?? null };
+        data.who = "entry";
+        data.gen = gen;
+        import.meta.hot.dispose(handed => globalThis.__disposed.push(["entry", handed.who, handed === data]));
+        console.log(JSON.stringify({
+          gen,
+          entrySeen,
+          depSeen,
+          separateData: depData !== data,
+          disposedSinceLastGeneration: globalThis.__disposed ?? [],
+        }));
+        globalThis.__disposed = [];
+      `;
+      const dep = `
+        export const depData = import.meta.hot.data;
+        export const depSeen = { who: depData.who ?? null, gen: depData.gen ?? null };
+        depData.who = "dep";
+        depData.gen = (depData.gen ?? 0) + 1;
+        import.meta.hot.dispose(handed => globalThis.__disposed.push(["dep", handed.who, handed === depData]));
+      `;
+      const { lines } = await collectGenerations(
+        "import-meta-hot-entry.ts",
+        { "import-meta-hot-entry.ts": entry, "import-meta-hot-dep.ts": dep },
+        3,
+      );
+      const nothing = { who: null, gen: null };
+      // The dependency evaluates (and so registers) before the entry does.
+      const bothDisposed = [
+        ["dep", "dep", true],
+        ["entry", "entry", true],
+      ];
+      expect(lines).toEqual([
+        { gen: 1, entrySeen: nothing, depSeen: nothing, separateData: true, disposedSinceLastGeneration: [] },
+        {
+          gen: 2,
+          entrySeen: { who: "entry", gen: 1 },
+          depSeen: { who: "dep", gen: 1 },
+          separateData: true,
+          disposedSinceLastGeneration: bothDisposed,
+        },
+        {
+          gen: 3,
+          entrySeen: { who: "entry", gen: 2 },
+          depSeen: { who: "dep", gen: 2 },
+          separateData: true,
+          disposedSinceLastGeneration: bothDisposed,
+        },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "runs the dispose callbacks of a module the next generation no longer loads",
+    async () => {
+      const entry = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        if (gen === 1) await import("./import-meta-hot-dropped.ts");
+        console.log(JSON.stringify({ gen, droppedDisposeRuns: globalThis.__droppedDisposeRuns ?? 0 }));
+      `;
+      const dropped = `
+        import.meta.hot.dispose(() => {
+          globalThis.__droppedDisposeRuns = (globalThis.__droppedDisposeRuns ?? 0) + 1;
+        });
+      `;
+      const { lines } = await collectGenerations(
+        "import-meta-hot-dropping-entry.ts",
+        { "import-meta-hot-dropping-entry.ts": entry, "import-meta-hot-dropped.ts": dropped },
+        3,
+      );
+      expect(lines).toEqual([
+        { gen: 1, droppedDisposeRuns: 0 },
+        { gen: 2, droppedDisposeRuns: 1 },
+        { gen: 3, droppedDisposeRuns: 1 },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "waits for every promise returned from dispose, including ones that reject, before re-evaluating",
+    async () => {
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const order = (globalThis.__order ??= []);
+        order.push("evaluate " + gen);
+        const macrotask = () => new Promise(resolve => setImmediate(resolve));
+        // A is registered first but settles last, by rejecting; B resolves
+        // first. The reload must wait for both.
+        import.meta.hot.dispose(async () => {
+          order.push("dispose A " + gen);
+          await macrotask();
+          await macrotask();
+          order.push("reject A " + gen);
+          throw new Error("dispose-a-rejected-" + gen);
+        });
+        import.meta.hot.dispose(async data => {
+          order.push("dispose B " + gen);
+          await macrotask();
+          order.push("resolve B " + gen);
+          data.lastDisposed = gen;
+        });
+        console.log(JSON.stringify({ gen, order: order.splice(0), lastDisposed: import.meta.hot.data.lastDisposed ?? null }));
+      `;
+      const { lines, stderr } = await collectGenerations(
+        "import-meta-hot-async.ts",
+        { "import-meta-hot-async.ts": source },
+        3,
+      );
+      expect(lines).toEqual([
+        { gen: 1, order: ["evaluate 1"], lastDisposed: null },
+        { gen: 2, order: ["dispose A 1", "dispose B 1", "resolve B 1", "reject A 1", "evaluate 2"], lastDisposed: 1 },
+        { gen: 3, order: ["dispose A 2", "dispose B 2", "resolve B 2", "reject A 2", "evaluate 3"], lastDisposed: 2 },
+      ]);
+      expect([count(stderr, "dispose-a-rejected-1"), count(stderr, "dispose-a-rejected-2")]).toEqual([1, 1]);
+    },
+    timeout,
+  );
+
+  it(
+    "resumes a reload parked on dispose after a generation that failed to evaluate",
+    async () => {
+      const print = (gen: number) => `
+        console.log(JSON.stringify({
+          gen: ${gen},
+          x: import.meta.hot.data.x ?? null,
+          disposedGenerations: globalThis.__disposedGenerations ?? [],
+        }));
+      `;
+      const sources = [
+        `
+          import.meta.hot.data.x = "set by generation 1";
+          import.meta.hot.dispose(() => { (globalThis.__disposedGenerations ??= []).push(1); });
+          ${print(1)}
+        `,
+        // Prints, registers an async dispose, then fails to evaluate: the
+        // reload that follows has to get past the reported rejection of this
+        // generation's entry promise both before and after parking on dispose.
+        `
+          import.meta.hot.dispose(async () => {
+            await new Promise(resolve => setImmediate(resolve));
+            (globalThis.__disposedGenerations ??= []).push(2);
+          });
+          ${print(2)}
+          const failing = 2;
+          throw new Error("generation-" + failing + "-failed");
+        `,
+        print(3),
+      ];
+      const { lines, stderr } = await collectGenerations("import-meta-hot-broken.ts", {}, 3, { sources });
+      expect(lines).toEqual([
+        { gen: 1, x: "set by generation 1", disposedGenerations: [] },
+        { gen: 2, x: "set by generation 1", disposedGenerations: [1] },
+        { gen: 3, x: "set by generation 1", disposedGenerations: [1, 2] },
+      ]);
+      expect(count(stderr, "generation-2-failed")).toBe(1);
+    },
+    timeout,
+  );
+
+  it(
+    "a server stopped from dispose is replaced by the next generation's Bun.serve on the same port",
+    async () => {
+      // The recipe from docs/runtime/watch-mode.mdx: without the dispose
+      // callback the reload hands the new fetch handler to the existing server.
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const server = Bun.serve({
+          hostname: "127.0.0.1",
+          port: import.meta.hot.data.port ?? 0,
+          fetch: () => new Response("generation " + gen),
+        });
+        import.meta.hot.data.port = server.port;
+        import.meta.hot.dispose(() => {
+          server.stop();
+        });
+        console.log(JSON.stringify({ gen, port: server.port, newServer: server !== globalThis.__server }));
+        globalThis.__server = server;
+      `;
+      const responses: string[] = [];
+      const { lines } = await collectGenerations(
+        "import-meta-hot-serve.ts",
+        { "import-meta-hot-serve.ts": source },
+        3,
+        {
+          async afterGeneration(line) {
+            const response = await fetch(`http://127.0.0.1:${line.port}/`, { headers: { connection: "close" } });
+            responses.push(await response.text());
+          },
+        },
+      );
+      const port = lines[0].port as number;
+      expect(port).toBeGreaterThan(0);
+      expect({ lines, responses }).toEqual({
+        lines: [
+          { gen: 1, port, newServer: true },
+          { gen: 2, port, newServer: true },
+          { gen: 3, port, newServer: true },
+        ],
+        responses: ["generation 1", "generation 2", "generation 3"],
+      });
+    },
+    timeout,
+  );
+
+  const preload = `
+    globalThis.__preloadEvaluations = (globalThis.__preloadEvaluations ?? 0) + 1;
+    import.meta.hot.dispose(() => {
+      globalThis.__preloadDisposeRuns = (globalThis.__preloadDisposeRuns ?? 0) + 1;
+    });
+  `;
+  const reportPreload = `
+    const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+    console.log(JSON.stringify({
+      gen,
+      preloadEvaluations: globalThis.__preloadEvaluations,
+      preloadDisposeRuns: globalThis.__preloadDisposeRuns ?? 0,
+    }));
+  `;
+
+  it(
+    "a --preload script is evaluated once, so a dispose registered there runs once",
+    async () => {
+      const { lines } = await collectGenerations(
+        "import-meta-hot-preload-entry.ts",
+        { "import-meta-hot-preload-entry.ts": reportPreload, "import-meta-hot-preload.ts": preload },
+        3,
+        { args: ["--preload", "./import-meta-hot-preload.ts"] },
+      );
+      expect(lines).toEqual([
+        { gen: 1, preloadEvaluations: 1, preloadDisposeRuns: 0 },
+        { gen: 2, preloadEvaluations: 1, preloadDisposeRuns: 1 },
+        { gen: 3, preloadEvaluations: 1, preloadDisposeRuns: 1 },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "a --preload script the entry point imports is reloaded like any other module",
+    async () => {
+      const { lines } = await collectGenerations(
+        "import-meta-hot-preload-importing-entry.ts",
+        {
+          "import-meta-hot-preload-importing-entry.ts": `import "./import-meta-hot-preload.ts";\n${reportPreload}`,
+          "import-meta-hot-preload.ts": preload,
+        },
+        3,
+        { args: ["--preload", "./import-meta-hot-preload.ts"] },
+      );
+      expect(lines).toEqual([
+        { gen: 1, preloadEvaluations: 1, preloadDisposeRuns: 0 },
+        { gen: 2, preloadEvaluations: 2, preloadDisposeRuns: 1 },
+        { gen: 3, preloadEvaluations: 3, preloadDisposeRuns: 2 },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "reports throwing and rejecting dispose callbacks and still reloads",
+    async () => {
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        // Touching \`process\` and then going idle is what makes a later
+        // uncaught exception fatal; dispose errors must not take that path.
+        process.on("exit", () => {});
+        import.meta.hot.dispose(() => { throw new Error("sync-throw-" + gen); });
+        // Already rejected by the time it is returned; a rejection that
+        // happens later is covered by the ordering test above.
+        import.meta.hot.dispose(async () => { throw new Error("async-reject-" + gen); });
+        import.meta.hot.dispose(() => { globalThis.__last = gen; });
+        console.log(JSON.stringify({ gen, lastRan: globalThis.__last ?? null }));
+      `;
+      const { lines, stderr } = await collectGenerations(
+        "import-meta-hot-throws.ts",
+        { "import-meta-hot-throws.ts": source },
+        3,
+      );
+      expect(lines).toEqual([
+        { gen: 1, lastRan: null },
+        { gen: 2, lastRan: 1 },
+        { gen: 3, lastRan: 2 },
+      ]);
+      expect(
+        ["sync-throw-1", "async-reject-1", "sync-throw-2", "async-reject-2"].map(message => count(stderr, message)),
+      ).toEqual([1, 1, 1, 1]);
+    },
+    timeout,
+  );
+
+  it(
+    "exists in CommonJS modules, once per query string, and however the property is read",
+    async () => {
+      const entry = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const cjs = require("./import-meta-hot-commonjs.cjs");
+        const a = await import("./import-meta-hot-query.ts?a");
+        const b = await import("./import-meta-hot-query.ts?b");
+        const meta = import.meta;
+        const { hot } = import.meta;
+        console.log(JSON.stringify({
+          gen,
+          cjs,
+          queries: [a.count, b.count],
+          separateData: a.data !== b.data,
+          sameObject: [meta.hot === import.meta.hot, hot === meta.hot, import.meta["hot"] === hot],
+          inOperator: "hot" in import.meta,
+          optionalChain: typeof import.meta?.hot?.dispose,
+        }));
+      `;
+      const commonjs = `
+        const data = import.meta.hot.data;
+        data.count = (data.count ?? 0) + 1;
+        import.meta.hot.dispose(() => {
+          globalThis.__commonjsDisposed = (globalThis.__commonjsDisposed ?? 0) + 1;
+        });
+        module.exports = {
+          isCommonJS: typeof module === "object" && module.exports === exports,
+          count: data.count,
+          disposed: globalThis.__commonjsDisposed ?? 0,
+        };
+      `;
+      const query = `
+        export const data = import.meta.hot.data;
+        data.count = (data.count ?? 0) + (import.meta.url.endsWith("?a") ? 1 : 10);
+        export const count = data.count;
+      `;
+      const { lines } = await collectGenerations(
+        "import-meta-hot-kinds.ts",
+        {
+          "import-meta-hot-kinds.ts": entry,
+          "import-meta-hot-commonjs.cjs": commonjs,
+          "import-meta-hot-query.ts": query,
+        },
+        3,
+      );
+      const shape = {
+        separateData: true,
+        sameObject: [true, true, true],
+        inOperator: true,
+        optionalChain: "function",
+      };
+      expect(lines).toEqual([
+        { ...shape, gen: 1, cjs: { isCommonJS: true, count: 1, disposed: 0 }, queries: [1, 10] },
+        { ...shape, gen: 2, cjs: { isCommonJS: true, count: 2, disposed: 1 }, queries: [2, 20] },
+        { ...shape, gen: 3, cjs: { isCommonJS: true, count: 3, disposed: 2 }, queries: [3, 30] },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "waits for a dispose callback that waits for a loop of its run, also after a run that failed",
+    async () => {
+      // An uncaught error stops the timers of its run. They run again while a reload waits for the
+      // dispose callbacks: a callback can wait for a timer, or for a loop of the run that one wakes.
+      const source = (gen: number, tail: string) => `
+        const order = (globalThis.__order ??= []);
+        let stopped = false;
+        const loop = (async () => {
+          while (!stopped) await new Promise(resolve => setTimeout(resolve, 1));
+        })();
+        import.meta.hot.dispose(async () => {
+          order.push("dispose ${gen} starts");
+          stopped = true;
+          await loop;
+          await new Promise(resolve => setTimeout(resolve, 1));
+          order.push("dispose ${gen} ends");
+        });
+        console.log(JSON.stringify({ gen: ${gen}, order: order.splice(0) }));
+        ${tail}
+      `;
+      const sources = [
+        source(1, `const failing = 1;\nthrow new Error("generation-" + failing + "-failed");`),
+        source(2, ""),
+        source(3, ""),
+      ];
+      const { lines, stderr } = await collectGenerations("import-meta-hot-timer.ts", {}, 3, { sources });
+      expect(lines).toEqual([
+        { gen: 1, order: [] },
+        { gen: 2, order: ["dispose 1 starts", "dispose 1 ends"] },
+        { gen: 3, order: ["dispose 2 starts", "dispose 2 ends"] },
+      ]);
+      expect(count(stderr, "generation-1-failed")).toBe(1);
+    },
+    timeout,
+  );
+
+  it(
+    "an uncaught error during the wait for dispose does not end the wait",
+    async () => {
+      // The callback waits for a timer that is due after the error. Each generation prints from a
+      // timer: the timers of the run after that reload work.
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const order = (globalThis.__order ??= []);
+        order.push("load " + gen);
+        import.meta.hot.dispose(async () => {
+          order.push("dispose " + gen + " starts");
+          await new Promise(resolve =>
+            setTimeout(() => {
+              setTimeout(resolve, 1);
+              throw new Error("thrown-in-the-wait-of-" + gen);
+            }, 1),
+          );
+          order.push("dispose " + gen + " ends");
+        });
+        setTimeout(() => console.log(JSON.stringify({ gen, order: order.splice(0) })), 1);
+      `;
+      const { lines, stderr } = await collectGenerations(
+        "import-meta-hot-error-in-wait.ts",
+        { "import-meta-hot-error-in-wait.ts": source },
+        3,
+      );
+      expect(lines).toEqual([
+        { gen: 1, order: ["load 1"] },
+        { gen: 2, order: ["dispose 1 starts", "dispose 1 ends", "load 2"] },
+        { gen: 3, order: ["dispose 2 starts", "dispose 2 ends", "load 3"] },
+      ]);
+      expect(count(stderr, "thrown-in-the-wait-of-1")).toBe(1);
+    },
+    timeout,
+  );
+
+  it(
+    "a dispose promise can settle while a later callback runs",
+    async () => {
+      // The second callback drains the microtasks, as `server.stop(true)` does when it closes a
+      // connection: the promise of the first settles inside the call. Generation 2 has no third.
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const order = (globalThis.__order ??= []);
+        if (gen === 1) process.on("unhandledRejection", error => order.push("unhandledRejection: " + error));
+        import.meta.hot.dispose(async () => {
+          order.push("first " + gen);
+        });
+        import.meta.hot.dispose(() => {
+          require("bun:jsc").drainMicrotasks();
+          order.push("second " + gen);
+        });
+        if (gen !== 2) {
+          import.meta.hot.dispose(async () => {
+            await new Promise(resolve => setTimeout(resolve, 1));
+            order.push("third " + gen);
+          });
+        }
+        setTimeout(() => console.log(JSON.stringify({ gen, order: order.splice(0) })), 1);
+      `;
+      const { lines } = await collectGenerations("import-meta-hot-drain.ts", { "import-meta-hot-drain.ts": source }, 4);
+      expect(lines).toEqual([
+        { gen: 1, order: [] },
+        { gen: 2, order: ["first 1", "second 1", "third 1"] },
+        { gen: 3, order: ["first 2", "second 2"] },
+        { gen: 4, order: ["first 3", "second 3", "third 3"] },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "a save during the wait for dispose is part of the reload that waits",
+    async () => {
+      const root = join(cwd, "import-meta-hot-save-during-wait.ts");
+      const released = join(cwd, "import-meta-hot-released");
+      const source = (version: string) => `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        import.meta.hot.dispose(async () => {
+          console.log("disposing");
+          const { existsSync } = require("node:fs");
+          while (!existsSync(${JSON.stringify(released)})) await new Promise(resolve => setTimeout(resolve, 1));
+        });
+        console.log(JSON.stringify({ gen, version: ${JSON.stringify(version)} }));
+      `;
+      writeFileSync(root, source("first"));
+      await using runner = spawn({
+        cmd: [bunExe(), "--hot", "--no-clear-screen", root],
+        env: bunEnv,
+        cwd,
+        stdout: "pipe",
+        stderr: "inherit",
+        stdin: "ignore",
+      });
+      const stdout = follow(runner.stdout);
+      expect(await stdout(JSON.stringify({ gen: 1, version: "first" }))).toBe(true);
+
+      writeFileSync(root, source("never evaluated"));
+      expect(await stdout("disposing")).toBe(true);
+      // The reload is waiting. What it evaluates is the file as it is once the wait is over.
+      writeFileSync(root, source("saved during the wait"));
+      writeFileSync(released, "");
+      expect(await stdout(JSON.stringify({ gen: 2, version: "saved during the wait" }))).toBe(true);
+    },
+    timeout,
+  );
+
+  it(
+    "reloads without a dispose promise that nothing is left to settle",
+    async () => {
+      // Each generation prints from beforeExit, so the save that follows finds an idle process.
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        import.meta.hot.dispose(() => new Promise(() => {}));
+        process.once("beforeExit", () => console.log(JSON.stringify({ gen })));
+      `;
+      const { lines } = await collectGenerations("import-meta-hot-never.ts", { "import-meta-hot-never.ts": source }, 3);
+      expect(lines).toEqual([{ gen: 1 }, { gen: 2 }, { gen: 3 }]);
+    },
+    timeout,
+  );
+
+  it(
+    "a dispose promise that settles after its reload went on does not end the wait of a later reload",
+    async () => {
+      // Nothing is left to settle the promise of generation 1, so its reload goes on without it.
+      // Generation 2 settles it while the next reload waits for generation 2's own promise.
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        const order = (globalThis.__order ??= []);
+        order.push("load " + gen);
+        if (gen === 1) {
+          import.meta.hot.dispose(() => new Promise(resolve => (globalThis.__late = resolve)));
+        } else {
+          import.meta.hot.dispose(async () => {
+            order.push("dispose " + gen + " starts");
+            globalThis.__late();
+            for (let turn = 0; turn < 5; turn++) await new Promise(resolve => setTimeout(resolve, 1));
+            order.push("dispose " + gen + " ends");
+          });
+        }
+        process.once("beforeExit", () => console.log(JSON.stringify({ gen, order: order.splice(0) })));
+      `;
+      const { lines } = await collectGenerations("import-meta-hot-late.ts", { "import-meta-hot-late.ts": source }, 3);
+      expect(lines).toEqual([
+        { gen: 1, order: ["load 1"] },
+        { gen: 2, order: ["load 2"] },
+        { gen: 3, order: ["dispose 2 starts", "dispose 2 ends", "load 3"] },
+      ]);
+    },
+    timeout,
+  );
+
+  it(
+    "reloads while a beforeExit listener keeps the event loop alive",
+    async () => {
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        import.meta.hot.dispose(() => {});
+        if (gen === 1) process.on("beforeExit", () => setTimeout(() => {}, 20));
+        console.log(JSON.stringify({ gen }));
+      `;
+      const { lines } = await collectGenerations(
+        "import-meta-hot-before-exit.ts",
+        { "import-meta-hot-before-exit.ts": source },
+        3,
+      );
+      expect(lines).toEqual([{ gen: 1 }, { gen: 2 }, { gen: 3 }]);
+    },
+    timeout,
+  );
+
+  it(
+    "a package in node_modules keeps the fold",
+    async () => {
+      // Its `if (import.meta.hot)` has meant "a dev server is driving me" so far.
+      const entry = `
+        import { seen } from "hot-dependency";
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        console.log(JSON.stringify({ gen, own: typeof import.meta.hot, seen, disposed: globalThis.__packageDisposed ?? 0 }));
+      `;
+      const dependency = `
+        const meta = import.meta;
+        import.meta.hot.dispose(() => {
+          globalThis.__packageDisposed = (globalThis.__packageDisposed ?? 0) + 1;
+        });
+        export const seen = {
+          guard: import.meta.hot ? "hot" : "cold",
+          dot: typeof import.meta.hot,
+          alias: typeof meta.hot,
+          inOperator: "hot" in meta,
+        };
+      `;
+      const { lines } = await collectGenerations(
+        "import-meta-hot-with-package.ts",
+        {
+          "import-meta-hot-with-package.ts": entry,
+          "node_modules/hot-dependency/package.json": JSON.stringify({ name: "hot-dependency", module: "index.js" }),
+          "node_modules/hot-dependency/index.js": dependency,
+        },
+        2,
+      );
+      // The property is on the prototype that every import.meta of the program has, with no value here.
+      const seen = { guard: "cold", dot: "undefined", alias: "undefined", inOperator: true };
+      expect(lines).toEqual([
+        { gen: 1, own: "object", seen, disposed: 0 },
+        { gen: 2, own: "object", seen, disposed: 0 },
+      ]);
+    },
+    timeout,
+  );
+
+  // What the parser makes of the expression and what the property answers are one decision, so
+  // every way to read it agrees. The call without a guard tells a folded expression, whose call
+  // the transpiler removes, from one that is kept and reads `undefined`.
+  const readings = `{
+    dot: typeof import.meta.hot,
+    index: typeof import.meta["hot"],
+    alias: typeof ((meta) => meta.hot)(import.meta),
+    inOperator: "hot" in import.meta,
+    optionalCall: typeof import.meta?.hot?.dispose,
+    unguardedCall: (() => { try { import.meta.hot.dispose(() => {}); return "returns"; } catch { return "throws"; } })(),
+  }`;
+  const everyReading = (hot: boolean, inOperator = hot, unguardedCall = "returns") => ({
+    dot: hot ? "object" : "undefined",
+    index: hot ? "object" : "undefined",
+    alias: hot ? "object" : "undefined",
+    inOperator,
+    optionalCall: hot ? "function" : "undefined",
+    unguardedCall,
+  });
+
+  it(
+    "is undefined by every way to read it wherever a reload evaluates nothing again",
+    async () => {
+      const print = `console.log(JSON.stringify(${readings})); process.exit(0);`;
+      const files: Record<string, string> = {
+        "import-meta-hot-readings.ts": print,
+        "import-meta-hot-readings.test.ts": `require("bun:test").test("readings", () => { ${print} });`,
+        "import-meta-hot-readings-worker.ts": `self.postMessage(${readings});`,
+        "import-meta-hot-readings-worker-main.ts": `
+          const worker = new Worker(new URL("./import-meta-hot-readings-worker.ts", import.meta.url).href);
+          worker.onmessage = event => { console.log(JSON.stringify(event.data)); process.exit(0); };
+        `,
+        "import-meta-hot-readings-macro.ts": `export function readings() { return ${readings}; }`,
+        "import-meta-hot-readings-macro-main.ts": `
+          import { readings } from "./import-meta-hot-readings-macro.ts" with { type: "macro" };
+          console.log(JSON.stringify(readings())); process.exit(0);
+        `,
+        "import-meta-hot-readings-realm.ts": `export const readings = JSON.stringify(${readings});`,
+        "import-meta-hot-readings-realm-main.ts": `
+          console.log(await new ShadowRealm().importValue("./import-meta-hot-readings-realm.ts", "readings"));
+          process.exit(0);
+        `,
+        "node_modules/hot-readings/bin.js": print,
+      };
+      for (const [name, contents] of Object.entries(files)) {
+        mkdirSync(join(cwd, name, ".."), { recursive: true });
+        writeFileSync(join(cwd, name), contents);
+      }
+      // `onPrototype`: the module shares the ImportMeta prototype of the modules that do have the
+      // object, so `in` finds the property, with no value.
+      // `keepsTheCall`: the parse of a realm's module is the parse of the program's modules, and
+      // the realm has no property.
+      type Context = { args: string[]; stdin?: string; onPrototype?: true; keepsTheCall?: true };
+      const contexts: Record<string, Context> = {
+        "without --hot": { args: ["import-meta-hot-readings.ts"] },
+        "--watch": { args: ["--watch", "--no-clear-screen", "import-meta-hot-readings.ts"] },
+        "--hot -e": { args: ["--hot", "--no-clear-screen", "-e", print], onPrototype: true },
+        "--hot, from standard input": { args: ["--hot", "--no-clear-screen", "-"], stdin: print, onPrototype: true },
+        "bun test --hot": { args: ["test", "--hot", "./import-meta-hot-readings.test.ts"] },
+        "a Worker": { args: ["--hot", "--no-clear-screen", "import-meta-hot-readings-worker-main.ts"] },
+        "a macro": {
+          args: ["--hot", "--no-clear-screen", "import-meta-hot-readings-macro-main.ts"],
+          onPrototype: true,
+        },
+        "a ShadowRealm": {
+          args: ["--hot", "--no-clear-screen", "import-meta-hot-readings-realm-main.ts"],
+          keepsTheCall: true,
+        },
+        "an entry point in node_modules": {
+          args: ["--hot", "--no-clear-screen", "node_modules/hot-readings/bin.js"],
+          onPrototype: true,
+        },
+      };
+      const results = await Promise.all(
+        Object.entries(contexts).map(async ([context, { args, stdin }]) => {
+          await using proc = spawn({
+            cmd: [bunExe(), ...args],
+            env: bunEnv,
+            cwd,
+            stdout: "pipe",
+            stderr: "pipe",
+            stdin: stdin === undefined ? "ignore" : new Blob([stdin]),
+          });
+          const [stdout, stderr] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          const line = stdout.split("\n").find(line => line.startsWith("{"));
+          return [context, line === undefined ? { stdout, stderr } : JSON.parse(line)];
+        }),
+      );
+      expect(Object.fromEntries(results)).toEqual(
+        Object.fromEntries(
+          Object.entries(contexts).map(([context, { onPrototype, keepsTheCall }]) => [
+            context,
+            everyReading(false, onPrototype === true, keepsTheCall ? "throws" : "returns"),
+          ]),
+        ),
+      );
+    },
+    timeout,
+  );
+
+  it(
+    "is an object by every way to read it in the module that used a macro and a ShadowRealm",
+    async () => {
+      // The modules of the entry point are not changed by what else the process loads.
+      const source = `
+        import { readings } from "./import-meta-hot-readings-macro.ts" with { type: "macro" };
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        readings();
+        await new ShadowRealm().importValue("./import-meta-hot-readings-realm.ts", "readings");
+        console.log(JSON.stringify({ gen, readings: ${readings} }));
+      `;
+      const { lines } = await collectGenerations(
+        "import-meta-hot-readings-entry.ts",
+        {
+          "import-meta-hot-readings-entry.ts": source,
+          "import-meta-hot-readings-macro.ts": `export function readings() { return ${readings}; }`,
+          "import-meta-hot-readings-realm.ts": `export const readings = JSON.stringify(${readings});`,
+        },
+        2,
+      );
+      expect(lines).toEqual([
+        { gen: 1, readings: everyReading(true) },
+        { gen: 2, readings: everyReading(true) },
+      ]);
+    },
+    timeout,
+  );
+
+  it.skipIf(isDebug || isASAN)("is undefined in a compiled executable that runs with --hot", async () => {
+    // Its modules were transpiled when it was built.
+    const root = join(cwd, "import-meta-hot-compiled.ts");
+    const executable = join(cwd, isWindows ? "import-meta-hot-compiled.exe" : "import-meta-hot-compiled");
+    writeFileSync(root, `console.log(JSON.stringify(${readings})); process.exit(0);`);
+    await using build = spawn({
+      cmd: [bunExe(), "build", "--compile", root, "--outfile", executable],
+      env: bunEnv,
+      cwd,
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    expect({ stderr: await build.stderr.text(), exitCode: await build.exited }).toMatchObject({ exitCode: 0 });
+    await using proc = spawn({
+      cmd: [executable],
+      env: { ...bunEnv, BUN_OPTIONS: "--hot" },
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({
+      stdout: JSON.stringify(everyReading(false)),
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it(
+    "clears the terminal before the dispose callbacks run, so what they print stays on it",
+    async () => {
+      const root = join(cwd, "import-meta-hot-clear-screen.ts");
+      const source = `
+        const gen = (globalThis.__gen = (globalThis.__gen ?? 0) + 1);
+        import.meta.hot.dispose(() => console.log("disposed " + gen));
+        console.log("loaded " + gen);
+      `;
+      writeFileSync(root, source);
+      const env: typeof bunEnv = { ...bunEnv, FORCE_COLOR: "1" };
+      delete env.NO_COLOR;
+      // stderr is piped, not inherited: the clear sequence would otherwise wipe the terminal that runs the tests.
+      await using runner = spawn({
+        cmd: [bunExe(), "--hot", root],
+        env,
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+      });
+      const stderr = runner.stderr.text();
+      const stdout = follow(runner.stdout);
+      expect(await stdout("loaded 1\n")).toBe(true);
+      (isWindows ? writeFileSync : writeHotFileAtomicSync)(root, `${source}\n// saved\n`);
+      expect(await stdout("loaded 2\n")).toBe(true);
+      runner.kill();
+      await stderr;
+
+      const clearScreen = "\x1b[2J\x1b[3J\x1b[H";
+      const text = (await stdout("\0")) as string;
+      expect(text.slice(0, text.indexOf("loaded 2\n"))).toBe(`loaded 1\n${clearScreen}disposed 1\n`);
+    },
+    timeout,
+  );
+
+  it("dispose() validates its argument", async () => {
+    const root = join(cwd, "import-meta-hot-invalid.ts");
+    writeFileSync(
+      root,
+      `
+        const results = [];
+        try {
+          import.meta.hot.dispose(123);
+          results.push("no-throw");
+        } catch (e) {
+          results.push(e?.code ?? e?.name);
+        }
+        // The methods read the module they belong to from \`this\`.
+        try {
+          import.meta.hot.dispose.call({}, () => {});
+          results.push("no-throw");
+        } catch (e) {
+          results.push(e?.code ?? e?.name);
+        }
+        console.log(JSON.stringify(results));
+        process.exit(0);
+      `,
+    );
+    await using proc = spawn({
+      cmd: [bunExe(), "--hot", "--no-clear-screen", root],
+      env: bunEnv,
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({
+      stdout: JSON.stringify(["ERR_INVALID_ARG_TYPE", "ERR_INVALID_THIS"]),
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it("is undefined inside workers even under --hot", async () => {
+    const workerPath = join(cwd, "import-meta-hot-worker.ts");
+    const mainPath = join(cwd, "import-meta-hot-worker-main.ts");
+    writeFileSync(
+      workerPath,
+      `
+        // Workers are not reloaded under --hot, so import.meta.hot is undefined
+        // and unguarded calls fold away at transpile time.
+        import.meta.hot.dispose(() => { throw new Error("should not run"); });
+        self.postMessage({ hot: typeof import.meta.hot });
+      `,
+    );
+    writeFileSync(
+      mainPath,
+      `
+        const w = new Worker(${JSON.stringify(workerPath)});
+        w.onmessage = (e) => {
+          console.log(JSON.stringify({ main: typeof import.meta.hot, worker: e.data.hot }));
+          w.terminate();
+          process.exit(0);
+        };
+        w.onerror = (e) => {
+          console.error(String(e?.message ?? e));
+          process.exit(1);
+        };
+      `,
+    );
+    await using proc = spawn({
+      cmd: [bunExe(), "--hot", "--no-clear-screen", mainPath],
+      env: bunEnv,
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({
+      stdout: JSON.stringify({ main: "object", worker: "undefined" }),
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+});
 
 it(
   "should import a module again after a hot reload while its import() was still loading its dependencies",

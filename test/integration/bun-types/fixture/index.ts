@@ -407,6 +407,12 @@ Bun.serve({
 
 import.meta.hot.accept();
 import.meta.hot.data;
+// `bun --hot` has these too.
+import.meta.hot.dispose(async data => {
+  clearInterval(data.interval);
+});
+import.meta.hot.on("bun:afterUpdate", () => {});
+import.meta.hot.off("vite:beforeUpdate", () => {});
 
 fetch("", {
   tls: {

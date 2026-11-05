@@ -97,7 +97,7 @@ fn report_unsupported_options(options: &BundleOptions<'_>, log: &mut Log) -> boo
         entry_naming: _, compile_entry_point_name: _, force_node_env: _,
         emit_decorator_metadata: _, experimental_decorators: _, use_define_for_class_fields: _,
         define: _, drop: _, bundler_feature_flags: _, asset_naming: _,
-        auto_import_jsx: _, allow_runtime: _,
+        auto_import_jsx: _, allow_runtime: _, runtime_hot: _,
         trim_unused_imports: _, ignore_dce_annotations: _, public_path: _, chunk_naming: _,
         source_map: _, minify_whitespace: _, minify_syntax: _, is_library: _, minify_identifiers: _,
         keep_names: _, css_chunking: _, code_splitting: _, split_require: _, min_chunk_size: _,
