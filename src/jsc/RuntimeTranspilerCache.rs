@@ -8,7 +8,7 @@ use bun_ast::Source;
 use bun_core::{FeatureFlags, env_var};
 use bun_core::{String as BunString, StringView, ZStr};
 use bun_js_parser::lower::defer_requires::has_react_compiler;
-use bun_js_parser::{CacheLookup, ParsedForCache, ParserOptions};
+use bun_js_parser::{CacheLookup, ImportMetaHotUse, ParsedForCache, ParserOptions};
 use bun_js_printer::analyze_transpiled_module::ModuleInfo;
 use bun_paths::{self as paths, Path};
 use bun_resolver::fs::FileSystem;
@@ -89,7 +89,8 @@ bun_core::declare_scope!(cache, visible);
 /// Version 52: Every directive is printed: a `"use strict"` in a function body too, and the
 /// prologue of the file first.
 /// Version 53: The name of a Node.js builtin in `import()` is printed as it is written.
-const EXPECTED_VERSION: u32 = 53;
+/// Version 54: An entry records what its parse did with `import.meta.hot`, which `bun --hot` leaves to the runtime.
+const EXPECTED_VERSION: u32 = 54;
 
 /// Source files smaller than this are not written to / read from the on-disk
 /// transpiler cache. Originally 50 KiB, which excluded almost every file in a
@@ -136,6 +137,8 @@ pub struct Metadata {
     pub(crate) cache_version: u32,
     pub(crate) output_encoding: Encoding,
     pub module_type: ModuleType,
+    /// In the two bits above `module_type`, in its byte.
+    pub(crate) import_meta_hot: ImportMetaHotUse,
 
     pub(crate) features_hash: u64,
 
@@ -161,6 +164,7 @@ impl Default for Metadata {
             cache_version: EXPECTED_VERSION,
             output_encoding: Encoding::NONE,
             module_type: ModuleType::None,
+            import_meta_hot: ImportMetaHotUse::Absent,
             features_hash: 0,
             input_byte_length: 0,
             input_hash: 0,
@@ -180,10 +184,14 @@ impl Default for Metadata {
 impl Metadata {
     // 1×u32 + 2×u8 (enum reprs) + 12×u64 = 4 + 2 + 96 = 102
     pub(crate) const SIZE: usize = 4 + 1 + 1 + 12 * 8;
+    const MODULE_TYPE_MASK: u8 = 0b11;
+    const IMPORT_META_HOT_SHIFT: u32 = 2;
 
     pub(crate) fn encode<W: bun_io::Write>(&self, writer: &mut W) -> crate::CrateResult<()> {
         writer.write_int_le::<u32>(self.cache_version)?;
-        writer.write_int_le::<u8>(self.module_type as u8)?;
+        writer.write_int_le::<u8>(
+            self.module_type as u8 | (self.import_meta_hot as u8) << Self::IMPORT_META_HOT_SHIFT,
+        )?;
         writer.write_int_le::<u8>(self.output_encoding.0)?;
 
         writer.write_int_le::<u64>(self.features_hash)?;
@@ -239,12 +247,15 @@ impl Metadata {
         self.esm_record_byte_length = reader.read_int_le::<u64>()?;
         self.esm_record_hash = reader.read_int_le::<u64>()?;
 
-        self.module_type = match module_type_raw {
+        self.module_type = match module_type_raw & Self::MODULE_TYPE_MASK {
             1 => ModuleType::Esm,
             2 => ModuleType::Cjs,
             // Invalid module type
             _ => return Err(crate::CrateError::InvalidModuleType),
         };
+        self.import_meta_hot =
+            ImportMetaHotUse::from_bits(module_type_raw >> Self::IMPORT_META_HOT_SHIFT)
+                .ok_or(crate::CrateError::InvalidModuleType)?;
 
         self.output_encoding = Encoding(output_encoding_raw);
         match self.output_encoding {
@@ -276,6 +287,7 @@ impl Entry {
         esm_record: &[u8],
         output_code: &BunString,
         exports_kind: ExportsKind,
+        import_meta_hot: ImportMetaHotUse,
     ) -> crate::CrateResult<()> {
         let _tracer = bun_core::perf::trace("RuntimeTranspilerCache.save");
 
@@ -302,6 +314,7 @@ impl Entry {
                         ExportsKind::Cjs => ModuleType::Cjs,
                         _ => ModuleType::Esm,
                     },
+                    import_meta_hot,
                     output_encoding: if output_code.is_utf16() {
                         Encoding::UTF16
                     } else if output_code.is_utf8() {
@@ -645,6 +658,7 @@ impl RuntimeTranspilerCache {
         input_hash: u64,
         feature_hashes: [u64; 3],
         input_stat_size: u64,
+        runtime_hot: bool,
     ) -> crate::CrateResult<Entry> {
         let _tracer = bun_core::perf::trace("RuntimeTranspilerCache.fromFile");
 
@@ -653,6 +667,7 @@ impl RuntimeTranspilerCache {
             input_hash,
             feature_hashes,
             input_stat_size,
+            runtime_hot,
         )
     }
 
@@ -661,6 +676,7 @@ impl RuntimeTranspilerCache {
         input_hash: u64,
         feature_hashes: [u64; 3],
         input_stat_size: u64,
+        runtime_hot: bool,
     ) -> crate::CrateResult<Entry> {
         let mut metadata_bytes_buf = [0u8; Metadata::SIZE];
         // NONBLOCK: a FIFO must not block the open. On Windows it would make the handle overlapped.
@@ -700,6 +716,11 @@ impl RuntimeTranspilerCache {
             return Err(crate::CrateError::MismatchedFeatureHash);
         }
 
+        if !entry.metadata.import_meta_hot.fits(runtime_hot) {
+            // The parse that follows writes the entry for this mode.
+            return Err(crate::CrateError::MismatchedImportMetaHot);
+        }
+
         entry.load(&file, stat_size)?;
 
         cache_file.keep();
@@ -714,6 +735,7 @@ impl RuntimeTranspilerCache {
         esm_record: &[u8],
         source_code: &BunString,
         exports_kind: ExportsKind,
+        import_meta_hot: ImportMetaHotUse,
     ) -> crate::CrateResult<()> {
         let _tracer = bun_core::perf::trace("RuntimeTranspilerCache.toFile");
 
@@ -741,6 +763,7 @@ impl RuntimeTranspilerCache {
             esm_record,
             source_code,
             exports_kind,
+            import_meta_hot,
         )
     }
 
@@ -795,6 +818,7 @@ impl RuntimeTranspilerCache {
             &esm_record,
             &StringView::ascii(output_code),
             parsed.exports_kind,
+            parsed.import_meta_hot,
         );
         if let Err(err) = result {
             bun_core::scoped_log!(cache, "put() = {}", err.name());
@@ -807,6 +831,7 @@ impl RuntimeTranspilerCache {
             exports_kind: ExportsKind::None,
             uses_test_api: false,
             imports_vitest: false,
+            import_meta_hot: ImportMetaHotUse::Absent,
         });
         CacheLookup::Miss(&mut self.parsed)
     }
@@ -864,6 +889,7 @@ impl bun_js_parser::TranspilerCache for RuntimeTranspilerCache {
             input_hash,
             [features_hash, test_features_hash, vitest_features_hash],
             source.contents.len() as u64,
+            parser_options.features.runtime_hot,
         ) {
             Ok(e) => Some(e),
             Err(err) => {

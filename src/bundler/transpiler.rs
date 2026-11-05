@@ -1316,6 +1316,10 @@ impl<'a> Transpiler<'a> {
                     self.options.defers_requires && this_parse.allow_commonjs;
                 opts.features.defers_requires =
                     opts.features.lists_loads && is_in_known_package(source.path.text);
+                // An entry point that is evaluated from a string has no CommonJS wrapper to take its `import.meta` from.
+                opts.features.runtime_hot = self
+                    .options
+                    .has_import_meta_hot(&source.path, this_parse.remove_cjs_module_wrapper);
 
                 opts.features.inlining = self.options.inlining;
                 opts.features.auto_import_jsx = self.options.auto_import_jsx;

@@ -1492,6 +1492,11 @@ impl Run<'_> {
             cli::command::HotReload::Hot => {
                 bun_removable_features::removable_body!(HotReload, Abort, {
                     bun_jsc::hot_reloader::enable_hot_module_reloading(vm, entry, None);
+                    // What a reload evaluates again gets `import.meta.hot`: the modules of an entry point.
+                    // A compiled executable has the expression folded in already.
+                    let runtime_hot = entry.is_some() && vm.standalone_module_graph.is_none();
+                    vm.transpiler
+                        .with_mut(|t| t.options.runtime_hot = runtime_hot);
                     // `bun bake` (no entry module) starts again when `bake.config.ts` changes: the kill signal's JS handlers run first, as in watch mode.
                     if entry.is_none() {
                         bun_jsc::posix_signal_handle::set_watch_kill_signal(
@@ -1604,7 +1609,7 @@ impl Run<'_> {
         if vm.is_watcher_enabled() {
             vm.report_exception_in_hot_reloaded_module_if_needed();
             loop {
-                while vm.is_event_loop_alive() {
+                while vm.is_hot_event_loop_alive() {
                     // After an unhandled error, only immediates keep the loop alive.
                     vm.timers_ran_after_error
                         .update(|ran| ran | (vm.unhandled_error_counter.get() > 0));
@@ -1612,8 +1617,18 @@ impl Run<'_> {
                     vm.report_exception_in_hot_reloaded_module_if_needed();
                     vm.auto_tick_active();
                 }
+                // Nothing is left that could settle what a reload's `dispose()` callbacks wait for.
+                if vm.finish_reload_after_dispose() {
+                    // Not started by a task: run its microtasks before the loop is looked at again.
+                    vm.tick();
+                    continue;
+                }
                 vm.on_before_exit();
                 vm.report_exception_in_hot_reloaded_module_if_needed();
+                // That can have started a reload that waits for its `dispose()` callbacks.
+                if vm.is_hot_reload_disposing() {
+                    continue;
+                }
                 // Watcher arm keeps the process alive across reloads.
                 vm.event_loop().tick_possibly_forever();
             }

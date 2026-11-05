@@ -216,6 +216,7 @@ impl<'a> Options<'a> {
                 react_compiler: f.react_compiler,
                 react_compiler_parse_test_pragmas: f.react_compiler_parse_test_pragmas,
                 hot_module_reloading: f.hot_module_reloading,
+                runtime_hot: f.runtime_hot,
                 server_components: f.server_components,
                 is_macro_runtime: f.is_macro_runtime,
                 top_level_await: f.top_level_await,
@@ -382,6 +383,49 @@ pub struct ParsedForCache {
     pub exports_kind: js_ast::ExportsKind,
     pub uses_test_api: bool,
     pub imports_vitest: bool,
+    pub import_meta_hot: ImportMetaHotUse,
+}
+
+/// What the parse behind a cache entry did with `import.meta.hot`. A parse for `bun --hot` leaves
+/// the expression alone and every other parse folds it to `undefined`, so the output of one is not
+/// the output of the other. Both have the same features hash: the entry of a file without the
+/// expression serves both.
+#[repr(u8)]
+#[derive(Copy, Clone, PartialEq, Eq, Default)]
+pub enum ImportMetaHotUse {
+    /// The source does not have the expression.
+    #[default]
+    Absent = 0,
+    Folded = 1,
+    Kept = 2,
+}
+
+impl ImportMetaHotUse {
+    pub(crate) fn of_parse(names_import_meta_hot: bool, runtime_hot: bool) -> Self {
+        match (names_import_meta_hot, runtime_hot) {
+            (false, _) => Self::Absent,
+            (true, false) => Self::Folded,
+            (true, true) => Self::Kept,
+        }
+    }
+
+    /// Whether a parse with this `runtime_hot` prints what the entry holds.
+    pub fn fits(self, runtime_hot: bool) -> bool {
+        match self {
+            Self::Absent => true,
+            Self::Folded => !runtime_hot,
+            Self::Kept => runtime_hot,
+        }
+    }
+
+    pub fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Absent),
+            1 => Some(Self::Folded),
+            2 => Some(Self::Kept),
+            _ => None,
+        }
+    }
 }
 
 // ── live `Parser::init` ───────────────────────────────────────────────────
@@ -2563,6 +2607,10 @@ impl<'a> Parser<'a> {
                     exports_kind,
                     uses_test_api,
                     imports_vitest,
+                    import_meta_hot: ImportMetaHotUse::of_parse(
+                        p.names_import_meta_hot,
+                        p.options.features.runtime_hot,
+                    ),
                 });
             }
         }
