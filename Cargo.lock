@@ -243,6 +243,7 @@ dependencies = [
  "bun_sys",
  "bun_tar",
  "bun_wyhash",
+ "bun_zip",
  "scopeguard",
  "thiserror",
 ]
@@ -2237,6 +2238,16 @@ dependencies = [
 [[package]]
 name = "bun_yarr"
 version = "0.0.0"
+
+[[package]]
+name = "bun_zip"
+version = "0.0.0"
+dependencies = [
+ "bun_alloc",
+ "bun_core",
+ "bun_zlib",
+ "thiserror",
+]
 
 [[package]]
 name = "bun_zlib"

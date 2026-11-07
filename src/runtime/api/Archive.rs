@@ -1,26 +1,32 @@
-//! `Bun.Archive` — tar/tgz pack + extract.
+//! `Bun.Archive`: tar, tar.gz and zip, packed and extracted.
 
 use crate::webcore::Blob;
 use crate::webcore::BlobExt as _;
 use crate::webcore::blob::store::{self, S3Ext as _};
 use crate::webcore::blob::{Store, WriteFileOptions, write_file_with_s3_options};
-use bun_archive::tar;
+use bun_archive::{AnyError, Format, Modified, tar, zip};
 use bun_core::{self, Output, Utf8Bytes, ZBox, strings};
 use bun_glob as glob;
 use bun_jsc::bindgen::{JsLocal, JsScope};
-use bun_jsc::{self as jsc, JSGlobalObject, JSMap, JSPromise, JSPromiseStrong, JSValue, JsResult};
+use bun_jsc::{
+    self as jsc, JSGlobalObject, JSMap, JSPromise, JSPromiseStrong, JSValue, JsError, JsResult,
+};
 use bun_jsc::{StringJsc as _, SysErrorJsc};
 use bun_ptr::RefPtr;
 #[cfg(unix)]
 use bun_sys::beneath::{self, Symlinks};
 use bun_sys::{self, Fd, FdDirExt as _, FdExt as _, Mode};
 
-/// Compression options for the archive
+/// What is made of the store's bytes when the archive is given out.
 #[derive(Clone, Copy, Default)]
 pub(crate) enum Compression {
+    /// Nothing: the store is the archive.
     #[default]
     None,
+    /// The whole store as one gzip stream.
     Gzip(GzipOptions),
+    /// For a zip that the constructor wrote, whose members are in the store uncompressed: each one deflated.
+    Deflate(DeflateOptions),
 }
 
 #[derive(Clone, Copy)]
@@ -29,12 +35,60 @@ pub(crate) struct GzipOptions {
     pub level: u8,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DeflateOptions {
+    /// As for gzip.
+    pub level: u8,
+}
+
+/// What is known about the bytes of an archive's store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Known {
+    /// Nothing. They are read as what they look like: a tar, and if they are not one, a zip.
+    Nothing,
+    /// The caller said that they are a tar, or the constructor wrote one.
+    Tar,
+    /// The caller said that they are a zip. Its members stay as they are.
+    Zip,
+    /// The constructor wrote a zip and stored every member, which is what `Compression::Deflate` works on.
+    StoredZip,
+}
+
+impl Known {
+    fn given(format: Option<Format>) -> Self {
+        match format {
+            None => Self::Nothing,
+            Some(Format::Tar) => Self::Tar,
+            Some(Format::Zip) => Self::Zip,
+        }
+    }
+
+    fn written(format: Format) -> Self {
+        match format {
+            Format::Tar => Self::Tar,
+            Format::Zip => Self::StoredZip,
+        }
+    }
+
+    fn format(self) -> Option<Format> {
+        match self {
+            Self::Nothing => None,
+            Self::Tar => Some(Format::Tar),
+            Self::Zip | Self::StoredZip => Some(Format::Zip),
+        }
+    }
+}
+
 pub(crate) struct Archive {
     /// The underlying data for the archive - uses Blob.Store for thread-safe ref counting
     store: RefPtr<Store>,
     /// Compression settings for this archive
     compress: Compression,
+    known: Known,
 }
+
+// `known` is in the padding behind `compress`.
+const _: () = assert!(core::mem::size_of::<Archive>() == 16);
 
 /// The bytes of an archive and what is made of them before they leave, on a pool thread.
 pub(crate) struct Rendering {
@@ -67,7 +121,7 @@ impl Archive {
         let rendering = self.rendering(self.compress);
         match rendering.compress {
             Compression::None => Outgoing::Store(rendering.store),
-            Compression::Gzip(_) => Outgoing::Render(rendering),
+            Compression::Gzip(_) | Compression::Deflate(_) => Outgoing::Render(rendering),
         }
     }
 }
@@ -85,6 +139,7 @@ fn changes(bytes: &[u8], compress: Compression) -> bool {
         Compression::None => false,
         // Bytes that are gzip already are the archive, gzipped.
         Compression::Gzip(_) => !tar::gzip::starts_like_header(bytes),
+        Compression::Deflate(_) => true,
     }
 }
 
@@ -94,6 +149,7 @@ fn render(bytes: &[u8], compress: Compression) -> Result<Option<Vec<u8>>, Compre
         _ if !changes(bytes, compress) => Ok(None),
         Compression::None => Ok(None),
         Compression::Gzip(options) => compress_gzip(bytes, options.level).map(Some),
+        Compression::Deflate(options) => deflate_zip(bytes, options.level).map(Some),
     }
 }
 
@@ -135,7 +191,8 @@ impl Archive {
                         Archive,
                         Abort,
                         count_files_in_archive,
-                        data
+                        data,
+                        self.known.format()
                     ))),
                     jsc::JSType::NumberObject,
                 )
@@ -151,8 +208,8 @@ impl Archive {
 
 /// Count the number of files in an archive
 #[inline(never)]
-fn count_files_in_archive(data: &[u8]) -> u32 {
-    let Ok(mut reader) = bun_archive::open_memory(data, tar::Dialect::General) else {
+fn count_files_in_archive(data: &[u8], format: Option<Format>) -> u32 {
+    let Ok(mut reader) = bun_archive::open(data, format) else {
         return 0;
     };
     let mut count: u32 = 0;
@@ -168,11 +225,12 @@ impl Archive {
     /// Constructor: new Archive(data, options?)
     /// Creates an Archive from either:
     /// - An object { [path: string]: Blob | string | ArrayBufferView | ArrayBufferLike }
-    /// - A Blob, ArrayBufferView, or ArrayBufferLike (assumes it's already a valid archive)
+    /// - A Blob, ArrayBufferView, or ArrayBufferLike (existing archive data)
     /// Options:
-    /// - compress: "gzip" - Enable gzip compression
+    /// - format: "tar" | "zip" - What to create from an object (default "tar"), or what existing data is
+    /// - compress: "gzip" for tar, "deflate" | "store" for a zip that is created (default "deflate")
     /// - level: number (1-12) - Compression level (default 6)
-    /// When no options are provided, no compression is applied
+    /// When no options are provided, a tar is created and no compression is applied
     pub(crate) fn constructor(
         cx: &mut JsScope<'_>,
         data: JsLocal<'_>,
@@ -181,29 +239,32 @@ impl Archive {
         let global = cx.global();
         let data = data.to_js();
 
-        // Parse compression options
-        let compress = parse_compression_options(global, options.to_js())?;
+        let options = Options::from_js(global, options.to_js())?;
 
         // For Blob/Archive, ref the existing store (zero-copy)
         if let Some(blob) = blob_from_js(data) {
+            let compress = options.for_given(global, blob.shared_view())?;
             if let Some(store) = blob.store.get().as_ref() {
                 return Ok(Self {
                     store: store.clone(),
                     compress,
+                    known: Known::given(options.format),
                 });
             }
         }
 
         // For ArrayBuffer/TypedArray, copy the data
         if let Some(array_buffer) = data.as_array_buffer(global) {
+            let compress = options.for_given(global, array_buffer.slice())?;
             let data: Vec<u8> = array_buffer.slice().to_vec();
-            return Ok(create_archive(data, compress));
+            return Ok(create_archive(data, compress, Known::given(options.format)));
         }
 
-        // For plain objects, build a tarball
+        // For plain objects, build a tarball or a zip
         if data.is_object() {
-            let data = build_tarball_from_object(global, data)?;
-            return Ok(create_archive(data, compress));
+            let (format, compress) = options.for_object(global)?;
+            let data = build_from_object(global, data, format)?;
+            return Ok(create_archive(data, compress, Known::written(format)));
         }
 
         Err(global.throw_invalid_arguments(format_args!(
@@ -212,42 +273,77 @@ impl Archive {
     }
 }
 
-/// Parse compression options from JS value
-/// Returns .none if no compression specified, caller must handle defaults
-fn parse_compression_options(
-    global: &JSGlobalObject,
-    options_arg: JSValue,
-) -> JsResult<Compression> {
-    // No options provided means no compression (caller handles defaults)
-    if options_arg.is_undefined_or_null() {
-        return Ok(Compression::None);
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Compress {
+    Gzip,
+    Deflate,
+    Store,
+}
 
-    if !options_arg.is_object() {
-        return Err(
-            global.throw_invalid_arguments(format_args!("Archive: options must be an object"))
-        );
-    }
+/// The options as they were given. What they mean depends on the data they come with.
+#[derive(Clone, Copy, Default)]
+struct Options {
+    format: Option<Format>,
+    compress: Option<Compress>,
+    level: Option<u8>,
+}
 
-    // Check for compress option
-    if let Some(compress_val) = options_arg.get_truthy(global, "compress")? {
-        // compress must be "gzip"
-        if !compress_val.is_string() {
-            return Err(global.throw_invalid_arguments(format_args!(
-                "Archive: compress option must be a string"
-            )));
+const DEFAULT_LEVEL: u8 = 6;
+
+impl Options {
+    fn from_js(global: &JSGlobalObject, options_arg: JSValue) -> JsResult<Options> {
+        let mut options = Options::default();
+        if options_arg.is_undefined_or_null() {
+            return Ok(options);
         }
 
-        let compress_str = compress_val.to_utf8(global)?;
-
-        if compress_str.slice() != b"gzip" {
-            return Err(global.throw_invalid_arguments(format_args!(
-                "Archive: compress option must be \"gzip\""
-            )));
+        if !options_arg.is_object() {
+            return Err(
+                global.throw_invalid_arguments(format_args!("Archive: options must be an object"))
+            );
         }
 
-        // Parse level option (1-12, default 6)
-        let mut level: u8 = 6;
+        if let Some(format_val) = options_arg.get_truthy(global, "format")? {
+            if !format_val.is_string() {
+                return Err(global.throw_invalid_arguments(format_args!(
+                    "Archive: format option must be a string"
+                )));
+            }
+            let format_str = format_val.to_utf8(global)?;
+            options.format = Some(match format_str.slice() {
+                b"tar" => Format::Tar,
+                b"zip" => Format::Zip,
+                _ => {
+                    return Err(global.throw_invalid_arguments(format_args!(
+                        "Archive: format option must be \"tar\" or \"zip\""
+                    )));
+                }
+            });
+        }
+
+        if let Some(compress_val) = options_arg.get_truthy(global, "compress")? {
+            if !compress_val.is_string() {
+                return Err(global.throw_invalid_arguments(format_args!(
+                    "Archive: compress option must be a string"
+                )));
+            }
+            let compress_str = compress_val.to_utf8(global)?;
+            options.compress = Some(match compress_str.slice() {
+                b"gzip" => Compress::Gzip,
+                b"deflate" => Compress::Deflate,
+                b"store" => Compress::Store,
+                _ => {
+                    return Err(global.throw_invalid_arguments(format_args!(
+                        "Archive: compress option must be \"gzip\", \"deflate\" or \"store\""
+                    )));
+                }
+            });
+        }
+
+        // A tar without `compress` has nothing that a level applies to, and never looked at it.
+        if options.compress.is_none() && options.format != Some(Format::Zip) {
+            return Ok(options);
+        }
         if let Some(level_val) = options_arg.get_truthy(global, "level")? {
             if !level_val.is_number() {
                 return Err(
@@ -260,25 +356,173 @@ fn parse_compression_options(
                     "Archive: level must be between 1 and 12"
                 )));
             }
-            level = u8::try_from(level_num).expect("int cast");
+            options.level = Some(u8::try_from(level_num).expect("int cast"));
         }
-
-        return Ok(Compression::Gzip(GzipOptions { level }));
+        Ok(options)
     }
 
-    // No compress option specified in options object means no compression
-    Ok(Compression::None)
+    fn level(self) -> u8 {
+        self.level.unwrap_or(DEFAULT_LEVEL)
+    }
+
+    /// A zip is not gzipped, and the members of one that was not created here are what they are.
+    fn zip_exists(global: &JSGlobalObject) -> JsError {
+        global.throw_invalid_arguments(format_args!(
+            "Archive: compress cannot be used with existing zip data. It is for a tar archive, and for a zip archive that is created from an object"
+        ))
+    }
+
+    fn stored_has_no_level(self, global: &JSGlobalObject) -> JsResult<()> {
+        if self.level.is_some() {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "Archive: level cannot be used with compress \"store\""
+            )));
+        }
+        Ok(())
+    }
+
+    /// For bytes that the caller gives, which `format` may name. A tar can be gzipped as a whole, and the members of a
+    /// zip that exists stay as they are. `bytes` is empty for data that is not in memory.
+    fn for_given(self, global: &JSGlobalObject, bytes: &[u8]) -> JsResult<Compression> {
+        match self.compress {
+            None => Ok(Compression::None),
+            Some(Compress::Deflate | Compress::Store) => Err(global.throw_invalid_arguments(
+                format_args!(
+                    "Archive: compress \"deflate\" and \"store\" are for a zip archive that is created from an object"
+                ),
+            )),
+            Some(Compress::Gzip) => {
+                // Without a `format` the bytes are what they will be read as.
+                let format = self.format.or_else(|| {
+                    bun_archive::open(bytes, None)
+                        .ok()
+                        .map(|reader| reader.format())
+                });
+                if format == Some(Format::Zip) {
+                    return Err(Self::zip_exists(global));
+                }
+                Ok(Compression::Gzip(GzipOptions {
+                    level: self.level(),
+                }))
+            }
+        }
+    }
+
+    /// For an object: what the constructor writes, and what is made of that later.
+    fn for_object(self, global: &JSGlobalObject) -> JsResult<(Format, Compression)> {
+        match (self.format.unwrap_or(Format::Tar), self.compress) {
+            (Format::Tar, None) => Ok((Format::Tar, Compression::None)),
+            (Format::Tar, Some(Compress::Gzip)) => Ok((
+                Format::Tar,
+                Compression::Gzip(GzipOptions {
+                    level: self.level(),
+                }),
+            )),
+            (Format::Tar, Some(Compress::Deflate | Compress::Store)) => Err(global
+                .throw_invalid_arguments(format_args!(
+                    "Archive: compress option must be \"gzip\" for a tar archive"
+                ))),
+            (Format::Zip, None | Some(Compress::Deflate)) => Ok((
+                Format::Zip,
+                Compression::Deflate(DeflateOptions {
+                    level: self.level(),
+                }),
+            )),
+            (Format::Zip, Some(Compress::Store)) => {
+                self.stored_has_no_level(global)?;
+                Ok((Format::Zip, Compression::None))
+            }
+            (Format::Zip, Some(Compress::Gzip)) => {
+                Err(global.throw_invalid_arguments(format_args!(
+                    "Archive: compress option must be \"deflate\" or \"store\" for a zip archive"
+                )))
+            }
+        }
+    }
+
+    /// For `Archive.write(path, archive, options)`. `None`: the options say nothing, and the archive's setting stays.
+    fn for_archive(
+        self,
+        global: &JSGlobalObject,
+        archive: &Archive,
+    ) -> JsResult<Option<Compression>> {
+        if self.format.is_some() {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "Archive: format cannot be used with an Archive. It is an option of the constructor"
+            )));
+        }
+        if archive.known != Known::StoredZip {
+            let given = Options {
+                format: archive.known.format(),
+                ..self
+            };
+            return Ok(
+                match given.for_given(global, archive.store.shared_view())? {
+                    Compression::None => None,
+                    compress => Some(compress),
+                },
+            );
+        }
+        match self.compress {
+            None => Ok(None),
+            Some(Compress::Deflate) => Ok(Some(Compression::Deflate(DeflateOptions {
+                level: self.level(),
+            }))),
+            Some(Compress::Store) => {
+                self.stored_has_no_level(global)?;
+                Ok(Some(Compression::None))
+            }
+            Some(Compress::Gzip) => Err(global.throw_invalid_arguments(format_args!(
+                "Archive: compress option must be \"deflate\" or \"store\" for a zip archive"
+            ))),
+        }
+    }
 }
 
-fn create_archive(data: Vec<u8>, compress: Compression) -> Archive {
+fn create_archive(data: Vec<u8>, compress: Compression, known: Known) -> Archive {
     let store = Store::init(data);
-    Archive { store, compress }
+    Archive {
+        store,
+        compress,
+        known,
+    }
 }
 
 /// The caller's `value` keeps the `Blob` alive.
 #[inline]
 fn blob_from_js(value: JSValue) -> Option<&'static Blob> {
     value.as_class_ref::<Blob>()
+}
+
+fn build_from_object(global: &JSGlobalObject, obj: JSValue, format: Format) -> JsResult<Vec<u8>> {
+    match format {
+        Format::Zip => build_zip_from_object(global, obj),
+        Format::Tar => build_tarball_from_object(global, obj),
+    }
+}
+
+/// Calls `add` with the name and the value of each property of `obj`, in the order of the object.
+fn each_entry(
+    global: &JSGlobalObject,
+    js_obj: *mut jsc::JSObject,
+    mut add: impl FnMut(&[u8], JSValue) -> JsResult<()>,
+) -> JsResult<()> {
+    let iter = jsc::JSPropertyIterator::init(
+        global,
+        js_obj,
+        jsc::PropertyIteratorOptions {
+            skip_empty_name: true,
+            include_value: true,
+        },
+    )?;
+
+    while let Some((key, value)) = iter.next()? {
+        if value == JSValue::ZERO {
+            continue;
+        }
+        add(key.to_utf8().slice(), value)?;
+    }
+    Ok(())
 }
 
 /// Shared helper that builds tarball bytes from a JS object
@@ -296,39 +540,124 @@ fn build_tarball_from_object(global: &JSGlobalObject, obj: JSValue) -> JsResult<
     let now_secs: i64 = bun_core::time::milli_timestamp() / 1000;
 
     // Iterate over object properties and write directly to archive
-    let iter = jsc::JSPropertyIterator::init(
-        global,
-        js_obj,
-        jsc::PropertyIteratorOptions {
-            skip_empty_name: true,
-            include_value: true,
-        },
-    )?;
-
-    while let Some((key, value)) = iter.next()? {
-        if value == JSValue::ZERO {
-            continue;
-        }
-
-        let key_slice = key.to_utf8();
-
+    each_entry(global, js_obj, |path, value| {
         // Get data - use view for Blob/ArrayBuffer, convert for strings
         let mut array_buffer = None;
         let data_slice = get_entry_data(global, value, &mut array_buffer)?;
         let data = data_slice.slice();
-
         writer
             .header(&tar::writer::File {
-                path: key_slice.slice(),
+                path,
                 size: data.len() as u64,
                 perm: 0o644,
                 mtime: now_secs,
             })
             .map_err(fail)?;
         writer.data(data).map_err(fail)?;
-    }
+        Ok(())
+    })?;
 
     writer.finish(true).map_err(fail)
+}
+
+/// The name of a zip entry for a key of the object. A zip has `/` between the parts of a path on every system.
+fn zip_name(key: &[u8], windows: bool) -> std::borrow::Cow<'_, [u8]> {
+    if !windows || !strings::contains_char(key, b'\\') {
+        return key.into();
+    }
+    let mut name = key.to_vec();
+    for byte in &mut name {
+        if *byte == b'\\' {
+            *byte = b'/';
+        }
+    }
+    name.into()
+}
+
+/// Builds a zip with every member stored, which costs a copy and a CRC-32. `deflate_zip` compresses it on a pool thread.
+fn build_zip_from_object(global: &JSGlobalObject, obj: JSValue) -> JsResult<Vec<u8>> {
+    let Some(js_obj) = obj.get_object() else {
+        return Err(global.throw_invalid_arguments(format_args!("Expected an object")));
+    };
+    // The entries of a Map or a Set are not properties, and the archive would be empty.
+    if matches!(obj.js_type(), jsc::JSType::Map | jsc::JSType::Set) {
+        return Err(global.throw_invalid_arguments(format_args!(
+            "Archive: a zip archive is created from an object. For a Map, pass Object.fromEntries(map)"
+        )));
+    }
+
+    let now_ms = bun_core::time::milli_timestamp();
+    let local = global.ms_to_gregorian_date_time(now_ms as f64);
+    let field = |value: i32| u8::try_from(value).unwrap_or(0);
+    let file = zip::Meta {
+        permissions: 0o644,
+        mtime: u32::try_from(now_ms / 1000).unwrap_or(0),
+        // Readers that do not know the UTC field take this for the local time of the writer.
+        dos: zip::DosDateTime {
+            year: u16::try_from(local.year).unwrap_or(1980),
+            month: field(local.month),
+            day: field(local.day),
+            hour: field(local.hour),
+            minute: field(local.minute),
+            second: field(local.second),
+        },
+    };
+    let directory = zip::Meta {
+        permissions: 0o755,
+        ..file
+    };
+    let mut writer = zip::Writer::new();
+    let fail = |err: zip::Error| match err {
+        zip::Error::Alloc(_) => global.throw_out_of_memory(),
+        err => global.throw_invalid_arguments(format_args!("Archive: {err}")),
+    };
+
+    each_entry(global, js_obj, |key, value| {
+        let name = zip_name(key, cfg!(windows));
+        let mut array_buffer = None;
+        let data = get_zip_entry_data(global, value, &mut array_buffer)?;
+        let meta = if name.last() == Some(&b'/') {
+            &directory
+        } else {
+            &file
+        };
+        writer
+            .add(&name, zip::Contents::Stored(data.slice()), meta)
+            .map_err(fail)
+    })?;
+
+    writer.finish().map_err(fail)
+}
+
+/// The bytes of a value for a zip. A tar takes any value and makes a string of it. A zip has no users that
+/// depend on that, so what is not bytes or a string is refused, and so is a file whose bytes are not in memory.
+fn get_zip_entry_data<'a>(
+    global: &JSGlobalObject,
+    value: JSValue,
+    array_buffer: &'a mut Option<bun_jsc::ArrayBuffer>,
+) -> JsResult<Utf8Bytes<'a>> {
+    if let Some(blob) = blob_from_js(value) {
+        let in_memory = blob
+            .store
+            .get()
+            .as_ref()
+            .is_none_or(|store| matches!(store.data, store::Data::Bytes(_)));
+        if !in_memory {
+            return Err(global.throw_invalid_arguments(format_args!(
+                "Archive: a zip entry cannot be a Bun.file() or an S3 file yet. Pass its bytes: `await file.bytes()`"
+            )));
+        }
+        return Ok(Utf8Bytes::Borrowed(blob.shared_view()));
+    }
+    if let Some(buffer) = value.as_array_buffer(global) {
+        return Ok(Utf8Bytes::Borrowed(array_buffer.insert(buffer).slice()));
+    }
+    if value.is_string() {
+        return value.to_utf8(global);
+    }
+    Err(global.throw_invalid_arguments(format_args!(
+        "Archive: a zip entry must be a string, a Blob, a TypedArray or an ArrayBuffer"
+    )))
 }
 
 fn get_entry_data<'a>(
@@ -352,7 +681,7 @@ fn get_entry_data<'a>(
 }
 
 impl Archive {
-    /// `Archive.write(path, data, options?)`. `options.gzip` overrides the compression of an `Archive` given as `data`.
+    /// `Archive.write(path, data, options?)`. `options.compress` overrides the compression of an `Archive` given as `data`.
     pub(crate) fn write(
         cx: &mut JsScope<'_>,
         path: JsLocal<'_>,
@@ -372,16 +701,13 @@ impl Archive {
 
         let path_slice = path_arg.to_utf8(global)?;
 
-        // Parse options for compression override
-        let options_compress = parse_compression_options(global, options.to_js())?;
+        let options = Options::from_js(global, options.to_js())?;
 
         // For Archive instances, use options override or archive's compression settings
         if let Some(archive) = data_arg.as_class_ref::<Archive>() {
-            let compress = if !matches!(options_compress, Compression::None) {
-                options_compress
-            } else {
-                archive.compress
-            };
+            let compress = options
+                .for_archive(global, archive)?
+                .unwrap_or(archive.compress);
             let rendering = archive.rendering(compress);
             return start_write_task(
                 &cx,
@@ -393,36 +719,29 @@ impl Archive {
 
         // For Blobs, use store reference with options compression
         if let Some(blob) = blob_from_js(data_arg) {
+            let compress = options.for_given(global, blob.shared_view())?;
             if let Some(store) = blob.store.get().as_ref() {
                 return start_write_task(
                     &cx,
                     WriteData::Store(store.clone()),
                     path_slice.slice(),
-                    options_compress,
+                    compress,
                 );
             }
         }
 
         // For ArrayBuffer/TypedArray, copy the data with options compression
         if let Some(array_buffer) = data_arg.as_array_buffer(global) {
+            let compress = options.for_given(global, array_buffer.slice())?;
             let data = array_buffer.slice().to_vec();
-            return start_write_task(
-                &cx,
-                WriteData::Owned(data),
-                path_slice.slice(),
-                options_compress,
-            );
+            return start_write_task(&cx, WriteData::Owned(data), path_slice.slice(), compress);
         }
 
-        // For plain objects, build a tarball with options compression
+        // For plain objects, build a tarball or a zip with options compression
         if data_arg.is_object() {
-            let data = build_tarball_from_object(global, data_arg)?;
-            return start_write_task(
-                &cx,
-                WriteData::Owned(data),
-                path_slice.slice(),
-                options_compress,
-            );
+            let (format, compress) = options.for_object(global)?;
+            let data = build_from_object(global, data_arg, format)?;
+            return start_write_task(&cx, WriteData::Owned(data), path_slice.slice(), compress);
         }
 
         Err(global.throw_invalid_arguments(format_args!(
@@ -468,7 +787,13 @@ impl Archive {
             }
         }
 
-        start_extract_task(&cx, &self.store, path_slice.slice(), glob_patterns)
+        start_extract_task(
+            &cx,
+            &self.store,
+            self.known.format(),
+            path_slice.slice(),
+            glob_patterns,
+        )
     }
 }
 
@@ -567,7 +892,7 @@ impl Archive {
             glob_patterns = parse_pattern_arg(global, glob, b"Archive.files", b"glob")?;
         }
 
-        start_files_task(&cx, &self.store, glob_patterns)
+        start_files_task(&cx, &self.store, self.known.format(), glob_patterns)
     }
 }
 
@@ -650,6 +975,7 @@ pub(crate) enum ExtractResult {
 
 pub(crate) struct ExtractContext {
     store: RefPtr<Store>,
+    format: Option<Format>,
     path: Box<[u8]>,
     glob_patterns: Option<Vec<GlobPattern>>,
     result: ExtractResult,
@@ -686,6 +1012,7 @@ impl ExtractContext {
         if self.glob_patterns.is_some() {
             let count = match extract_to_disk_filtered(
                 self.store.shared_view(),
+                self.format,
                 &self.path,
                 self.glob_patterns.as_deref(),
             ) {
@@ -696,11 +1023,10 @@ impl ExtractContext {
         }
 
         // Otherwise use the fast path without filtering
-        let count = match bun_archive::Archiver::extract_to_disk(
+        let count = match bun_archive::Archiver::extract_to_disk_any(
             self.store.shared_view(),
             &self.path,
-            None,
-            &mut (),
+            self.format,
             bun_archive::ExtractOptions {
                 depth_to_skip: 0,
                 close_handles: true,
@@ -725,6 +1051,7 @@ pub(crate) type ExtractTask = AsyncTask<ExtractContext>;
 fn start_extract_task(
     cx: &bun_jsc::JsThread<'_>,
     store: &RefPtr<Store>,
+    format: Option<Format>,
     path: &[u8],
     glob_patterns: Option<Vec<GlobPattern>>,
 ) -> JsResult<JSValue> {
@@ -738,6 +1065,7 @@ fn start_extract_task(
         cx,
         ExtractContext {
             store,
+            format,
             path: path_copy,
             glob_patterns,
             result: ExtractResult::Err(ExtractError::ReadError),
@@ -1025,7 +1353,7 @@ pub(crate) fn write_rendered(
 struct FileEntry {
     path: Box<[u8]>,
     data: Vec<u8>,
-    mtime: i64,
+    modified: Modified,
 }
 
 type FileEntryList = Vec<FileEntry>;
@@ -1040,7 +1368,7 @@ enum FilesError {
 
 enum FilesResult {
     Success(FileEntryList),
-    ArchiveErr(tar::Error),
+    ArchiveErr(AnyError),
     Err(FilesError),
 }
 
@@ -1048,21 +1376,24 @@ enum FilesResult {
 
 pub(crate) struct FilesContext {
     store: RefPtr<Store>,
+    format: Option<Format>,
     glob_patterns: Option<Vec<GlobPattern>>,
     result: FilesResult,
 }
 
 impl FilesContext {
     fn do_run(&mut self) -> Result<FilesResult, bun_alloc::AllocError> {
-        let read_error = |err: tar::Error| match err {
-            tar::Error::Alloc(err) => Err(err),
-            err => Ok(FilesResult::ArchiveErr(err)),
+        let read_error = |err: AnyError| {
+            if err.is_out_of_memory() {
+                Err(bun_alloc::AllocError)
+            } else {
+                Ok(FilesResult::ArchiveErr(err))
+            }
         };
-        let mut reader =
-            match bun_archive::open_memory(self.store.shared_view(), tar::Dialect::General) {
-                Ok(reader) => reader,
-                Err(err) => return read_error(err),
-            };
+        let mut reader = match bun_archive::open(self.store.shared_view(), self.format) {
+            Ok(reader) => reader,
+            Err(err) => return read_error(err),
+        };
 
         let mut entries: FileEntryList = Vec::new();
 
@@ -1086,9 +1417,9 @@ impl FilesContext {
             }
 
             let size: usize = usize::try_from(entry_ref.size().max(0)).expect("int cast");
-            let mtime: i64 = entry_ref.mtime();
 
             let path_copy: Box<[u8]> = Box::from(pathname);
+            let modified = reader.modified();
 
             let mut data: Vec<u8> = Vec::new();
             if let Err(err) = reader.read_data(size, &mut data) {
@@ -1098,7 +1429,7 @@ impl FilesContext {
             entries.push(FileEntry {
                 path: path_copy,
                 data,
-                mtime,
+                modified,
             });
         }
 
@@ -1129,7 +1460,19 @@ impl TaskContext for FilesContext {
                     let blob = Blob::create_with_bytes_and_allocator(data, global, false);
                     blob.is_jsdom_file.set(true);
                     blob.name.set(bun_core::String::clone_utf8(&entry.path));
-                    blob.last_modified.set(entry.mtime as f64 * 1000.0);
+                    blob.last_modified.set(match entry.modified {
+                        Modified::Utc(seconds) => seconds as f64 * 1000.0,
+                        // A date that does not exist moves to one that does, as in `new Date(year, month, day)`.
+                        Modified::Local(dos) => global.gregorian_date_time_to_ms(
+                            i32::from(dos.year),
+                            i32::from(dos.month),
+                            i32::from(dos.day),
+                            i32::from(dos.hour),
+                            i32::from(dos.minute),
+                            i32::from(dos.second),
+                            0,
+                        )?,
+                    });
 
                     let name_js = blob.name.get().to_js(global)?;
                     let blob_js = blob.into_js(global);
@@ -1154,6 +1497,7 @@ pub(crate) type FilesTask = AsyncTask<FilesContext>;
 fn start_files_task(
     cx: &bun_jsc::JsThread<'_>,
     store: &RefPtr<Store>,
+    format: Option<Format>,
     glob_patterns: Option<Vec<GlobPattern>>,
 ) -> JsResult<JSValue> {
     let store = store.clone();
@@ -1165,6 +1509,7 @@ fn start_files_task(
         cx,
         FilesContext {
             store,
+            format,
             glob_patterns,
             result: FilesResult::Err(FilesError::ReadError),
         },
@@ -1181,15 +1526,32 @@ enum CompressError {
     GzipInitFailed,
     #[error("GzipCompressFailed")]
     GzipCompressFailed,
+    #[error("DeflateInitFailed")]
+    DeflateInitFailed,
+    #[error("DeflateCompressFailed")]
+    DeflateCompressFailed,
     /// The output buffer (sized by the data being compressed) could not be allocated.
     #[error("OutOfMemory")]
     OutOfMemory,
+    /// The zip that the constructor wrote could not be read or written again.
+    #[error("{0}")]
+    Zip(zip::Error),
+}
+
+impl From<zip::Error> for CompressError {
+    fn from(err: zip::Error) -> Self {
+        match err {
+            zip::Error::Alloc(_) => Self::OutOfMemory,
+            err => Self::Zip(err),
+        }
+    }
 }
 
 impl CompressError {
     fn to_js(&self, global: &JSGlobalObject) -> JSValue {
         match self {
             CompressError::OutOfMemory => global.create_out_of_memory_error(),
+            CompressError::Zip(err) => global.create_error_instance(format_args!("{err}")),
             other => global.create_error_instance(format_args!("{}", <&'static str>::from(other))),
         }
     }
@@ -1210,6 +1572,60 @@ fn compress_gzip(data: &[u8], level: u8) -> Result<Vec<u8>, CompressError> {
         return Err(CompressError::GzipCompressFailed);
     }
     Ok(output)
+}
+
+/// Appends `data` as a DEFLATE stream with nothing around it.
+fn deflate_raw(
+    compressor: &mut bun_libdeflate_sys::libdeflate::Compressor,
+    data: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), CompressError> {
+    use bun_libdeflate_sys::libdeflate;
+    let result = compressor
+        .compress_to_vec(data, out, libdeflate::Encoding::Deflate)
+        .map_err(|_| CompressError::OutOfMemory)?;
+    if result.status != libdeflate::Status::Success {
+        return Err(CompressError::DeflateCompressFailed);
+    }
+    Ok(())
+}
+
+/// Writes the zip that the constructor made, where every member is stored, with each member deflated that gets
+/// smaller by it. Everything else about a member stays, and so does the order.
+fn deflate_zip(stored: &[u8], level: u8) -> Result<Vec<u8>, CompressError> {
+    use bun_libdeflate_sys::libdeflate;
+    libdeflate::load();
+
+    let mut compressor = libdeflate::OwnedCompressor::new(i32::from(level))
+        .ok_or(CompressError::DeflateInitFailed)?;
+    let mut reader = zip::Reader::new(stored)?;
+    let mut writer = zip::Writer::new();
+    let mut deflated: Vec<u8> = Vec::new();
+    while let Some(entry) = reader.next_entry() {
+        let Some(data) = entry.stored() else {
+            return Err(CompressError::DeflateCompressFailed);
+        };
+        let meta = zip::Meta {
+            permissions: (entry.external_attributes() >> 16) as u16 & 0o7777,
+            mtime: entry.utc_mtime().unwrap_or(0),
+            dos: entry.dos_time(),
+        };
+        deflated.clear();
+        if !data.is_empty() {
+            deflate_raw(&mut compressor, data, &mut deflated)?;
+        }
+        let contents = if deflated.len() < data.len() {
+            zip::Contents::Deflated {
+                crc: entry.crc32(),
+                size: data.len() as u64,
+                data: &deflated,
+            }
+        } else {
+            zip::Contents::Stored(data)
+        };
+        writer.add(entry.name(), contents, &meta)?;
+    }
+    Ok(writer.finish()?)
 }
 
 /// Check if a path is safe (no absolute paths or path traversal)
@@ -1294,14 +1710,17 @@ pub(crate) fn match_glob_patterns(patterns: &[GlobPattern], pathname: &[u8]) -> 
 /// Supports negative patterns with "!" prefix (e.g., "!node_modules/**").
 fn extract_to_disk_filtered(
     file_buffer: &[u8],
+    format: Option<Format>,
     root: &[u8],
     glob_patterns: Option<&[GlobPattern]>,
 ) -> crate::Result<u32> {
-    let mut reader =
-        bun_archive::open_memory(file_buffer, tar::Dialect::General).map_err(|err| match err {
-            tar::Error::Alloc(err) => crate::Error::Alloc(err),
-            _ => crate::Error::ReadError,
-        })?;
+    let mut reader = bun_archive::open(file_buffer, format).map_err(|err| {
+        if err.is_out_of_memory() {
+            crate::Error::Alloc(bun_alloc::AllocError)
+        } else {
+            crate::Error::ReadError
+        }
+    })?;
 
     // Open/create target directory using bun.sys
     let cwd = Fd::cwd();
@@ -1401,7 +1820,8 @@ fn extract_to_disk_filtered(
                 let Ok(file_fd) = opened else { continue };
 
                 let write_success = size == 0
-                    || bun_archive::read_data_into_fd(&mut reader, file_fd, &mut write_strategy)
+                    || reader
+                        .read_data_into_fd(file_fd, &mut write_strategy)
                         .is_ok();
                 let _ = file_fd.close();
 
@@ -1416,16 +1836,19 @@ fn extract_to_disk_filtered(
                 count += 1;
             }
             bun_sys::FileKind::SymLink => {
-                let link_target = ZBox::from_bytes(entry_ref.symlink().unwrap_or_default());
-                let link_target_z = link_target.as_zstr();
-                // Validate symlink target is also safe
-                if !is_safe_path(link_target_z.as_bytes()) {
-                    continue;
-                }
                 // Symlinks are only extracted on POSIX systems (Linux/macOS).
                 // On Windows, symlinks are skipped since they require elevated privileges.
                 #[cfg(unix)]
                 {
+                    let Ok(link_target) = reader.link_target() else {
+                        return Err(crate::Error::ReadError);
+                    };
+                    let link_target = ZBox::from_bytes(link_target);
+                    let link_target_z = link_target.as_zstr();
+                    // Validate symlink target is also safe
+                    if !is_safe_path(link_target_z.as_bytes()) {
+                        continue;
+                    }
                     let mut symlinkat = || {
                         beneath::symlinkat_where_safe(link_target_z, dir_fd, pathname, |path| {
                             let target = link_target_z.as_bytes();
@@ -1460,11 +1883,13 @@ fn extract_to_disk_filtered(
 /// `bun:internal-for-testing`
 pub(crate) mod testing {
     use crate::generated_bindgen::archive_internals::{
-        ReadTarOptions, ReadTarSkip as Skip, WriteTarFile, WriteTarOptions,
+        ReadTarOptions, ReadTarSkip as Skip, ReadZipOptions, WriteTarFile, WriteTarOptions,
+        WriteZipFile, WriteZipOptions,
     };
     use bun_archive::tar::output::Output;
     use bun_archive::tar::writer::{File, Names, Writer};
     use bun_archive::tar::{self, Event};
+    use bun_archive::zip;
     use bun_core::{S, strings};
     use bun_jsc::bindgen::{self, BufferSource, JsHeap, JsLocal};
     use core::fmt::Write as _;
@@ -1519,6 +1944,67 @@ pub(crate) mod testing {
         }
     }
 
+    /// What was read of the current entry's contents.
+    #[derive(Default)]
+    struct Contents {
+        crc: u32,
+        run: Run,
+    }
+
+    impl Contents {
+        fn data(&mut self, log: &mut String, offset: i64, bytes: &[u8]) {
+            self.crc = bun_zlib::crc32_bytes(self.crc, bytes);
+            if offset != self.run.offset + self.run.len {
+                self.run.flush(log);
+                self.run.offset = offset;
+            }
+            self.run.len += bytes.len() as i64;
+        }
+
+        fn end(&mut self, log: &mut String, size: i64) {
+            self.run.flush(log);
+            _ = writeln!(log, "  end {size} crc32={:08x}", self.crc);
+        }
+    }
+
+    /// An entry without what a zip says of it elsewhere. `windows`: the name is given the way Windows takes it.
+    fn write_entry_start(log: &mut String, entry: &tar::Entry, windows: bool) {
+        match type_name(entry.filetype()) {
+            Some(name) => log.push_str(name),
+            None => _ = write!(log, "type-{:o}", entry.filetype()),
+        }
+        _ = write!(
+            log,
+            " perm={:o} size={} mtime={} path=",
+            entry.perm(),
+            entry.size(),
+            entry.mtime(),
+        );
+        let mut wide = Vec::new();
+        if windows && entry.path_to_utf16(&mut wide).is_ok() {
+            // A name whose encoding is not known has one unit for each byte.
+            let name = if entry.path_encoding() == tar::PathEncoding::Bytes {
+                wide.into_iter().map(|unit| unit as u8).collect()
+            } else {
+                String::from_utf16_lossy(&wide).into_bytes()
+            };
+            write_name(log, &name);
+        } else {
+            write_name(log, entry.path());
+        }
+    }
+
+    /// One line for an entry.
+    fn write_entry(log: &mut String, entry: &tar::Entry, windows: bool) {
+        write_entry_start(log, entry, windows);
+        // Nothing reads a link's target on Windows.
+        if let Some(target) = entry.symlink().filter(|_| !windows) {
+            log.push_str(" -> ");
+            write_name(log, target);
+        }
+        log.push('\n');
+    }
+
     pub(crate) fn read_tar(data: &[u8], options: &ReadTarOptions) -> String {
         let reader_options = tar::Options {
             dialect: if options.npm {
@@ -1547,8 +2033,7 @@ pub(crate) mod testing {
         // `data[pos..end]` has arrived and was not taken yet.
         let (mut pos, mut end) = (0usize, 0usize);
         let mut index = 0usize;
-        let mut crc = 0u32;
-        let mut run = Run::default();
+        let mut contents = Contents::default();
         loop {
             let mut skip = false;
             let ended = end == data.len() && (!options.late_end || pos == end);
@@ -1559,7 +2044,7 @@ pub(crate) mod testing {
             let (used, event) = match next {
                 Ok(next) => next,
                 Err(err) => {
-                    run.flush(&mut log);
+                    contents.run.flush(&mut log);
                     _ = writeln!(log, "error: {err}");
                     return log;
                 }
@@ -1576,38 +2061,7 @@ pub(crate) mod testing {
                     };
                 }
                 Event::Entry(entry) => {
-                    match type_name(entry.filetype()) {
-                        Some(name) => log.push_str(name),
-                        None => _ = write!(log, "type-{:o}", entry.filetype()),
-                    }
-                    _ = write!(
-                        log,
-                        " perm={:o} size={} mtime={} path=",
-                        entry.perm(),
-                        entry.size(),
-                        entry.mtime(),
-                    );
-                    let mut wide = Vec::new();
-                    if options.windows
-                        && tar::compose::to_utf16(entry.path(), entry.path_is_utf8(), &mut wide)
-                            .is_ok()
-                    {
-                        // A name that is not UTF-8 has one unit for each byte.
-                        let name = if entry.path_is_utf8() {
-                            String::from_utf16_lossy(&wide).into_bytes()
-                        } else {
-                            wide.into_iter().map(|unit| unit as u8).collect()
-                        };
-                        write_name(&mut log, &name);
-                    } else {
-                        write_name(&mut log, entry.path());
-                    }
-                    // Nothing reads a link's target on Windows.
-                    if let Some(target) = entry.symlink().filter(|_| !options.windows) {
-                        log.push_str(" -> ");
-                        write_name(&mut log, target);
-                    }
-                    log.push('\n');
+                    write_entry(&mut log, entry, options.windows);
                     skip = match options.skip {
                         Skip::None => false,
                         Skip::All => true,
@@ -1615,21 +2069,10 @@ pub(crate) mod testing {
                         Skip::OtherThanFiles => entry.filetype() != S::IFREG,
                     };
                     index += 1;
-                    crc = 0;
-                    run = Run::default();
+                    contents = Contents::default();
                 }
-                Event::Data { offset, bytes } => {
-                    crc = bun_zlib::crc32_bytes(crc, bytes);
-                    if offset != run.offset + run.len {
-                        run.flush(&mut log);
-                        run.offset = offset;
-                    }
-                    run.len += bytes.len() as i64;
-                }
-                Event::EndOfEntry { size } => {
-                    run.flush(&mut log);
-                    _ = writeln!(log, "  end {size} crc32={crc:08x}");
-                }
+                Event::Data { offset, bytes } => contents.data(&mut log, offset, bytes),
+                Event::EndOfEntry { size } => contents.end(&mut log, size),
                 Event::EndOfArchive => {
                     log.push_str("end\n");
                     return log;
@@ -1698,6 +2141,106 @@ pub(crate) mod testing {
                 .and_then(|writer| writer.finish(false))
                 .and_then(|encoder| encoder.finish()),
         };
+        heap.create_buffer(&written.map_err(|err| heap.error(format_args!("{err}")))?)
+    }
+
+    /// What `Bun.Archive` is given for a zip: the entries and the events of the tar reader. A symlink has its target
+    /// behind it, or why it could not be read, and an entry without a time in UTC has its MS-DOS date and time.
+    pub(crate) fn read_zip(data: &[u8], options: &ReadZipOptions) -> String {
+        let mut reader = match bun_archive::open(data, Some(bun_archive::Format::Zip)) {
+            Ok(reader) => reader,
+            Err(err) => return format!("refused: {err}\n"),
+        };
+        let mut log = String::new();
+        let mut contents = Contents::default();
+        loop {
+            let event = match reader.next() {
+                Ok(event) => event,
+                Err(err) => {
+                    contents.run.flush(&mut log);
+                    _ = writeln!(log, "error: {err}");
+                    return log;
+                }
+            };
+            match event {
+                Event::NeedInput => {
+                    log.push_str("error: the reader wants more input than there is\n");
+                    return log;
+                }
+                Event::Entry(entry) => {
+                    write_entry_start(&mut log, entry, options.windows);
+                    let is_symlink = entry.filetype() == S::IFLNK;
+                    if let bun_archive::Modified::Local(dos) = reader.modified() {
+                        _ = write!(
+                            log,
+                            " dos={:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                            dos.year, dos.month, dos.day, dos.hour, dos.minute, dos.second,
+                        );
+                    }
+                    if is_symlink && !options.windows {
+                        match reader.link_target() {
+                            Ok(target) => {
+                                log.push_str(" -> ");
+                                write_name(&mut log, target);
+                            }
+                            Err(err) => _ = write!(log, " -> error: {err}"),
+                        }
+                    }
+                    log.push('\n');
+                    contents = Contents::default();
+                }
+                Event::Data { offset, bytes } => contents.data(&mut log, offset, bytes),
+                Event::EndOfEntry { size } => contents.end(&mut log, size),
+                Event::EndOfArchive => {
+                    log.push_str("end\n");
+                    return log;
+                }
+            }
+        }
+    }
+
+    /// The zip that `Bun.Archive` writes for these files, with what the options change.
+    pub(crate) fn write_zip<'a>(
+        heap: &JsHeap<'a>,
+        files: Vec<WriteZipFile>,
+        names: &[u8],
+        mut contents: &[u8],
+        options: &WriteZipOptions,
+    ) -> bindgen::Result<'a, JsLocal<'a, BufferSource>> {
+        use bun_libdeflate_sys::libdeflate;
+        libdeflate::load();
+        let written = (|| -> Result<Vec<u8>, super::CompressError> {
+            let mut compressor = libdeflate::OwnedCompressor::new(6)
+                .ok_or(super::CompressError::DeflateInitFailed)?;
+            let limit = |from: Option<f64>| from.map_or(u64::MAX, |from| from as u64);
+            let mut writer =
+                zip::Writer::with_zip64_from(limit(options.wide_from), limit(options.many_from));
+            let dos = zip::DosDateTime::from_fields(options.dos_date, options.dos_time);
+            let mut deflated = Vec::new();
+            for (file, key) in files.into_iter().zip(strings::split(names, b"\0")) {
+                let (data, rest) = contents.split_at(file.size.min(contents.len()));
+                contents = rest;
+                let name = super::zip_name(key, options.windows);
+                let meta = zip::Meta {
+                    permissions: file.perm as u16,
+                    mtime: options.mtime as u32,
+                    dos,
+                };
+                let contents = if file.deflate {
+                    deflated.clear();
+                    super::deflate_raw(&mut compressor, data, &mut deflated)?;
+                    zip::Contents::Deflated {
+                        crc: bun_zlib::crc32_bytes(0, data),
+                        size: data.len() as u64,
+                        data: &deflated,
+                    }
+                } else {
+                    zip::Contents::Stored(data)
+                };
+                writer.add(&name, contents, &meta)?;
+            }
+            Ok(writer.finish()?)
+        })();
         heap.create_buffer(&written.map_err(|err| heap.error(format_args!("{err}")))?)
     }
 }

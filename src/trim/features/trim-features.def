@@ -96,7 +96,7 @@ trim-feature image : Image
   saves 1.3 0.9
 
 trim-feature archive : Archive
-  about "`Bun.Archive`, and everything else that reads or writes a tar archive."
+  about "`Bun.Archive`, and everything else that reads or writes a tar or a zip archive."
   also "unpacking packages in `bun install`, and `bun pm pack`"
   also "unpacking a template in `bun create`"
   also "installing a missing package during `bun build` or `bun compile`"

@@ -9243,6 +9243,264 @@ mode and failed for a plain string too.
 Files: `src/runtime/api/Archive.rs`, `src/runtime/webcore/Blob.rs`, `src/tar/gzip.rs`,
 `docs/runtime/archive.mdx`, `packages/bun-types/bun.d.ts`, `test/js/bun/archive.test.ts`.
 
+### 2026-11-06: zip in `Bun.Archive`, read and written in safe Rust
+
+`Bun.Archive` was tar only. oven-sh/bun#27077 asks for zip and is open, with ten thumbs-up and no
+comment. Five attempts came before this one and none merged. No maintainer rejected one, and four
+of them were bindings over libarchive, this stack's own patch of 2026-09-02 among them. Then
+oven-sh/bun#46638 replaced libarchive with `src/tar`, a tar reader and writer in safe Rust, and
+the patch was dropped on 2026-10-27 with the note that zip "would need a reader and a writer of
+its own". This is that reader and that writer: `src/zip`, a crate in the shape of `src/tar`, with
+`#![forbid(unsafe_code)]` and the same clippy denies, behind the same class.
+
+```ts
+// Create
+const archive = new Bun.Archive(
+  { "README.md": "# My Project", "src/index.ts": source, "empty/": "" },
+  { format: "zip" },
+);
+await Bun.write("project.zip", archive); // or archive.bytes(), archive.blob(), an S3 file
+await Bun.Archive.write("stored.zip", files, {
+  format: "zip",
+  compress: "store",
+});
+
+// Read
+const bytes = await Bun.file("project.zip").bytes();
+const zip = new Bun.Archive(bytes, { format: "zip" });
+const files = await zip.files("src/**");
+await zip.extract("./project", { glob: ["**", "!**/*.test.ts"] });
+```
+
+The options:
+
+- `format` is `"tar"` or `"zip"`. With an object it says what to create, and the default is a tar.
+  With a `Blob`, a typed array or an `ArrayBuffer` it is the caller's word for what the bytes are,
+  and they are read as that and as nothing else.
+- Without `format`, given bytes are a guess: a tar, and a zip if they are not a tar. That is what
+  `Bun.Archive` always did for a tar, so it stays the default. The guess can be wrong. One file can
+  be a valid tar and a valid zip with other contents in each, and unzip, Python, Go and Node.js
+  read the zip in it. The first version of this patch made `format` with bytes a `TypeError`, and
+  the self-review built such a file. The docs say to pass `format` for bytes from somewhere else.
+- `compress` is `"gzip"` for a tar, and `"deflate"` (the default) or `"store"` for a zip that is
+  created from an object. `level` is 1 to 12 as before, and throws with `"store"`. The files of a
+  zip that exists stay as they are: `compress` with such bytes throws, also `"gzip"`, and also
+  where only the bytes say that they are a zip.
+- `Archive.write(path, archive, options)` keeps its rule: `compress` in the options wins over what
+  the archive was made with, and without it that stays. `format` throws there. An archive keeps
+  the format that it has.
+- The types have one overload per kind of data: an object, bytes, and an `Archive` for
+  `Archive.write`. The types of the first version took 201 of 264 combinations of options that
+  throw at run time. `test/integration/bun-types/fixture/archive.ts` has what each overload takes
+  and what it refuses.
+- `format`, `"deflate"` and `"store"` are the names of oven-sh/bun#33318, the largest of the
+  earlier attempts, which a stale sweep closed.
+
+Creating:
+
+- The constructor writes a zip with every member stored. That is a copy and a CRC-32 on the
+  JavaScript thread, where a tar is a copy. The CRC-32 is taken from the copy, so a buffer that
+  another thread writes to cannot give a member a wrong one. DEFLATE runs later, on a pool thread,
+  when the bytes leave: each member by itself with libdeflate, and a member that does not get
+  smaller stays stored.
+- A value is a string, a `Blob`, a typed array or an `ArrayBuffer`. Anything else throws, where a
+  tar stores `String(value)`: a forgotten `await` would be a member that holds
+  `[object Promise]`. A `Bun.file()` or an S3 file throws too, because its bytes are not in memory
+  and the tar path writes an empty file for it today (oven-sh/bun#28459). A `Map` throws, because
+  its entries are not properties and the archive would be empty.
+- A key that ends in `/` with an empty value is a directory, and with data it throws. A NUL in a
+  key throws, and so does a key of more than 65,535 bytes. On Windows a `\` in a key is written as
+  `/`, as the tar writer does it.
+- Every member has the time of the constructor call: in UTC in the extended timestamp field, and
+  as local time in the MS-DOS fields, which is where Python and other readers without the UTC
+  field look. The first version wrote UTC there too. Members are 0644 (directories 0755), "made
+  by Unix", with the UTF-8 flag if the name is not ASCII.
+- The ZIP64 records are written only when they are needed: from 65,535 entries, and from 4 GiB.
+  A test writes them with the limits set to 10 bytes and 2 entries, and compares every byte with
+  what the format's description says.
+- What the writer writes, the reader reads, and so do Node.js, Python, Go and unzip for the
+  archives of the tests. One case needed work: a last name that ends like a ZIP64 locator
+  (`PK\x06\x07` and seven more bytes) is where Python looks for one, and Python then refuses the
+  archive. Such an archive gets the real ZIP64 records behind its directory. Two limits are known
+  from the second review: Node.js refuses an archive whose last 64 KiB hold the end record of a
+  zip that is stored in it (it refuses such an archive from Python and Go too), and 7-Zip 16.02
+  reports "Headers Error" for one with the ZIP64 records.
+
+Reading, what an entry is. Readers do not agree on these, so each one is a ruling. They were
+compared with Node.js 26.12.1 (`zlib.ZipBuffer`), Python 3.13.5, Go 1.24.4 and unzip 6.00 on 83
+archives, and each ruling is a test:
+
+- The name is the Info-ZIP Unicode Path field if the entry has one for its name, as in Node.js,
+  Python and unzip (Go reads the name field). A field for the name that is not UTF-8, or has a
+  NUL, is an error: the four readers give three names and an error for it.
+- Without that field a name is UTF-8 if the entry says so or if its bytes are valid UTF-8 (Node.js
+  and Go), and code page 437 otherwise (Node.js and Python).
+- A `\` is a `/` in a name that MS-DOS wrote and that has no `/`. That is the rule of unzip, which
+  extracts such an archive into directories on Linux. Node.js, Python and Go list the name with
+  the `\` in it.
+- A name that ends in `/` is a directory. A symlink is an entry from Unix with the mode of a
+  symlink. Everything else is a regular file, whatever type its mode has (Node.js and Python). The
+  first version took the type from the mode, and a member with the mode of a FIFO was counted and
+  never shown.
+- An entry without a UTC time has its MS-DOS date and time, and they are local time, as in
+  Node.js, Python and unzip.
+- A Unix mode counts only if the archive was made on Unix. An entry without permissions is 0644,
+  and a directory 0755, or `extract()` could not write into the directories of a zip from
+  `git archive` or Go.
+- A symlink target is read when the symlink is made: at most 4,096 bytes, checked like contents.
+  `files()` and a glob that leaves the symlink out never read it.
+
+Reading, what is checked:
+
+- The central directory is the only authority. The end record is the last one whose comment fits
+  in the bytes behind it, data in front of the archive is accepted (a self-extracting archive),
+  and the directory has to end where the end record starts.
+- The local header of every member is read when the archive is opened and has to agree with the
+  directory on the name, the method, the encryption flags, the CRC-32 and the sizes, also the
+  64-bit sizes of a ZIP64 field. With a data descriptor it may have zeros for the last three.
+  Node.js refuses the same archives. unzip reads the sizes of the local header, and Python and Go
+  the ones of the directory, so an archive where the two differ is two archives.
+- What is not checked, and the docs say so: the data descriptor itself, and bytes that no entry
+  covers. A reader that walks the file from its start can still see other members than Bun.
+- Members that share bytes are refused, also when one of them is never read. That is how a zip of
+  a few kilobytes unpacks to gigabytes. Without shared bytes an archive unpacks to no more than
+  DEFLATE makes of it, so `files()` has no other limit for a zip.
+- Contents come in blocks of 64 KiB and nothing is sized by what the archive declares. A member
+  that unpacks to more or to less than its declared size, or to another CRC-32, is an error before
+  its end is reported.
+- The count of an end record without ZIP64 has 16 bits, and writers let it wrap around. An archive
+  with 65,536 entries and a count of 0 is read, as Python, Go and unzip read it. Node.js refuses
+  it.
+- The ZIP64 end record is the one that its locator names, and it has to end where the locator
+  starts. With data in front of the archive it is the record right in front of the locator. An
+  archive where the locator names a record somewhere else is refused, as Python refuses it.
+  Node.js and Go read it.
+- An entry that is encrypted, or packed with another method than stored and DEFLATE, is an error
+  when its contents are read and not before. A glob that leaves it out reads the rest.
+
+One loop, two readers. `src/archive` decides what an entry may write: paths, symlinks, modes,
+`EXDEV` for a symlink that leads out of the destination. Its loop is now generic over a private
+trait with two implementations, the tar reader and `AnyReader`, which is a tar or a zip and gives
+the members of a zip as the entries and events of the tar reader. `open_memory`, `extract_to_dir`
+and `extract_to_disk` keep their signatures and the tar reader, so `bun install`, `bun create`,
+`bun publish`, `bun pm diff` and the download of a compile target read tar whatever the bytes are.
+`Bun.Archive` calls the two new functions, `open` and `extract_to_disk_any`. `src/zip` has no
+policy in it: it says what an archive holds, and `src/archive/any.rs` says what kind of file that
+is and what it is called.
+
+The rules of `extract()` are the ones of tar, and there are two sets of them: without a glob
+the loop of `bun install`, and with a glob the loop in `Archive.rs`. A test extracts eight sets of
+entries as a tar and as a zip, in both modes, and pins what is left on disk for each. Among them
+are paths and symlinks that lead out, a file through a symlink of the same archive, and a
+directory that cannot be written. The two modes differ in six of the eight, for tar as for zip.
+The first version said "one policy" in three places. That was wrong, and merging the two loops is
+not part of this patch.
+
+What changes for a program that does not use zip. Measured on two release builds for linux-x64,
+this commit and the one in front of it:
+
+- The stripped binary grows by 61,440 bytes, from 141,601,088 to 141,662,528. By symbols that is
+  13,152 bytes for `src/zip`, 11,915 for `src/archive`, 7,947 for `Archive.rs`, 647 for `src/tar`,
+  and 14,387 for the two hooks of `bun:internal-for-testing`, which a release build has as it has
+  the hooks for tar. Most of the rest is the sort of the members' ranges.
+- `bun install` extracts with `ExtractTarball::run`. That function makes the same calls as before
+  and is 13 bytes smaller (9,119 from 9,132), and the copy of a file's contents that it calls has
+  the 397 bytes of the function that it replaces. An install of one tarball with 3,001 files
+  takes 68.3 ms of CPU in the base build, 68.0 ms with this commit, and 67.6 ms in the base build
+  again (the least of 31 runs each, in turns).
+- `extract_to_dir::<()>`, which `bun create` and the download of a compile target run, is 471
+  bytes larger (5,284 from 4,813). LLVM now puts the copy of a file's contents and a destructor
+  into it. It makes the same calls.
+- `Bun.Archive` reads a tar through `AnyReader`, which allocates nothing that `open_memory` does
+  not. One call in a running process, for a gzipped tar of 3,001 files, base, this commit, and
+  base again: `files()` 3.90, 3.94 and 3.61 ms of CPU, `extract()` 37.6, 36.8 and 36.6 ms,
+  `extract()` with a glob 36.9, 36.7 and 37.2 ms (the least of 7 runs). The commit is inside the
+  spread of the two base runs.
+- The constructor, for one entry of 64 MiB of random bytes: 55.5 ms for a tar, 57.7 ms for a zip,
+  59.9 ms for a zip at level 12 and 58.5 ms for a stored zip (the least of 10 each, in turns).
+  What a zip adds is the CRC-32. DEFLATE of those bytes takes 730 ms, on the pool.
+- `extract()` of 256 MiB in 16 files has the same peak memory for a zip (423 MiB) as for a
+  `.tar.gz` (424 MiB).
+- The options object gets one more property lookup, `format`. `Archive` stays 16 bytes: what is
+  known about its bytes is one byte in the padding.
+- The test hooks `readZip` and `writeZip` are in `bun:internal-for-testing`. `Bun.Archive` has no
+  new method.
+- Not measured: instructions, allocations and system calls. `perf`, `valgrind`, `strace` and
+  `/usr/bin/time` are not on this machine, so the times are CPU times of whole runs.
+
+Not done, and not run:
+
+- Encryption, methods other than stored and DEFLATE, archives on several disks.
+- `Bun.file()` and S3 files as values, for zip as for tar (oven-sh/bun#28459, and the open draft
+  oven-sh/bun#46661 reads them on the pool).
+- `new Response(archive)`, `new Blob([archive])` and `fetch(url, { body: archive })` still carry
+  the text `[object Archive]`, for tar as for zip. An `Archive` is not a `Blob`.
+- A zip consumer inside bun: `bun upgrade` still runs `unzip` or PowerShell, and `node:zlib` has
+  none of the zip classes of Node.js 26.
+- macOS and Windows were compiled (`rust:check-all`) and not run. The Windows rules for names are
+  tested on Linux through options of the two hooks.
+- There was no fuzzing campaign against a second reader. The comparison with the four readers was
+  run by hand, on archives that the test helper makes.
+- Seven archives in the tree come from other writers: Python's zipfile, Go's archive/zip and
+  Node.js' zlib. `test/js/bun/archive-golden/zip-writers.json` has them, the scripts that made
+  them, and what Python reads from each, which is what the test expects of Bun.
+
+The self-review of the first version ended in "restructure": 30 findings and no objection to the
+feature. The split into two commits, `format` with bytes, the rulings on names, types and times,
+the ZIP64 locator, the local header, the lazy symlink target, the values that throw and the
+overloads in the types all come from it.
+
+A second self-review read this commit. It ended in "merge after changes", again with no objection
+to the feature, and with 44 findings that are not in this commit. It came back too late in the day
+to act on, so its findings are listed here and not fixed. This commit is not ready for upstream
+as it is. The findings that change what a program sees, and that are cheap to change only before
+a release:
+
+- Read a zip only with `format: "zip"`, and drop the guess. Without `format`, any bytes that the
+  tar reader refuses and that have an end record in their last 64 KiB are read as a zip. That
+  changes what `new Bun.Archive(bytes)` does for bytes that were "Unrecognized archive format"
+  before, and it makes `compress: "gzip"` throw for such bytes.
+- As the object of files, only a `Map` and a `Set` throw. A `Promise` of a forgotten `await`,
+  another `Archive` or a `Response` has no properties either and becomes a valid empty zip. The
+  review asks for a list of the classes that are taken.
+- A `Blob` from `blob.slice()` is read by its whole store and not by its window, for tar as for
+  zip (oven-sh/bun#44779 is open). With two zips in one store, the slice of one lists the other.
+  A `Blob` of zero bytes with `format: "zip"` becomes an empty zip and is not refused.
+- The time of an entry comes from the extended timestamp field (0x5455) of the central directory
+  or from the MS-DOS fields. Node.js and Go also read the NTFS field (0x000a) and the Info-ZIP
+  Unix field (0x5855). For archives from 7-Zip, WinRAR, WinZip and macOS in Go's test data,
+  `lastModified` is 7 to 8 hours from what they give. The 0x5455 time is read as unsigned, so a
+  time before 1970 comes out after 2038.
+- `extract()` does not read a member that declares a size of 0, as for tar, so it does not check
+  what `files()` checks for such a member.
+- The end record is the last one whose comment fits. A record whose comment is cut off is
+  skipped, and an earlier archive in the same bytes is read. unzip, Python and Go each give
+  another answer for such bytes.
+- A name that MS-DOS wrote in Shift-JIS, Big5 or GBK has 0x5C as the second byte of some
+  characters, and the rule for `\` cuts the name there.
+- The local header is checked against the name field, and the name of the entry can come from the
+  Unicode Path field, so a reader of local headers can still see another name.
+- The types refuse calls that the run time takes, such as a `format` that is chosen at run time.
+  `format: ""` is taken as no format. `Archive.write(path, bytes, { format })` never reads the
+  bytes, and `Archive.write(path, zipArchive, { level })` without `compress` does nothing.
+- The errors for a value or a key that a zip does not take do not name the key.
+- `cargo mordant` (advisory in CI) has one finding in `src/archive/any.rs`: the offset of the
+  contents belongs in the variant that it is valid in.
+- Still missing from the first review: archives from Info-ZIP's zip, 7-Zip, Windows and macOS in
+  the tree, a fuzzing run against a second reader, runs on macOS and Windows, and a line in the
+  docs that `new Response(archive)` sends the text `[object Archive]`.
+
+Rebase notes: 66 patches onto oven-sh/bun b1305ddc7c, one commit after the base of 2026-11-05.
+No conflicts, nothing dropped.
+
+Files: `src/zip/` (new), `src/archive/any.rs` (new), `src/archive/lib.rs`,
+`src/archive/error.rs`, `src/tar/reader.rs`, `src/tar/compose.rs`, `src/runtime/api/Archive.rs`,
+`src/runtime/api/ArchiveInternals.bind.ts`, `src/js/internal-for-testing.ts`,
+`src/trim/features/trim-features.def`, `packages/bun-types/bun.d.ts`, `docs/runtime/archive.mdx`,
+`docs/compiler/size.mdx`, `test/js/bun/archive.test.ts`,
+`test/js/bun/archive-golden/zip-writers.json` (new),
+`test/integration/bun-types/fixture/archive.ts` (new).
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
