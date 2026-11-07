@@ -228,6 +228,8 @@ export const readTarball = $bindgen("pack_command.bind.ts", "readTarball");
 
 export const readTar = $bindgen("ArchiveInternals.bind.ts", "readTar");
 export const writeTar = $bindgen("ArchiveInternals.bind.ts", "writeTar");
+export const readZip = $bindgen("ArchiveInternals.bind.ts", "readZip");
+export const writeZip = $bindgen("ArchiveInternals.bind.ts", "writeZip");
 
 export const isArchitectureMatch: (architecture: string[]) => boolean = $bindgen(
   "npm_jsc.bind.ts",

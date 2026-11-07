@@ -1,9 +1,9 @@
 ---
 title: Archive
-description: Create and extract tar archives with Bun's fast native implementation
+description: Create and extract tar and zip archives with Bun's fast native implementation
 ---
 
-`Bun.Archive` is Bun's native API for tar archives. It creates archives from in-memory data, extracts archives to disk, and reads archive contents without extraction.
+`Bun.Archive` is Bun's native API for tar and zip archives. It creates archives from in-memory data, extracts archives to disk, and reads archive contents without extraction.
 
 ## Quickstart
 
@@ -43,7 +43,7 @@ for (const [path, file] of files) {
 
 ## Creating Archives
 
-Use `new Bun.Archive()` to create an archive from an object where keys are file paths and values are file contents. By default, archives are uncompressed:
+Use `new Bun.Archive()` to create an archive from an object where keys are file paths and values are file contents. By default, the archive is a tar and it is not compressed. Pass `{ format: "zip" }` for a [zip archive](#zip-archives):
 
 ```ts
 // Creates an uncompressed tar archive (default)
@@ -88,9 +88,13 @@ await Bun.write("output.tar", archive);
 // Write gzipped tar
 const compressed = new Bun.Archive({ "src/index.ts": "console.log('Hello');" }, { compress: "gzip" });
 await Bun.write("output.tar.gz", compressed);
+
+// Write a zip
+const zip = new Bun.Archive({ "src/index.ts": "console.log('Hello');" }, { format: "zip" });
+await Bun.write("output.zip", zip);
 ```
 
-`Bun.write()`, `Bun.file().write()` and a write to S3 put the same bytes at the destination that `archive.bytes()` returns. The compression is the one of the archive, whatever the destination is called.
+`Bun.write()`, `Bun.file().write()` and a write to S3 put the same bytes at the destination that `archive.bytes()` returns. The format and the compression are the ones of the archive, whatever the destination is called.
 
 ### Getting Archive Bytes
 
@@ -115,7 +119,7 @@ const gzippedBlob = await gzipped.blob();
 
 ### From Existing Archive Data
 
-Create an archive from existing tar/tar.gz data:
+Create an archive from existing tar, tar.gz or zip data:
 
 ```ts
 // From a file
@@ -128,6 +132,13 @@ const archiveFromFile = new Bun.Archive(tarball);
 const response = await fetch("https://example.com/archive.tar.gz");
 const archiveFromFetch = new Bun.Archive(await response.blob());
 ```
+
+```ts
+// A zip
+const zip = new Bun.Archive(await Bun.file("package.zip").bytes(), { format: "zip" });
+```
+
+`format` says what the data is, and Bun reads it as that and as nothing else. Without `format`, Bun reads the data as a tar or a gzipped tar, and as a zip if it is not a tar. See [the format of existing data](#the-format-of-existing-data).
 
 ### Extracting to Disk
 
@@ -332,8 +343,88 @@ The `options` argument accepts:
 - No options or `undefined` - Uncompressed tar (default)
 - `{ compress: "gzip" }` - Enable gzip compression at level 6
 - `{ compress: "gzip", level: number }` - Gzip with custom level 1-12 (1 = fastest, 12 = smallest)
+- `{ format: "zip" }` - A zip archive with each file deflated at level 6
+- `{ format: "zip", level: number }` - A zip archive with each file deflated at level 1-12
+- `{ format: "zip", compress: "store" }` - A zip archive with its files as they are
 
-Existing archive data that is gzip already stays as it is with `{ compress: "gzip" }`. Bun does not compress it a second time.
+A tar archive takes `"gzip"`. A zip archive that is created from an object takes `"deflate"` or `"store"`. Every other combination throws a `TypeError`, and so does `level` together with `"store"`.
+
+Existing archive data that is gzip already stays as it is with `{ compress: "gzip" }`. Bun does not compress it a second time. Existing data that is a zip takes no `compress` at all.
+
+## Zip archives
+
+`Bun.Archive` creates a zip archive from an object when you pass `{ format: "zip" }`, and reads one with the same methods as a tar archive:
+
+```ts
+// Create
+const archive = new Bun.Archive(
+  {
+    "README.md": "# My Project",
+    "src/index.ts": "console.log('Hello');",
+    "empty-directory/": "",
+  },
+  { format: "zip" },
+);
+await Bun.write("project.zip", archive);
+
+// Read
+const zip = new Bun.Archive(await Bun.file("project.zip").bytes(), { format: "zip" });
+const files = await zip.files();
+await zip.extract("./project");
+```
+
+### The format of existing data
+
+With existing data, `format` is your word for what the data is. `{ format: "zip" }` reads it as a zip and `{ format: "tar" }` as a tar or a gzipped tar. Data that is not what you said is an error when it is read.
+
+Without `format`, Bun guesses. It reads the data as a tar, and as a zip only if the data is not a tar. The guess can be wrong: one file can be a valid tar and a valid zip at the same time, with other files in each, and `unzip`, Python, Go and Node.js read the zip in such a file. Pass `format` for data that you did not make yourself.
+
+Bun never takes the format from a file name, and an `Archive` keeps the format that it has.
+
+### Creating
+
+- Each file is compressed with DEFLATE by itself, and a file that does not get smaller is stored as it is. `{ compress: "store" }` stores every file.
+- Bun compresses on a thread pool when the archive is written or its bytes are read, not in the constructor.
+- A value is a string, a `Blob`, a `TypedArray` or an `ArrayBuffer`. Every other value throws a `TypeError`, where a tar archive stores `String(value)`. A `Bun.file()` or an S3 file throws too: pass `await file.bytes()`.
+- A key that ends in `/` with an empty value is a directory. With any other value it throws a `TypeError`.
+- The entries come from an object. A `Map` throws a `TypeError`: pass `Object.fromEntries(map)`.
+- A name is recorded in UTF-8. On Windows, a `\` in a key becomes `/`, which is what a zip has between the parts of a path on every system.
+- Every entry gets the time of the constructor call and mode `0644` (`0755` for a directory). The time is recorded twice: in UTC, and as local time in the MS-DOS fields, where programs that do not know the UTC field look.
+- Bun writes the ZIP64 records only when an archive needs them: for 65,535 entries or more, and for sizes and offsets of 4 GiB or more.
+
+To make a zip of a tar, read the files of the tar and create a new archive from them:
+
+```ts
+const tar = new Bun.Archive(await Bun.file("project.tar.gz").bytes(), { format: "tar" });
+const zip = new Bun.Archive(Object.fromEntries(await tar.files()), { format: "zip" });
+await Bun.write("project.zip", zip);
+```
+
+`files()` returns regular files only. The new archive has no directory entries and no symlinks, and its files have mode `0644` and the time of the conversion.
+
+### Reading
+
+`files()`, `extract()` and their glob filters work on a zip as they do on a tar, and `files()` returns regular files only. `extract()` follows the same rules for paths and symlinks as for a tar.
+
+What an entry is:
+
+- The name is the Info-ZIP Unicode Path field if the entry has one for its name. Such a field that is not UTF-8 is an error. Without the field, the name is UTF-8 if the entry says so or if its bytes are valid UTF-8, and code page 437 otherwise.
+- In a name from MS-DOS (the FAT host) that has no `/`, a `\` is a `/`. `unzip` has the same rule.
+- A name that ends in `/` is a directory. A symlink is an entry from Unix with the mode of a symlink. Every other entry is a regular file, whatever its mode says.
+- The permissions are the ones of the Unix mode. An entry without permissions, as in every archive that was not made on Unix, is `0644`, and a directory `0755`.
+- The modification time is the UTC time of the "extended timestamp" field. An entry without that field has only its MS-DOS date and time, and Bun reads them as local time.
+- A symlink target is read when the symlink is made, and a target of more than 4,096 bytes is an error then. `files()` and a glob that leaves the symlink out do not read it.
+
+What Bun checks:
+
+- Bun reads the central directory at the end of the archive and takes every fact about an entry from it. It accepts data in front of the archive, such as the program of a self-extracting archive, and an archive comment.
+- The local header of each entry has to agree with the central directory about the name, the compression method and the encryption flags. The CRC-32 and the sizes have to agree too. If the entry has a data descriptor, the local header can have zeros for them. Bun does not read the data descriptor, and it does not look at bytes that no entry of the directory covers.
+- Bun rejects an archive in which two entries share bytes. A zip bomb is made that way: one compressed file with thousands of entries that point at it. Without shared bytes, an archive unpacks to no more than DEFLATE can make of it, about 1,032 times its size.
+- Bun checks each file against the size and the CRC-32 that the archive records. `files()` and `extract()` reject at the first file that differs. What `extract()` has already written stays.
+- An archive without ZIP64 records counts its entries in 16 bits. Bun reads an archive with more entries whose count wrapped around.
+- The ZIP64 end record is the one that the locator names, and it has to end where the locator starts. If there is data in front of the archive, it is the record directly in front of the locator. Bun rejects an archive where the locator names a record somewhere else, because other programs do not agree on which record counts.
+
+Not supported: encrypted entries, compression methods other than "stored" and DEFLATE, and archives that span several disks. An entry that is encrypted or uses another method is an error when Bun reads its contents, so a glob that leaves it out still extracts the rest.
 
 ## Examples
 
@@ -417,9 +508,11 @@ type ArchiveInput =
   Record<string, string | Blob | Bun.ArrayBufferView | ArrayBufferLike> | Blob | Bun.ArrayBufferView | ArrayBufferLike;
 
 type ArchiveOptions = {
-  /** Compression algorithm. Currently only "gzip" is supported. */
-  compress?: "gzip";
-  /** Compression level 1-12 (default 6 when gzip is enabled). */
+  /** With an object: what to create (default "tar"). With existing data: what the data is (default: a guess). */
+  format?: "tar" | "zip";
+  /** "gzip" for tar (default: none). "deflate" (default) or "store" for a zip that is created from an object. */
+  compress?: "gzip" | "deflate" | "store";
+  /** Compression level 1-12 (default 6). */
   level?: number;
 };
 
@@ -432,10 +525,15 @@ class Archive {
   /**
    * Create an Archive from input data
    * @param data - Files to archive (as object) or existing archive data (as bytes/blob)
-   * @param options - Compression options. Uncompressed by default.
-   *                  Pass { compress: "gzip" } to enable compression.
+   * @param options - Format and compression options. An uncompressed tar by default.
+   *                  Pass { compress: "gzip" } to enable compression, or { format: "zip" } for a zip.
    */
   constructor(data: ArchiveInput, options?: ArchiveOptions);
+
+  /**
+   * Create an archive and write it to a file
+   */
+  static write(path: string, data: ArchiveInput | Archive, options?: ArchiveOptions): Promise<void>;
 
   /**
    * Extract archive to a directory
@@ -444,12 +542,12 @@ class Archive {
   extract(path: string, options?: ArchiveExtractOptions): Promise<number>;
 
   /**
-   * Get archive as a Blob (uses compression setting from constructor)
+   * Get archive as a Blob (uses the format and compression settings from the constructor)
    */
   blob(): Promise<Blob>;
 
   /**
-   * Get archive as a Uint8Array (uses compression setting from constructor)
+   * Get archive as a Uint8Array (uses the format and compression settings from the constructor)
    */
   bytes(): Promise<Uint8Array<ArrayBuffer>>;
 

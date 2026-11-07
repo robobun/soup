@@ -12361,21 +12361,29 @@ declare module "bun" {
   /**
    * Input data for creating an archive. Can be:
    * - An object mapping paths to file contents (string, Blob, TypedArray, or ArrayBuffer)
-   * - A Blob containing existing archive data
-   * - A TypedArray or ArrayBuffer containing existing archive data
+   * - A Blob containing existing archive data (tar, tar.gz or zip)
+   * - A TypedArray or ArrayBuffer containing existing archive data (tar, tar.gz or zip)
    */
   type ArchiveInput = Record<string, BlobPart> | Blob | ArrayBufferView | ArrayBufferLike;
 
   /**
-   * Compression format for archive output.
-   * Only `"gzip"` is supported.
+   * What an archive is: a tar, which can be gzipped, or a zip.
    */
-  type ArchiveCompression = "gzip";
+  type ArchiveFormat = "tar" | "zip";
 
   /**
-   * Options for creating an Archive instance.
+   * Compression for archive output.
+   * - `"gzip"`: the whole tar archive as one gzip stream (`.tar.gz`)
+   * - `"deflate"`: each file of a zip archive by itself. A file that does not get smaller is stored.
+   * - `"store"`: the files of a zip archive as they are
+   */
+  type ArchiveCompression = "gzip" | "deflate" | "store";
+
+  /**
+   * Options for a tar archive: one that is created from an object, or existing archive data.
    *
    * By default, archives are not compressed. Use `{ compress: "gzip" }` to enable compression.
+   * For a zip archive, see {@link ArchiveZipOptions}.
    *
    * @example
    * ```ts
@@ -12391,14 +12399,25 @@ declare module "bun" {
    */
   interface ArchiveOptions {
     /**
+     * With an object: the format to create. With existing archive data: what the data is.
+     *
+     * Existing archive data without a `format` is read as what it looks like: a tar, and if it is not one, a zip.
+     * That is a guess. One file can be a valid tar and a valid zip, with other contents in each.
+     * If you know what the data is, say so.
+     *
+     * @default "tar"
+     */
+    format?: "tar";
+    /**
      * Compression algorithm to use.
-     * Only `"gzip"` is supported.
+     * Only `"gzip"` is supported for a tar archive.
      * If not specified, no compression is applied.
      *
      * `Bun.write()` and the other ways to write an archive compress it as `bytes()` and `blob()` do.
      * Existing archive data that is gzip already is not compressed again.
+     * It is a `TypeError` for existing archive data that is a zip.
      */
-    compress?: ArchiveCompression;
+    compress?: "gzip";
     /**
      * Compression level (1-12). Only applies when `compress` is set.
      * - 1: Fastest compression, lowest ratio
@@ -12409,6 +12428,37 @@ declare module "bun" {
      */
     level?: number;
   }
+
+  /**
+   * Options that create a zip archive from an object.
+   *
+   * Each file is compressed by itself with DEFLATE, and a file that does not get smaller is stored.
+   * With `compress: "store"` every file is stored as it is, and there is no `level`.
+   *
+   * @example
+   * ```ts
+   * // A zip archive. Its files are deflated at the default level (6).
+   * new Bun.Archive(data, { format: "zip" });
+   *
+   * // Specify compression level
+   * new Bun.Archive(data, { format: "zip", level: 12 });
+   *
+   * // A zip archive with its files as they are
+   * new Bun.Archive(data, { format: "zip", compress: "store" });
+   * ```
+   */
+  type ArchiveZipOptions =
+    | {
+        format: "zip";
+        compress?: "deflate";
+        /**
+         * Compression level (1-12).
+         *
+         * @default 6
+         */
+        level?: number;
+      }
+    | { format: "zip"; compress: "store" };
 
   /**
    * Options for extracting archive contents.
@@ -12447,7 +12497,7 @@ declare module "bun" {
   }
 
   /**
-   * Create and extract tar archives, with optional gzip compression.
+   * Create and extract tar and zip archives. A tar archive can be gzipped.
    *
    * `Bun.Archive` builds an archive from in-memory data, or wraps an existing
    * archive so you can extract it to disk or memory.
@@ -12499,17 +12549,30 @@ declare module "bun" {
    *   "package.json": packageJson,
    * }, { compress: "gzip" });
    * ```
+   *
+   * @example
+   * **Create a zip archive, and read one:**
+   * ```ts
+   * const zip = new Bun.Archive({ "hello.txt": "Hello, World!" }, { format: "zip" });
+   * await Bun.write("bundle.zip", zip);
+   *
+   * const bytes = await Bun.file("bundle.zip").bytes();
+   * const files = await new Bun.Archive(bytes, { format: "zip" }).files();
+   * ```
    */
   export class Archive {
     /**
      * Create an `Archive` instance from input data.
      *
-     * By default, archives are not compressed. Use `{ compress: "gzip" }` to enable compression.
+     * By default, an object becomes a tar archive that is not compressed. Use `{ compress: "gzip" }` to enable
+     * compression, or `{ format: "zip" }` to create a zip archive.
      *
      * @param data - The input data for the archive:
-     *   - **Object**: Creates a new tarball with the object's keys as file paths and values as file contents
-     *   - **Blob/TypedArray/ArrayBuffer**: Wraps existing archive data (tar or tar.gz)
-     * @param options - Archive options, including compression settings
+     *   - **Object**: Creates a new archive with the object's keys as file paths and values as file contents.
+     *     A zip archive takes strings and bytes only. A key that ends in `/` with an empty value is a directory.
+     *     Any other value is a `TypeError`, and so is a `Bun.file()` or an S3 file: pass `await file.bytes()`.
+     *   - **Blob/TypedArray/ArrayBuffer**: Wraps existing archive data (tar, tar.gz or zip)
+     * @param options - Archive options, including the format and compression settings
      *
      * @example
      * **From an object (creates uncompressed tarball):**
@@ -12533,13 +12596,31 @@ declare module "bun" {
      * ```
      *
      * @example
+     * **A zip archive:**
+     * ```ts
+     * const archive = new Bun.Archive(data, { format: "zip" });
+     * ```
+     *
+     * @example
      * **From existing archive data:**
      * ```ts
      * const response = await fetch("https://example.com/package.tar.gz");
      * const archive = new Bun.Archive(await response.blob());
      * ```
+     *
+     * @example
+     * **From existing archive data that is a zip:**
+     * ```ts
+     * const response = await fetch("https://example.com/package.zip");
+     * const archive = new Bun.Archive(await response.blob(), { format: "zip" });
+     * ```
      */
     constructor(data: ArchiveInput, options?: ArchiveOptions);
+    constructor(files: Record<string, BlobPart>, options: ArchiveZipOptions);
+    /**
+     * Existing archive data that is a zip. Its files stay as they are: there is no `compress` for it.
+     */
+    constructor(data: Blob | ArrayBufferView | ArrayBufferLike, options: { format: "zip" });
 
     /**
      * Create an archive and write it to disk in one operation.
@@ -12547,9 +12628,9 @@ declare module "bun" {
      * The data streams directly to disk, which is more efficient than creating an
      * archive and then writing it separately.
      *
-     * @param path - The file path to write the archive to
+     * @param path - The file path to write the archive to. The format is never taken from its extension.
      * @param data - The input data for the archive (same as `new Archive()`)
-     * @param options - Optional archive options including compression settings
+     * @param options - Optional archive options including the format and compression settings
      *
      * @returns A promise that resolves when the write is complete
      *
@@ -12567,8 +12648,32 @@ declare module "bun" {
      * ```ts
      * await Bun.Archive.write("output.tar.gz", files, { compress: "gzip" });
      * ```
+     *
+     * @example
+     * **Write a zip archive:**
+     * ```ts
+     * await Bun.Archive.write("output.zip", files, { format: "zip" });
+     * ```
      */
-    static write(path: string, data: ArchiveInput | Archive, options?: ArchiveOptions): Promise<void>;
+    static write(path: string, data: ArchiveInput, options?: ArchiveOptions): Promise<void>;
+    static write(path: string, files: Record<string, BlobPart>, options: ArchiveZipOptions): Promise<void>;
+    static write(
+      path: string,
+      data: Blob | ArrayBufferView | ArrayBufferLike,
+      options: { format: "zip" },
+    ): Promise<void>;
+    /**
+     * Write an `Archive` to disk.
+     *
+     * `compress` replaces the compression that the archive was created with: `"gzip"` for a tar archive, and
+     * `"deflate"` or `"store"` for a zip archive that was created from an object. There is no `format` here.
+     * An archive keeps the format that it has.
+     */
+    static write(
+      path: string,
+      archive: Archive,
+      options?: { compress?: "gzip" | "deflate"; level?: number } | { compress: "store" },
+    ): Promise<void>;
 
     /**
      * Extract the archive contents to a directory on disk.
@@ -12579,6 +12684,10 @@ declare module "bun" {
      * On Linux and macOS, nothing is written through a symlink in the target directory that is absolute or leads out of it.
      * The promise rejects when a file entry needs such a symlink, unless `options.glob` is set, which skips the entry.
      * The `code` of the error is `"EXDEV"`, and its `path` is the path of the entry relative to the target directory.
+     *
+     * The entries of a zip archive are extracted by the same rules as the entries of a tar archive. Each file is
+     * checked against the size and the CRC-32 that the archive records for it, and the promise rejects at the first
+     * one that differs.
      *
      * @param path - The directory path to extract to
      * @param options - Optional extraction options
@@ -12618,7 +12727,7 @@ declare module "bun" {
     /**
      * Get the archive contents as a `Blob`.
      *
-     * Uses the compression settings specified when the Archive was created.
+     * Uses the format and the compression settings specified when the Archive was created.
      *
      * @returns A promise that resolves with the archive data as a Blob
      *
@@ -12641,7 +12750,7 @@ declare module "bun" {
     /**
      * Get the archive contents as a `Uint8Array`.
      *
-     * Uses the compression settings specified when the Archive was created.
+     * Uses the format and the compression settings specified when the Archive was created.
      *
      * @returns A promise that resolves with the archive data as a Uint8Array
      *
@@ -12673,6 +12782,8 @@ declare module "bun" {
      * File contents are loaded into memory, so for large archives consider using `extract()` instead.
      * The promise rejects once the holes read from the archive's sparse files add up to more than 1,024 times
      * the size of the archive. Up to 64 MiB are always read, and never more than 1 GiB.
+     * A zip archive is rejected if two of its entries share bytes, so its files unpack to no more than DEFLATE
+     * can make of the archive, which is about 1,032 times its size.
      *
      * @param glob - Optional glob pattern(s) to filter files. Supports the same syntax as {@link Bun.Glob},
      *   including negation patterns (prefixed with `!`). Patterns are matched against paths normalized
