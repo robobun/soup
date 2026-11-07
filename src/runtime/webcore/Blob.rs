@@ -2827,7 +2827,7 @@ impl BlobExt for Blob {
 // ──────────────────────────────────────────────────────────────────────────
 
 use self::write_file::WriteFileWaitFromLockedValueTask;
-use crate::api::archive::Archive;
+use crate::api::archive::{self, Archive};
 use crate::image::Image;
 use crate::node;
 use crate::webcore::s3::client as s3_client;
@@ -3589,6 +3589,17 @@ pub(crate) fn write_file_with_source_destination(
     destination_blob: &mut Blob,
     options: &WriteFileOptions,
 ) -> JsResult<JSValue> {
+    write_file_with_s3_options(cx, source_blob, destination_blob, options, None)
+}
+
+/// `write_file_with_source_destination` with the S3 options that an earlier call already read.
+pub(crate) fn write_file_with_s3_options(
+    cx: &bun_jsc::JsThread<'_>,
+    source_blob: &mut Blob,
+    destination_blob: &mut Blob,
+    options: &WriteFileOptions,
+    s3_options: Option<bun_s3_signing::S3CredentialsWithOptions>,
+) -> JsResult<JSValue> {
     let destination_store = destination_blob
         .store
         .get()
@@ -3709,14 +3720,19 @@ pub(crate) fn write_file_with_source_destination(
         return Ok(JSPromise::resolved_promise_value(cx.global(), blob_value));
     } else if destination_type == store::DataTag::S3 {
         let s3 = destination_store.data.as_s3();
-        let aws_options = match s3.get_credentials_with_options(options.extra_options, cx.global())
-        {
-            Ok(o) => o,
-            Err(err) => {
-                return Ok(
-                    JSPromise::rejected_promise_with_caught_exception(cx.global(), err)?.to_js(),
-                );
-            }
+        let options_given = options.extra_options.is_some() || s3_options.is_some();
+        let aws_options = match s3_options {
+            Some(aws_options) => aws_options,
+            None => match s3.get_credentials_with_options(options.extra_options, cx.global()) {
+                Ok(o) => o,
+                Err(err) => {
+                    return Ok(JSPromise::rejected_promise_with_caught_exception(
+                        cx.global(),
+                        err,
+                    )?
+                    .to_js());
+                }
+            },
         };
         match &source_store.data {
             store::Data::Bytes(_) => {
@@ -3731,7 +3747,7 @@ pub(crate) fn write_file_with_source_destination(
                         cx.global(),
                     )? {
                         return s3_client::upload_stream(
-                            if options.extra_options.is_some() {
+                            if options_given {
                                 aws_options.credentials.dupe()
                             } else {
                                 s3.get_credentials().clone()
@@ -3806,7 +3822,7 @@ pub(crate) fn write_file_with_source_destination(
                     cx.global(),
                 )? {
                     return s3_client::upload_stream(
-                        if options.extra_options.is_some() {
+                        if options_given {
                             aws_options.credentials.dupe()
                         } else {
                             s3.get_credentials().clone()
@@ -4234,7 +4250,13 @@ pub(crate) fn write_file_internal(
 
         // Check for Archive - allows Bun.write() and S3 writes to accept Archive instances
         if let Some(archive) = data.as_class_ref::<Archive>() {
-            break 'brk archive.data().dupe();
+            match archive.outgoing() {
+                archive::Outgoing::Data(blob) => break 'brk blob,
+                // Its bytes are made on a pool thread first, and the write goes on from there.
+                archive::Outgoing::Render(rendering) => {
+                    return archive::write_rendered(cx, rendering, &mut destination_blob, &options);
+                }
+            }
         }
 
         if let Some(readable) = ReadableStream::from_js_direct(data) {

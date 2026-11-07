@@ -12628,6 +12628,9 @@ declare module "bun" {
      * Compression algorithm to use.
      * Only `"gzip"` is supported.
      * If not specified, no compression is applied.
+     *
+     * `Bun.write()` and the other ways to write an archive compress it as `bytes()` and `blob()` do.
+     * Existing archive data that is gzip already is not compressed again.
      */
     compress?: ArchiveCompression;
     /**
