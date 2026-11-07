@@ -47,11 +47,22 @@ impl Options {
     }
 }
 
+/// What the bytes of a path are. It decides the name that Windows gives the file, and nothing else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PathEncoding {
+    /// Not known. Each byte is one character.
+    #[default]
+    Bytes,
+    /// A pax record that [`Charset`] could convert. Its characters are composed, as libarchive composed them.
+    Pax,
+    /// UTF-8, taken as it is: nothing composes. npm's paths are this.
+    Utf8,
+}
+
 #[derive(Debug, Default)]
 pub struct Entry {
     path: Vec<u8>,
-    path_is_utf8: bool,
-    path_is_final: bool,
+    path_encoding: PathEncoding,
     link: Vec<u8>,
     is_symlink: bool,
     mode: u32,
@@ -60,17 +71,35 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// An entry of an archive that is not tar, for what takes the entries of this reader. `mode` has the file type.
+    /// A symlink made here has no target: whoever made it knows where to read one. `None` if the path holds a NUL.
+    pub fn new(
+        path: Vec<u8>,
+        path_encoding: PathEncoding,
+        mode: u32,
+        size: i64,
+        mtime: i64,
+    ) -> Option<Self> {
+        if strings::contains_char(&path, 0) {
+            return None;
+        }
+        Some(Self {
+            path,
+            path_encoding,
+            link: Vec::new(),
+            is_symlink: mode & S::IFMT == S::IFLNK,
+            mode,
+            size,
+            mtime: Some(mtime),
+        })
+    }
+
     /// Never holds a NUL.
     pub fn path(&self) -> &[u8] {
         &self.path
     }
-    /// The path is a pax record that [`Charset`] could convert, or npm's. Otherwise its encoding is unknown.
-    pub fn path_is_utf8(&self) -> bool {
-        self.path_is_utf8
-    }
-    /// The path is npm's, in which nothing composes.
-    pub(crate) fn path_is_final(&self) -> bool {
-        self.path_is_final
+    pub fn path_encoding(&self) -> PathEncoding {
+        self.path_encoding
     }
     pub fn symlink(&self) -> Option<&[u8]> {
         self.is_symlink.then_some(&self.link[..])
@@ -1324,7 +1353,11 @@ impl Reader {
         if !path.is_empty() {
             let converts = !utf8 || self.converts(path)?;
             assign(&mut self.entry.path, slice_to_nul(path))?;
-            self.entry.path_is_utf8 = utf8 && converts;
+            self.entry.path_encoding = if utf8 && converts {
+                PathEncoding::Pax
+            } else {
+                PathEncoding::Bytes
+            };
             if !converts {
                 status = Status::Warn;
             }
@@ -1367,7 +1400,7 @@ impl Reader {
                             return Err(Error::Ambiguous);
                         }
                         assign(&mut self.entry.path, name)?;
-                        self.entry.path_is_utf8 = false;
+                        self.entry.path_encoding = PathEncoding::Bytes;
                     }
                     Collect::LongLink => {
                         assign(&mut self.entry.link, slice_to_nul(value))?;
@@ -1551,7 +1584,7 @@ impl Reader {
         if magic == gnu::MAGIC {
             self.format = Format::Gnu;
             if self.entry.path.is_empty() {
-                self.entry.path_is_utf8 = false;
+                self.entry.path_encoding = PathEncoding::Bytes;
                 assign(&mut self.entry.path, slice_to_nul(header::name(h)))?;
             }
             if !npm && header::typeflag(h) == b'S' {
@@ -1573,7 +1606,7 @@ impl Reader {
                 self.format = Format::Ustar;
             }
             if self.entry.path.is_empty() {
-                self.entry.path_is_utf8 = false;
+                self.entry.path_encoding = PathEncoding::Bytes;
                 let prefix = slice_to_nul(header::prefix(h));
                 assign(&mut self.entry.path, prefix)?;
                 if !prefix.is_empty() && (npm || prefix.last() != Some(&b'/')) {
@@ -1584,7 +1617,7 @@ impl Reader {
         } else {
             self.format = Format::Old;
             if self.entry.path.is_empty() {
-                self.entry.path_is_utf8 = false;
+                self.entry.path_encoding = PathEncoding::Bytes;
                 assign(&mut self.entry.path, slice_to_nul(header::name(h)))?;
             }
         }
@@ -1824,8 +1857,7 @@ impl Reader {
                     self.entry.path.write(piece.as_bytes())?;
                 }
             }
-            self.entry.path_is_utf8 = true;
-            self.entry.path_is_final = true;
+            self.entry.path_encoding = PathEncoding::Utf8;
         }
 
         self.state = State::Emit;

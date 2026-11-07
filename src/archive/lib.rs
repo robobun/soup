@@ -1,4 +1,4 @@
-//! Extracts tar archives to disk. The format itself is `bun_tar`'s.
+//! Extracts archives to disk. The formats themselves are `bun_tar`'s and `bun_zip`'s.
 #![warn(unused_must_use)]
 
 use bun_alloc::AllocError;
@@ -11,13 +11,86 @@ use bun_sys::beneath::{self, Symlinks};
 use bun_sys::{self, Fd, FdExt, File};
 use bun_wyhash::hash;
 
+mod any;
 pub mod error;
-pub use error::{Error, ReadDataError, Result};
+pub use any::{AnyReader, Format, Modified, open};
+pub use error::{AnyError, Error, ReadDataError, Result};
 mod npm_path;
 pub use npm_path::{normalize_npm_entry_path, npm_entry_destination};
 
 pub use bun_tar as tar;
 use bun_tar::{Dialect, Entry, Event, MemoryDecoder, Options};
+pub use bun_zip as zip;
+
+/// What the extraction loop asks of an archive in memory. Two types answer: the tar reader, and [`AnyReader`].
+trait Source {
+    type Error: core::fmt::Display + Into<Error>;
+    fn next_entry(&mut self) -> core::result::Result<Option<&Entry>, Self::Error>;
+    fn next(&mut self) -> core::result::Result<Event<'_>, Self::Error>;
+    fn read_data(
+        &mut self,
+        size: usize,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), Self::Error>;
+    /// Where the current entry, which is a symlink, points. Windows makes no symlinks and does not ask.
+    #[cfg(unix)]
+    fn link_target(&mut self) -> core::result::Result<&[u8], Self::Error>;
+    /// See [`tar::Reader::skipped_header`].
+    fn skipped_header(&self) -> bool;
+}
+
+impl Source for MemoryDecoder<'_> {
+    type Error = bun_tar::Error;
+    #[inline]
+    fn next_entry(&mut self) -> bun_tar::Result<Option<&Entry>> {
+        MemoryDecoder::next_entry(self)
+    }
+    #[inline]
+    fn next(&mut self) -> bun_tar::Result<Event<'_>> {
+        MemoryDecoder::next(self)
+    }
+    #[inline]
+    fn read_data(&mut self, size: usize, out: &mut Vec<u8>) -> bun_tar::Result<()> {
+        MemoryDecoder::read_data(self, size, out)
+    }
+    #[cfg(unix)]
+    #[inline]
+    fn link_target(&mut self) -> bun_tar::Result<&[u8]> {
+        Ok(self.entry().symlink().unwrap_or_default())
+    }
+    #[inline]
+    fn skipped_header(&self) -> bool {
+        MemoryDecoder::skipped_header(self)
+    }
+}
+
+impl Source for AnyReader<'_> {
+    type Error = AnyError;
+    #[inline]
+    fn next_entry(&mut self) -> core::result::Result<Option<&Entry>, AnyError> {
+        AnyReader::next_entry(self)
+    }
+    #[inline]
+    fn next(&mut self) -> core::result::Result<Event<'_>, AnyError> {
+        AnyReader::next(self)
+    }
+    #[inline]
+    fn read_data(&mut self, size: usize, out: &mut Vec<u8>) -> core::result::Result<(), AnyError> {
+        AnyReader::read_data(self, size, out)
+    }
+    #[cfg(unix)]
+    #[inline]
+    fn link_target(&mut self) -> core::result::Result<&[u8], AnyError> {
+        AnyReader::link_target(self)
+    }
+    #[inline]
+    fn skipped_header(&self) -> bool {
+        match self {
+            AnyReader::Tar(reader) => reader.skipped_header(),
+            AnyReader::Zip(_) => false,
+        }
+    }
+}
 
 /// The entry's path the way the file system takes it. `buf` is scratch space for Windows.
 #[cfg(not(windows))]
@@ -53,16 +126,26 @@ pub fn open_memory(bytes: &[u8], dialect: Dialect) -> bun_tar::Result<MemoryDeco
     MemoryDecoder::new(bytes, Options::for_host(dialect))
 }
 
-/// Writes the contents of the current entry to `file`, then closes it.
+impl AnyReader<'_> {
+    /// Writes the contents of the current entry to `file`, then closes it.
+    pub fn read_data_into_file(
+        &mut self,
+        file: File,
+        strategy: &mut WriteStrategy,
+    ) -> Result<(), ReadDataError<AnyError>> {
+        read_data_into(self, file, strategy)
+    }
+}
+
 // Closing asynchronously gains nothing on Windows and can make NtSetInformationFile fail.
-pub fn read_data_into_file(
-    reader: &mut MemoryDecoder<'_>,
+fn read_data_into<R: Source>(
+    reader: &mut R,
     file: File,
     strategy: &mut WriteStrategy,
-) -> Result<(), ReadDataError> {
+) -> Result<(), ReadDataError<R::Error>> {
     let mut writer = EntryWriter::new(file);
     loop {
-        match reader.next()? {
+        match reader.next().map_err(ReadDataError::Archive)? {
             Event::Data { offset, bytes } => writer.write(strategy, offset, bytes)?,
             Event::EndOfEntry { size } => return Ok(writer.finish(size)?),
             Event::NeedInput | Event::Entry(_) | Event::EndOfArchive => return Ok(()),
@@ -485,6 +568,19 @@ impl Archiver {
             Dialect::General
         };
         let mut reader = open_memory(file_buffer, dialect)?;
+        Self::extract_entries(&mut reader, dir, ctx, appender, options)
+    }
+
+    /// The loop of [`Self::extract_to_dir`], for either reader. It is compiled for each one, so the tar reader's
+    /// copy does not know of another.
+    #[inline]
+    fn extract_entries<A: ArchiveAppender, R: Source>(
+        reader: &mut R,
+        dir: Fd,
+        ctx: Option<&mut Context>,
+        appender: &mut A,
+        options: ExtractOptions,
+    ) -> crate::Result<u32> {
         let mut os_path_buf: Vec<OSPathChar> = Vec::new();
         let mut count: u32 = 0;
         let dir_fd = dir;
@@ -504,7 +600,7 @@ impl Archiver {
 
         let mut write_strategy = WriteStrategy::default();
 
-        'loop_: while let Some(entry) = reader.next_entry()? {
+        'loop_: while let Some(entry) = reader.next_entry().map_err(Into::into)? {
             let pathname_z = os_path(entry, &mut os_path_buf)?;
 
             if A::HAS_ON_FIRST_DIRECTORY_NAME {
@@ -608,9 +704,17 @@ impl Archiver {
                     }
                 }
                 bun_sys::FileKind::SymLink => {
-                    let link_target = entry.symlink().unwrap_or_default();
                     #[cfg(unix)]
                     {
+                        let link_target = match reader.link_target() {
+                            Ok(target) => target,
+                            Err(err) => {
+                                if options.log {
+                                    log_archive_error(path_slice, &err);
+                                }
+                                return Err(err.into());
+                            }
+                        };
                         // Validate that the symlink target doesn't escape the extraction directory.
                         // This prevents path traversal attacks where a malicious tarball creates a symlink
                         // pointing outside (e.g., to /tmp), then writes files through that symlink.
@@ -629,10 +733,6 @@ impl Archiver {
                             continue;
                         }
                         deferred_symlinks.push(DeferredSymlink::new(path_slice, link_target));
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = link_target;
                     }
                 }
                 bun_sys::FileKind::File => {
@@ -702,7 +802,7 @@ impl Archiver {
                                         reader.read_data(size, &mut plucker_.contents.list)
                                     {
                                         if options.log {
-                                            log_archive_error(path_slice, err);
+                                            log_archive_error(path_slice, &err);
                                         }
                                         return Err(err.into());
                                     }
@@ -712,9 +812,7 @@ impl Archiver {
                                 }
                             }
                         }
-                        if let Err(err) =
-                            read_data_into_file(&mut reader, output, &mut write_strategy)
-                        {
+                        if let Err(err) = read_data_into(reader, output, &mut write_strategy) {
                             if options.log {
                                 log_archive_error(path_slice, err);
                             }
@@ -743,19 +841,31 @@ impl Archiver {
         appender: &mut A,
         options: ExtractOptions,
     ) -> crate::Result<u32> {
-        let dir: Fd = 'brk: {
-            let cwd = Fd::cwd();
-            let _ = cwd.make_path_u8(root);
-
-            if bun_paths::is_absolute(root) {
-                break 'brk bun_sys::open_dir_absolute(root)?;
-            } else {
-                break 'brk bun_sys::open_dir_at(cwd, root)?;
-            }
-        };
-
-        let dir = File::from_fd(dir);
+        let dir = Self::make_destination(root)?;
 
         Self::extract_to_dir(file_buffer, dir.fd(), ctx, appender, options)
+    }
+
+    /// Makes the directory `root` if there is none, and opens it.
+    fn make_destination(root: &[u8]) -> crate::Result<File> {
+        let cwd = Fd::cwd();
+        let _ = cwd.make_path_u8(root);
+        Ok(File::from_fd(if bun_paths::is_absolute(root) {
+            bun_sys::open_dir_absolute(root)?
+        } else {
+            bun_sys::open_dir_at(cwd, root)?
+        }))
+    }
+
+    /// [`Self::extract_to_disk`] for `Bun.Archive`, which also reads zip. `format` is for [`open`].
+    pub fn extract_to_disk_any(
+        file_buffer: &[u8],
+        root: &[u8],
+        format: Option<Format>,
+        options: ExtractOptions,
+    ) -> crate::Result<u32> {
+        let dir = Self::make_destination(root)?;
+        let mut reader = open(file_buffer, format)?;
+        Self::extract_entries(&mut reader, dir.fd(), None, &mut (), options)
     }
 }
