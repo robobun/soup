@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "path";
+import { serve as serveS3 } from "s3-server";
 
 // Minimal ustar tarball builder (pathnames must be <100 bytes). `name` accepts
 // a Buffer so tests can put raw, non-UTF-8 byte sequences into the name field.
@@ -1814,6 +1815,16 @@ describe("Bun.Archive", () => {
         );
       }).toThrow();
     });
+
+    test("data that is gzip already is written as it is", async () => {
+      using dir = tempDir("archive-write-gzip-once", {});
+      const gzipped = Buffer.from(await new Bun.Archive({ "file.txt": "content" }, { compress: "gzip" }).bytes());
+      const given = { bytes: gzipped, blob: new Blob([gzipped]), archive: new Bun.Archive(gzipped) };
+      for (const [kind, data] of Object.entries(given)) {
+        await Bun.Archive.write(join(String(dir), kind), data, { compress: "gzip" });
+        expect({ kind, same: readFileSync(join(String(dir), kind)).equals(gzipped) }).toEqual({ kind, same: true });
+      }
+    });
   });
 
   describe("GC safety", () => {
@@ -3062,6 +3073,119 @@ describe("Bun.Archive", () => {
       const readArchive = new Bun.Archive(await bunFile.bytes());
       const files = await readArchive.files();
       expect(await files.get("test.txt")!.text()).toBe("test content");
+    });
+
+    // What `bytes()` gives is what every write of the archive puts at its destination.
+    describe("every way out gives the same bytes", () => {
+      const files = { "a.txt": Buffer.alloc(50_000, "a").toString(), "b/c.txt": "c" };
+      const kinds = {
+        "a tar": () => new Bun.Archive(files),
+        "a gzipped tar": () => new Bun.Archive(files, { compress: "gzip" }),
+        "a gzipped tar at level 12": () => new Bun.Archive(files, { compress: "gzip", level: 12 }),
+        // Bytes that are gzip already are the archive, gzipped. They are not gzipped again.
+        "bytes that are a gzipped tar": async () =>
+          new Bun.Archive(await new Bun.Archive(files, { compress: "gzip" }).bytes(), { compress: "gzip" }),
+      };
+
+      test.each(Object.entries(kinds))("%s", async (kind, make) => {
+        const archive = await make();
+        const bytes = Buffer.from(await archive.bytes());
+        expect(bytes.subarray(0, 2).toString("hex")).toBe(kind === "a tar" ? "612e" : "1f8b");
+        if (kind !== "a tar") expect(bytes.length).toBeLessThan(400);
+        expect([...(await new Bun.Archive(bytes).files()).keys()]).toEqual(["a.txt", "b/c.txt"]);
+
+        using dir = tempDir("archive-doors", {});
+        await using server = serveS3({ buckets: ["doors"] });
+        const { bucket, ...account } = server.clientOptions("doors");
+        const client = new Bun.S3Client({ ...account, bucket });
+        const path = (name: string) => join(String(dir), name);
+        await Bun.Archive.write(path("archive-write"), archive);
+        const written = [
+          await Bun.write(path("bun-write"), archive),
+          await Bun.write(Bun.file(path("bun-write-file")), archive),
+          await Bun.file(path("file-write")).write(archive),
+          await client.write("client-write", archive),
+          await client.file("s3-file-write").write(archive),
+          await Bun.write(client.file("bun-write-s3"), archive),
+          await Bun.write("s3://doors/bun-write-url", archive, account),
+        ];
+        expect(written).toEqual(written.map(() => bytes.length));
+        const doors = {
+          "blob()": Buffer.from(await (await archive.blob()).bytes()),
+          "bytes() again": Buffer.from(await archive.bytes()),
+          "Archive.write": readFileSync(path("archive-write")),
+          "Bun.write": readFileSync(path("bun-write")),
+          "Bun.write to Bun.file()": readFileSync(path("bun-write-file")),
+          "file.write": readFileSync(path("file-write")),
+          "S3Client.write": Buffer.from(await client.file("client-write").bytes()),
+          "S3File.write": Buffer.from(await client.file("s3-file-write").bytes()),
+          "Bun.write to an S3 file": Buffer.from(await client.file("bun-write-s3").bytes()),
+          "Bun.write to an s3:// URL": Buffer.from(await client.file("bun-write-url").bytes()),
+        };
+        for (const [door, other] of Object.entries(doors)) {
+          expect({ door, length: other.length, same: other.equals(bytes) }).toEqual({
+            door,
+            length: bytes.length,
+            same: true,
+          });
+        }
+      });
+    });
+
+    test("the options of the call are read before Bun.write returns", async () => {
+      await using server = serveS3({ buckets: ["named", "other"] });
+      const archive = new Bun.Archive({ "a.txt": Buffer.alloc(10_000, "a").toString() }, { compress: "gzip" });
+      const bytes = Buffer.from(await archive.bytes());
+      const options = { ...server.clientOptions("named") };
+      const written = Bun.write("s3://a.tar.gz", archive, options);
+      // The archive is compressed on another thread first, and the upload starts after that.
+      options.bucket = "other";
+      options.accessKeyId = "nobody";
+      expect(await written).toBe(bytes.length);
+      const read = (bucket: string) =>
+        new Bun.S3Client(server.clientOptions(bucket))
+          .file("a.tar.gz")
+          .bytes()
+          .then(
+            found => Buffer.from(found).equals(bytes),
+            error => error.code,
+          );
+      expect({ named: await read("named"), other: await read("other") }).toEqual({ named: true, other: "NoSuchKey" });
+    });
+
+    test("options that cannot be read reject the write of a compressed archive", async () => {
+      await using server = serveS3({ buckets: ["named"] });
+      const archive = new Bun.Archive({ "a.txt": "a" }, { compress: "gzip" });
+      const plain = new Bun.Archive({ "a.txt": "a" });
+      const options = { ...server.clientOptions("named"), acl: "not an acl" };
+      // The same error, at the same moment, as for an archive that is written as it is.
+      const outcome = (written: Promise<number>) => written.then(String, error => `${error.name}: ${error.message}`);
+      // @ts-expect-error
+      const compressed = await outcome(Bun.write("s3://a.tar.gz", archive, options));
+      // @ts-expect-error
+      expect(compressed).toBe(await outcome(Bun.write("s3://a.tar", plain, options)));
+      expect(compressed).toStartWith("TypeError");
+    });
+
+    test("a compressed archive is written with the options of the write", async () => {
+      using dir = tempDir("archive-bunwrite-options", {});
+      const archive = new Bun.Archive({ "a.txt": Buffer.alloc(5000, "a").toString() }, { compress: "gzip" });
+      const bytes = Buffer.from(await archive.bytes());
+      expect(await Bun.write(join(String(dir), "made", "for", "it.tar.gz"), archive)).toBe(bytes.length);
+      expect(readFileSync(join(String(dir), "made", "for", "it.tar.gz")).equals(bytes)).toBe(true);
+      const refused = Bun.write(join(String(dir), "not", "made.tar.gz"), archive, { createPath: false });
+      expect(await refused.then(String, error => error.code)).toBe("ENOENT");
+      expect(existsSync(join(String(dir), "not"))).toBe(false);
+    });
+
+    test("an archive that is a file on disk is copied, with or without compress", async () => {
+      using dir = tempDir("archive-bunwrite-file-backed", {});
+      const tar = Buffer.from(await new Bun.Archive({ "a.txt": "a" }).bytes());
+      await Bun.write(join(String(dir), "in.tar"), tar);
+      // Its bytes are not in memory, so there is nothing here to compress.
+      const archive = new Bun.Archive(Bun.file(join(String(dir), "in.tar")), { compress: "gzip" });
+      expect(await Bun.write(join(String(dir), "out.tar"), archive)).toBe(tar.length);
+      expect(readFileSync(join(String(dir), "out.tar")).equals(tar)).toBe(true);
     });
   });
 

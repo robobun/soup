@@ -9181,6 +9181,68 @@ Files: `src/js/internal/hot.ts` (new), `src/jsc/bindings/ImportMetaObject.cpp`,
 `docs/bundler/hot-reloading.mdx`, `test/cli/hot/hot.test.ts`,
 `test/cli/run/transpiler-cache.test.ts`, `test/integration/bun-types/fixture/index.ts`.
 
+### 2026-11-06: `Bun.write(destination, archive)` writes what `archive.bytes()` gives
+
+An `Archive` that was created with `compress: "gzip"` had two answers to the question of what its
+bytes are. `bytes()`, `blob()` and `Archive.write()` gave the gzipped tar. `Bun.write()`,
+`Bun.file().write()` and the S3 writes took the store as it was and wrote the plain tar, also to a
+path that ends in `.tar.gz`. The docs of `Bun.Archive` show this very call. oven-sh/bun#30234
+reports it.
+
+```ts
+const archive = new Bun.Archive(
+  { "src/index.ts": source },
+  { compress: "gzip" },
+);
+
+await Bun.write("bundle.tar.gz", archive); // was a plain tar, is a gzipped tar now
+await Bun.file("bundle.tar.gz").write(archive); // the same
+await s3.write("bundle.tar.gz", archive); // the same, and `s3.file(key).write(archive)` too
+```
+
+What the commit does:
+
+- Every way out of an archive asks one function, `Archive::rendering`, what leaves it. `bytes()`,
+  `blob()` and `Archive.write()` each had a `match` of their own for it, and `Bun.write` had none.
+- When a compression is pending, `Bun.write` starts a job. A pool thread makes the bytes, and then
+  the write goes on as it does for any bytes. The promise that `Bun.write` returned settles with
+  that write, so its value is still the number of bytes written.
+- The options of the call are read before `Bun.write` returns, as they are for every other input.
+  An S3 destination takes its credentials and its options from that moment, and options that
+  cannot be read reject at once. The open draft oven-sh/bun#46661 made the same decision, and the
+  job has the shape of the one in that draft.
+- Bytes that are gzip already are the archive, gzipped. With `compress: "gzip"`, an `Archive` of
+  such bytes now gives them at every door, and `Archive.write(path, gzippedBytes, options)` writes
+  them as they are. Before, `bytes()`, `blob()` and `Archive.write()` compressed them a second
+  time, and tar, Python and Go do not read the result.
+- An archive whose store is a file on disk or an S3 object has no bytes in memory. It is copied as
+  before, with or without `compress`.
+
+What it costs a program that does not use it: `Bun.write(destination, archive)` without a pending
+compression takes the path that it took before, with one `match` in front. A write of anything
+that is not an `Archive` is not touched. `write_rendered` is `#[inline(never)]` and a declared use
+of the `archive` trim feature, so a build without that feature loses it with the rest of
+`Bun.Archive`.
+
+A test writes one archive through ten doors (four of them S3, against the in-process S3 server of
+the test suite) and compares every result with `bytes()`. It does that for a tar, a gzipped tar, a
+gzipped tar at level 12, and bytes that are a gzipped tar already. Other tests change the options
+object after the call, pass options that cannot be read, and write a compressed archive with
+`createPath: false`.
+
+This is a commit of its own, in front of the zip commit of the same day. The self-review of the
+first version, which had both in one commit, asked for the split: upstream can take the fix without
+a zip reader and writer, and zip without a change for tar users. This commit applies to
+oven-sh/bun main (b1305ddc7c) without the rest of the stack, and the zip commit applies on top of
+it.
+
+Seen on the way and not part of this: `Bun.write(path, data, { mode })` ignores `mode` for strings,
+typed arrays and in-memory Blobs on upstream main. The first version of a test here asserted the
+mode and failed for a plain string too.
+
+Files: `src/runtime/api/Archive.rs`, `src/runtime/webcore/Blob.rs`, `src/tar/gzip.rs`,
+`docs/runtime/archive.mdx`, `packages/bun-types/bun.d.ts`, `test/js/bun/archive.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
