@@ -2,7 +2,8 @@
 
 use crate::webcore::Blob;
 use crate::webcore::BlobExt as _;
-use crate::webcore::blob::Store;
+use crate::webcore::blob::store::{self, S3Ext as _};
+use crate::webcore::blob::{Store, WriteFileOptions, write_file_with_s3_options};
 use bun_archive::tar;
 use bun_core::{self, Output, Utf8Bytes, ZBox, strings};
 use bun_glob as glob;
@@ -35,11 +36,64 @@ pub(crate) struct Archive {
     compress: Compression,
 }
 
+/// The bytes of an archive and what is made of them before they leave, on a pool thread.
+pub(crate) struct Rendering {
+    store: RefPtr<Store>,
+    compress: Compression,
+}
+
+/// What an archive gives to `Bun.write`.
+pub(crate) enum Outgoing {
+    /// The store is the archive.
+    Store(RefPtr<Store>),
+    Render(Rendering),
+}
+
 impl Archive {
-    /// Borrow the backing `RefPtr<Store>`.
-    #[inline]
-    pub(crate) fn store_ref(&self) -> &RefPtr<Store> {
-        &self.store
+    /// Every way out of an archive asks here, so that none gives the store where the store is not the archive.
+    fn rendering(&self, compress: Compression) -> Rendering {
+        let pending = match &self.store.data {
+            // A file or an S3 object has no bytes here to make anything of.
+            store::Data::File(_) | store::Data::S3(_) => false,
+            store::Data::Bytes(bytes) => changes(bytes.slice(), compress),
+        };
+        Rendering {
+            store: self.store.clone(),
+            compress: if pending { compress } else { Compression::None },
+        }
+    }
+
+    pub(crate) fn outgoing(&self) -> Outgoing {
+        let rendering = self.rendering(self.compress);
+        match rendering.compress {
+            Compression::None => Outgoing::Store(rendering.store),
+            Compression::Gzip(_) => Outgoing::Render(rendering),
+        }
+    }
+}
+
+impl Rendering {
+    /// `None`: the bytes of the store are the archive.
+    fn run(&self) -> Result<Option<Vec<u8>>, CompressError> {
+        render(self.store.shared_view(), self.compress)
+    }
+}
+
+/// Whether `compress` makes other bytes of `bytes`.
+fn changes(bytes: &[u8], compress: Compression) -> bool {
+    match compress {
+        Compression::None => false,
+        // Bytes that are gzip already are the archive, gzipped.
+        Compression::Gzip(_) => !tar::gzip::starts_like_header(bytes),
+    }
+}
+
+/// The one function that makes what leaves of an archive's bytes. `None`: the bytes themselves.
+fn render(bytes: &[u8], compress: Compression) -> Result<Option<Vec<u8>>, CompressError> {
+    match compress {
+        _ if !changes(bytes, compress) => Ok(None),
+        Compression::None => Ok(None),
+        Compression::Gzip(options) => compress_gzip(bytes, options.level).map(Some),
     }
 }
 
@@ -328,11 +382,12 @@ impl Archive {
             } else {
                 archive.compress
             };
+            let rendering = archive.rendering(compress);
             return start_write_task(
                 &cx,
-                WriteData::Store(archive.store.clone()),
+                WriteData::Store(rendering.store),
                 path_slice.slice(),
-                compress,
+                rendering.compress,
             );
         }
 
@@ -488,14 +543,14 @@ impl Archive {
     /// Returns Promise<Blob> with the archive data (compressed if gzip was set in options)
     pub(crate) fn blob(&self, cx: &mut JsScope<'_>) -> JsResult<JSValue> {
         let cx = cx.js_thread();
-        start_blob_task(&cx, &self.store, self.compress, BlobOutputType::Blob)
+        start_blob_task(&cx, self.rendering(self.compress), BlobOutputType::Blob)
     }
 
     /// Instance method: archive.bytes()
     /// Returns Promise<Uint8Array> with the archive data (compressed if gzip was set in options)
     pub(crate) fn bytes(&self, cx: &mut JsScope<'_>) -> JsResult<JSValue> {
         let cx = cx.js_thread();
-        start_blob_task(&cx, &self.store, self.compress, BlobOutputType::Bytes)
+        start_blob_task(&cx, self.rendering(self.compress), BlobOutputType::Bytes)
     }
 
     /// Instance method: archive.files(glob?)
@@ -703,20 +758,17 @@ enum BlobResult {
 }
 
 pub(crate) struct BlobContext {
-    store: RefPtr<Store>,
-    compress: Compression,
+    rendering: Rendering,
     output_type: BlobOutputType,
     result: BlobResult,
 }
 
 impl TaskContext for BlobContext {
     fn run(&mut self) {
-        self.result = match &self.compress {
-            Compression::Gzip(opts) => match compress_gzip(self.store.shared_view(), opts.level) {
-                Ok(data) => BlobResult::Compressed(data),
-                Err(e) => BlobResult::Err(e),
-            },
-            Compression::None => BlobResult::Uncompressed,
+        self.result = match self.rendering.run() {
+            Ok(Some(data)) => BlobResult::Compressed(data),
+            Ok(None) => BlobResult::Uncompressed,
+            Err(e) => BlobResult::Err(e),
         };
     }
 
@@ -739,12 +791,12 @@ impl TaskContext for BlobContext {
                 BlobOutputType::Blob => {
                     // The clone bumps the refcount; ownership of
                     // the new ref transfers into the Blob via init_with_store.
-                    let store = self.store.clone();
+                    let store = self.rendering.store.clone();
                     PromiseResult::Resolve(Blob::init_with_store(store, global).into_js(global))
                 }
                 BlobOutputType::Bytes => {
                     // On allocation failure, reject the promise instead of aborting.
-                    let view = self.store.shared_view();
+                    let view = self.rendering.store.shared_view();
                     let mut dup: Vec<u8> = Vec::new();
                     if dup.try_reserve_exact(view.len()).is_err() {
                         return Ok(PromiseResult::Reject(global.create_out_of_memory_error()));
@@ -764,18 +816,13 @@ pub(crate) type BlobTask = AsyncTask<BlobContext>;
 
 fn start_blob_task(
     cx: &bun_jsc::JsThread<'_>,
-    store: &RefPtr<Store>,
-    compress: Compression,
+    rendering: Rendering,
     output_type: BlobOutputType,
 ) -> JsResult<JSValue> {
-    let store = store.clone();
-    // errdefer store.deref() — Drop handles it
-
     Ok(BlobTask::start(
         cx,
         BlobContext {
-            store,
-            compress,
+            rendering,
             output_type,
             result: BlobResult::Uncompressed,
         },
@@ -820,18 +867,11 @@ impl WriteContext {
             WriteData::Owned(d) => d,
             WriteData::Store(s) => s.shared_view(),
         };
-        let compressed_buf;
-        let data_to_write: &[u8] = match &self.compress {
-            Compression::Gzip(opts) => {
-                compressed_buf = match compress_gzip(source_data, opts.level) {
-                    Ok(v) => v,
-                    Err(e) => return WriteResult::Err(e),
-                };
-                &compressed_buf
-            }
-            Compression::None => source_data,
+        let rendered = match render(source_data, self.compress) {
+            Ok(rendered) => rendered,
+            Err(e) => return WriteResult::Err(e),
         };
-        // `defer if (compress != .none) free(data_to_write)` — handled by `compressed_buf: Vec<u8>` Drop.
+        let data_to_write: &[u8] = rendered.as_deref().unwrap_or(source_data);
 
         let file = match bun_sys::File::openat(
             Fd::cwd(),
@@ -872,6 +912,114 @@ fn start_write_task(
             result: WriteResult::Success,
         },
     ))
+}
+
+/// `Bun.write(destination, archive)` for an archive whose store is not what it writes: a pool thread makes the bytes,
+/// and then the write goes on as it does for any bytes.
+pub(crate) struct RenderThenWrite;
+
+pub(crate) struct Rendered {
+    rendering: Rendering,
+    /// `None` until the pool ran the job.
+    bytes: Option<Result<Option<Vec<u8>>, CompressError>>,
+}
+
+/// What the write needs when the bytes exist.
+pub(crate) struct PendingWrite {
+    promise: JSPromiseStrong,
+    destination: Blob,
+    /// Without the options object of the call, which is not read again.
+    options: WriteFileOptions,
+    /// For an S3 destination: the credentials and options as they were when `Bun.write` was called.
+    s3_options: Option<bun_s3_signing::S3CredentialsWithOptions>,
+}
+
+// SAFETY: a job's `Js` half, which is used and dropped on the JS thread only.
+unsafe impl jsc::job::JsAffine for PendingWrite {}
+
+impl jsc::JobContext for RenderThenWrite {
+    type OffThread = Rendered;
+    type Js = PendingWrite;
+
+    fn run(rendered: &mut Rendered, done: jsc::Completion<Self>) -> Option<jsc::Completion<Self>> {
+        rendered.bytes = Some(rendered.rendering.run());
+        Some(done)
+    }
+
+    fn then(rendered: Rendered, mut write: PendingWrite, cx: &jsc::JsThread<'_>) -> JsResult<()> {
+        let global = cx.global();
+        let source = match rendered.bytes {
+            Some(Ok(Some(bytes))) => Blob::create_with_bytes_and_allocator(bytes, global, false),
+            Some(Ok(None)) => Blob::init_with_store(rendered.rendering.store, global),
+            Some(Err(e)) => {
+                write.destination.detach();
+                return write
+                    .promise
+                    .swap()
+                    .reject_with_async_stack(global, Ok(e.to_js(global)));
+            }
+            // The pool gave the job back without a run: the VM stops.
+            None => return Ok(()),
+        };
+        let mut source = scopeguard::guard(source, |blob| blob.detach());
+        let mut destination = scopeguard::guard(write.destination, |blob| blob.detach());
+        // The promise that `Bun.write` returned takes the outcome of this write.
+        let written = write_file_with_s3_options(
+            cx,
+            &mut source,
+            &mut destination,
+            &write.options,
+            write.s3_options.take(),
+        );
+        write.promise.settle(global, written)
+    }
+}
+
+/// Takes `destination`. Returns the promise of the write.
+#[inline(never)]
+pub(crate) fn write_rendered(
+    cx: &jsc::JsThread<'_>,
+    rendering: Rendering,
+    destination: &mut Blob,
+    options: &WriteFileOptions,
+) -> JsResult<JSValue> {
+    bun_removable_features::removable_definition!(Archive, write_rendered);
+    let global = cx.global();
+    // The options object is read now, while `Bun.write` runs, as every other write reads it.
+    let destination_store = destination.store().cloned();
+    let s3_options = match destination_store.as_ref().map(|store| &store.data) {
+        Some(store::Data::S3(s3)) => {
+            match s3.get_credentials_with_options(options.extra_options, global) {
+                Ok(s3_options) => Some(s3_options),
+                Err(err) => {
+                    destination.detach();
+                    return Ok(
+                        JSPromise::rejected_promise_with_caught_exception(global, err)?.to_js(),
+                    );
+                }
+            }
+        }
+        _ => None,
+    };
+    let promise = JSPromiseStrong::init(global);
+    let value = promise.value();
+    jsc::Job::<RenderThenWrite>::schedule(
+        cx,
+        Rendered {
+            rendering,
+            bytes: None,
+        },
+        PendingWrite {
+            promise,
+            destination: core::mem::replace(destination, Blob::init_empty(global)),
+            options: WriteFileOptions {
+                extra_options: None,
+                ..*options
+            },
+            s3_options,
+        },
+    );
+    Ok(value)
 }
 
 struct FileEntry {

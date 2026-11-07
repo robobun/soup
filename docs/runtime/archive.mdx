@@ -90,6 +90,8 @@ const compressed = new Bun.Archive({ "src/index.ts": "console.log('Hello');" }, 
 await Bun.write("output.tar.gz", compressed);
 ```
 
+`Bun.write()`, `Bun.file().write()` and a write to S3 put the same bytes at the destination that `archive.bytes()` returns. The compression is the one of the archive, whatever the destination is called.
+
 ### Getting Archive Bytes
 
 Get the archive data as bytes or a Blob:
@@ -330,6 +332,8 @@ The `options` argument accepts:
 - No options or `undefined` - Uncompressed tar (default)
 - `{ compress: "gzip" }` - Enable gzip compression at level 6
 - `{ compress: "gzip", level: number }` - Gzip with custom level 1-12 (1 = fastest, 12 = smallest)
+
+Existing archive data that is gzip already stays as it is with `{ compress: "gzip" }`. Bun does not compress it a second time.
 
 ## Examples
 
