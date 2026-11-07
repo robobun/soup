@@ -15,18 +15,46 @@ pub enum Error {
     LeavesDestination(bun_sys::Error),
 }
 
-/// Why the contents of an entry did not reach the file.
+/// Why the contents of an entry did not reach the file. `E` is the error of the archive's reader.
 #[derive(Debug, thiserror::Error)]
-pub enum ReadDataError {
-    #[error(transparent)]
-    Archive(#[from] bun_tar::Error),
+pub enum ReadDataError<E = bun_tar::Error> {
+    #[error("{0}")]
+    Archive(E),
     #[error("{0}")]
     Sys(bun_sys::Error),
 }
 
-impl From<bun_sys::Error> for ReadDataError {
+impl<E> From<bun_sys::Error> for ReadDataError<E> {
     fn from(e: bun_sys::Error) -> Self {
         Self::Sys(e)
+    }
+}
+
+/// What reading an archive that is tar or zip fails with.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum AnyError {
+    #[error(transparent)]
+    Tar(#[from] bun_tar::Error),
+    #[error(transparent)]
+    Zip(#[from] bun_zip::Error),
+}
+
+impl AnyError {
+    pub fn is_out_of_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Tar(bun_tar::Error::Alloc(_)) | Self::Zip(bun_zip::Error::Alloc(_))
+        )
+    }
+}
+
+impl From<AnyError> for Error {
+    fn from(e: AnyError) -> Self {
+        match e {
+            AnyError::Tar(e) => e.into(),
+            AnyError::Zip(bun_zip::Error::Alloc(e)) => Self::Alloc(e),
+            AnyError::Zip(_) => Self::Fail,
+        }
     }
 }
 

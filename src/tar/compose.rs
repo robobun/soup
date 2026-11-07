@@ -3,7 +3,7 @@
 mod tables;
 
 use crate::error::Result;
-use crate::{Entry, npm};
+use crate::{Entry, PathEncoding};
 use tables::{COMBINING_CLASSES, COMPOSING_BLOCKS, COMPOSITIONS};
 
 /// More combining marks than this on one character make the name count as unconvertible.
@@ -261,17 +261,24 @@ pub(crate) fn windows_name(name: &[u8]) -> Result<Option<Vec<u8>>> {
 pub fn to_utf16(entry: &Entry, out: &mut Vec<u16>) -> Result<()> {
     let name = entry.path();
     out.try_reserve(name.len())?;
-    if entry.path_is_final() {
-        out.extend(npm::decode(name).flat_map(str::encode_utf16));
-        return Ok(());
-    }
-    if entry.path_is_utf8() && !name.is_ascii() {
-        if let Some(chars) = compose(name)? {
-            for c in chars {
-                let c = char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER);
-                out.extend_from_slice(c.encode_utf16(&mut [0; 2]));
+    if !name.is_ascii() {
+        match entry.path_encoding() {
+            PathEncoding::Pax => {
+                if let Some(chars) = compose(name)? {
+                    for c in chars {
+                        let c = char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER);
+                        out.extend_from_slice(c.encode_utf16(&mut [0; 2]));
+                    }
+                    return Ok(());
+                }
             }
-            return Ok(());
+            PathEncoding::Utf8 => {
+                if let Ok(text) = core::str::from_utf8(name) {
+                    out.extend(text.encode_utf16());
+                    return Ok(());
+                }
+            }
+            PathEncoding::Bytes => {}
         }
     }
     out.extend(name.iter().map(|&b| u16::from(b)));
