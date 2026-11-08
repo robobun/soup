@@ -2253,6 +2253,212 @@ pub(crate) mod js_bundler {
         bv2_mut(this.bv2).on_load_async(this);
     }
 
+    use bun_bundler::plugin_resolve::{PluginResolveAnswer, PluginResolveQuery};
+
+    /// One `build.resolve()` call that no plugin answered, on its way to the bundle and back.
+    /// The JS thread boxes it and frees it. In between the thread of the bundle has it, and
+    /// writes `answer`.
+    pub(crate) struct PluginQuery {
+        specifier: Box<[u8]>,
+        resolve_dir: Box<[u8]>,
+        kind: bun_ast::ImportKind,
+        target: Option<bun_ast::Target>,
+        answer: PluginResolveAnswer,
+        promise: jsc::JSPromiseStrong,
+        context: jsc::ContextId,
+        /// Its place in the queue of the bundle's loop.
+        task: bun_event_loop::AnyTaskWithExtraContext::AnyTaskWithExtraContext,
+        /// Its place in the queue of the JS loop, on the way back.
+        answered: ConcurrentTask,
+    }
+
+    impl bun_event_loop::Taskable for PluginQuery {
+        const TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::BundleV2PluginQueryAnswered;
+        /// The VM is going, and nothing can read the answer.
+        unsafe fn release_unrun(this: *mut Self) {
+            // SAFETY: fn contract; `resolve_default` boxed it.
+            drop(unsafe { bun_core::heap::take(this) });
+        }
+        /// The answer continues the plugin callback that called `build.resolve()`.
+        unsafe fn context(this: *const Self) -> bun_event_loop::ContextId {
+            // SAFETY: fn contract.
+            unsafe { (*this).context }
+        }
+    }
+
+    impl PluginQuery {
+        fn ask(&self, bundle: &mut BundleV2<'static>) -> PluginResolveAnswer {
+            bundle.resolve_for_plugin(&PluginResolveQuery {
+                specifier: &self.specifier,
+                resolve_dir: &self.resolve_dir,
+                kind: self.kind,
+                target: self.target,
+            })
+        }
+
+        /// JS thread: gives the answer to the promise that `build.resolve()` waits for.
+        pub(crate) fn settle(mut self: Box<Self>, global: &JSGlobalObject) -> JsResult<()> {
+            let answer = plugin_answer_to_js(global, &self.answer);
+            self.promise.settle(global, answer)
+        }
+    }
+
+    fn plugin_answer_to_js(
+        global: &JSGlobalObject,
+        answer: &PluginResolveAnswer,
+    ) -> JsResult<JSValue> {
+        fn texts(global: &JSGlobalObject, texts: &[Box<[u8]>]) -> JsResult<JSValue> {
+            let array = JSValue::create_empty_array(global, texts.len())?;
+            for (index, text) in texts.iter().enumerate() {
+                let text = bun_string_jsc::create_utf8_for_js(global, text)?;
+                array.put_index(global, index as u32, text)?;
+            }
+            Ok(array)
+        }
+
+        let object = JSValue::create_empty_object(global, 6);
+        let path = bun_string_jsc::create_utf8_for_js(global, &answer.path)?;
+        object.put(global, b"path", path);
+        let namespace = bun_string_jsc::create_utf8_for_js(global, &answer.namespace)?;
+        object.put(global, b"namespace", namespace);
+        object.put(global, b"external", JSValue::from(answer.external));
+        object.put(global, b"sideEffects", JSValue::from(answer.side_effects));
+        object.put(global, b"errors", texts(global, &answer.errors)?);
+        object.put(global, b"warnings", texts(global, &answer.warnings)?);
+        Ok(object)
+    }
+
+    /// The bundle's thread, between two tasks of its loop.
+    #[inline(never)]
+    fn answer_plugin_query(query: *mut PluginQuery, bundle: *mut BundleV2<'static>) {
+        bun_removable_features::removable_definition!(Bundler, answer_plugin_query);
+        // SAFETY: the loop hands over what `resolve_default` queued, and the bundle it runs for.
+        // Until the query is posted back, this thread is the only one that has it.
+        let (query, bundle) = unsafe { (&mut *query, &mut *bundle) };
+        query.answer = query.ask(bundle);
+        let query: *mut PluginQuery = query;
+        // SAFETY: as above. The node is in the query, which the JS thread frees once it has it.
+        let answered = unsafe {
+            (*query).answered.from(
+                query,
+                bun_event_loop::ConcurrentTask::AutoDeinit::ManualDeinit,
+            )
+        };
+        bundle.enqueue_on_js_loop_for_plugins(core::ptr::NonNull::from(answered));
+    }
+
+    /// The last step of `build.resolve()`: asks the bundle that `bv2` is, which waits for an
+    /// answer of these plugins and so cannot end before it has answered this. Returns the
+    /// promise of what its resolver finds.
+    fn resolve_default(
+        global: &JSGlobalObject,
+        bv2: *mut BundleV2<'static>,
+        specifier: &BunString,
+        resolve_dir: &BunString,
+        kind: &BunString,
+        target: Option<bun_ast::Target>,
+    ) -> JsResult<JSValue> {
+        let Some(kind) = bun_ast::ImportKind::from_label(&kind.to_utf8()) else {
+            return Err(global.throw_invalid_arguments(format_args!("Invalid kind: \"{kind}\"")));
+        };
+        let query = Box::new(PluginQuery {
+            specifier: specifier.to_owned_slice().into_boxed_slice(),
+            resolve_dir: resolve_dir.to_owned_slice().into_boxed_slice(),
+            kind,
+            target,
+            answer: PluginResolveAnswer::default(),
+            promise: jsc::JSPromiseStrong::init(global),
+            context: global.bun_vm().context_of_caller().id(),
+            task: Default::default(),
+            answered: ConcurrentTask::default(),
+        });
+        let promise = query.promise.value();
+
+        let bundle = bv2_mut(bv2);
+        let any_loop = bundle
+            .r#loop()
+            .expect("BundleV2.linker.loop must be set before plugins run");
+        // SAFETY: the loop outlives the bundle, which waits for an answer of these plugins.
+        match unsafe { &mut *any_loop.as_ptr() } {
+            // The bundle runs on this thread, and it is between two of its tasks.
+            bun_event_loop::AnyEventLoop::Js { .. } => {
+                let mut query = query;
+                query.answer = query.ask(bundle);
+                query.settle(global)?;
+            }
+            bun_event_loop::AnyEventLoop::Mini(mini) => {
+                // SAFETY: the query is boxed, and `answer_plugin_query` gets it back from the
+                // loop. The loop runs what this thread queues in order, so it runs this before
+                // the answer that lets the bundle end.
+                unsafe {
+                    mini.enqueue_task_concurrent_with_extra_ctx::<PluginQuery, BundleV2<'static>>(
+                        bun_core::heap::into_raw(query),
+                        answer_plugin_query,
+                        core::mem::offset_of!(PluginQuery, task),
+                    );
+                }
+            }
+        }
+        Ok(promise)
+    }
+
+    /// # Safety
+    /// `held` is a request that the plugin object holds: a live `*mut Resolve` (`held_kind == 0`)
+    /// or `*mut Load` (`held_kind == 1`). JS thread.
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn JSBundlerPlugin__resolveDefault(
+        held: *mut c_void,
+        held_kind: u8,
+        global: &JSGlobalObject,
+        specifier: &BunString,
+        resolve_dir: &BunString,
+        kind: &BunString,
+        target: i32,
+    ) -> JSValue {
+        // What `JSBundlerPlugin__targetOfRequest` gave when `build.resolve()` was called, or -1.
+        let target = usize::try_from(target)
+            .ok()
+            .filter(|&target| target < <bun_ast::Target as enum_map::Enum>::LENGTH)
+            .map(<bun_ast::Target as enum_map::Enum>::from_usize);
+        // SAFETY: per fn contract. The plugins have not answered the request, so nothing writes it.
+        let (bv2, owner) = unsafe {
+            match held_kind {
+                0 => (
+                    (*held.cast::<Resolve>()).bv2,
+                    (*held.cast::<Resolve>()).owner,
+                ),
+                1 => ((*held.cast::<Load>()).bv2, (*held.cast::<Load>()).owner),
+                _ => unreachable!("RequestKind"),
+            }
+        };
+        // A thread waits for that answer, not a loop: nothing would run the question.
+        if matches!(owner, RequestOwner::Waiter(_)) {
+            return JSValue::UNDEFINED;
+        }
+        jsc::to_js_host_call(global, || {
+            resolve_default(global, bv2, specifier, resolve_dir, kind, target)
+        })
+    }
+
+    /// The target of the graph that the file of a held request is in.
+    ///
+    /// # Safety
+    /// As for `JSBundlerPlugin__resolveDefault`.
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn JSBundlerPlugin__targetOfRequest(held: *mut c_void, held_kind: u8) -> i32 {
+        bun_removable_features::removable_definition!(Bundler, JSBundlerPlugin__targetOfRequest);
+        // SAFETY: per fn contract. The plugins have not answered the request, so nothing writes it.
+        let target = unsafe {
+            match held_kind {
+                0 => (*held.cast::<Resolve>()).target(),
+                1 if matches!((*held.cast::<Load>()).owner, RequestOwner::Waiter(_)) => return -1,
+                1 => (*held.cast::<Load>()).target(),
+                _ => unreachable!("RequestKind"),
+            }
+        };
+        <bun_ast::Target as enum_map::Enum>::into_usize(target) as i32
+    }
+
     /// Opaque FFI handle for the C++ `JSBundlerPlugin`. The opaque type and
     /// `has_any_matches` (the one method `bun_bundler` needs) live in the
     /// lower-tier crate; JSC-aware methods are added here via `PluginJscExt`.
@@ -2296,6 +2502,7 @@ pub(crate) mod js_bundler {
         safe fn JSBundlerPlugin__globalObject(plugin: &Plugin) -> &JSGlobalObject;
         safe fn JSBundlerPlugin__appendDeferPromise(plugin: &mut Plugin) -> JSValue;
         safe fn JSBundlerPlugin__setConfig(plugin: &mut Plugin, config: *mut c_void);
+        safe fn JSBundlerPlugin__setCompilesAheadOfTime(plugin: &mut Plugin);
         safe fn JSBundlerPlugin__runSetupFunction(
             plugin: &Plugin,
             object: JSValue,
@@ -2341,6 +2548,8 @@ pub(crate) mod js_bundler {
             is_bake: bool,
         ) -> JsResult<JSValue>;
         fn set_config(&mut self, config: *mut c_void);
+        /// The build compiles ahead of time, where `build.resolve()` has nothing to ask.
+        fn set_compiles_ahead_of_time(&mut self);
         /// Thin FFI forward; the host-call wrapper / exception check is the
         /// caller's responsibility (`jsc::host_fn::from_js_host_call`).
         fn load_and_resolve_plugins_for_serve(
@@ -2443,6 +2652,10 @@ pub(crate) mod js_bundler {
         fn set_config(&mut self, config: *mut c_void) {
             jsc::mark_binding();
             JSBundlerPlugin__setConfig(self, config);
+        }
+
+        fn set_compiles_ahead_of_time(&mut self) {
+            JSBundlerPlugin__setCompilesAheadOfTime(self);
         }
 
         fn load_and_resolve_plugins_for_serve(

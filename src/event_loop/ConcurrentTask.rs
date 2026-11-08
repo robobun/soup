@@ -70,6 +70,7 @@ pub mod task_tag {
         BundleV2PluginResolveAnswered, // bun.bundle_v2.Resolve (hop back to the bundle's loop)
         BundleV2PluginLoadAnswered, // bun.bundle_v2.Load (hop back to the bundle's loop)
         BundleV2PluginLoadDeferred, // bun.bundle_v2.Load (`.defer()` notice to the bundle's loop)
+        BundleV2PluginQueryAnswered, // bun_runtime PluginQuery (`build.resolve()`: the answer, back on the JS thread)
         BundleV2ParseTaskResult,  // bun.bundle_v2.ParseTask.Result
         ChromePipeEvent,
         CopyFileWindowsMkdirp,

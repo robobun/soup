@@ -93,6 +93,47 @@ describe("bundler", () => {
     expect(appStderr).toContain("[aot] image: ");
     expect(appExitCode).toBe(0);
   });
+
+  // Such a build asks its plugins from threads that wait for the answer. It has no loop that
+  // build.resolve() could ask, so the call says that it cannot.
+  test.concurrent(
+    "compile/aot/PluginResolveIsRefused",
+    async () => {
+      using dir = tempDir("compile-aot-plugin-resolve", {
+        "app.ts": `import { value } from "./value.ts";\nconsole.log("from the executable", value);`,
+        "value.ts": `export const value = 1;`,
+        "build.ts": `
+        let outcome: unknown;
+        const result = await Bun.build({
+          entrypoints: ["./app.ts"],
+          compile: { aot: true, outfile: "./app" },
+          plugins: [
+            {
+              name: "asks",
+              setup(build) {
+                build.onResolve({ filter: /value\\.ts$/ }, async args => {
+                  outcome = await build
+                    .resolve(args.path, { kind: args.kind, importer: args.importer })
+                    .then(answer => answer.path, error => [error.name, error.message]);
+                  return undefined;
+                });
+              },
+            },
+          ],
+        });
+        console.log(JSON.stringify({ success: result.success, outcome }));
+      `,
+      });
+      const { stdout, exitCode } = await runCommand([bunExe(), "build.ts"], String(dir));
+      expect(JSON.parse(stdout)).toEqual({
+        success: true,
+        outcome: ["TypeError", "build.resolve() is not supported with compile.aot yet"],
+      });
+      expect(exitCode).toBe(0);
+      // The build writes an executable, which takes a debug build of Bun longer than the default.
+    },
+    60_000,
+  );
 });
 
 test.concurrent("compile.aot: concurrent builds from several threads", async () => {

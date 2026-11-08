@@ -108,6 +108,33 @@ Bun.build({
           return { path: args.path };
         });
 
+        build.onResolve({ filter: /^there$/ }, async args => {
+          expectType(args.pluginData).is<any>();
+          const result = await build.resolve(args.path, {
+            kind: args.kind,
+            importer: args.importer,
+            namespace: args.namespace,
+            resolveDir: args.resolveDir,
+            pluginData: { asked: true },
+            pluginName: "my-terrible-plugin",
+          });
+          expectType(result).is<Bun.ResolveResult>();
+          expectType(result.errors).is<Bun.ResolveResultMessage[]>();
+          expectType(result.external).is<boolean>();
+          build.resolve("there", { kind: "entry-point" });
+          // What a callback is given can be handed on, and a key can be there without a value.
+          const { path, ...rest } = args;
+          build.resolve(path, { ...rest, pluginData: { asked: true } });
+          build.resolve("there", { kind: "import-statement", importer: undefined, resolveDir: undefined });
+          // @ts-expect-error
+          build.resolve("there");
+          // @ts-expect-error
+          build.resolve("there", { kind: "import" });
+
+          if (result.errors.length > 0) return { errors: result.errors };
+          return { path: result.path, external: result.external, pluginData: result.pluginData };
+        });
+
         build.onLoad({ filter: /^hey$/ }, args => {
           expectType(args).is<Bun.OnLoadArgs>();
 

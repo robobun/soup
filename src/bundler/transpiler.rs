@@ -335,8 +335,32 @@ impl<'a> Transpiler<'a> {
         entry_point: &'e [u8],
         dot_slash: &'e OnceCell<Vec<u8>>,
     ) -> crate::Result<resolver::Result<'e>> {
-        match self._resolve_entry_point(entry_point, dot_slash) {
+        match self.resolve_entry_point_past_cache(entry_point, dot_slash) {
             Ok(r) => self.reject_unbundleable_entry_point(r, entry_point),
+            Err(err) => {
+                self.log_mut().add_error_fmt(
+                    None,
+                    bun_ast::Loc::EMPTY,
+                    format_args!(
+                        "{} resolving \"{}\" (entry point)",
+                        err,
+                        bstr::BStr::new(entry_point)
+                    ),
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// The lookup of [`resolve_entry_point`](Self::resolve_entry_point), with its second look past
+    /// the directory cache, and without what that function writes to the log.
+    pub(crate) fn resolve_entry_point_past_cache<'e>(
+        &mut self,
+        entry_point: &'e [u8],
+        dot_slash: &'e OnceCell<Vec<u8>>,
+    ) -> crate::Result<resolver::Result<'e>> {
+        match self._resolve_entry_point(entry_point, dot_slash) {
+            Ok(r) => Ok(r),
             Err(err) => {
                 let mut cache_bust_buf = bun_paths::path_buffer_pool::get();
 
@@ -393,20 +417,11 @@ impl<'a> Transpiler<'a> {
                 // Only re-query if we previously had something cached.
                 if busted {
                     if let Ok(result) = self._resolve_entry_point(entry_point, dot_slash) {
-                        return self.reject_unbundleable_entry_point(result, entry_point);
+                        return Ok(result);
                     }
-                    // ignore this error, we will print the original error
+                    // ignore this error, the caller reports the original error
                 }
 
-                self.log_mut().add_error_fmt(
-                    None,
-                    bun_ast::Loc::EMPTY,
-                    format_args!(
-                        "{} resolving \"{}\" (entry point)",
-                        err,
-                        bstr::BStr::new(entry_point)
-                    ),
-                );
                 Err(err)
             }
         }

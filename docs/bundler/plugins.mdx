@@ -17,6 +17,8 @@ Plugins register callbacks that run at various points in the lifecycle of a bund
 - `onBeforeParse()`: Run zero-copy native addons in the parser thread before the bundler parses a file
 - `onEnd()`: Run after the bundle is complete
 
+In `Bun.build`, a callback can also ask the bundler a question: [`resolve()`](#resolve) returns what an import resolves to.
+
 ## Reference
 
 A rough overview of the types (see Bun's `bun.d.ts` for the full type definitions):
@@ -40,6 +42,10 @@ type PluginBuilder = {
     },
   ) => void;
   onEnd(callback: (result: BuildOutput) => void | Promise<void>): void;
+  resolve(
+    path: string,
+    options: { kind: ImportKind; importer?: string; namespace?: string; resolveDir?: string; pluginData?: any },
+  ): Promise<{ path: string; namespace: string; external: boolean; errors: { text: string }[] }>;
   config: BuildConfig;
 };
 
@@ -358,6 +364,132 @@ const result = await Bun.build({
   ],
 });
 ```
+
+### resolve
+
+```ts
+resolve(
+  path: string,
+  options: {
+    kind: ImportKind;
+    importer?: string;
+    namespace?: "file";
+    resolveDir?: string;
+    pluginData?: any;
+    pluginName?: string;
+  },
+): Promise<{
+  path: string;
+  namespace: string;
+  external: boolean;
+  sideEffects: boolean;
+  pluginData: any;
+  suffix: string;
+  errors: { text: string; pluginName: string; detail: any }[];
+  warnings: { text: string; pluginName: string; detail: any }[];
+}>;
+```
+
+`build.resolve()` asks the build where an import leads. The resolver of the build answers, so the answer follows the `target`, `conditions`, `external`, `alias`, and `files` of that build. `Bun.resolveSync()` asks the resolver of the process that runs the build, which knows none of them.
+
+For example, a plugin that uses `config.local.ts` where that file exists:
+
+```ts title="index.ts" icon="/icons/typescript.svg"
+import type { BunPlugin } from "bun";
+
+const localConfig: BunPlugin = {
+  name: "local config",
+  setup(build) {
+    build.onResolve({ filter: /^#config$/ }, async args => {
+      const from = { kind: args.kind, resolveDir: args.resolveDir };
+      const local = await build.resolve("./config.local", from);
+      const found = local.errors.length === 0 ? local : await build.resolve("./config", from);
+      return found.errors.length === 0 ? { path: found.path } : { errors: found.errors };
+    });
+  },
+};
+```
+
+The options say how the path is imported and from where:
+
+- `kind` is required. Pass the `kind` that your `onResolve` callback received, or name one, such as `"import-statement"` or `"require-call"`. The resolver picks the `"exports"` conditions of a package by it.
+- `resolveDir` is the directory that the resolver starts from. A relative `resolveDir` is relative to the current working directory. Without `resolveDir`, Bun uses the directory of `importer`. With neither, only a path that needs no directory has an answer: a name that `external` matches, a builtin module, a URL, an absolute path, or a key of `files`.
+- `importer` is the file that the import is in. Bun hands it to the `onResolve` callbacks.
+- `namespace` can only be `"file"`. A call without `namespace` does not ask the `onResolve` callbacks that you registered with a `namespace`. A call with `namespace: "file"` asks all of them, and `{ ...args }` carries it.
+- `pluginData` goes to the `onResolve` callbacks as `args.pluginData`. `pluginName` labels the messages of the resolver in the result.
+- An entry point (`kind: "entry-point-build"`) that the resolver looks up from the current working directory resolves as `entrypoints` do: `src/app.ts` means `./src/app.ts`.
+- For a reference in an HTML page, pass the `path` that `onResolve` received, not the text in the page.
+
+Bun reads only the own properties of `options`. It throws for a property that is not in the list above.
+
+#### Plugins answer first
+
+Bun first asks the `onResolve` callbacks of every plugin, in the order of `plugins`. The first answer is the result, with the `pluginData` that the callback returned. If no callback answers, the resolver of the build does.
+
+The callback that calls `build.resolve()` is one of them. If its filter matches the path that it asks about, Bun calls it again, with the `pluginData` of the call as `args.pluginData`. Return `undefined` for that call, or the calls never end:
+
+```ts title="index.ts" icon="/icons/typescript.svg"
+build.onResolve({ filter: /.*/ }, async ({ path, ...args }) => {
+  // Our own question has come back. The next callback, or Bun, answers it.
+  if (args.pluginData?.asked) return undefined;
+
+  const result = await build.resolve(path, { ...args, pluginData: { asked: true } });
+  console.log(path, "->", result.path);
+  return undefined;
+});
+```
+
+With `target: "bun"`, the build does not ask plugins about a builtin module such as `node:fs` or `bun:sqlite`. `build.resolve()` does ask them. If one of your callbacks answers for such a name, the result is not what the import gets.
+
+#### The result
+
+`build.resolve()` fulfills its promise also for a path that does not resolve. Then `path` is `""` and `errors` says why. For a path that resolves, `errors` is empty. The build does not fail, and its `logs` do not get the error: your plugin decides what a missing path means. To fail the import with that error, return it from `onResolve`:
+
+```ts title="index.ts" icon="/icons/typescript.svg"
+const result = await build.resolve(path, { kind: args.kind, resolveDir: args.resolveDir });
+if (result.errors.length > 0) return { errors: result.errors };
+```
+
+| Property      | Value                                                                                                                                                                                 |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`        | The absolute path of the file. For an external import, the path as it stays in the output. `""` if the path did not resolve.                                                          |
+| `namespace`   | `"file"` for a file, and for every answer of an `onResolve` callback that names no namespace. `""` for an import that the resolver leaves external, a `data:` URL among them.         |
+| `external`    | `true` if the import stays in the output, by `external`, `packages: "external"`, the target, or a plugin.                                                                             |
+| `sideEffects` | `false` if `"sideEffects"` in the `package.json` of the module says that Bun can leave the module out when nothing of it is used.                                                     |
+| `pluginData`  | What the `onResolve` callback that answered returned as `pluginData`.                                                                                                                 |
+| `errors`      | Objects with a `text`. If an `onResolve` callback threw, `detail` is what it threw. For a message of the resolver, `pluginName` is the `pluginName` of the options.                   |
+| `warnings`    | Objects with a `text`: what the resolver found wrong on the way to a path, such as a `package.json` that it cannot read. The build reports the same when one of its imports reads it. |
+| `suffix`      | Always `""`.                                                                                                                                                                          |
+
+In a build for the browser, Bun has modules of its own for some Node.js builtins, such as `node:path`. `build.resolve()` reports one with the namespace `"node"` and a path that is not a file. A plugin cannot return such a module from `onResolve`: return `undefined` there, and Bun bundles it.
+
+An `onResolve` answer carries `path`, `namespace`, and `external`. What the resolver knows beyond those, such as `sideEffects`, does not travel with `{ path: result.path }`. To leave an import as it is, return `undefined`.
+
+Bun does not bundle a file that your plugin only asked about, and `watch: true` does not watch it.
+
+Bun reads each directory once per build, and `build.resolve()` can make Bun read one before an import would. If your plugin writes files during the build, Bun still finds a file that it writes later when the import path starts with `./`, `../`, or `/`. Bun does not find one that only a `tsconfig.json` path, a `package.json` `"imports"` entry, or `node_modules` leads to.
+
+#### When you can call it
+
+The resolver exists while the build runs. Call `build.resolve()` in an `onResolve` or `onLoad` callback, before the callback returns its answer.
+
+A build can have two graphs. A `target: "bun"` build that imports an HTML file has one for the server and one for the pages, and so does `Bun.serve` in development. The same path can be a different module in each, for example by the `"browser"` condition of a package. Bun answers for the graph of the import that your callback runs for, if your callback makes the call before its first `await`:
+
+```ts title="index.ts" icon="/icons/typescript.svg"
+build.onResolve({ filter: /^pkg$/ }, async args => {
+  // The call comes before the first `await` of the callback.
+  const result = await build.resolve("pkg/browser-or-server", { kind: args.kind, resolveDir: args.resolveDir });
+  // A call from here on is after an `await`.
+});
+```
+
+After an `await`, Bun no longer knows which import the call belongs to. It then asks every graph of the build. If they all give the same module, that is the result. If they do not, the result has an error.
+
+- In `setup()` and in `onStart()`, the call throws. `Bun.build()` runs both before it starts the build, so there is no resolver yet.
+- In `onEnd()`, and after the build, Bun rejects the promise.
+- If you do not `await` the call, Bun still answers it when no `onResolve` callback that runs for it awaits anything. If one does, and the build ends first, Bun rejects the promise.
+- With [`compile.aot`](/compiler/aot), Bun rejects the promise. Such a build has no `build.resolve()` yet.
+- The builder of a runtime plugin, `Bun.plugin()`, has no `resolve()`. Use `Bun.resolveSync()` or `import.meta.resolve()` there.
 
 ## Native plugins
 

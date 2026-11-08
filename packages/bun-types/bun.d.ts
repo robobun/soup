@@ -8277,8 +8277,115 @@ declare module "bun" {
      * The kind of import this resolve is for.
      */
     kind: ImportKind;
-    // resolveDir: string;
-    // pluginData: any;
+    /**
+     * What the caller of {@link PluginBuilder.resolve | build.resolve()} passed
+     * as `pluginData`. `undefined` for an import of the build.
+     */
+    pluginData?: any;
+  }
+
+  /**
+   * The options of {@link PluginBuilder.resolve | build.resolve()}
+   */
+  interface ResolveOptions {
+    /**
+     * How the path is imported. The resolver picks the conditions of
+     * `"exports"` and the file extensions by it.
+     *
+     * esbuild's `"entry-point"` and `"composes-from"` are taken for
+     * `"entry-point-build"` and `"composes"`.
+     */
+    kind: ImportKind | "entry-point" | "composes-from";
+    /**
+     * The module that the import is in. `onResolve` callbacks receive it. If
+     * `resolveDir` is not given, its directory is the directory to resolve
+     * from.
+     */
+    importer?: string | undefined;
+    /**
+     * Only `"file"`. A call without `namespace` does not ask the `onResolve`
+     * callbacks that were registered with a `namespace`.
+     */
+    namespace?: string | undefined;
+    /**
+     * The directory to resolve from. A relative path is relative to the
+     * current working directory.
+     */
+    resolveDir?: string | undefined;
+    /**
+     * Passed to the `onResolve` callbacks that this call runs, as
+     * `args.pluginData`. A callback that calls `build.resolve()` for a path
+     * that its own filter matches uses it to tell its own question apart.
+     */
+    pluginData?: any;
+    /**
+     * The `pluginName` of the errors and warnings that the resolver of the
+     * build gives in the result.
+     */
+    pluginName?: string | undefined;
+  }
+
+  /**
+   * An error or a warning in the result of
+   * {@link PluginBuilder.resolve | build.resolve()}
+   */
+  interface ResolveResultMessage {
+    id: string;
+    pluginName: string;
+    text: string;
+    location: null;
+    notes: { text: string; location: null }[];
+    /**
+     * What an `onResolve` callback threw, if that is what the message is for.
+     */
+    detail: any;
+  }
+
+  /**
+   * The result of {@link PluginBuilder.resolve | build.resolve()}
+   */
+  interface ResolveResult {
+    /**
+     * Why the path did not resolve. A path that does not resolve is not a
+     * rejection, and it is not an error of the build. Empty for a path that
+     * resolved.
+     *
+     * To fail the import with it, return `{ errors: result.errors }` from
+     * `onResolve`.
+     */
+    errors: ResolveResultMessage[];
+    /**
+     * What the resolver found wrong on the way to the path, for example a
+     * `package.json` that it cannot read.
+     */
+    warnings: ResolveResultMessage[];
+    /**
+     * The resolved path, `""` if the path did not resolve.
+     */
+    path: string;
+    /**
+     * `true` if the import stays in the output as it is.
+     */
+    external: boolean;
+    /**
+     * `false` if the module can be left out when nothing of it is used, for
+     * example by `"sideEffects": false` in its `package.json`.
+     */
+    sideEffects: boolean;
+    /**
+     * `"file"` for a file on disk. `"node"` for a module that Bun has in itself
+     * for a Node.js builtin in a browser build: return `undefined` from
+     * `onResolve` to get it.
+     */
+    namespace: string;
+    /**
+     * Always `""`.
+     */
+    suffix: string;
+    /**
+     * What the `onResolve` callback that answered returned as `pluginData`.
+     */
+    pluginData: any;
   }
 
   interface OnResolveResult {
@@ -8305,11 +8412,31 @@ declare module "bun" {
      */
     namespace?: string;
     external?: boolean;
+    /**
+     * Given to the {@link PluginBuilder.resolve | build.resolve()} call that
+     * this answer is for, as `pluginData` of its result. Ignored in an answer
+     * for an import.
+     */
+    pluginData?: any;
+  }
+
+  /**
+   * An answer of an `onResolve` callback of {@link Bun.build} that fails the
+   * import, with the `text` of each entry as the error of the build. The
+   * `errors` of a {@link ResolveResult} can be returned as they are.
+   */
+  interface OnResolveErrors {
+    errors: { text: string }[];
   }
 
   type OnResolveCallback = (
     args: OnResolveArgs,
-  ) => OnResolveResult | Promise<OnResolveResult | undefined | null> | undefined | null;
+  ) =>
+    | OnResolveResult
+    | OnResolveErrors
+    | Promise<OnResolveResult | OnResolveErrors | undefined | null>
+    | undefined
+    | null;
 
   type FFIFunctionCallable = Function & {
     // Making a nominally typed function so that the user must get it from dlopen
@@ -8317,7 +8444,8 @@ declare module "bun" {
   };
 
   /**
-   * The builder object passed to `Bun.plugin`
+   * The builder object passed to the `setup()` of a plugin, by `Bun.build`
+   * and by `Bun.plugin`
    *
    * @category Bundler
    */
@@ -8396,6 +8524,35 @@ declare module "bun" {
      * @returns `this` for method chaining
      */
     onResolve(constraints: PluginConstraints, callback: OnResolveCallback): this;
+    /**
+     * Resolve a path with the resolver of the build: its `target`,
+     * `conditions`, `external`, `alias` and `files`. The `onResolve` callbacks
+     * of every plugin are asked first, the caller's own too.
+     *
+     * Call it in an `onResolve` or `onLoad` callback of {@link Bun.build}, and
+     * before the first `await` of that callback if the build has a graph for a
+     * server and one for its pages: after an `await`, the build cannot tell
+     * which of the two asks. It throws in `setup()` and `onStart()`, and
+     * rejects once no callback of the build is running. The builder of
+     * {@link Bun.plugin} does not have it yet.
+     *
+     * @example
+     * ```ts
+     * const plugin: Bun.BunPlugin = {
+     *   name: "local config",
+     *   setup(build) {
+     *     // "#config" is ./config.local.ts where that file exists.
+     *     build.onResolve({ filter: /^#config$/ }, async args => {
+     *       const from = { kind: args.kind, resolveDir: args.resolveDir };
+     *       const local = await build.resolve("./config.local", from);
+     *       const found = local.errors.length === 0 ? local : await build.resolve("./config", from);
+     *       return found.errors.length === 0 ? { path: found.path } : { errors: found.errors };
+     *     });
+     *   },
+     * };
+     * ```
+     */
+    resolve(path: string, options: ResolveOptions): Promise<ResolveResult>;
     /**
      * The config object passed to `Bun.build` as is. Can be mutated.
      */

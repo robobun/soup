@@ -99,6 +99,13 @@ impl ImportKind {
         }
     }
 
+    /// The first kind that [`label`](Self::label) gives this text for.
+    pub fn from_label(label: &[u8]) -> Option<ImportKind> {
+        (0..<ImportKind as enum_map::Enum>::LENGTH)
+            .map(<ImportKind as enum_map::Enum>::from_usize)
+            .find(|kind| kind.label() == label)
+    }
+
     #[inline]
     pub fn error_label(self) -> &'static [u8] {
         match self {

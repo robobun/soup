@@ -33,6 +33,40 @@ devTest("onResolve", {
     await dev.fetch("/").equals("value: 1");
   },
 });
+// The bundle of the dev server runs on the thread of the plugins.
+devTest("build.resolve()", {
+  framework: minimalFramework,
+  pluginFile: `
+    export default [
+      {
+        name: 'a',
+        setup(build) {
+          build.onResolve({ filter: /^trigger$/ }, async (args) => {
+            const found = await build.resolve('./file.ts', { kind: args.kind, importer: args.importer });
+            const missing = await build.resolve('./missing.ts', { kind: args.kind, importer: args.importer });
+            if (missing.path !== '' || missing.errors.length !== 1) throw new Error('expected one error');
+            return { path: found.path };
+          });
+        },
+      }
+    ];
+  `,
+  files: {
+    "routes/file.ts": `
+      export const value = 1;
+    `,
+    "routes/index.ts": `
+      import { value } from 'trigger';
+
+      export default function (req, meta) {
+        return new Response('value: ' + value);
+      }
+    `,
+  },
+  async test(dev) {
+    await dev.fetch("/").equals("value: 1");
+  },
+});
 devTest("onLoad", {
   framework: minimalFramework,
   pluginFile: `

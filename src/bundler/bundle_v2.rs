@@ -91,9 +91,10 @@ pub struct BundleV2<'a> {
     // The hot reloader (`jsc::hot_reloader::NewHotReloader<BundleV2, …>`) owns the
     // boxed `Watcher`; bundler only ever calls `Watcher::add_file` on it.
     pub bun_watcher: Option<NonNull<bun_watcher::Watcher>>,
-    /// For a build of `Bun.build({ watch: true })`, which is one of many in its process: an
-    /// import that does not resolve is looked for once more past the resolver's directory
-    /// cache, as under `bun_watcher`, before it is an error.
+    /// For a build of `Bun.build({ watch: true })`, which is one of many in its process, and for
+    /// one whose plugins have called `build.resolve()`, which reads directories before an import
+    /// would have: an import that does not resolve is looked for once more past the resolver's
+    /// directory cache, as under `bun_watcher`, before it is an error.
     pub recheck_unresolved_imports: bool,
     pub plugins: Option<NonNull<JSBundlerPlugin>>,
     pub completion: Option<dispatch::CompletionHandle>,
@@ -1189,6 +1190,11 @@ pub mod bv2_impl {
                 }
             }
             impl Resolve {
+                /// The target of the graph that the importing file is in.
+                #[inline]
+                pub fn target(&self) -> Target {
+                    self.import_record.original_target
+                }
                 pub(crate) fn init(bv2: &mut BundleV2<'_>, record: MiniImportRecord) -> Self {
                     Self {
                     // SAFETY: lifetime erased — Resolve is owned by the dispatch
@@ -1342,6 +1348,11 @@ pub mod bv2_impl {
                     // SAFETY: see fn doc — exclusivity established by `&mut self`;
                     // backref liveness established by the `BackRef` invariant.
                     unsafe { self.parse_task.get_mut() }
+                }
+                /// The target of the graph that the file is loaded for.
+                #[inline]
+                pub fn target(&self) -> Target {
+                    self.parse_task().known_target
                 }
                 #[inline]
                 pub(crate) fn bake_graph(&self) -> crate::bake_types::Graph {
@@ -1959,7 +1970,7 @@ pub mod bv2_impl {
         /// Folds the JS-loop lookup + enqueue so the bundler never dereferences
         /// `JSBundleCompletionTask` (its layout lives in `bun_runtime`); the
         /// `completion` handle carries the `&'static` vtable.
-        pub(crate) fn enqueue_on_js_loop_for_plugins(
+        pub fn enqueue_on_js_loop_for_plugins(
             &mut self,
             task: NonNull<bun_event_loop::ConcurrentTask::ConcurrentTask>,
         ) {
@@ -2767,6 +2778,21 @@ pub mod bv2_impl {
                     Err(err) => {
                         // Only perform directory busting when hot-reloading is enabled
                         if err == _resolver::Error::ModuleNotFound {
+                            // Or where `recheck_unresolved_imports` asks for it, as in
+                            // `resolve_import_records`.
+                            if self.recheck_unresolved_imports
+                                && !had_busted_dir_cache
+                                // SAFETY: see `transpiler` note above.
+                                && unsafe { &mut *transpiler }
+                                    .resolver
+                                    .bust_dir_cache_from_specifier(
+                                        &import_record.source_file,
+                                        &import_record.specifier,
+                                    )
+                            {
+                                had_busted_dir_cache = true;
+                                continue;
+                            }
                             if let Some(dev) = &self.dev_server {
                                 if !had_busted_dir_cache {
                                     // Only re-query if we previously had something cached.
@@ -3497,14 +3523,14 @@ pub mod bv2_impl {
 
         /// `alias`: what an import of `specifier` is looked up as, if it has an alias. The
         /// text lives as long as the build does.
-        fn alias_substitute(&self, specifier: &[u8]) -> Option<&'a [u8]> {
+        pub(crate) fn alias_substitute(&self, specifier: &[u8]) -> Option<&'a [u8]> {
             let (substitute, rest) = self.transpiler.options.alias.find(specifier)?;
             Some(self.arena_concat(substitute, rest))
         }
 
         /// Where an alias is looked up from: the working directory, and a file in it for the
         /// rules that ask for the file that has the import.
-        fn alias_base(&self) -> (&'static [u8], &'a [u8]) {
+        pub(crate) fn alias_base(&self) -> (&'static [u8], &'a [u8]) {
             let top_level_dir = Fs::FileSystem::get().top_level_dir();
             let file: &[u8] = match top_level_dir.last() {
                 Some(&last) if bun_paths::is_sep_native(last) => b"alias",

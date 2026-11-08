@@ -9552,6 +9552,317 @@ Files: `src/ast/lib.rs`, `src/codegen/replacements.ts`, `src/jsc/ResolveMessage.
 `packages/bun-types/bun.d.ts`, `test/bundler/bundler_plugin.test.ts`,
 `test/bundler/bun-build-api.test.ts`.
 
+### 2026-11-07: `build.resolve()` in `Bun.build` plugins
+
+An esbuild plugin asks the bundler where an import leads with `build.resolve()`. In Bun the
+function was on the builder and threw `build.resolve() is not implemented yet`, with a link to
+oven-sh/bun#2771. A maintainer opened that issue in April 2023. It has 13 thumbs-up and still
+lists `resolve()` as not done, and `docs/bundler/esbuild.mdx` named it as missing. No pull request
+has tried it. What a plugin could call in its place is `Bun.resolveSync()`, which is the resolver
+of the process that runs the build and not the one of the build: another `target`, no
+`conditions`, no `external`, no `files`. In the probe of the design review it named another file
+than the import of the same build for 14 of 15 paths.
+
+```ts
+const plugin: Bun.BunPlugin = {
+  name: "local config",
+  setup(build) {
+    // "#config" is ./config.local.ts where that file exists.
+    build.onResolve({ filter: /^#config$/ }, async args => {
+      const from = { kind: args.kind, resolveDir: args.resolveDir };
+      const local = await build.resolve("./config.local", from);
+      const found =
+        local.errors.length === 0
+          ? local
+          : await build.resolve("./config", from);
+      return found.errors.length === 0
+        ? { path: found.path }
+        : { errors: found.errors };
+    });
+
+    // Every import of the build, and where the build finds it.
+    build.onResolve({ filter: /.*/ }, async ({ path, ...args }) => {
+      if (args.pluginData?.asked) return undefined; // our own question has come back
+      const result = await build.resolve(path, {
+        ...args,
+        pluginData: { asked: true },
+      });
+      console.log(path, "->", result.path);
+      return undefined;
+    });
+  },
+};
+```
+
+What a call does:
+
+- The options are esbuild's: `kind` (required), `importer`, `namespace`, `resolveDir`,
+  `pluginData` and `pluginName`. `kind` takes the names that Bun tells `onResolve`, and esbuild's
+  `entry-point` and `composes-from`. A relative `resolveDir` is relative to the working directory.
+  Without one, the directory of `importer` is used. An option that is not one of these throws,
+  and so does a `with`, which is not supported.
+- The `onResolve` callbacks of every plugin are asked first, in order, the caller's own too. They
+  are told what the call was given, and `pluginData` with it, which is how a callback knows its
+  own question. The first answer is the result, with the `pluginData` that the callback returned.
+- As in esbuild, a call without `namespace` does not ask a callback that was registered with a
+  `namespace`. A call with `namespace: "file"` asks all, and `{ ...args }` carries that. Another
+  namespace throws: Bun asks the callbacks of `"file"` for every import of a build, whatever
+  namespace the importer is in, so no import could get what such a call would.
+- If no callback answers, the resolver of the build does, by the rules that an import of the same
+  path gets: `alias`, the builtins of a build for Bun, the in-memory `files`, then the resolver of
+  the graph that asks, with the `target`, `conditions`, `external` and `packages` of the build.
+- The promise is fulfilled with esbuild's eight keys: `errors`, `warnings`, `path`, `external`,
+  `sideEffects`, `namespace`, `suffix` and `pluginData`. A path that does not resolve is an entry
+  of `errors` with `path: ""`. It is not a rejection, the build does not fail, and its `logs` do
+  not get the text. `errors` is empty for every path that resolves. An error that a callback
+  throws is in `errors` too, with the thrown value as `detail`. A file that was only asked about
+  is not in the bundle and not in the `metafile`.
+- An `onResolve` callback can return `{ errors }`, and the import fails with the texts. That is
+  how esbuild's own examples hand the result of `build.resolve()` on. Bun read such an answer as
+  no answer, and the build went on with another module.
+- Without a directory there is an answer for what needs none: a name that `external` matches, a
+  builtin, a URL, an absolute path, a key of `files`.
+- An entry point is looked up as `entrypoints` are. Bun tells `onResolve` an entry as it is
+  written (`src/app.ts`, with the directory `.`), and a plugin that passes that on gets the file.
+
+Which graph answers. A build can have two graphs: `target: "bun"` with an HTML import has one for
+the server and one for the pages, and so has every page of `Bun.serve` in development. A package
+with a `"browser"` condition is another file in each. An import is resolved for the graph of the
+file that it is in, and the path of a file does not say which graph that is: one file can be in
+both. So the call is answered for the request that it is made for:
+
+- `dispatchRequest` in `JSBundlerPlugin.cpp` records the request that it calls the plugins for,
+  in one field of the plugin object, for the time of that call. `resolve()` reads the target of
+  that request when it is called. That covers every call that a callback makes before its first
+  `await`, which is what the examples above do, and a callback that such a call makes run.
+- After an `await` the callback is not on the stack, and nothing says which request a call
+  belongs to. Then every graph that the build has is asked. If all give the same module, that is
+  the answer. If not, the result is an error that says so, and says to call before the first
+  `await`. It is never the answer of the wrong graph.
+- The first version looked the `importer` up in the graphs of the build. The self-review showed
+  that this reads how far the scan has come and not who asks: the same call got an answer while
+  one graph had the file, and `cannot tell which graph asks` once both had.
+
+When it can be called. The resolver of a build lives on the thread that runs the build, from the
+start of the build to the last answer of its plugins. A call needs that build to be there, and
+the rule for it is the one that `defer()` has: the plugin object holds a request of the build
+that it has not answered yet.
+
+- In an `onResolve` or `onLoad` callback the call works, also after an `await`, after
+  `await defer()`, and from a callback that another `build.resolve()` made run.
+- In `setup()` and in `onStart()` it throws `ERR_INVALID_STATE` at once. `Bun.build()` runs both
+  before it reads the rest of its options, so no build exists, and a promise would keep it from
+  starting. esbuild answers in `onStart()`. That needs `onStart` to run after the build is
+  scheduled, which is a change for everybody who has an `onStart`, and it is not in this patch.
+- In `onEnd()`, after the build, and from a timer while no callback runs, the promise rejects
+  with `ERR_INVALID_STATE`. esbuild rejects the same calls for a build without a context.
+- A call that the callback does not wait for is answered, if the `onResolve` callbacks that ran
+  for it did not wait for anything: then the resolver was asked before the callback returned. If
+  one of them waits until the build is over, the promise rejects, and the message names the path.
+- With `compile: { aot }` the promise rejects, and the message says that `build.resolve()` is
+  not supported with `compile.aot` yet. Such a build asks its plugins from threads that wait for
+  the answer, and it has no loop that could be asked back.
+- The builder of `Bun.plugin()` is another object and has no `resolve()`.
+
+How it is built:
+
+- `resolveInBuild` in `src/js/builtins/BundlerPlugin.ts` checks the call and runs the one chain
+  of `onResolve` callbacks, `runOnResolvePlugins`, with another `this`: an object that has the
+  four properties that the chain uses and keeps the answer. For an import, `this` is the plugin
+  object, which tells the build. There is no second copy of the chain, and its text changed in
+  one place, for `errors`.
+- If no callback answers, a host function puts a `PluginQuery` on the loop of the build that
+  waits. The JS thread is the only thread that queues on that loop for the plugins, and it
+  queues the question before the answer that lets the build end, so the build runs the question
+  first. The build's thread calls `BundleV2::resolve_for_plugin` and posts the answer back
+  through the ticket that every other message of the build to its VM uses, under one new task
+  tag. A VM that is going away frees the question and never settles the promise.
+- Where the build runs on the JS thread itself (the dev server, and `bun build --app`), the
+  lookup is a direct call.
+- The plugin object has one new function, `resolveBinding`. `runSetupFunction` calls it when a
+  plugin first calls `resolve()`, and it makes the rest: `resolveInBuild`, and the three host
+  functions that it calls. The first version asked for them with `$cpp(...)`. The model of
+  `--trim` then counted the bundler as used by every program that calls the runtime
+  `Bun.plugin()`, which shares `runSetupFunction`, and kept it in the executable.
+- `src/bundler/plugin_resolve.rs` is the lookup. It writes nothing to the graph, and the
+  resolver's messages go to a log of its own. The resolver reports a `package.json` or a
+  `tsconfig.json` that is wrong once, when it reads it, and keeps what it read. So that a plugin
+  that asks first does not take the report from the build, the lookup forgets the directory of
+  each file that a message names, and the next import that looks there reads it again and
+  reports. In the result such a message is a warning if the path resolved. The first version
+  kept the messages, and a build that failed without the plugin was `success: true` with it.
+- `Transpiler::resolve_entry_point` is split in two: the lookup with its second look past the
+  directory cache, which `plugin_resolve.rs` calls too, and what it writes to the log.
+
+A question for the bun team, from the design review. The rules that come before the resolver
+(`alias`, the builtins, `files`) are written in `BundleV2::resolve_import_records`, which answers
+only for an import record of a parsed file, and `run_resolver` has a second copy of some of them.
+`plugin_resolve.rs` is a third one. The choices are: keep the copy; share the three leaves (the
+texts for a path that is not found, the builtin path of a build for Bun, the second look) and
+copy only the order, which is 3 hunks in `resolve_import_records` and no new branch; or call
+`resolve_import_records` for a record that belongs to no file, which needs a flag on `BundleV2`
+and 3 guarded places in that function, and an `ImportRecord` cannot say `external`. This patch
+has the copy, because it changes nothing in `resolve_import_records` and because
+oven-sh/bun#45408, which removes `run_resolver`, is open on the same lines. The test
+"build.resolve() and the import agree" compares 36 answers of the copy with what the import of
+the same build gets. The self-review ran the same comparison over four existing bundler suites
+and found 16 of 378 building cases where the two differ, in rule classes that the 36 rows do not
+have. A mode of `expectBundled.ts` that makes the comparison for every bundler test is the guard
+that this copy needs, and it is not built.
+
+One more thing that was wrong before and is in this commit, because `resolve()` depends on it.
+The resolver reads a directory once per build. `build.resolve()` makes it read one before an
+import would have, and a file that a plugin wrote into it later was `Could not resolve`: the
+reason why oven-sh/bun#43190 was withdrawn. A build whose plugins have called `resolve()` now
+looks a second time for an import that does not resolve, past that cache, as a `watch: true`
+build does. `resolve()` itself looks twice before it says that a path is not there.
+`run_resolver`, which answers for an import that an `onResolve` callback declined, did not read
+the field that asks for the second look, and reads it now. That hunk goes away with
+`run_resolver` when #45408 lands.
+
+Tests, in the files that have the tests of each host. All of them fail on bun 1.4.3, where the
+call throws:
+
+- `test/bundler/bundler_plugin.test.ts`, 14 tests: every shape of the answer of the resolver,
+  with and without a directory, for `import` and `require` of a package that has both; the 36
+  answers that are compared with the import of the same build, for three targets, two sets of
+  conditions and six kinds of path; the chain of callbacks with `pluginData`, the rule for
+  `namespace`, a callback that throws an error, a symbol and an object without a prototype, a
+  callback that asks on, three questions at once; every place where the call is refused and
+  every wrong argument, with the text of each error; `onLoad` before and after `defer()`; a
+  server and its page that import a package with a `"browser"` and a `"bun"` condition, asked in
+  `onResolve` and in `onLoad`, before and after an `await`, with outputs that are those of the
+  build without the plugin; a plugin that writes a file after it asked about the directory, in
+  three variants, and one that writes an entry point; a `package.json` that is not JSON, with a
+  build that fails with the plugin as it does without; `{ errors }` returned from `onResolve`;
+  a plugin that passes every import of a build on, for every kind of import, with an output that
+  is equal to the one without the plugin; 400 questions that no callback waits for, and a process
+  that exits, and frees its VM, while answers are on their way.
+- `test/bundler/bun-build-watch.test.ts`: a rebuild asks again, and finds a file that was made
+  since the last build.
+- `test/bundler/bundler_compile_aot.test.ts`: `compile.aot` refuses.
+- `test/bake/dev/plugins.test.ts`: the dev server.
+- `test/js/bun/http/bun-serve-html.test.ts`: a `[serve.static]` plugin of `Bun.serve`, with
+  `development: false` and `development: true`. Both serve the `"browser"` file of a package
+  that the plugin asked about with `resolveDir` only. The first version served the `"bun"` file
+  in development.
+- `test/integration/bun-types/fixture/build.ts`: the types.
+
+What it costs a build that does not call it. Measured on two release builds for linux-x64:
+e985484c8c, the commit under the two of this day, and this one. Instructions are counted in user
+mode with `perf_event_open`, and a cost per import is the difference between an entry with 8,000
+imports and one with 2,000, divided by 6,000.
+
+- A build without plugins runs no new code. Per import, on all threads: 49,648 and 49,560
+  instructions in two readings of the base, 49,661 and 49,618 in two of this commit (the least of
+  9 runs each).
+- A plugin whose `onResolve` callback answers nothing: 11,816 and 11,809 instructions per request
+  on the JS thread in two readings of the base, 11,824 and 11,825 in this commit (JIT off, the
+  least of 7). That is about 10 more per request: the field that `dispatchRequest` sets and
+  clears around the call. `runOnResolvePlugins` reads one more property, `errors`, of an answer
+  that is an object, so a callback that answers pays that too.
+- Per build with plugins: about 860 instructions more on the JS thread, for the one new function
+  of the plugin object (167,408 and 167,524 per build in the base, 168,329 and 168,314 here, from
+  220 builds against 20 with an empty `setup()`, JIT off).
+- Once per process that builds with plugins: about 28,000 instructions more to compile
+  `runSetupFunction` (12.258 M and 12.253 M for one build with an empty `setup()` in the base,
+  12.283 M and 12.284 M here).
+- The plugin object has one more pointer and one more `bool`. `Resolve`, `Load`, `BundleV2` and
+  `JSBundleCompletionTask` have no new field. Each registered callback is an array of three
+  items where it had two.
+- The stripped binary grows by 28,672 bytes, from 141,662,528 to 141,691,200: 17,920 of `.text`
+  and 4,096 of `.rodata`. `resolve_for_plugin` and the function that it calls for one graph are
+  7,348 bytes, the native code of the entry points 5,243, and the rest is the text of
+  `resolveInBuild` and what frees and fills the answer.
+- One more task tag (88 to 89).
+
+The first version of this patch had the two ways to end inside `runOnResolvePlugins`, with a
+test of "is this a question" at each. The same measurement read 724 more instructions per
+request for a plugin that never calls `resolve()` (12,535 from 11,811, 6%), and 303,000 more per
+process. So the chain is called as it is, with another `this`.
+
+What a call costs the plugin that makes it: about 17,600 instructions on the JS thread (41,400
+with the JIT off) and about 7,100 on the thread of the build. One call at a time, each waited
+for, takes about 250 µs, which is two wake-ups of a thread. A plugin that passes every import of
+an entry with 8,000 imports on took between 16 and 36 µs a call in two sets of runs on a machine
+that was not idle.
+
+What is not done, and what was not run. The self-review of the first version had 57 findings.
+The four that gave a wrong result without an error are fixed above: the graph, the report of the
+resolver, `{ errors }`, and `namespace`. These are open:
+
+- A call after an `await` in a build with two graphs gets an error where the graphs differ, as
+  said above. That is so for every such call on a page of `Bun.serve` in development too, where
+  only the page graph has files. A way to carry the request over an `await` (an async context
+  frame, or an option) is the follow-up. `onLoad` has `args.side`, and `onResolve` has nothing
+  like it.
+- A callback that runs after another plugin's callback has waited is in the same position: the
+  chain went on from a promise, and the request is not on the stack.
+- With `target: "bun"`, the build does not ask plugins about a builtin such as `node:fs`.
+  `resolve()` does. A callback that answers for such a name makes the result differ from the
+  import. The rule has to be asked of the build before the chain, and it is not.
+- One plugin object serves many builds of a dev server or of a `watch: true` build. A question
+  whose callbacks wait until another build of the same object holds a request is answered by
+  that build. A number for each build on the question would refuse it.
+- A module in a plugin namespace whose path is not absolute: the build resolves its imports from
+  the working directory. `resolve()` with the `resolveDir` that `onResolve` is told for it
+  (`dirname` of that path) resolves from a directory below.
+- In an HTML page, only the path that `onResolve` is told works. The page scanner rewrites
+  `/src/app.js` and a bare `side.js` before any rule, and `resolve()` does not.
+- The second look past the directory cache covers a path that starts with `./`, `../` or `/`.
+  A file that a plugin writes late and that only a `tsconfig.json` path, a `package.json`
+  `"imports"` entry or `node_modules` leads to is not found, by the import or by `resolve()`.
+  Each second look reads the directory again, and the resolver does not free the old list. A
+  plugin that asks for many files that do not exist pays that for each.
+- `errors` and `warnings` have a `text`, a `pluginName` and a `detail`. `location` is `null` and
+  `notes` is empty. The resolver has a file and a line for some, and they do not cross.
+  `pluginName` is the option for a message of the resolver and empty for an error that a
+  callback threw: the chain does not know the name of the plugin that a callback is of.
+- `resolve()` in `onStart()`. `compile.aot`. The `with` option, a `suffix` (always `""`), and
+  `pluginData` from an `onResolve` answer to the `onLoad` callback of that module.
+- `resolve()` on the builder of a runtime plugin, `Bun.plugin()`. The types are shared, so a call
+  there type-checks and fails with `build.resolve is not a function`.
+- The lookup does not have the rules for `bun:wrap` and for the virtual modules of a framework
+  (`bun:bake/server`). The resolver answers for those names.
+- The production build of a framework runs its bundle on the JS thread like the dev server, by
+  the same direct call. No test builds one with a plugin that calls `resolve()`. No test runs a
+  trimmed executable, or a worker that is terminated while it asks.
+- macOS and Windows were not built or run. A `resolveDir` that starts with `/` is kept as it is
+  written on Windows, for the keys of `files`, and that path has no test there.
+- On the debug build, `test/js/bun/plugin/plugins.test.ts` has one test that runs into its
+  timeout ("keeps the object alive across a GC so require() can create the module again"). It
+  does the same on the release build of e985484c8c, without this commit.
+
+To pick this commit onto upstream, three places need a hand, because it sits on other patches of
+this stack:
+
+- `src/runtime/dispatch.rs`: the count of task tags is upstream's plus one.
+- `src/bundler/plugin_resolve.rs` calls `alias_substitute` and `alias_base` of the `alias` patch
+  (2026-10-21), and sets `recheck_unresolved_imports` of the `watch: true` patch (2026-10-09).
+  Without `alias`, the eight lines around `aliased` go. Without the field, the second look goes,
+  with its hunk in `run_resolver`, the comment on the field, and the tests for a file that is
+  written later.
+- `test/bundler/bun-build-watch.test.ts` is a file of the `watch: true` patch, and the test
+  "build.resolve() and the import agree" passes an `alias`.
+- `ImportKind::from_label` reads the labels of the commit in front of this one. Without that
+  commit an `@import` with a `supports()` condition has an empty label, which no call names.
+
+Rebase notes: 68 patches onto oven-sh/bun 7ca0042d3b, one commit after the base of 2026-11-06.
+No conflicts, nothing dropped. The fork's `bun-types`, `source-lints` and `Packages CI` runs for
+the push of 2026-11-06 were green. The work took until the morning of 2026-11-08, most of it for
+the self-review and what it found.
+
+Files: `src/bundler/plugin_resolve.rs` (new), `src/bundler/bundle_v2.rs`, `src/bundler/lib.rs`,
+`src/bundler/transpiler.rs`, `src/runtime/api/JSBundler.rs`,
+`src/runtime/api/js_bundle_completion_task.rs`, `src/runtime/dispatch.rs`,
+`src/event_loop/ConcurrentTask.rs`, `src/ast/lib.rs`, `src/jsc/bindings/JSBundlerPlugin.cpp`,
+`src/jsc/bindings/JSBundlerPlugin.h`, `src/js/builtins/BundlerPlugin.ts`, `src/js/private.d.ts`,
+`src/codegen/builtins/host/runtime-dependencies.builtins.ts`, `packages/bun-types/bun.d.ts`,
+`docs/bundler/plugins.mdx`, `docs/bundler/esbuild.mdx`, `test/bundler/bundler_plugin.test.ts`,
+`test/bundler/bun-build-watch.test.ts`, `test/bundler/bundler_compile_aot.test.ts`,
+`test/bake/dev/plugins.test.ts`, `test/js/bun/http/bun-serve-html.test.ts`,
+`test/integration/bun-types/fixture/build.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

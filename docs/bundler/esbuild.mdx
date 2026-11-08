@@ -197,7 +197,7 @@ const myPlugin: BunPlugin = {
 };
 ```
 
-The builder object's methods hook into parts of the bundling process. Bun implements `onStart`, `onEnd`, `onResolve`, and `onLoad`; it does not implement the esbuild hooks `onDispose` and `resolve`. Bun partially implements `initialOptions`: the object is read-only and exposes only a subset of esbuild's options. Use `config` (the same thing in Bun's `BuildConfig` format) instead.
+The builder object's methods hook into parts of the bundling process. Bun implements `onStart`, `onEnd`, `onResolve`, `onLoad`, and [`resolve`](#resolve); it does not implement the esbuild hook `onDispose`. Bun partially implements `initialOptions`: the object is read-only and exposes only a subset of esbuild's options. Use `config` (the same thing in Bun's `BuildConfig` format) instead.
 
 ```ts title="myPlugin.ts" icon="/icons/typescript.svg"
 import type { BunPlugin } from "bun";
@@ -236,16 +236,16 @@ const myPlugin: BunPlugin = {
     - 🟢 `namespace`
     - 🟢 `resolveDir`
     - 🟢 `kind`
-    - 🔴 `pluginData`
+    - 🟡 `pluginData`: what a `build.resolve()` call passed. An import of the build has none.
 
   </Tab>
   <Tab title="results">
 
     - 🟢 `namespace`
     - 🟢 `path`
-    - 🔴 `errors`
+    - 🟡 `errors`: a non-empty array fails the import with the `text` of each entry
     - 🟢 `external`
-    - 🔴 `pluginData`
+    - 🟡 `pluginData`: returned to the `build.resolve()` call that asked. Not passed on to `onLoad`.
     - 🔴 `pluginName`
     - 🔴 `sideEffects`
     - 🔴 `suffix`
@@ -287,3 +287,39 @@ const myPlugin: BunPlugin = {
 
   </Tab>
 </Tabs>
+
+### resolve
+
+The resolver of the build answers [`build.resolve()`](/bundler/plugins#resolve), after the `onResolve` callbacks of every plugin. As in esbuild, a path that does not resolve is an entry of `errors` in the result and not a rejection.
+
+<Tabs>
+  <Tab title="options">
+
+    - 🟢 `kind`: Bun's names, which `onResolve` callbacks receive, and esbuild's `entry-point` and `composes-from`
+    - 🟢 `importer`
+    - 🟡 `namespace`: only `"file"`. As in esbuild, a call without it does not ask the callbacks that have a `namespace`
+    - 🟢 `resolveDir`: if it is missing, the directory of `importer`
+    - 🟢 `pluginData`
+    - 🟡 `pluginName`: labels the messages of the resolver. An error that a callback threw has an empty `pluginName`
+    - 🔴 `with`
+
+  </Tab>
+  <Tab title="results">
+
+    - 🟢 `path`
+    - 🟢 `namespace`
+    - 🟢 `external`
+    - 🟢 `sideEffects`
+    - 🟢 `pluginData`
+    - 🟡 `errors`: `text`, `pluginName` and `detail`. `location` is `null` and `notes` is empty
+    - 🟡 `warnings`: as `errors`
+    - 🟡 `suffix`: always `""`
+
+  </Tab>
+</Tabs>
+
+Bun differs from esbuild in three ways:
+
+- When the call is valid. It works while an `onResolve` or `onLoad` callback of the build runs. It throws in `setup()` and in `onStart()`, where esbuild throws only in `setup()`. Bun runs `onStart` callbacks before the build has a resolver. It rejects in `onEnd()`, as esbuild does for a build without a context.
+- `errors` is empty for a path that resolves. What the resolver finds wrong on the way, such as a `package.json` that it cannot read, is in `warnings`. esbuild reports it in `errors` and fails the build.
+- A build with a server graph and a page graph answers for the graph of the calling import only when the callback calls before its first `await`. See [when you can call it](/bundler/plugins#when-you-can-call-it).

@@ -380,6 +380,17 @@ pub(crate) fn run_task(
         task_tag::BundleV2PluginLoadDeferred => {
             cast!(bun_bundler::bundle_v2::api::JSBundler::LoadDeferred).run();
         }
+        task_tag::BundleV2PluginQueryAnswered => in_features!(
+            [Bundler],
+            (
+                query: *mut crate::api::JSBundler::PluginQuery =
+                    cast_ptr!(crate::api::JSBundler::PluginQuery),
+                global: &JSGlobalObject = global,
+            ) -> JsResult<()> {
+                // SAFETY: boxed by `build.resolve()`; the arm consumes the box.
+                unsafe { bun_core::heap::take(query) }.settle(global)
+            }
+        )?,
         task_tag::BundleV2ParseTaskResult => {
             feature_arm!([Bundler], |result: BundleV2ParseTaskResult| {
                 // SAFETY: boxed by the parse worker; `on_complete` consumes it.
@@ -898,7 +909,7 @@ fn run_task_cold(task: Task) {
 /// `release_task_unrun` track `bun_event_loop::task_tag::COUNT`. Bump when
 /// adding a variant — and give it an arm in both.
 const _: () = assert!(
-    task_tag::COUNT == 88,
+    task_tag::COUNT == 89,
     "dispatch::run_task / release_task_unrun arm count out of sync with bun_event_loop::task_tag",
 );
 
@@ -1735,6 +1746,9 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
                 [Bundler],
                 bun_bundler::bundle_v2::api::JSBundler::LoadDeferred
             )
+        }
+        task_tag::BundleV2PluginQueryAnswered => {
+            release_in!([Bundler], crate::api::JSBundler::PluginQuery)
         }
         task_tag::BundleV2ParseTaskResult => {
             release_in!([Bundler], BundleV2ParseTaskResult)

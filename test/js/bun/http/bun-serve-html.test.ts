@@ -1390,6 +1390,58 @@ test.concurrent("a route keeps failing when its broken module was imported throu
   expect({ stdout, exitCode }, stderr).toEqual({ stdout: "500 200 500", exitCode: 0 });
 });
 
+// A `[serve.static]` plugin asks the resolver of the route's build: the build of a production
+// route, which has a thread of its own, and the one of the dev server, which has not. A page is
+// bundled for the browser in both, and that is the graph that answers.
+test.concurrent("build.resolve() in a [serve.static] plugin, in production and in development", async () => {
+  using dir = tempDir("bun-serve-html-plugin-resolve", {
+    "bunfig.toml": `[serve.static]\nplugins = ["./plugin.ts"]\n`,
+    "index.html": `<!DOCTYPE html><html><head><title>t</title></head><body><script type="module" src="./entry.ts"></script></body></html>`,
+    "entry.ts": `import { message } from "virtual-message";\nimport cond from "cond";\nconsole.log(message, cond);`,
+    "message.ts": `export const message = "resolved by the build";`,
+    "node_modules/cond/package.json": JSON.stringify({
+      name: "cond",
+      exports: { ".": { browser: "./browser.js", bun: "./bun.js", default: "./default.js" } },
+    }),
+    "node_modules/cond/browser.js": `export default "cond-browser";`,
+    "node_modules/cond/bun.js": `export default "cond-bun";`,
+    "node_modules/cond/default.js": `export default "cond-default";`,
+    "plugin.ts": /*ts*/ `
+      export default {
+        name: "asks",
+        setup(build) {
+          build.onResolve({ filter: /^virtual-message$/ }, async args => {
+            const found = await build.resolve("./message.ts", { kind: args.kind, importer: args.importer });
+            const missing = await build.resolve("./missing.ts", { kind: args.kind, importer: args.importer });
+            if (missing.path !== "" || missing.errors.length !== 1) throw new Error("expected one error");
+            return { path: found.path };
+          });
+          build.onResolve({ filter: /^cond$/ }, async args => {
+            if (args.pluginData === "asked") return undefined;
+            const found = await build.resolve("cond", { kind: args.kind, resolveDir: args.resolveDir, pluginData: "asked" });
+            return { path: found.path };
+          });
+        },
+      };
+    `,
+    "serve.ts": /*ts*/ `
+      import page from "./index.html";
+
+      const bundled = [];
+      for (const development of [false, true]) {
+        using server = Bun.serve({ port: 0, development, routes: { "/": page } });
+        const html = await fetch(server.url).then(response => response.text());
+        const script = html.match(/src="([^"]+\\.js[^"]*)"/)?.[1];
+        const code = script ? await fetch(new URL(script, server.url)).then(response => response.text()) : "";
+        bundled.push(code.includes("resolved by the build") && code.includes("cond-browser") && !code.includes("cond-bun"));
+      }
+      console.log(bundled.join(" "));
+    `,
+  });
+  const { stdout, stderr, exitCode } = await runServeFixture(dir);
+  expect({ stdout, exitCode }, stderr).toEqual({ stdout: "true true", exitCode: 0 });
+});
+
 // process.chdir() leaves the cached top-level directory with a trailing slash,
 // which the dev server then used as its root. Reporting a bundle failure
 // relativizes the failing file against that root and hit a debug assertion

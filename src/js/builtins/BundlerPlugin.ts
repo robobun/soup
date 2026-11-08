@@ -18,6 +18,15 @@ interface OnBeforeParseOptions {
   symbol: string;
   external?: unknown;
 }
+interface ResolveOptions {
+  kind?: string;
+  importer?: string;
+  namespace?: string;
+  resolveDir?: string;
+  pluginData?: unknown;
+  pluginName?: string;
+  with?: undefined;
+}
 interface PluginBuilderExt {
   config: $Node.BundlerPlugin.Config;
   onStart(callback: () => void | Promise<void>): PluginBuilderExt;
@@ -200,7 +209,10 @@ export function runSetupFunction(
       }
     }
 
-    var { filter, namespace = "file" } = filterObject;
+    var { filter, namespace } = filterObject;
+    // A `build.resolve()` call that names no namespace asks the callbacks that name none.
+    const namesNamespace = !!namespace;
+    if (namespace === undefined) namespace = "file";
 
     if (!filter) {
       throw new TypeError('Expected an object with "filter" RegExp');
@@ -225,9 +237,14 @@ export function runSetupFunction(
     var callbacks = map.$get(namespace);
 
     if (!callbacks) {
-      map.$set(namespace, [isOnBeforeParse ? [filter, callback, symbol, external] : [filter, callback]]);
+      map.$set(namespace, [
+        isOnBeforeParse ? [filter, callback, symbol, external] : [filter, callback, namesNamespace],
+      ]);
     } else {
-      $arrayPush(callbacks, isOnBeforeParse ? [filter, callback, symbol, external] : [filter, callback]);
+      $arrayPush(
+        callbacks,
+        isOnBeforeParse ? [filter, callback, symbol, external] : [filter, callback, namesNamespace],
+      );
     }
   }
 
@@ -287,6 +304,10 @@ export function runSetupFunction(
 
     return this;
   }
+
+  // `build.resolve()` is `resolveInBuild`. Native code makes it, and what it calls, when a plugin
+  // first calls `resolve()`, so a build whose plugins never do has neither.
+  var resolveBinding: $Node.BundlerPlugin.ResolveBinding | undefined;
 
   const processSetupResult = () => {
     var anyOnLoad = false,
@@ -365,9 +386,8 @@ export function runSetupFunction(
     onResolve,
     onBeforeParse,
     onStart,
-    resolve: () => {
-      throw new TypeError("build.resolve() is not implemented yet. See https://github.com/oven-sh/bun/issues/2771");
-    },
+    resolve: (path: string, options?: ResolveOptions) =>
+      (resolveBinding ??= self.resolveBinding())[0].$call(self, resolveBinding, path, options),
     module: () => {
       throw new TypeError("module() is not supported in Bun.build() yet. Only via Bun.plugin() at runtime");
     },
@@ -413,14 +433,243 @@ export function runSetupFunction(
   return processSetupResult();
 }
 
-export function runOnResolvePlugins(
+/**
+ * `build.resolve()` of a `Bun.build` plugin. `binding` is what `resolveBinding` in
+ * JSBundlerPlugin.cpp made: this function, the chain of onResolve callbacks, the state of the
+ * plugin object, the graph that asks, and the resolver of the build.
+ */
+export function resolveInBuild(
   this: $Node.BundlerPlugin,
+  binding: $Node.BundlerPlugin.ResolveBinding,
+  path: string,
+  options?: ResolveOptions,
+) {
+  const { 1: runOnResolve, 2: resolveState, 3: askingTarget, 4: resolveDefault } = binding;
+  // `BundlerPlugin::ResolveState` of JSBundlerPlugin.h.
+  const NotStarted = 0,
+    BundleWaits = 2,
+    CompilesAheadOfTime = 3;
+
+  // Bun.build() waits for setup() and onStart() before the build starts, so a promise made here
+  // for an answer of the build would keep it from ever starting.
+  const stateAtCall = resolveState.$call(this);
+  if (stateAtCall === NotStarted) {
+    throw $ERR_INVALID_STATE(
+      "build.resolve() was called before the build started. Call it in an onResolve() or onLoad() callback",
+    );
+  }
+  if (typeof path !== "string") throw $ERR_INVALID_ARG_TYPE("path", "string", path);
+  if (options === undefined) options = {};
+  else if (!$isObject(options)) throw $ERR_INVALID_ARG_TYPE("options", "object", options);
+
+  let kind: string | undefined, resolveDir: string | undefined, pluginData: unknown;
+  let importer = "",
+    pluginName = "";
+  // Without a namespace, the callbacks that were registered with one are not asked.
+  let namesNamespace = false;
+  for (const key of Object.keys(options)) {
+    const value = options[key];
+    switch (key) {
+      case "pluginData":
+        pluginData = value;
+        continue;
+      case "with":
+        if (value !== undefined) throw new TypeError('build.resolve() does not support the "with" option yet');
+        continue;
+      case "kind":
+      case "importer":
+      case "namespace":
+      case "resolveDir":
+      case "pluginName":
+        break;
+      default:
+        throw new TypeError(`Invalid option in resolve() call: "${key}"`);
+    }
+    if (value === undefined) continue;
+    if (typeof value !== "string") throw $ERR_INVALID_ARG_TYPE(`options.${key}`, "string", value);
+    if (key === "kind") kind = value;
+    else if (key === "importer") importer = value;
+    else if (key === "namespace") {
+      // The build asks the callbacks of "file" for every import, whatever namespace the importer is in.
+      if (value !== "" && value !== "file") {
+        throw new TypeError('build.resolve() does not support a "namespace" other than "file" yet');
+      }
+      namesNamespace = value === "file";
+    } else if (key === "resolveDir") resolveDir = value;
+    else pluginName = value;
+  }
+
+  // A directory is a path of the file system, which has no NUL in it. The name of a module that
+  // a plugin made up can have one. A path that starts with "/" stays as it is written, on
+  // Windows too, where the keys of `files` can be written so.
+  const { resolve: absolute, dirname, posix } = require("node:path");
+  if (resolveDir) {
+    if (resolveDir.includes("\0")) {
+      throw $ERR_INVALID_ARG_VALUE("options.resolveDir", resolveDir, "must be a string without null bytes");
+    }
+    resolveDir = resolveDir[0] === "/" ? posix.resolve(resolveDir) : absolute(resolveDir);
+  } else if (importer !== "" && !importer.includes("\0")) {
+    resolveDir = importer[0] === "/" ? posix.dirname(posix.resolve(importer)) : dirname(absolute(importer));
+  } else {
+    resolveDir = "";
+  }
+
+  // The graph that asks is the one of the request whose callback makes this call. Once that
+  // callback has waited for something it is not on the stack, and nothing says which request
+  // the call belongs to.
+  const target = stateAtCall === BundleWaits ? askingTarget.$call(this) : -1;
+
+  const message = (text: string, pluginName: string, detail?: unknown) => ({
+    id: "",
+    pluginName,
+    text,
+    location: null,
+    notes: [],
+    detail,
+  });
+
+  return (async () => {
+    if (kind === undefined) throw new TypeError('Must specify "kind" when calling "resolve"');
+    // esbuild's names for the two kinds that Bun names differently.
+    if (kind === "entry-point") kind = "entry-point-build";
+    else if (kind === "composes-from") kind = "composes";
+    const kindId = $ImportKindIdToLabel.indexOf(kind as any);
+    if (kindId === -1) throw new TypeError(`Invalid kind: ${JSON.stringify(kind)}`);
+
+    const state = resolveState.$call(this);
+    if (state === CompilesAheadOfTime) {
+      throw new TypeError("build.resolve() is not supported with compile.aot yet");
+    }
+    if (state !== BundleWaits) {
+      throw $ERR_INVALID_STATE(
+        "build.resolve() was called while no onResolve() or onLoad() callback of the build was running",
+      );
+    }
+
+    // The callbacks are asked by `runOnResolvePlugins`, which tells its `this` the answer. For an
+    // import that is the plugin object, which tells the build. Here it is an object that keeps
+    // the answer, and that has the callbacks with what this call tells them: its `resolveDir`
+    // and its `pluginData`.
+    let callbacks = this.onResolve?.$get("file");
+    if (callbacks && !namesNamespace) callbacks = callbacks.filter(registered => !registered[2]);
+    if (callbacks && callbacks.length > 0) {
+      let answered = false,
+        failed = false;
+      let answer: $Node.BundlerPlugin.ResolveAnswer | undefined, failure: unknown, returned: any, wake: () => void;
+      const asked = new Map();
+      asked.$set(
+        "file",
+        callbacks.map(({ 0: filter, 1: callback }) => [
+          filter,
+          (args: $Node.BundlerPlugin.OnResolveArgs) =>
+            (returned = callback({
+              path: args.path,
+              importer: args.importer,
+              namespace: args.namespace,
+              resolveDir,
+              kind: args.kind,
+              pluginData,
+            })),
+        ]),
+      );
+      runOnResolve.$call(
+        {
+          onResolve: asked,
+          onLoad: this.onLoad,
+          onResolveAsync: (_, answeredPath, answeredNamespace, external) => {
+            if (answeredPath !== null) {
+              // The answer is what the callback that ran last returned, and the chain has waited for it.
+              if ($isPromise(returned)) returned = $peekPromiseSettledValue(returned);
+              answer = {
+                path: answeredPath,
+                namespace: answeredNamespace!,
+                external: !!external,
+                pluginData: returned.pluginData,
+              };
+            }
+            answered = true;
+            wake?.();
+          },
+          addError: (_, error) => {
+            failure = error;
+            answered = failed = true;
+            wake?.();
+          },
+        },
+        path,
+        "file",
+        importer,
+        0,
+        kindId,
+      );
+      // Without a wait where no callback waits: then the resolver of the build is asked before
+      // the callback that called `resolve()` can answer, also when that one does not wait for this.
+      if (!answered) await new Promise<void>(resolve => (wake = resolve));
+      if (failed) {
+        // A callback can throw anything, also what has no text.
+        let text: string;
+        try {
+          const thrown = failure as Error;
+          text = typeof thrown?.message === "string" ? thrown.message : String(thrown);
+        } catch {
+          text = "An onResolve() callback threw a value that has no text";
+        }
+        return {
+          errors: [message(text, "", failure)],
+          warnings: [],
+          path: "",
+          external: false,
+          sideEffects: false,
+          namespace: "",
+          suffix: "",
+          pluginData: undefined,
+        };
+      }
+      if (answer) {
+        return {
+          errors: [],
+          warnings: [],
+          path: answer.path,
+          external: answer.external,
+          sideEffects: true,
+          namespace: answer.namespace,
+          suffix: "",
+          pluginData: answer.pluginData,
+        };
+      }
+    }
+
+    const lookup = resolveDefault.$call(this, path, resolveDir, kind, target);
+    if (lookup === undefined) {
+      // The callbacks above waited for longer than the build did for the callback that this
+      // call was made in, and the resolver went with the build.
+      throw $ERR_INVALID_STATE(
+        `build.resolve(${JSON.stringify(path)}) has no build to ask: no onResolve() or onLoad() callback of the build was running any more when the onResolve() callbacks that it asked had answered`,
+      );
+    }
+    const found = await lookup;
+    return {
+      errors: found.errors.map(text => message(text, pluginName)),
+      warnings: found.warnings.map(text => message(text, pluginName)),
+      path: found.path,
+      external: found.external,
+      sideEffects: found.sideEffects,
+      namespace: found.namespace,
+      suffix: "",
+      pluginData: undefined,
+    };
+  })();
+}
+
+export function runOnResolvePlugins(
+  this: $Node.BundlerPlugin.OnResolveHost,
   specifier: string,
   inputNamespace: string,
   importer: string,
   internalID: number,
   kindId: number,
 ) {
+  // `this` is the plugin object, or what `resolveInBuild` asks the same callbacks with.
   // Must be kept in sync with ImportRecord.label
   const kind = $ImportKindIdToLabel[kindId];
 
@@ -462,7 +711,13 @@ export function runOnResolvePlugins(
           continue;
         }
 
-        var { path, namespace: userNamespace = inputNamespace, external } = result;
+        var { path, namespace: userNamespace = inputNamespace, external, errors } = result;
+        // What `build.resolve()` gave for a path that does not resolve, handed on as the answer.
+        if ($isJSArray(errors) && errors.length > 0) {
+          throw new Error(
+            errors.map(error => (typeof error?.text === "string" ? error.text : String(error))).join("\n"),
+          );
+        }
         if (path !== undefined && typeof path !== "string") {
           throw new TypeError("onResolve plugins 'path' field must be a string if provided");
         }

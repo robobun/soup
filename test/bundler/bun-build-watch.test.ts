@@ -635,6 +635,31 @@ describe("Bun.build({ watch: true })", () => {
     expect(await outer.next()).toEqual({ value: undefined, done: true });
   });
 
+  test("build.resolve() of a plugin is answered in every build, also for a file made since the last one", async () => {
+    using dir = tempDir("build-watch-plugin-resolve", {
+      "index.ts": `import value from "generated";\nconsole.log(value);`,
+      "fallback.ts": `export default "fallback";`,
+    });
+    const root = String(dir);
+    const plugin: BunPlugin = {
+      name: "resolves",
+      setup(build) {
+        build.onResolve({ filter: /^generated$/ }, async args => {
+          const found = await build.resolve("./generated.ts", { kind: args.kind, importer: args.importer });
+          return { path: found.errors.length > 0 ? join(root, "fallback.ts") : found.path };
+        });
+      },
+    };
+    await using watcher = Bun.build({ entrypoints: [join(root, "index.ts")], plugins: [plugin], watch: true });
+    await until(watcher, contains(`"fallback"`));
+
+    // Nothing watches for the file that was only asked about. The change to the entry point
+    // starts the build that finds it.
+    writeFileSync(join(root, "generated.ts"), `export default "generated";`);
+    writeFileSync(join(root, "index.ts"), `import value from "generated";\nconsole.log(value, 2);`);
+    await until(watcher, contains(`"generated"`));
+  });
+
   test("plugins are set up again for every build, and a file a plugin loads is watched", async () => {
     using dir = tempDir("build-watch-plugin", {
       "index.ts": `import value from "virtual:value";\nimport text from "./data.txt";\nconsole.log(value, text);`,

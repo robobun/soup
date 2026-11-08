@@ -156,6 +156,45 @@ public:
     // and whatever its JS side delivers later is dropped.
     void tombstone();
 
+    // A request this plugin chain holds, if it holds one. The bundle that made it waits for its answer, so
+    // until then that bundle can be asked something: what build.resolve() needs.
+    std::optional<std::pair<void*, RequestKind>> anyRequest() const
+    {
+        if (held.isEmpty())
+            return std::nullopt;
+        auto it = held.begin();
+        return std::make_pair(it->key, it->value);
+    }
+    // The request whose callbacks are on the stack, if it is still held: the one that a build.resolve() call
+    // made now is asked for. A callback that has waited for something is no longer on the stack.
+    std::optional<std::pair<void*, RequestKind>> dispatchingRequest() const
+    {
+        auto it = dispatching ? held.find(dispatching) : held.end();
+        if (it == held.end())
+            return std::nullopt;
+        return std::make_pair(it->key, it->value);
+    }
+    // Whether build.resolve() can ask a bundle. BundlerPlugin.ts reads the numbers.
+    enum class ResolveState : uint8_t {
+        // No build has started: setup() or onStart() is running.
+        NotStarted = 0,
+        // No bundle waits for an answer of these plugins.
+        NoBundleWaits = 1,
+        BundleWaits = 2,
+        // The plugins of such a build are asked by threads that wait for the answer, with no loop to ask back.
+        CompilesAheadOfTime = 3,
+    };
+    ResolveState resolveState() const
+    {
+        if (!filtersFrozen)
+            return ResolveState::NotStarted;
+        if (compilesAheadOfTime)
+            return ResolveState::CompilesAheadOfTime;
+        if (tombstoned || held.isEmpty())
+            return ResolveState::NoBundleWaits;
+        return ResolveState::BundleWaits;
+    }
+
     BundlerPlugin(void* config, BunPluginTarget target, JSBundlerPluginAddErrorCallback addError, JSBundlerPluginOnLoadAsyncCallback onLoadAsync, JSBundlerPluginOnResolveAsyncCallback onResolveAsync)
         : addError(addError)
         , onLoadAsync(onLoadAsync)
@@ -182,6 +221,10 @@ public:
     bool tombstoned { false };
     // Set on the JS thread before a bundle pass. After that, other threads read the filter lists without a lock.
     bool filtersFrozen { false };
+    // Set with filtersFrozen, for a Bun.build with compile.aot.
+    bool compilesAheadOfTime { false };
+    // The request that dispatchRequest() is calling the plugins for. JS thread only.
+    void* dispatching { nullptr };
 
 private:
     WTF::HashMap<void*, RequestKind> held;

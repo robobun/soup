@@ -93,6 +93,7 @@ const loadedModulesByPath: Readonly<Record<b.BuiltinPath, readonly b.ModuleLoadS
 
 const pluginFunctionsOfBuild = functionsIn(
   "builtins/BundlerPlugin",
+  "resolveInBuild",
   "runOnEndCallbacks",
   "runOnLoadPlugins",
   "runOnResolvePlugins",

@@ -839,8 +839,9 @@ declare namespace $Node {
 
   // src/jsc/bindings/JSBundlerPlugin.cpp. The functions of src/js/builtins/BundlerPlugin.ts run with it as `this`.
   interface BundlerPlugin {
-    onLoad: Map<string, [RegExp, BundlerPlugin.OnLoadCallback][]> | undefined;
-    onResolve: Map<string, [RegExp, BundlerPlugin.OnResolveCallback][]> | undefined;
+    /** The third item: the callback was registered with a `namespace`. */
+    onLoad: Map<string, [RegExp, BundlerPlugin.OnLoadCallback, boolean?][]> | undefined;
+    onResolve: Map<string, [RegExp, BundlerPlugin.OnResolveCallback, boolean?][]> | undefined;
     promises: Promise<unknown>[] | undefined;
     $onEndCallbacks: BundlerPlugin.OnEndCallback[] | undefined;
     /** `internalID`: the address of the native request, as a double. */
@@ -860,6 +861,8 @@ declare namespace $Node {
     addFilter(filter: RegExp, namespace: string, kind: number): void;
     onBeforeParse(filter: RegExp, namespace: string, addon: unknown, symbol: string, external?: unknown): void;
     generateDeferPromise(internalID: number): Promise<void>;
+    /** `build.resolve()` and what it calls. */
+    resolveBinding(): BundlerPlugin.ResolveBinding;
   }
   namespace BundlerPlugin {
     interface OnLoadArgs {
@@ -884,12 +887,63 @@ declare namespace $Node {
       namespace: string;
       resolveDir: string | undefined;
       kind: string;
+      /** Only in what a `build.resolve()` call makes a callback run for. */
+      pluginData?: unknown;
     }
     interface OnResolveResult {
       path?: string;
       namespace?: string;
       external?: boolean | null;
+      /** Read for an answer to a `build.resolve()`. */
+      pluginData?: unknown;
+      /** What a `build.resolve()` gave, handed on: the import fails with it. */
+      errors?: { text?: unknown }[];
     }
+    /** The answer of an onResolve callback to a `build.resolve()`. */
+    interface ResolveAnswer {
+      path: string;
+      namespace: string;
+      external: boolean;
+      pluginData: unknown;
+    }
+    /** What the resolver of the build found, or why it found nothing. */
+    interface ResolveDefault {
+      path: string;
+      namespace: string;
+      external: boolean;
+      sideEffects: boolean;
+      errors: string[];
+      warnings: string[];
+    }
+    /**
+     * What `runOnResolvePlugins` uses of its `this`: the plugin object for an import, and an object of
+     * `resolveInBuild` for a `build.resolve()`.
+     */
+    type OnResolveHost = Pick<BundlerPlugin, "onResolve" | "onLoad" | "onResolveAsync" | "addError">;
+    /** `resolveBinding` in JSBundlerPlugin.cpp. */
+    type ResolveBinding = [
+      resolveInBuild: (this: BundlerPlugin, binding: ResolveBinding, path: string, options?: object) => Promise<object>,
+      runOnResolvePlugins: (
+        this: OnResolveHost,
+        specifier: string,
+        namespace: string,
+        importer: string,
+        internalID: number,
+        kindId: number,
+      ) => void,
+      /** A `BundlerPlugin::ResolveState` of JSBundlerPlugin.h. */
+      resolveState: (this: BundlerPlugin) => number,
+      /** The graph of the request whose callbacks are on the stack, as native code numbers it. -1: none. */
+      askingTarget: (this: BundlerPlugin) => number,
+      /** `undefined`: no bundle waits for an answer of these plugins. */
+      resolveDefault: (
+        this: BundlerPlugin,
+        path: string,
+        resolveDir: string,
+        kind: string,
+        target: number,
+      ) => Promise<ResolveDefault> | undefined,
+    ];
     type OnResolveCallback = (
       args: OnResolveArgs,
     ) => OnResolveResult | undefined | null | void | Promise<OnResolveResult | undefined | null | void>;

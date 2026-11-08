@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
+import { writeFileSync } from "node:fs";
 import path, { dirname, join, resolve } from "node:path";
 import { itBundled } from "./expectBundled";
 
@@ -2092,6 +2093,7 @@ describe("bundler", () => {
           onResolveAsync: [0, null, null, null],
           onBeforeParse: [/x/, "a", {}, "symbol"],
           generateDeferPromise: [0],
+          resolveBinding: [],
         };
         const receivers = Object.entries(calls).map(([name, args]) => attempt(() => plugin[name].apply(undefined, args)));
         console.log(JSON.stringify({ success: result.success, leaked, outcomes, receivers }));
@@ -2112,10 +2114,1054 @@ describe("bundler", () => {
       success: true,
       leaked: [],
       outcomes: { duringSetup: "accepted", duringBuild: "ERR_INVALID_STATE" },
-      receivers: Array(6).fill("ERR_INVALID_THIS"),
+      receivers: Array(7).fill("ERR_INVALID_THIS"),
     });
     expect(exitCode).toBe(0);
   });
+
+  // build.resolve(): the answers come from the resolver of the build, as data, and asking
+  // leaves no trace in the build.
+  test.concurrent("plugin/build.resolve() gives what the resolver of the build finds", async () => {
+    using dir = tempDir("plugin-resolve-default", {
+      "entry.js": `import { b } from "virtual"; console.log(b);`,
+      "lib/b.js": `export const b = 42;`,
+      "lib/unused.js": `export const unused = 1;`,
+      "node_modules/pkg/package.json": JSON.stringify({ name: "pkg", main: "./main.js", sideEffects: false }),
+      "node_modules/pkg/main.js": `module.exports = 1;`,
+      "node_modules/dual/package.json": JSON.stringify({
+        name: "dual",
+        exports: { import: "./esm.js", require: "./cjs.js" },
+      }),
+      "node_modules/dual/esm.js": `export default 1;`,
+      "node_modules/dual/cjs.js": `module.exports = 1;`,
+    });
+    const root = String(dir);
+    const answers: Record<string, any> = {};
+    const result = await Bun.build({
+      entrypoints: [join(root, "entry.js")],
+      external: ["left-out"],
+      files: { [join(root, "in-memory.js")]: "export default 1;" },
+      metafile: true,
+      throw: false,
+      plugins: [
+        {
+          name: "asks",
+          setup(build) {
+            build.onResolve({ filter: /^virtual$/ }, async args => {
+              const ask = (path: string) => build.resolve(path, { kind: args.kind, resolveDir: args.resolveDir });
+              answers.file = await ask("./lib/b.js");
+              answers.fromImporter = await build.resolve("./b.js", {
+                kind: "require-call",
+                importer: join(root, "lib", "unused.js"),
+              });
+              answers.relativeResolveDir = await build.resolve("./b.js", {
+                kind: "dynamic-import",
+                resolveDir: path.relative(process.cwd(), join(root, "lib")),
+              });
+              answers.package = await ask("pkg");
+              answers.external = await ask("left-out");
+              answers.inMemory = await ask("./in-memory.js");
+              answers.missing = await ask("./missing.js");
+              answers.missingPackage = await build.resolve("missing-package", {
+                kind: args.kind,
+                resolveDir: args.resolveDir,
+                pluginName: "asks",
+              });
+              // The kind picks the condition of "exports".
+              answers.imported = await build.resolve("dual", { kind: "import-statement", resolveDir: root });
+              answers.required = await build.resolve("dual", { kind: "require-call", resolveDir: root });
+              answers.dataUrl = await ask("data:text/plain,hello");
+              // Without a directory, what needs none has an answer.
+              const kind = "import-statement";
+              answers.noDirectory = await build.resolve("./lib/b.js", { kind });
+              answers.noDirectoryPackage = await build.resolve("pkg", { kind });
+              answers.noDirectoryExternal = await build.resolve("left-out", { kind });
+              answers.noDirectoryAbsolute = await build.resolve(join(root, "lib", "b.js"), { kind });
+              answers.noDirectoryInMemory = await build.resolve(join(root, "in-memory.js"), { kind, resolveDir: "" });
+              answers.askedOnly = await ask("./lib/unused.js");
+              return { path: answers.file.path };
+            });
+          },
+        },
+      ],
+    });
+
+    const found = (file: string, rest = {}) => ({
+      errors: [],
+      warnings: [],
+      path: file,
+      external: false,
+      sideEffects: true,
+      namespace: "file",
+      suffix: "",
+      pluginData: undefined,
+      ...rest,
+    });
+    const failed = (text: string, pluginName = "") => ({
+      errors: [{ id: "", pluginName, text, location: null, notes: [], detail: undefined }],
+      warnings: [],
+      path: "",
+      external: false,
+      sideEffects: false,
+      namespace: "",
+      suffix: "",
+      pluginData: undefined,
+    });
+    expect(answers).toEqual({
+      file: found(join(root, "lib", "b.js")),
+      fromImporter: found(join(root, "lib", "b.js")),
+      relativeResolveDir: found(join(root, "lib", "b.js")),
+      package: found(join(root, "node_modules", "pkg", "main.js"), { sideEffects: false }),
+      external: found("left-out", { external: true, namespace: "" }),
+      inMemory: found(join(root, "in-memory.js").replaceAll("\\", "/")),
+      missing: failed('Could not resolve: "./missing.js"'),
+      missingPackage: failed('Could not resolve: "missing-package". Maybe you need to "bun install"?', "asks"),
+      imported: found(join(root, "node_modules", "dual", "esm.js")),
+      required: found(join(root, "node_modules", "dual", "cjs.js")),
+      dataUrl: found("data:text/plain,hello", { external: true, namespace: "" }),
+      noDirectory: failed(
+        'Could not resolve: "./lib/b.js". build.resolve() has no directory to look from: pass "resolveDir", or an "importer" in the "file" namespace',
+      ),
+      noDirectoryPackage: failed(
+        'Could not resolve: "pkg". build.resolve() has no directory to look from: pass "resolveDir", or an "importer" in the "file" namespace',
+      ),
+      noDirectoryExternal: found("left-out", { external: true, namespace: "" }),
+      noDirectoryAbsolute: found(join(root, "lib", "b.js")),
+      noDirectoryInMemory: found(join(root, "in-memory.js").replaceAll("\\", "/")),
+      askedOnly: found(join(root, "lib", "unused.js")),
+    });
+    // Every answer has the eight keys, also where a value is undefined.
+    for (const answer of Object.values(answers)) {
+      expect(Object.keys(answer)).toEqual([
+        "errors",
+        "warnings",
+        "path",
+        "external",
+        "sideEffects",
+        "namespace",
+        "suffix",
+        "pluginData",
+      ]);
+    }
+    // A path that was only asked about is not in the build, and one that did not resolve is not in its log.
+    expect({
+      success: result.success,
+      logs: result.logs.map(log => log.message),
+      inputs: Object.keys(result.metafile!.inputs)
+        .map(input => path.basename(input))
+        .sort(),
+    }).toEqual({ success: true, logs: [], inputs: ["b.js", "entry.js"] });
+  });
+
+  // The same package resolves to another file for another target or condition. build.resolve()
+  // and the import of the same build have to name the same one.
+  test.concurrent("plugin/build.resolve() and the import agree", async () => {
+    using dir = tempDir("plugin-resolve-agrees", {
+      "entry.js": `
+        import "fields";
+        import "conditions";
+        import "./local.js";
+        import "left-out";
+        import "other-name";
+        import "node:path";
+      `,
+      "local.js": `export default "local";`,
+      "substitute.js": `export default "substitute";`,
+      "node_modules/fields/package.json": JSON.stringify({
+        name: "fields",
+        main: "./main.js",
+        module: "./module.js",
+        browser: "./browser.js",
+      }),
+      "node_modules/fields/main.js": `module.exports = "main";`,
+      "node_modules/fields/module.js": `export default "module";`,
+      "node_modules/fields/browser.js": `export default "browser";`,
+      "node_modules/conditions/package.json": JSON.stringify({
+        name: "conditions",
+        exports: { ".": { custom: "./custom.js", default: "./default.js" } },
+      }),
+      "node_modules/conditions/custom.js": `export default "custom";`,
+      "node_modules/conditions/default.js": `export default "default";`,
+      "build.mjs": `
+        import { relative } from "node:path";
+        const specifiers = ["fields", "conditions", "./local.js", "left-out", "other-name", "node:path"];
+        const rows = [];
+        for (const target of ["browser", "bun", "node"]) {
+          for (const conditions of [[], ["custom"]]) {
+            const asked = {};
+            const result = await Bun.build({
+              entrypoints: ["./entry.js"],
+              target,
+              conditions,
+              external: ["left-out"],
+              alias: { "other-name": "./substitute.js" },
+              metafile: true,
+              throw: false,
+              plugins: [
+                {
+                  name: "asks",
+                  setup(build) {
+                    build.onLoad({ filter: /entry\\.js$/ }, async args => {
+                      for (const specifier of specifiers) {
+                        const answer = await build.resolve(specifier, { kind: "import-statement", importer: args.path });
+                        // A module that Bun has in itself, like what a browser build gets for a Node.js
+                        // builtin, has the namespace "node" and a path that is no file. The build
+                        // lists it under the name of the import.
+                        asked[specifier] =
+                          answer.namespace === "node"
+                            ? [specifier, answer.external]
+                            : answer.external
+                              ? [answer.path, true]
+                              : [relative(process.cwd(), answer.path).replaceAll("\\\\", "/"), false];
+                      }
+                    });
+                  },
+                },
+              ],
+            });
+            if (!result.success) throw new AggregateError(result.logs);
+            const imported = {};
+            for (const record of result.metafile.inputs["entry.js"].imports) {
+              imported[record.original ?? record.path] = [record.path, record.external === true];
+            }
+            for (const specifier of specifiers) {
+              rows.push({ target, conditions, specifier, asked: asked[specifier], imported: imported[specifier] });
+            }
+          }
+        }
+        console.log(JSON.stringify(rows));
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build.mjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stderr).toBe("");
+    const rows: { target: string; conditions: string[]; specifier: string; asked: unknown; imported: unknown }[] =
+      JSON.parse(stdout || "[]");
+    expect(rows.length).toBe(36);
+    expect(rows.filter(row => !Bun.deepEquals(row.asked, row.imported))).toEqual([]);
+    // The answers differ by target and by condition, so the rows above compare more than one file.
+    const asked = (target: string, conditions: string[], specifier: string) =>
+      rows.find(
+        row => row.target === target && row.specifier === specifier && Bun.deepEquals(row.conditions, conditions),
+      )?.asked;
+    expect({
+      browser: asked("browser", [], "fields"),
+      bun: asked("bun", [], "fields"),
+      custom: asked("node", ["custom"], "conditions"),
+      default: asked("node", [], "conditions"),
+      alias: asked("bun", [], "other-name"),
+      external: asked("bun", [], "left-out"),
+      builtin: asked("bun", [], "node:path"),
+    }).toEqual({
+      browser: ["node_modules/fields/browser.js", false],
+      bun: ["node_modules/fields/module.js", false],
+      custom: ["node_modules/conditions/custom.js", false],
+      default: ["node_modules/conditions/default.js", false],
+      alias: ["substitute.js", false],
+      external: ["left-out", true],
+      builtin: ["path", true],
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  // The onResolve callbacks of every plugin are asked first, the caller's too. pluginData is how
+  // a callback knows its own question.
+  test.concurrent("plugin/build.resolve() asks the onResolve callbacks first", async () => {
+    using dir = tempDir("plugin-resolve-chain", {
+      "entry.js": `import "wrapped"; import "./other.js";`,
+      "wrapped.js": `export default 1;`,
+      "other.js": `export default 2;`,
+    });
+    const root = String(dir);
+    const told: unknown[] = [];
+    const answers: Record<string, any> = {};
+    const virtualDirectories: unknown[] = [];
+    const guardedCalls: unknown[] = [];
+    const thrownSymbol = Symbol("thrown");
+    const thrownBare = Object.create(null);
+    const result = await Bun.build({
+      entrypoints: [join(root, "entry.js")],
+      throw: false,
+      plugins: [
+        {
+          name: "first",
+          setup(build) {
+            build.onResolve({ filter: /^wrapped$/ }, async args => {
+              told.push({ ...args });
+              // The question comes back to this callback. It leaves it to the rest.
+              if (args.pluginData?.asked) return;
+              answers.self = await build.resolve("wrapped", {
+                kind: "dynamic-import",
+                importer: args.importer,
+                resolveDir: join(root, "nowhere"),
+                pluginData: { asked: true },
+              });
+              answers.virtual = await build.resolve("virtual:module", { kind: args.kind, importer: args.importer });
+              answers.virtualAgain = await build.resolve("virtual:module", { kind: args.kind });
+              // A callback that was registered with a namespace is asked only by a call that names it.
+              answers.withoutNamespace = await build.resolve("guarded", { kind: args.kind });
+              answers.withNamespace = await build.resolve("guarded", { kind: args.kind, namespace: "file" });
+              answers.throws = await build.resolve("throws", { kind: args.kind, pluginName: "first" });
+              answers.throwsSymbol = await build.resolve("throws-symbol", { kind: args.kind });
+              answers.throwsBare = await build.resolve("throws-bare", { kind: args.kind });
+              answers.nested = await build.resolve("nested", { kind: args.kind, importer: args.importer });
+              answers.together = await Promise.all(
+                ["./wrapped.js", "./other.js", "./missing.js"].map(path =>
+                  build.resolve(path, { kind: args.kind, importer: args.importer }),
+                ),
+              );
+              return { path: answers.self.path };
+            });
+          },
+        },
+        {
+          name: "second",
+          setup(build) {
+            build.onResolve({ filter: /^wrapped$/ }, args => {
+              told.push({ ...args, plugin: "second" });
+              return { path: join(root, "wrapped.js"), pluginData: { answeredBy: "second" } };
+            });
+            build.onResolve({ filter: /^virtual:/ }, args => {
+              virtualDirectories.push(args.resolveDir);
+              return { path: args.path.slice("virtual:".length), namespace: "virtual" };
+            });
+            build.onResolve({ filter: /^guarded$/, namespace: "file" }, args => {
+              guardedCalls.push(args.namespace);
+              return { path: args.path, external: true };
+            });
+            build.onResolve({ filter: /^throws$/ }, () => {
+              throw new RangeError("the callback threw");
+            });
+            build.onResolve({ filter: /^throws-symbol$/ }, () => {
+              throw thrownSymbol;
+            });
+            build.onResolve({ filter: /^throws-bare$/ }, () => {
+              throw thrownBare;
+            });
+            build.onResolve({ filter: /^nested$/ }, async args => {
+              // Asked by build.resolve(), and asking on.
+              const inner = await build.resolve("./other.js", { kind: args.kind, importer: args.importer });
+              return { path: inner.path, pluginData: inner.errors.length };
+            });
+            build.onLoad({ filter: /.*/, namespace: "virtual" }, () => ({ contents: "" }));
+          },
+        },
+      ],
+    });
+
+    // An import of the build tells its callbacks what it did before: there is no `pluginData` key.
+    expect(told[0]).toStrictEqual({
+      path: "wrapped",
+      importer: join(root, "entry.js"),
+      namespace: "file",
+      resolveDir: root,
+      kind: "import-statement",
+    });
+    expect(told.slice(1)).toEqual([
+      // What build.resolve() was given is what the callbacks are told.
+      {
+        path: "wrapped",
+        importer: join(root, "entry.js"),
+        namespace: "file",
+        resolveDir: join(root, "nowhere"),
+        kind: "dynamic-import",
+        pluginData: { asked: true },
+      },
+      {
+        path: "wrapped",
+        importer: join(root, "entry.js"),
+        namespace: "file",
+        resolveDir: join(root, "nowhere"),
+        kind: "dynamic-import",
+        pluginData: { asked: true },
+        plugin: "second",
+      },
+    ]);
+    const answered = (rest: object) => ({
+      errors: [],
+      warnings: [],
+      external: false,
+      sideEffects: true,
+      namespace: "file",
+      suffix: "",
+      pluginData: undefined,
+      ...rest,
+    });
+    expect(answers.self).toEqual(answered({ path: join(root, "wrapped.js"), pluginData: { answeredBy: "second" } }));
+    expect(answers.virtual).toEqual(answered({ path: "module", namespace: "virtual" }));
+    // Nothing is remembered: the callback ran for each question. A question without a directory
+    // tells the callbacks an empty one.
+    expect(answers.virtualAgain).toEqual(answers.virtual);
+    expect(virtualDirectories).toEqual([root, ""]);
+    expect(answers.withoutNamespace.errors.map((error: any) => error.text)).toEqual([
+      'Could not resolve: "guarded". build.resolve() has no directory to look from: pass "resolveDir", or an "importer" in the "file" namespace',
+    ]);
+    expect(answers.withNamespace).toEqual(answered({ path: "guarded", external: true }));
+    expect(guardedCalls).toEqual(["file"]);
+    // The name of the plugin that threw is not known, and `pluginName` is not it.
+    expect(answers.throws.errors).toEqual([
+      {
+        id: "",
+        pluginName: "",
+        text: "the callback threw",
+        location: null,
+        notes: [],
+        detail: expect.any(RangeError),
+      },
+    ]);
+    // What a callback throws can be anything, also what has no text.
+    expect(answers.throwsSymbol.errors.map((error: any) => [error.text, error.detail === thrownSymbol])).toEqual([
+      ["Symbol(thrown)", true],
+    ]);
+    expect(answers.throwsBare.errors.map((error: any) => [error.text, error.detail === thrownBare])).toEqual([
+      ["An onResolve() callback threw a value that has no text", true],
+    ]);
+    expect({ ...answers.throws, errors: [] }).toEqual({
+      errors: [],
+      warnings: [],
+      path: "",
+      external: false,
+      sideEffects: false,
+      namespace: "",
+      suffix: "",
+      pluginData: undefined,
+    });
+    expect(answers.nested).toEqual(answered({ path: join(root, "other.js"), pluginData: 0 }));
+    expect(answers.together.map((answer: any) => [answer.path, answer.errors.map((error: any) => error.text)])).toEqual(
+      [
+        [join(root, "wrapped.js"), []],
+        [join(root, "other.js"), []],
+        ["", ['Could not resolve: "./missing.js"']],
+      ],
+    );
+    expect({ success: result.success, logs: result.logs.map(log => log.message) }).toEqual({ success: true, logs: [] });
+  });
+
+  // The build has a resolver from its start to the last answer of its plugins. Outside of
+  // that, build.resolve() says so: at once where a promise could never settle.
+  test.concurrent("plugin/build.resolve() outside of an onResolve or onLoad callback", async () => {
+    using dir = tempDir("plugin-resolve-lifecycle", {
+      "entry.js": `import "./a.js"; import "./b.js";`,
+      "a.js": `export default 1;`,
+      "b.js": `export default 2;`,
+    });
+    const root = String(dir);
+    const outcomes: Record<string, unknown> = {};
+    const attempt = (call: () => unknown) => {
+      try {
+        call();
+        return "returned";
+      } catch (error: any) {
+        return [error.code ?? error.name, error.message];
+      }
+    };
+    const settled = (promise: Promise<any>) =>
+      promise.then(
+        answer => answer.path,
+        error => [error.code ?? error.name, error.message],
+      );
+    const ask = { kind: "import-statement", resolveDir: root } as const;
+    let builder: Bun.PluginBuilder;
+    let floating: Promise<unknown>;
+    let outlivesTheBuild: Promise<unknown>;
+    const buildEnded = Promise.withResolvers<void>();
+    const result = await Bun.build({
+      entrypoints: [join(root, "entry.js")],
+      throw: false,
+      plugins: [
+        {
+          name: "asks",
+          async setup(build) {
+            builder = build;
+            outcomes.setup = attempt(() => build.resolve("./a.js", ask));
+            await Promise.resolve();
+            outcomes.setupAfterAwait = attempt(() => build.resolve("./a.js", ask));
+            build.onStart(() => {
+              outcomes.onStart = attempt(() => build.resolve("./a.js", ask));
+            });
+            build.onEnd(async () => {
+              buildEnded.resolve();
+              outcomes.onEnd = await settled(build.resolve("./a.js", ask));
+            });
+            build.onResolve({ filter: /^slow$/ }, async () => {
+              await buildEnded.promise;
+              return undefined;
+            });
+            build.onResolve({ filter: /[ab]\.js$/ }, args => {
+              // What this plugin asks comes back to its own callback.
+              if (args.pluginData === "asked") return undefined;
+              if (args.path === "./b.js") {
+                // Not waited for: the callback answers first, and the promise still settles.
+                floating = settled(
+                  build.resolve(args.path, { kind: args.kind, importer: args.importer, pluginData: "asked" }),
+                );
+                // A callback that this one makes run waits until the build is over.
+                outlivesTheBuild = settled(build.resolve("slow", ask));
+                return undefined;
+              }
+              return (async () => {
+                outcomes.noKind = await settled(build.resolve("./a.js", { resolveDir: root } as any));
+                outcomes.unknownKind = await settled(build.resolve("./a.js", { ...ask, kind: "import" as any }));
+                outcomes.pathIsNoString = attempt(() => build.resolve(1 as any, ask));
+                outcomes.optionsAreNoObject = attempt(() => build.resolve("./a.js", "import-statement" as any));
+                outcomes.kindIsNoString = attempt(() => build.resolve("./a.js", { ...ask, kind: 1 as any }));
+                outcomes.unknownOption = attempt(() => build.resolve("./a.js", { ...ask, resolvedir: root } as any));
+                outcomes.with = attempt(() => build.resolve("./a.js", { ...ask, with: { type: "json" } } as any));
+                outcomes.otherNamespace = attempt(() => build.resolve("./a.js", { ...ask, namespace: "made-up" }));
+                outcomes.withUndefined = await settled(
+                  build.resolve("./a.js", { ...ask, with: undefined, pluginData: "asked" } as any),
+                );
+                // A directory with a NUL in its name is none. The name of a module can have one.
+                outcomes.nulInResolveDir = attempt(() => build.resolve("./a.js", { ...ask, resolveDir: "\0" }));
+                outcomes.nulInImporter = await build
+                  .resolve("./a.js", {
+                    ...ask,
+                    resolveDir: undefined,
+                    importer: join(root, "\0virtual"),
+                    pluginData: "asked",
+                  })
+                  .then(answer => answer.errors.length);
+                outcomes.nulFirstInImporter = await build
+                  .resolve("./a.js", { kind: "import-statement", importer: "\0virtual:pkg/x", pluginData: "asked" })
+                  .then(answer => answer.errors.length);
+                return undefined;
+              })();
+            });
+          },
+        },
+      ],
+    });
+    outcomes.floating = await floating!;
+    outcomes.outlivesTheBuild = await outlivesTheBuild!;
+    outcomes.afterTheBuild = await settled(builder!.resolve("./a.js", ask));
+
+    const notStarted = [
+      "ERR_INVALID_STATE",
+      "Invalid state: build.resolve() was called before the build started. Call it in an onResolve() or onLoad() callback",
+    ];
+    const noCallbackRuns = [
+      "ERR_INVALID_STATE",
+      "Invalid state: build.resolve() was called while no onResolve() or onLoad() callback of the build was running",
+    ];
+    expect(outcomes).toEqual({
+      setup: notStarted,
+      setupAfterAwait: notStarted,
+      onStart: notStarted,
+      onEnd: noCallbackRuns,
+      noKind: ["TypeError", 'Must specify "kind" when calling "resolve"'],
+      unknownKind: ["TypeError", 'Invalid kind: "import"'],
+      pathIsNoString: ["ERR_INVALID_ARG_TYPE", 'The "path" argument must be of type string. Received type number (1)'],
+      optionsAreNoObject: [
+        "ERR_INVALID_ARG_TYPE",
+        `The "options" argument must be of type object. Received type string ('import-statement')`,
+      ],
+      kindIsNoString: [
+        "ERR_INVALID_ARG_TYPE",
+        'The "options.kind" property must be of type string. Received type number (1)',
+      ],
+      unknownOption: ["TypeError", 'Invalid option in resolve() call: "resolvedir"'],
+      with: ["TypeError", 'build.resolve() does not support the "with" option yet'],
+      otherNamespace: ["TypeError", 'build.resolve() does not support a "namespace" other than "file" yet'],
+      withUndefined: join(root, "a.js"),
+      nulInResolveDir: [
+        "ERR_INVALID_ARG_VALUE",
+        "The property 'options.resolveDir' must be a string without null bytes. Received '\\x00'",
+      ],
+      nulInImporter: 1,
+      nulFirstInImporter: 1,
+      floating: join(root, "b.js"),
+      outlivesTheBuild: [
+        "ERR_INVALID_STATE",
+        'Invalid state: build.resolve("slow") has no build to ask: no onResolve() or onLoad() callback of the build was running any more when the onResolve() callbacks that it asked had answered',
+      ],
+      afterTheBuild: noCallbackRuns,
+    });
+    expect({ success: result.success, logs: result.logs.map(log => log.message) }).toEqual({ success: true, logs: [] });
+  });
+
+  test.concurrent("plugin/build.resolve() in onLoad, before and after defer()", async () => {
+    using dir = tempDir("plugin-resolve-onload", {
+      "entry.js": `import "./first.js"; import "./second.js";`,
+      "first.js": `export default 1;`,
+      "second.js": `export default 2;`,
+    });
+    const root = String(dir);
+    const answers: Record<string, string> = {};
+    const result = await Bun.build({
+      entrypoints: [join(root, "entry.js")],
+      throw: false,
+      plugins: [
+        {
+          name: "asks",
+          setup(build) {
+            build.onLoad({ filter: /first\.js$/ }, async args => {
+              const ask = () => build.resolve("./second.js", { kind: "import-statement", importer: args.path });
+              answers.before = (await ask()).path;
+              await args.defer();
+              answers.after = (await ask()).path;
+              return undefined;
+            });
+          },
+        },
+      ],
+    });
+    expect(answers).toEqual({ before: join(root, "second.js"), after: join(root, "second.js") });
+    expect({ success: result.success, logs: result.logs.map(log => log.message) }).toEqual({ success: true, logs: [] });
+  });
+
+  // A server that imports a page has two graphs, and the same path can be another module in each.
+  // build.resolve() answers for the graph of the import that the calling callback runs for. Once
+  // that callback has waited, nothing says which import a call belongs to, and there is an answer
+  // only where both graphs give the same one.
+  test.concurrent("plugin/build.resolve() in a build with a graph for a server and one for its page", async () => {
+    using dir = tempDir("plugin-resolve-two-graphs", {
+      "server.ts": `import page from "./index.html";\nimport { shared } from "./shared.ts";\nimport cond from "cond";\nconsole.log(typeof page, shared, cond);`,
+      "index.html": `<!DOCTYPE html><html><head></head><body><script type="module" src="./client.ts"></script></body></html>`,
+      "client.ts": `import { shared } from "./shared.ts";\nimport cond from "cond";\nconsole.log(shared, cond);`,
+      "shared.ts": `import { value } from "./value.ts";\nexport const shared = value;`,
+      "value.ts": `export const value = 1;`,
+      "node_modules/cond/package.json": JSON.stringify({
+        name: "cond",
+        exports: { ".": { browser: "./browser.js", bun: "./bun.js", default: "./default.js" } },
+      }),
+      "node_modules/cond/browser.js": `export default "cond-browser";`,
+      "node_modules/cond/bun.js": `export default "cond-bun";`,
+      "node_modules/cond/default.js": `export default "cond-default";`,
+    });
+    const root = String(dir);
+    const inCallback: Record<string, string> = {};
+    const afterAwait: Record<string, string> = {};
+    const inOnLoad: Record<string, string> = {};
+    const told = (answer: Bun.ResolveResult) =>
+      answer.errors.length > 0 ? answer.errors[0].text : path.relative(root, answer.path).replaceAll("\\", "/");
+    const build = (plugins: Bun.BunPlugin[]) =>
+      Bun.build({ entrypoints: [join(root, "server.ts")], target: "bun", throw: false, plugins });
+    const result = await build([
+      {
+        name: "asks",
+        setup(build) {
+          build.onResolve({ filter: /^cond$/ }, async args => {
+            if (args.pluginData === "asked") return undefined;
+            // Only `resolveDir` says where the import is. The call is made before the first await.
+            const from = { kind: args.kind, resolveDir: args.resolveDir, pluginData: "asked" };
+            const answer = await build.resolve("cond", from);
+            const importer = path.basename(args.importer);
+            inCallback[importer] = told(answer);
+            if (importer === "client.ts") {
+              afterAwait.cond = told(await build.resolve("cond", from));
+              afterAwait.relative = told(await build.resolve("./value.ts", from));
+            }
+            return { path: answer.path };
+          });
+          build.onLoad({ filter: /shared\.ts$/ }, args => {
+            const asked = build.resolve("cond", { kind: "import-statement", importer: args.path, pluginData: "asked" });
+            return asked.then(answer => {
+              inOnLoad[args.side] = told(answer);
+              return undefined;
+            });
+          });
+        },
+      },
+    ]);
+
+    expect(inCallback).toEqual({
+      "server.ts": "node_modules/cond/bun.js",
+      "client.ts": "node_modules/cond/browser.js",
+    });
+    expect(inOnLoad).toEqual({ server: "node_modules/cond/bun.js", client: "node_modules/cond/browser.js" });
+    expect(afterAwait).toEqual({
+      cond: 'build.resolve() cannot tell which graph asks for "cond": this build has more than one (a server and its pages), and the path is not the same module in each. Call build.resolve() in an onResolve() or onLoad() callback before the first await of that callback',
+      relative: "value.ts",
+    });
+    expect({ success: result.success, logs: result.logs.map(log => log.message) }).toEqual({
+      success: true,
+      logs: [],
+    });
+    // Each graph bundles the file that it gets without the plugin.
+    const bundled = async (outputs: Bun.BuildArtifact[]) =>
+      (await Promise.all(outputs.map(output => output.text())))
+        .map(text => ["cond-bun", "cond-browser", "cond-default"].filter(marker => text.includes(marker)).join("+"))
+        .filter(Boolean)
+        .sort();
+    expect(await bundled(result.outputs)).toEqual(await bundled((await build([])).outputs));
+    expect(await bundled(result.outputs)).toEqual(["cond-browser", "cond-bun"]);
+  });
+
+  // The resolver reads a directory once per build, and build.resolve() can make it read one before
+  // an import would have. A file that a plugin writes there afterwards is found all the same: by
+  // the import, also when an onResolve callback declines it, and by the plugin when it asks again.
+  for (const then of ["the file is imported", "a callback declines the import", "the plugin asks again"]) {
+    test.concurrent(`plugin/build.resolve() before a plugin writes into the directory, and then ${then}`, async () => {
+      using dir = tempDir("plugin-resolve-late-file", {
+        "entry.js": `import "generated:a";`,
+        "generated/a.js": `import "generated:b";`,
+      });
+      const root = String(dir);
+      const answers: Record<string, string> = {};
+      const result = await Bun.build({
+        entrypoints: [join(root, "entry.js")],
+        throw: false,
+        plugins: [
+          {
+            name: "generates",
+            setup(build) {
+              const ask = (kind: Bun.ImportKind) => build.resolve("./generated/c.js", { kind, resolveDir: root });
+              build.onResolve({ filter: /^generated:a$/ }, async args => {
+                answers.before = (await ask(args.kind)).path;
+                return { path: join(root, "generated", "a.js") };
+              });
+              build.onResolve({ filter: /^generated:b$/ }, async args => {
+                writeFileSync(join(root, "generated", "c.js"), `export default "c";`);
+                writeFileSync(join(root, "generated", "b.js"), `import c from "./c.js";\nconsole.log(c);`);
+                if (then === "the plugin asks again") answers.after = (await ask(args.kind)).path;
+                return { path: join(root, "generated", "b.js") };
+              });
+              if (then === "a callback declines the import") {
+                build.onResolve({ filter: /c\.js$/ }, () => undefined);
+              }
+            },
+          },
+        ],
+      });
+      expect(answers).toEqual({
+        before: "",
+        ...(then === "the plugin asks again" && { after: join(root, "generated", "c.js") }),
+      });
+      expect({ success: result.success, logs: result.logs.map(log => log.message) }).toEqual({
+        success: true,
+        logs: [],
+      });
+    });
+  }
+
+  // An entry point is looked up past the directory cache too, as the build looks its own up.
+  test.concurrent("plugin/build.resolve() for an entry point that a plugin writes", async () => {
+    using dir = tempDir("plugin-resolve-late-entry", {
+      "entry.js": `console.log("entry");`,
+      "build.mjs": `
+        import { writeFileSync } from "node:fs";
+        const answers = {};
+        const result = await Bun.build({
+          entrypoints: ["./entry.js", "./generated.js"],
+          throw: false,
+          plugins: [
+            {
+              name: "generates",
+              setup(build) {
+                build.onResolve({ filter: /.*/ }, async ({ path, ...args }) => {
+                  if (args.pluginData === "asked") return undefined;
+                  if (path === "./generated.js") {
+                    // The directory is read for this, and the file is written after.
+                    await build.resolve("./entry.js", { ...args, pluginData: "asked" });
+                    writeFileSync("generated.js", 'console.log("generated");');
+                  }
+                  const answer = await build.resolve(path, { ...args, pluginData: "asked" });
+                  answers[path] = answer.errors.length > 0 ? answer.errors[0].text : "found";
+                  return undefined;
+                });
+              },
+            },
+          ],
+        });
+        const missing = await Bun.build({
+          entrypoints: ["./entry.js"],
+          plugins: [
+            {
+              name: "asks",
+              setup(build) {
+                build.onLoad({ filter: /entry\\.js$/ }, async () => {
+                  const answer = await build.resolve("./nowhere.js", { kind: "entry-point-build", resolveDir: "." });
+                  answers.missing = answer.errors.map(error => error.text);
+                });
+              },
+            },
+          ],
+        });
+        console.log(JSON.stringify({ success: result.success, logs: result.logs.map(log => log.message), answers }));
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build.mjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout || "null")).toEqual({
+      success: true,
+      logs: [],
+      answers: {
+        "./entry.js": "found",
+        "./generated.js": "found",
+        // The text that the build has for an entry point that is not there.
+        missing: ['ModuleNotFound resolving "./nowhere.js" (entry point)'],
+      },
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  // The resolver says what is wrong with a package.json once, when it reads it. A plugin that asks
+  // first must not take that from the build: the import of the build reports it all the same.
+  test.concurrent("plugin/build.resolve() leaves the build what the resolver reports", async () => {
+    const files = {
+      "entry.js": `import "badpkg";`,
+      "node_modules/badpkg/package.json": `{ "name": "badpkg", "main": `,
+      "node_modules/badpkg/index.js": `console.log("badpkg");`,
+    };
+    using plain = tempDir("plugin-resolve-diagnostics-plain", files);
+    using asked = tempDir("plugin-resolve-diagnostics-asked", files);
+    const outcome = async (root: string, plugins: Bun.BunPlugin[]) => {
+      const result = await Bun.build({ entrypoints: [join(root, "entry.js")], throw: false, plugins });
+      return {
+        success: result.success,
+        logs: result.logs.map(log => log.message.replaceAll(root, "<root>")),
+      };
+    };
+    let answer: Bun.ResolveResult | undefined;
+    const withoutPlugin = await outcome(String(plain), []);
+    const withPlugin = await outcome(String(asked), [
+      {
+        name: "asks",
+        setup(build) {
+          build.onResolve({ filter: /.*/ }, async ({ path, ...args }) => {
+            if (args.pluginData === "asked") return undefined;
+            const result = await build.resolve(path, { ...args, pluginData: "asked" });
+            if (path === "badpkg") answer = result;
+            return undefined;
+          });
+        },
+      },
+    ]);
+
+    expect(withoutPlugin.success).toBe(false);
+    expect(withoutPlugin.logs.length).toBeGreaterThan(0);
+    expect(withPlugin).toEqual(withoutPlugin);
+    // The path resolved, so the result has no error. What the resolver reported is a warning.
+    expect({
+      path: answer!.path,
+      errors: answer!.errors,
+      warnings: answer!.warnings.map(warning => warning.text.replaceAll(String(asked), "<root>")),
+    }).toEqual({
+      path: join(String(asked), "node_modules", "badpkg", "index.js"),
+      errors: [],
+      warnings: withoutPlugin.logs,
+    });
+  });
+
+  // esbuild's way to fail an import with what build.resolve() found.
+  test.concurrent("plugin/onResolve fails the import with the errors that it returns", async () => {
+    using dir = tempDir("plugin-resolve-errors-returned", {
+      "entry.js": `import "./missing-thing.js";`,
+    });
+    const root = String(dir);
+    const result = await Bun.build({
+      entrypoints: [join(root, "entry.js")],
+      throw: false,
+      plugins: [
+        {
+          name: "asks",
+          setup(build) {
+            build.onResolve({ filter: /missing-thing/ }, async ({ path, ...args }) => {
+              if (args.pluginData === "asked") return undefined;
+              const answer = await build.resolve(path, { ...args, pluginData: "asked" });
+              return { errors: answer.errors };
+            });
+          },
+        },
+      ],
+    });
+    expect({ success: result.success, logs: result.logs.map(log => log.message) }).toEqual({
+      success: false,
+      logs: ['Could not resolve: "./missing-thing.js"'],
+    });
+  });
+
+  // A plugin that hands every import of a build to build.resolve() gets the build that has no
+  // plugin: entry points as they are written, and every kind of import under the name that
+  // onResolve is told it by.
+  test.concurrent("plugin/build.resolve() takes what onResolve is told, for every kind of import", async () => {
+    using dir = tempDir("plugin-resolve-forwards", {
+      "entry.js": `
+        import value from "./esm.js";
+        const required = require("./cjs.cjs");
+        const lazy = await import("./lazy.js");
+        console.log([value, required.value, lazy.default].join(" "));
+      `,
+      "esm.js": `export default "esm";`,
+      "cjs.cjs": `exports.value = "cjs";`,
+      "lazy.js": `export default "lazy";`,
+      "src/second.js": `console.log("second");`,
+      "styles.css": `@import "./imported.css";\n@import "./print.css" supports(display: grid);\nbody { background: url(./pixel.png); }`,
+      "imported.css": `p { color: red; }`,
+      "print.css": `p { color: black; }`,
+      "pixel.png": "not really a png",
+      "build.mjs": `
+        const told = [];
+        const forward = {
+          name: "forward",
+          setup(build) {
+            build.onResolve({ filter: /.*/ }, async ({ path, ...args }) => {
+              if (args.pluginData?.forwarded) return;
+              told.push([path, args.kind]);
+              const answer = await build.resolve(path, { ...args, pluginData: { forwarded: true } });
+              if (answer.errors.length > 0) throw new Error(answer.errors[0].text);
+              return { path: answer.path, external: answer.external };
+            });
+          },
+        };
+        const output = async plugins => {
+          const result = await Bun.build({
+            entrypoints: ["./entry.js", "src/second.js", "styles.css"],
+            target: "bun",
+            plugins,
+          });
+          return Promise.all(result.outputs.map(async output => [output.path, await output.text()]));
+        };
+        const plain = await output([]);
+        const forwarded = await output([forward]);
+        console.log(JSON.stringify({ same: Bun.deepEquals(plain, forwarded), outputs: plain.length, told: told.sort() }));
+        // Every name that a callback can be told is a name that build.resolve() takes.
+        const kinds = {};
+        await Bun.build({
+          entrypoints: ["./esm.js"],
+          plugins: [
+            {
+              name: "kinds",
+              setup(build) {
+                build.onLoad({ filter: /esm\\.js$/ }, async args => {
+                  for (const kind of [
+                    "entry-point-run", "entry-point-build", "import-statement", "require-call", "dynamic-import",
+                    "require-resolve", "import-rule", "url-token", "composes", "html_manifest", "internal",
+                    "entry-point", "composes-from",
+                  ]) {
+                    const answer = await build.resolve("./lazy.js", { kind, importer: args.path });
+                    kinds[kind] = answer.path.endsWith("lazy.js");
+                  }
+                });
+              },
+            },
+          ],
+        });
+        console.log(JSON.stringify(kinds));
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build.mjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stderr).toBe("");
+    const [forwarded, kinds] = stdout
+      .trim()
+      .split("\n")
+      .map(line => JSON.parse(line));
+    expect(forwarded).toEqual({
+      same: true,
+      outputs: expect.any(Number),
+      told: [
+        ["./cjs.cjs", "require-call"],
+        ["./entry.js", "entry-point-build"],
+        ["./esm.js", "import-statement"],
+        ["./imported.css", "import-rule"],
+        ["./lazy.js", "dynamic-import"],
+        ["./pixel.png", "url-token"],
+        ["./print.css", "import-rule"],
+        ["src/second.js", "entry-point-build"],
+        ["styles.css", "entry-point-build"],
+      ],
+    });
+    expect(kinds).toEqual({
+      "entry-point-run": true,
+      "entry-point-build": true,
+      "import-statement": true,
+      "require-call": true,
+      "dynamic-import": true,
+      "require-resolve": true,
+      "import-rule": true,
+      "url-token": true,
+      "composes": true,
+      "html_manifest": true,
+      "internal": true,
+      "entry-point": true,
+      "composes-from": true,
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  // The callbacks answer without waiting for what they asked, hundreds of times, and the process
+  // can end while answers are on their way. Nothing is asked of a build that has ended.
+  test.concurrent("plugin/build.resolve() that no callback waits for", async () => {
+    const count = 100;
+    using dir = tempDir("plugin-resolve-floating", {
+      "entry.js": Array.from({ length: count }, (_, i) => `import "./file${i}.js";`).join("\n"),
+      ...Object.fromEntries(Array.from({ length: count }, (_, i) => [`file${i}.js`, `export default ${i};`])),
+      "build.mjs": `
+        const exits = process.argv[2] === "exit";
+        const pending = [];
+        const result = await Bun.build({
+          entrypoints: ["./entry.js"],
+          plugins: [
+            {
+              name: "asks",
+              setup(build) {
+                build.onResolve({ filter: /file\\d+\\.js$/ }, args => {
+                  if (args.pluginData === "asked") return;
+                  for (let i = 0; i < 4; i++) {
+                    pending.push(
+                      build.resolve(args.path, { kind: args.kind, importer: args.importer, pluginData: "asked" }),
+                    );
+                  }
+                  if (exits && pending.length === ${count * 2}) process.exit(0);
+                });
+              },
+            },
+          ],
+        });
+        const answers = await Promise.all(pending);
+        console.log(JSON.stringify({
+          success: result.success,
+          asked: answers.length,
+          found: answers.filter(answer => /file\\d+\\.js$/.test(answer.path) && answer.errors.length === 0).length,
+        }));
+      `,
+    });
+
+    async function run(...args: string[]) {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "build.mjs", ...args],
+        // The process that exits frees its VM, and with it the answers that are on their way.
+        env: args.length > 0 ? { ...bunEnv, BUN_DESTRUCT_VM_ON_EXIT: "1" } : bunEnv,
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout, stderr, exitCode };
+    }
+    const [whole, exiting] = await Promise.all([run(), run("exit")]);
+    expect(whole.stderr).toBe("");
+    expect(JSON.parse(whole.stdout || "null")).toEqual({ success: true, asked: count * 4, found: count * 4 });
+    expect(whole.exitCode).toBe(0);
+    expect(exiting).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+  });
+
   test.concurrent("plugin/onResolve is told the kind of every import", async () => {
     using dir = tempDir("plugin-onresolve-kinds", {
       "entry.js": `

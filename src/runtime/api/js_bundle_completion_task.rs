@@ -231,11 +231,15 @@ impl JSBundleCompletionTask {
     pub(crate) fn schedule(mut self) {
         self.poll_ref.ref_(self.global_this.bun_vm().loop_ctx());
         let plugins = self.plugins;
+        let compiles_ahead_of_time = self.compiles_ahead_of_time();
         let completion = RefPtr::new(self).into_raw();
         if let Some(plugin) = plugins {
             let plugin = Plugin::opaque_mut(plugin.as_ptr());
             plugin.set_config(completion.cast());
             plugin.freeze_filters();
+            if compiles_ahead_of_time {
+                plugin.set_compiles_ahead_of_time();
+            }
         }
 
         // Ensure this exists before we spawn the thread to prevent any race
