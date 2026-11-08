@@ -4243,6 +4243,7 @@ declare module "bun" {
     | "dynamic-import"
     | "import-rule"
     | "url-token"
+    | "composes"
     | "internal"
     | "entry-point-run"
     | "entry-point-build";
