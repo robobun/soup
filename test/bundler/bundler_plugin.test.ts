@@ -2116,4 +2116,72 @@ describe("bundler", () => {
     });
     expect(exitCode).toBe(0);
   });
+  test.concurrent("plugin/onResolve is told the kind of every import", async () => {
+    using dir = tempDir("plugin-onresolve-kinds", {
+      "entry.js": `
+        import value from "./esm.js";
+        const required = require("./cjs.cjs");
+        const lazy = await import("./lazy.js");
+        console.log(value, required.value, lazy.default, require.resolve("./resolved.js"));
+      `,
+      "esm.js": `export default "esm";`,
+      "cjs.cjs": `exports.value = "cjs";`,
+      "lazy.js": `export default "lazy";`,
+      "resolved.js": `export default "resolved";`,
+      "styles.css": `@import "./imported.css";\n@import "./print.css" supports(display: grid);\nbody { background: url(./pixel.png); }`,
+      "imported.css": `p { color: red; }`,
+      "print.css": `p { color: black; }`,
+      "pixel.png": "not really a png",
+      "button.module.css": `.button { composes: base from "./base.module.css"; }`,
+      "base.module.css": `.base { color: blue; }`,
+      "modules.js": `import styles from "./button.module.css";\nconsole.log(styles.button);`,
+      "build.mjs": `
+        const told = [];
+        const result = await Bun.build({
+          entrypoints: ["./entry.js", "./styles.css", "./modules.js"],
+          target: "bun",
+          plugins: [
+            {
+              name: "kinds",
+              setup(build) {
+                build.onResolve({ filter: /.*/ }, args => {
+                  told.push([args.path, args.kind]);
+                });
+              },
+            },
+          ],
+        });
+        console.log(JSON.stringify({ success: result.success, told: told.sort() }));
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build.mjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout || "null")).toEqual({
+      success: true,
+      told: [
+        ["./base.module.css", "composes"],
+        ["./button.module.css", "import-statement"],
+        ["./cjs.cjs", "require-call"],
+        ["./entry.js", "entry-point-build"],
+        ["./esm.js", "import-statement"],
+        ["./imported.css", "import-rule"],
+        ["./lazy.js", "dynamic-import"],
+        ["./modules.js", "entry-point-build"],
+        ["./pixel.png", "url-token"],
+        ["./print.css", "import-rule"],
+        ["./resolved.js", "require-resolve"],
+        ["./styles.css", "entry-point-build"],
+      ],
+    });
+    expect(exitCode).toBe(0);
+  });
 });

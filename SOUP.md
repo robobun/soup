@@ -9501,6 +9501,57 @@ Files: `src/zip/` (new), `src/archive/any.rs` (new), `src/archive/lib.rs`,
 `test/js/bun/archive-golden/zip-writers.json` (new),
 `test/integration/bun-types/fixture/archive.ts` (new).
 
+### 2026-11-07: `onResolve` is told the `kind` of a CSS `url()`, a `composes` and a conditional `@import`
+
+A fix, not a feature. It is a commit of its own in front of `build.resolve()` of the same day,
+which passes the `kind` of an import on and so needs it to be right.
+
+A `Bun.build` plugin reads `args.kind` from a table of names that is indexed by the discriminant
+of `ImportKind` (`enums.ImportKind` in `src/codegen/replacements.ts`). The table had 9 names for
+12 kinds. It was right when it was written and was not updated when the enum grew, twice.
+
+| import                                         | `args.kind` on bun 1.4.3 | now             |
+| ---------------------------------------------- | ------------------------ | --------------- |
+| `background: url(./pixel.png)`                 | `"internal"`             | `"url-token"`   |
+| `composes: base from "./b"`                    | `undefined`              | `"composes"`    |
+| `@import "./grid.css" supports(display: grid)` | `"url-token"`            | `"import-rule"` |
+
+```ts
+build.onResolve({ filter: /\.png$/ }, args => {
+  // On bun 1.4.3 `args.kind` is "internal" for a `url()`, and this never runs.
+  if (args.kind === "url-token") return { path: args.path, external: true };
+});
+```
+
+What the commit does:
+
+- The table has one name for each kind, in the order of the enum, with the variant beside it.
+- `ImportKind::AtConditional`, the kind of an `@import` with a `supports()` condition, has the
+  label of an `@import`, `import-rule`, and the error label `@import`. Both were empty strings:
+  `ResolveMessage.importKind` was `""` for such an import that did not resolve.
+- `src/jsc/ResolveMessage.rs` had a copy of the label table. It reads `ImportKind::label()` now.
+- `Bun.ImportKind` has `"composes"`.
+
+oven-sh/bun#38549 ("label conditional CSS @import records as import-rule") is open upstream and
+changes the same lines of `src/ast/lib.rs`, `src/codegen/replacements.ts` and
+`src/jsc/ResolveMessage.rs` in the same way. This commit follows it, so that the rebase can drop
+this commit when that one lands. Its test for `importKind` is here under the same name.
+oven-sh/bun#38542 is open for the `importKind` types. `"html_manifest"` is a kind that a callback
+can be told too, and it is not in the type: oven-sh/bun#38621, also open, changes what that kind
+is, and the type can follow it.
+
+Tests: `test/bundler/bundler_plugin.test.ts` builds an entry with every kind of import that a
+source file can have and compares what a catch-all `onResolve` is told: 12 imports, 8 names.
+`test/bundler/bun-build-api.test.ts` reads `importKind` of the error for an `@import` that does
+not resolve, with and without a `supports()` condition. Both fail on bun 1.4.3.
+
+What it costs: nothing at run time. The table is 3 strings longer, and `ResolveMessage.rs` lost
+a function.
+
+Files: `src/ast/lib.rs`, `src/codegen/replacements.ts`, `src/jsc/ResolveMessage.rs`,
+`packages/bun-types/bun.d.ts`, `test/bundler/bundler_plugin.test.ts`,
+`test/bundler/bun-build-api.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
