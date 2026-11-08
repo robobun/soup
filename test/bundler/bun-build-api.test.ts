@@ -3129,3 +3129,17 @@ test.skipIf(!isWindows)(
     expect(outputs.map(output => path.normalize(output.path)).sort()).toEqual(["img\\logo.png", "index.js"]);
   },
 );
+
+test("css @import resolve errors report importKind 'import-rule' with and without import conditions", async () => {
+  using dir = tempDir("css-import-kind", {
+    "plain.css": `@import "./missing-plain.css";`,
+    "conditional.css": `@import "./missing-conditional.css" supports(display: grid);`,
+  });
+  const kinds: Record<string, unknown> = {};
+  for (const entry of ["plain.css", "conditional.css"]) {
+    const build = await Bun.build({ entrypoints: [join(String(dir), entry)], throw: false });
+    expect(build.success).toBe(false);
+    kinds[entry] = build.logs.map(log => (log as ResolveMessage).importKind);
+  }
+  expect(kinds).toEqual({ "plain.css": ["import-rule"], "conditional.css": ["import-rule"] });
+});
