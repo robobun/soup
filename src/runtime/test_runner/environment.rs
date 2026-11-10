@@ -5,7 +5,7 @@ use bun_core::lexer::end_of_run;
 use bun_core::{Output, Timespec, TimespecMockMode};
 use bun_core::strings;
 use bun_jsc::event_loop::TopLevelWaitError;
-use bun_jsc::virtual_machine::{VirtualMachine, runtime_hooks};
+use bun_jsc::virtual_machine::{InSourceTests, VirtualMachine, runtime_hooks};
 use bun_jsc::{
     JSInternalPromise, JSPromise, JSValue, JsError, JsResult,
     StringJsc as _, Strong, bun_string_jsc, js_promise,
@@ -89,15 +89,26 @@ pub(crate) struct Environment {
     project: TestEnvironment,
     is_entered: bool,
     teardown: Option<Strong>,
+    pub(crate) in_source_tests: InSourceTests,
 }
 
 impl Environment {
-    pub(crate) fn of_file(path: &[u8], project: Option<TestEnvironment>) -> Self {
+    /// `has_had_turn`: the file is listed twice, and this run has loaded it as a test file.
+    pub(crate) fn of_file(
+        path: &[u8],
+        project: Option<TestEnvironment>,
+        has_had_turn: bool,
+    ) -> Self {
         let project = project.unwrap_or(TestEnvironment::Node);
         // Read errors are ignored here because the module loader reports them.
         let source = bun_sys::File::read_from(bun_sys::Fd::cwd(), path).unwrap_or_default();
         let pragmas = Pragmas::find(&source);
         Self {
+            in_source_tests: match crate::cli::test::scanner::names_in_source_tests(&source) {
+                false => InSourceTests::None,
+                true if has_had_turn => InSourceTests::HaveRun,
+                true => InSourceTests::Run,
+            },
             comment: pragmas
                 .environment
                 .map(|name| TestEnvironment::from_name(name).ok_or_else(|| name.into())),
@@ -145,7 +156,7 @@ impl Environment {
                 }
             }
         }
-        Ok(vm.load_entry_point_for_test_runner(path)?)
+        Ok(vm.load_entry_point_for_test_runner(path, self.in_source_tests)?)
     }
 
     /// An unsupported pragma only warns, so files with pragmas that older `bun test` versions ignored keep running.

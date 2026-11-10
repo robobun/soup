@@ -220,10 +220,12 @@ impl TestRunner {
         false
     }
 
-    pub(crate) fn get_or_put_file(&self, path: &'static [u8]) -> File {
+    /// The `bool`: the file has had a turn in this run, so it is listed twice.
+    pub(crate) fn get_or_put_file(&self, path: &'static [u8]) -> (File, bool) {
         self.file_ids.with_taken(|file_ids| {
             let next_id = file_ids.count() as FileId;
-            File { id: *file_ids.entry(path).or_insert_with(|| next_id), path }
+            let id = *file_ids.entry(path).or_insert_with(|| next_id);
+            (File { id, path }, id != next_id)
         })
     }
 }

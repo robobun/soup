@@ -106,6 +106,17 @@ By default, Bun looks for test files starting from the current working directory
 root = "src"  # Only scan for tests in the src directory
 ```
 
+### Running the Tests Inside Source Files
+
+A source file can hold its own tests in an `if (import.meta.vitest)` block. To have `bun test` run such files too, list glob patterns for them in `includeSource`:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+includeSource = ["src/**/*.ts"]
+```
+
+A file that a pattern matches runs as a test file if its text contains `import.meta.vitest`. See [In-source testing](/test/writing-tests#in-source-testing).
+
 ### Changing Which Files Are Tests
 
 To run files with other names as tests, list glob patterns in `testMatch`. They replace the default patterns:

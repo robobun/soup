@@ -32,3 +32,8 @@ describe("globals", () => {
   });
   it("it", () => {});
 });
+
+// In-source testing
+if (import.meta.vitest) {
+  expectTypeOf(import.meta.vitest.test).toEqualTypeOf<typeof test>();
+}
