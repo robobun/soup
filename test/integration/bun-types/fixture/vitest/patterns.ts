@@ -270,3 +270,13 @@ describe("loose expected values", () => {
   expect(1).toBeCloseTo(1, 2);
   expect<number>(1).toBe(1);
 });
+
+// In-source testing
+expectTypeOf(import.meta.vitest).toEqualTypeOf<typeof import("vitest") | undefined>();
+if (import.meta.vitest) {
+  const { test: inSourceTest, expect: inSourceExpect } = import.meta.vitest;
+  inSourceTest("in source", ({ task }) => {
+    inSourceExpect(math.add(1, 2)).toBe(3);
+    expectTypeOf(task.name).toBeString();
+  });
+}

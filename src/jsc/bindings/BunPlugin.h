@@ -152,6 +152,13 @@ public:
         // Modules a preload loaded that the running test file evicted. Restored when the file ends.
         WTF::UncheckedKeyHashMap<String, JSC::Strong<JSC::JSCell>> evictedPreloadModules = {};
         WTF::UncheckedKeyHashMap<String, JSC::Strong<JSC::JSCell>> evictedPreloadCommonJSModules = {};
+        // The turn of a source file with in-source tests puts aside what test files loaded too (JSMock__putTestFileAside()). The test file
+        // of each such module, which it is of again when it comes back.
+        WTF::UncheckedKeyHashMap<String, unsigned> testFileOfModulesPutAside = {};
+        // The source file that has that turn, until the next test file begins.
+        String sourceFileOfTurn;
+        // Its copy of this turn is in the registry.
+        bool hasCopyOfSourceFileOfTurn = false;
         // Starts at 1 so that a missing testFileOfModule entry (0) means a preload fetched the module.
         unsigned testFile = 1;
         // The modules that have called mock.module(), vi.mock() and the like since the running test file started.

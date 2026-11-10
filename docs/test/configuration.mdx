@@ -39,6 +39,25 @@ root = "tests"
 # root = ["src", "lib"]  # This syntax is not supported
 ```
 
+### includeSource
+
+`includeSource` lists glob patterns for source files that hold their own tests, in an `if (import.meta.vitest)` block. `bun test` runs them next to the files with a test name. See [In-source testing](/test/writing-tests#in-source-testing).
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+# Single pattern
+includeSource = "src/**/*.ts"
+
+# Multiple patterns
+includeSource = ["src/**/*.ts", "lib/**/*.{ts,tsx}"]
+```
+
+Bun reads the patterns as it reads those of [`testMatch`](#testmatch): it matches them against the path of a file relative to the project root, drops a `./` at the start, and lets a pattern that starts with `!` take files away. A list of only negated patterns names no file.
+
+A file that a pattern matches runs as a test file if its text contains `import.meta.vitest`. To find that out, Bun reads each file that a pattern matches until it finds the text. So name the directories that have such files and not `**`.
+
+The rest of discovery applies as it does to a test file: the extension has to be one that Bun loads as code, `node_modules` and hidden directories aren't scanned, and `root`, `pathIgnorePatterns` and the filters on the command line narrow the list. `testMatch` and `--test-match` change which names are tests, and take no source file away.
+
 ### testMatch
 
 `testMatch` sets which files `bun test` runs as tests, using glob patterns. The patterns replace the default names, so a project can name its tests `*.unit.ts`, or keep them in a `tests/` directory without a suffix.
@@ -684,6 +703,7 @@ exact = true
 # Test discovery
 root = "src"
 preload = ["./test-setup.ts", "./global-mocks.ts"]
+includeSource = ["src/**/*.ts"]
 testMatch = ["**/*.test.ts", "**/*.unit.ts"]
 pathIgnorePatterns = ["vendor/**", "submodules/**"]
 

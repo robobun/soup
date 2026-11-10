@@ -248,6 +248,7 @@ impl<'a> TestRunner<'a> {
         if entry.found_existing {
             return GetOrPutFileResult {
                 file_id: *entry.value_ptr,
+                found_existing: true,
             };
         }
         let file_id = self.files.len() as FileId;
@@ -257,7 +258,10 @@ impl<'a> TestRunner<'a> {
             })
             .expect("unreachable");
         *entry.value_ptr = file_id;
-        GetOrPutFileResult { file_id }
+        GetOrPutFileResult {
+            file_id,
+            found_existing: false,
+        }
     }
 }
 
@@ -289,6 +293,8 @@ impl Summary {
 
 pub(crate) struct GetOrPutFileResult {
     pub(crate) file_id: FileId,
+    /// The file has had a turn in this run: it is listed twice.
+    pub(crate) found_existing: bool,
 }
 
 pub(crate) struct File {

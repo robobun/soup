@@ -152,6 +152,20 @@ pub enum MainEntryPoint {
     StaticServer,
 }
 
+/// `bun test`: what the turn of a test file does about the tests that the file keeps under
+/// `if (import.meta.vitest)`. They run only in the module that is the test file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InSourceTests {
+    /// The text of the file does not name `import.meta.vitest`. The file loads as a test file
+    /// always did: where something has loaded it, it is not evaluated again.
+    None,
+    /// They run. The load evaluates the file, also where something has loaded it, and that copy
+    /// of the file is of this turn alone.
+    Run,
+    /// They have run: the file is listed twice. This load is an import like any other.
+    HaveRun,
+}
+
 /// The built-in module that `Bun__loadBuiltinEntryPoint` runs. Mirrors
 /// `Bun::BuiltinEntryPoint` in `BuiltinEntryPoint.cpp`.
 #[repr(u8)]
@@ -311,6 +325,9 @@ pub struct VirtualMachine {
 
     /// Used by bun:test to set global hooks for beforeAll, beforeEach, etc.
     pub is_in_preload: bool,
+    /// `bun test`: the preloads of the test file are done and its turn has not ended. A module that
+    /// loads under `main` meanwhile is the test file, and gets `import.meta.vitest`.
+    pub is_in_test_entry_turn: bool,
     /// `Watcher::get_hash()` of the preload script currently loading.
     pub preload_hash: u32,
     /// True if `load_preloads` kept the preload list for a reload that was deferred while it ran.
@@ -3685,6 +3702,8 @@ impl VirtualMachine {
     pub fn set_main(&mut self, path: Option<&[u8]>) {
         self.main = path.map(bun_ptr::RawSlice::new);
         self.main_hash = path.map_or(0, bun_watcher::Watcher::get_hash);
+        // Its preloads come first.
+        self.is_in_test_entry_turn = false;
     }
 
     pub fn entry_point_is_commonjs(&self) -> bool {
@@ -6343,6 +6362,13 @@ impl VirtualMachine {
                 && self.preload_hash == bun_watcher::Watcher::get_hash(&key.to_utf8()))
     }
 
+    /// Whether a module that is made now under `key` is the test file that `bun test` is running.
+    /// Not one that a preload of the file imports, and not what the file imports.
+    #[unsafe(export_name = "Bun__VM__isEntryOfTestFile")]
+    pub extern "C" fn is_entry_of_test_file(&self, key: &bun_core::String) -> bool {
+        self.is_in_test_entry_turn && self.is_main_module(key)
+    }
+
     #[unsafe(export_name = "Bun__VM__isRunningVitestEntry")]
     pub extern "C" fn is_running_vitest_entry(&self) -> bool {
         self.is_running_vitest_entry
@@ -6357,6 +6383,7 @@ impl VirtualMachine {
     pub(crate) fn reload_entry_point_for_test_runner(
         &mut self,
         entry_path: &[u8],
+        in_source_tests: InSourceTests,
     ) -> crate::CrateResult<*mut JSInternalPromise> {
         let entry_path = crate::compiled_program::entry_module_key(entry_path);
         self.has_loaded = crate::compiled_program::runs_in_place()
@@ -6385,6 +6412,39 @@ impl VirtualMachine {
 
         // After the preloads, so the modules they loaded still count as loaded by a preload.
         crate::cpp::JSMock__didBeginTestFile(self.global());
+        // Also after the preloads: one of them may have imported the file.
+        if in_source_tests == InSourceTests::Run {
+            let key = bun_core::StringView::from_bytes(entry_path);
+            // SAFETY: `key` is a live `String` for the call, which copies it.
+            let put_aside =
+                unsafe { crate::cpp::JSMock__putTestFileAside(self.global(), &raw const *key) };
+            let global = self.global();
+            // Tests that cannot run are this file's failure, like not loading.
+            let rejected = match put_aside {
+                Err(thrown) => Some(crate::JSPromise::rejected_promise_with_caught_exception(
+                    global, thrown,
+                )?),
+                Ok(()) if crate::compiled_program::has_run_commonjs_file(global, entry_path) => {
+                    Some(crate::JSPromise::rejected_promise(
+                        global,
+                        global.create_error_instance(format_args!(
+                            "{} has run, and --aot runs a CommonJS file once, so its in-source tests cannot run\nnote: another file loaded it first, or --rerun-each runs it again. Make it an ES module, or run without --aot",
+                            bun_core::fmt::quote(entry_path)
+                        )),
+                    ))
+                }
+                Ok(()) => None,
+            };
+            if let Some(rejected) = rejected {
+                // Whoever loads the file reports it, not the rejection tracker.
+                rejected.set_handled();
+                let rejected = std::ptr::from_mut(rejected);
+                self.set_pending_internal_promise(Some(rejected));
+                return Ok(rejected);
+            }
+            crate::compiled_program::will_run_entry_point_again(global, entry_path);
+        }
+        self.is_in_test_entry_turn = in_source_tests != InSourceTests::HaveRun;
 
         // Note: reshaped for borrowck.
         let global = self.global;
@@ -6461,8 +6521,9 @@ impl VirtualMachine {
     pub fn load_entry_point_for_test_runner(
         &mut self,
         entry_path: &[u8],
+        in_source_tests: InSourceTests,
     ) -> crate::CrateResult<*mut JSInternalPromise> {
-        let promise = self.reload_entry_point_for_test_runner(entry_path)?;
+        let promise = self.reload_entry_point_for_test_runner(entry_path, in_source_tests)?;
 
         if !self.is_watcher_enabled()
             && crate::JSPromise::status_ptr(promise) == crate::js_promise::Status::Rejected

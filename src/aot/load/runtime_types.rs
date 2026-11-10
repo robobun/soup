@@ -15,6 +15,9 @@ pub(crate) const OTHER_NAMES_OF_TEST_RUNNER: &[u8] = b"declare module \"@jest/gl
 declare module \"vitest\" {
   export * from \"bun:test\";
 }
+interface ImportMeta {
+  readonly vitest?: typeof import(\"vitest\");
+}
 ";
 
 pub(crate) const GLOBALS_THAT_NOTHING_DECLARES_PATH: &[u8] = b"/$bun/types/globals.d.ts";

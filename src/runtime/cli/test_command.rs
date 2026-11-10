@@ -17,7 +17,7 @@ use bun_core::{EncodedSlice, strings};
 use bun_core::{pretty_error, pretty_errorln};
 use bun_dotenv as DotEnv;
 use bun_jsc::event_loop::TopLevelWaitError;
-use bun_jsc::virtual_machine::VirtualMachine;
+use bun_jsc::virtual_machine::{InSourceTests, VirtualMachine};
 use bun_jsc::{self as jsc};
 use bun_options_types::aot_options::ReplacedByTests;
 use bun_options_types::code_coverage_options::CodeCoverageOptions;
@@ -742,7 +742,7 @@ fn has_file_with_window<'a>(
 ) -> bool {
     // Preloads run in the environment of the project, whatever the test files ask for.
     environment_of_project.is_some_and(|kind| kind != TestEnvironment::Node)
-        || test_files.any(|path| Environment::of_file(path, None).has_window())
+        || test_files.any(|path| Environment::of_file(path, None, false).has_window())
 }
 
 // No file of the run spells what the runner does for a test file that asks for a DOM: it loads a module of Bun's own code from its text and the package that makes the window from
@@ -3085,6 +3085,21 @@ impl TestCommand {
             ctx.args.disable_default_env_files = true;
         }
 
+        // A project defines `import.meta.vitest` as `undefined` to keep the in-source tests out
+        // of its bundles, and bunfig.toml has one `[define]` for all commands. `bun test` is where
+        // those tests run, so the define is not for it. Vitest drops it from its config as well.
+        if let Some(define) = ctx.args.define.as_mut() {
+            let mut index = 0;
+            while index < define.keys.len() {
+                if &*define.keys[index] == b"import.meta.vitest" {
+                    define.keys.remove(index);
+                    define.values.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+
         bun_ast::initialize_store();
         // SAFETY: `init` returns the heap-allocated process-lifetime VM; deref once.
         let vm: &mut VirtualMachine = unsafe {
@@ -3196,11 +3211,17 @@ impl TestCommand {
             .iter()
             .map(|b| bun_glob::Prepared::new(&**b))
             .collect();
+        let include_source = scanner::TestMatch::of_include_source(
+            &ctx.test_options.include_source,
+            FileSystem::get().top_level_dir(),
+            &ctx.debug.test_directory,
+        );
         #[cfg(windows)]
         let filter_names_normalized: Vec<Box<[u8]>>;
 
         let mut scanner = Scanner::init(&vm.transpiler, ctx.positionals.len()).expect("oom");
         scanner.path_ignore_patterns = &path_ignore_patterns;
+        scanner.include_source = include_source.as_ref();
         scanner.test_match = test_files.as_ref().and_then(scanner::TestFiles::scanned);
         let has_relative_path = 'hr: {
             for arg in &ctx.positionals {
@@ -3555,6 +3576,10 @@ impl TestCommand {
                     test_files.iter().map(|path| (**path).to_vec()).collect();
                 aot.replaced_by_tests.preloads =
                     preloads.iter().map(|path| path.to_vec()).collect();
+                // The turn of a file with in-source tests evaluates it again, as a repeat does.
+                aot.entry_points_run_again |= test_files
+                    .iter()
+                    .any(|path| scanner::file_names_in_source_tests(path));
             }
             run_compiled::start(ctx, entry_points, file_count);
         }
@@ -3801,6 +3826,11 @@ impl TestCommand {
                         bstr::BStr::new(&ctx.positionals[i]),
                     );
                 }
+            }
+            if include_source.is_some() {
+                pretty_errorln!(
+                    "<blue>note<r><d>:<r> A file that includeSource names is a test file if it has \"import.meta.vitest\" in it"
+                );
             }
             if !Output::is_ai_agent() {
                 pretty_error!(
@@ -4390,10 +4420,8 @@ impl TestCommand {
         if let Some(last_failed) = reporter.last_failed.as_mut() {
             last_failed.begin_file(file_name);
         }
-        let file_id = jest::Jest::runner()
-            .unwrap()
-            .get_or_put_file(file_path)
-            .file_id;
+        let file = jest::Jest::runner().unwrap().get_or_put_file(file_path);
+        let file_id = file.file_id;
 
         // In Github Actions, append a special prefix that will group
         // subsequent log lines into a collapsable group.
@@ -4409,8 +4437,12 @@ impl TestCommand {
         vm.on_unhandled_rejection_ctx = None;
         vm.on_unhandled_rejection = jest::on_unhandled_rejection::on_unhandled_rejection;
         vm.is_running_vitest_entry = false;
-        let mut environment =
-            Environment::of_file(file_path, reporter.jest.test_options.environment);
+        let mut environment = Environment::of_file(
+            file_path,
+            reporter.jest.test_options.environment,
+            // With `--isolate` the second turn of a file that is listed twice knows nothing of the first.
+            file.found_existing && !vm.test_isolation_enabled,
+        );
 
         if let Some(json) = reporter.reporters.json.as_mut() {
             json.begin_file(file_path);
@@ -4420,10 +4452,13 @@ impl TestCommand {
             // Clear the module cache before re-running (except for the first run)
             if repeat_index > 0 {
                 vm.clear_entry_point()?;
-                let key = jsc::compiled_program::entry_module_key(file_path);
-                vm.global()
-                    .delete_module_registry_entry(&EncodedSlice::from_bytes(key))?;
-                jsc::compiled_program::will_run_entry_point_again(vm.global(), key);
+                // The load of a file with in-source tests puts the file aside itself, on every run.
+                if environment.in_source_tests != InSourceTests::Run {
+                    let key = jsc::compiled_program::entry_module_key(file_path);
+                    vm.global()
+                        .delete_module_registry_entry(&EncodedSlice::from_bytes(key))?;
+                    jsc::compiled_program::will_run_entry_point_again(vm.global(), key);
+                }
             }
             if repeat_index > 0 {
                 // Reset per-test snapshot counters so rerun N matches the same
@@ -4718,6 +4753,7 @@ impl Drop for EnteredFile<'_> {
         // A mock.module() patch still pending must not hold up the next file.
         bun_jsc::cpp::JSMock__forgetPendingModulePatches(self.global);
         bun_jsc::cpp::JSMock__undoModuleMocksOfTestFile(self.global, self.next_load_shares_global);
+        self.global.bun_vm().as_mut().is_in_test_entry_turn = false;
     }
 }
 

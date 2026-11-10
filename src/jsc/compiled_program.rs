@@ -51,6 +51,7 @@ unsafe extern "C" {
     safe fn Bun__isCompiledProgramFile(path: &bun_core::String) -> bool;
     safe fn Bun__isCompiledProgramFileInSomeForm(path: &bun_core::String) -> bool;
     safe fn Bun__AOT__willReevaluateEntryPoint(global: &JSGlobalObject, path: &bun_core::String);
+    safe fn Bun__AOT__hasRunCommonJSFile(global: &JSGlobalObject, path: &bun_core::String) -> bool;
     safe fn Bun__AOT__willRunPreloads(global: &JSGlobalObject);
     safe fn Bun__AOT__didRunPreloads(global: &JSGlobalObject);
     safe fn Bun__AOT__mayHoldPathStartingWith(start: FfiSlice<'_>) -> bool;
@@ -389,6 +390,13 @@ pub fn will_run_entry_point_again(global: &JSGlobalObject, key: &[u8]) {
     if compiled_program().is_some() {
         Bun__AOT__willReevaluateEntryPoint(global, &bun_core::StringView::from_bytes(key));
     }
+}
+
+/// `bun test --aot`: `key` is a CommonJS file of the program that has run in this realm. It runs once there, so
+/// [`will_run_entry_point_again`] does nothing for it.
+pub fn has_run_commonjs_file(global: &JSGlobalObject, key: &[u8]) -> bool {
+    compiled_program().is_some()
+        && Bun__AOT__hasRunCommonJSFile(global, &bun_core::StringView::from_bytes(key))
 }
 
 /// `bun test --preload`, round the preloads and round each hook that one of them has registered: what runs between the two calls comes back for the next test file

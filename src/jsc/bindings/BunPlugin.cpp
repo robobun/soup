@@ -3359,6 +3359,8 @@ struct ModulesToEvict {
     // The later mock sets the restored packages aside again.
     bool isReplacedByLaterMock { false };
 #endif
+    // What goes comes back when the test file ends, as a module of a preload does, whoever loaded it.
+    bool putsAside { false };
 };
 
 static JSC::JSPromise* pendingLoadOf(JSC::JSGlobalObject* globalObject, JSC::ModuleRegistryEntry* entry)
@@ -3743,8 +3745,14 @@ __attribute__((minsize)) static void evictModulesAndTheirImporters(Zig::GlobalOb
     }
 
     bool isTestFileRunning = Bun::isBunTest && !JSMock__isInPreload(globalObject);
+    // A module of a preload comes back when the test file ends. With putsAside, one that a test file loaded does too.
+    auto comesBack = [&](const String& key) { return isTestFileRunning && (evict.putsAside || !plugins.testFileOfModule.get(key)); };
+    auto rememberTestFile = [&](const String& key) {
+        if (unsigned testFile = plugins.testFileOfModule.get(key))
+            plugins.testFileOfModulesPutAside.add(key, testFile);
+    };
     auto keepPreloadModule = [&](const String& key, JSC::ModuleRegistryEntry* entry) {
-        if (!isTestFileRunning || !entry || !entry->record() || entry->status() >= JSC::ModuleRegistryEntry::Status::FetchFailed || plugins.testFileOfModule.get(key))
+        if (!comesBack(key) || !entry || !entry->record() || entry->status() >= JSC::ModuleRegistryEntry::Status::FetchFailed)
             return;
 #if ENABLE(AOT)
         // The loader gets the record of a compiled module without a fetch.
@@ -3752,6 +3760,7 @@ __attribute__((minsize)) static void evictModulesAndTheirImporters(Zig::GlobalOb
             return;
 #endif
         plugins.evictedPreloadModules.add(key, JSC::Strong<JSC::JSCell> { vm, entry->record() });
+        rememberTestFile(key);
     };
     bool clearsRegistry = evict.all && !evict.exceptPackages && loading.isEmpty();
     if (clearsRegistry) {
@@ -3823,11 +3832,13 @@ __attribute__((minsize)) static void evictModulesAndTheirImporters(Zig::GlobalOb
             }
             auto* record = esModule ? uncheckedDowncast<JSC::AbstractModuleRecord>(esModule) : nullptr;
             bool isCommonJSModule = !record || (!record->hasLiveExports() && !record->inherits<JSC::CyclicModuleRecord>());
-            if (isTestFileRunning && isCommonJSModule && !plugins.testFileOfModule.get(key)) {
+            if (isCommonJSModule && comesBack(key)) {
                 JSValue commonJSModule = requireMap->get(globalObject, keyString);
                 RETURN_IF_EXCEPTION(scope, );
-                if (commonJSModule.isCell())
+                if (commonJSModule.isCell()) {
                     plugins.evictedPreloadCommonJSModules.add(key, JSC::Strong<JSC::JSCell> { vm, commonJSModule.asCell() });
+                    rememberTestFile(key);
+                }
                 // Undo the patch now, because unmockModule() can't find the module once it's evicted.
                 auto* mock = registeredModuleMock(globalObject, key);
                 if (auto* patched = mock && mock->originalCommonJSExports ? dynamicDowncast<Bun::JSCommonJSModule>(commonJSModule) : nullptr)
@@ -7317,6 +7328,8 @@ __attribute__((minsize)) static void giveBackPreloadModules(Zig::GlobalObject* g
         if (plugins.modulesToEvictOnceLoaded.contains(key))
             continue;
         plugins.testFileOfModule.remove(key);
+        if (unsigned testFile = plugins.testFileOfModulesPutAside.take(key))
+            plugins.testFileOfModule.set(key, testFile);
         if (auto kept = plugins.evictedPreloadModules.take(key)) {
             auto* entry = loader->ensureRegistered(globalObject, JSC::Identifier::fromString(vm, key), JSC::ScriptFetchParameters::Type::JavaScript);
             RETURN_IF_EXCEPTION(scope, );
@@ -7335,14 +7348,46 @@ __attribute__((minsize)) static void giveBackPreloadModules(Zig::GlobalObject* g
 // Called after the preloads and before the load of each test file, including the first. Modules loaded before the first call belong to a preload.
 extern "C" [[ZIG_EXPORT(nothrow)]] void JSMock__didBeginTestFile(Zig::GlobalObject* globalObject)
 {
+    auto& plugins = globalObject->onLoadPlugins;
+    plugins.sourceFileOfTurn = String();
+    plugins.hasCopyOfSourceFileOfTurn = false;
 #if ENABLE(AOT)
     if (globalObject->vm().hasCompiledCode()) {
         Bun::clearSavedResolutions(globalObject);
         JSC::AOT::didBeginTestFile(globalObject);
     }
-#else
-    UNUSED_PARAM(globalObject);
 #endif
+}
+
+// In front of each load of a source file with in-source tests as the test file. `import.meta.vitest` runs those tests only in the module that
+// is the test file, so the load has to evaluate the file, and the copy that it makes is of this turn alone. What an earlier load left of the
+// file is put aside, the ES module and the CommonJS one, and with it what imported it, so that nothing of the turn links to a copy that the
+// registry no longer has. giveBackPreloadModules() brings all of it back when the file ends, as it does for the modules of a preload, and
+// JSMock__undoModuleMocksOfTestFile() takes the copy of the turn out before that. A test file without such tests is not put aside: a repeat
+// of --rerun-each takes only its ES module out of the registry, and what imports it stays linked to the first run.
+extern "C" [[ZIG_EXPORT(check_slow)]] void JSMock__putTestFileAside(Zig::GlobalObject* globalObject, const BunString* path)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto& plugins = globalObject->onLoadPlugins;
+    String key = path->toWTFString();
+    // The mocks of test files are undone by now. One of a preload stands in for the file in this load too, and the tests are in the file.
+    if (registeredModuleMock(globalObject, key)) {
+        throwException(globalObject, scope, createError(globalObject, makeString("A preload mocks \""_s, key, "\", so its in-source tests cannot run"_s)));
+        return;
+    }
+    plugins.sourceFileOfTurn = key;
+    plugins.hasCopyOfSourceFileOfTurn = true;
+    bool isLoaded = Bun::testFileModuleLoader(globalObject)->registryEntry(JSC::Identifier::fromString(vm, key));
+    if (!isLoaded) {
+        isLoaded = Bun::testFileRequireMap(globalObject)->has(globalObject, jsString(vm, key));
+        RETURN_IF_EXCEPTION(scope, );
+    }
+    if (!isLoaded)
+        return;
+    ModulesToEvict evict { Vector<String> { key } };
+    evict.putsAside = true;
+    RELEASE_AND_RETURN(scope, evictModulesAndTheirImporters(globalObject, WTF::move(evict)));
 }
 
 extern "C" [[ZIG_EXPORT(nothrow)]] __attribute__((minsize)) void JSMock__undoModuleMocksOfTestFile(Zig::GlobalObject* globalObject, bool nextLoadSharesModules)
@@ -7492,6 +7537,13 @@ extern "C" [[ZIG_EXPORT(nothrow)]] __attribute__((minsize)) void JSMock__undoMod
     if (scope.exception()) [[unlikely]]
         (void)scope.tryClearException();
 #endif
+
+    // The copy of a source file that ran its in-source tests goes, with what imported it in its turn. The next import evaluates the file.
+    if (std::exchange(plugins.hasCopyOfSourceFileOfTurn, false)) {
+        evictModulesAndTheirImporters(globalObject, Vector<String> { plugins.sourceFileOfTurn });
+        if (scope.exception()) [[unlikely]]
+            (void)scope.tryClearException();
+    }
 
     giveBackPreloadModules(globalObject);
     if (scope.exception()) [[unlikely]]
@@ -7660,8 +7712,9 @@ extern "C" __attribute__((minsize)) void JSMock__replaceModuleOfTestFile(Zig::Gl
 #endif
     auto* entry = Bun::testFileModuleLoader(globalObject)->registryEntry(JSC::Identifier::fromString(vm, testFile));
     auto* record = entry ? dynamicDowncast<JSC::CyclicModuleRecord>(entry->record()) : nullptr;
-    // A module that was compiled ahead of time can't be evicted.
-    if (record && !(record->vm().hasCompiledCode() && JSC::AOT::isCompiledModuleRecord(record)) && record->status() == JSC::CyclicModuleRecord::Status::Evaluated && !record->evaluationError()) {
+    // A module that was compiled ahead of time can't be evicted. What stands under the key of a source file that ran its in-source tests
+    // is not its copy of the turn: that one is gone, and later test files import the file as the module of the program that it is.
+    if (record && testFile != plugins.sourceFileOfTurn && !(record->vm().hasCompiledCode() && JSC::AOT::isCompiledModuleRecord(record)) && record->status() == JSC::CyclicModuleRecord::Status::Evaluated && !record->evaluationError()) {
         replaceModuleWithItsExports(globalObject, record);
         if (scope.exception()) [[unlikely]]
             (void)scope.tryClearException();

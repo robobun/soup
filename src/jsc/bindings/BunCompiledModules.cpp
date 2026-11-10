@@ -2596,6 +2596,12 @@ extern "C" void Bun__AOT__willReevaluateEntryPoint(JSC::JSGlobalObject* globalOb
         JSC::AOT::willReevaluateEntryPoint(globalObject, *module);
 }
 
+extern "C" bool Bun__AOT__hasRunCommonJSFile(JSC::JSGlobalObject* globalObject, const BunString* path)
+{
+    auto module = Bun::compiledModuleForPath(path->toWTFString(BunString::ZeroCopy));
+    return module && !JSC::AOT::isESModule(*module) && !JSC::AOT::isDataFile(*module) && JSC::AOT::hasRequireCacheEntry(globalObject, *module);
+}
+
 extern "C" void Bun__AOT__willRunPreloads(JSC::JSGlobalObject* globalObject)
 {
     if (!Bun::hasCompiledModules())
@@ -2800,6 +2806,7 @@ void forEachEvaluatedCompiledFile(Zig::GlobalObject*, const WTF::Function<void(c
 extern "C" bool Bun__refusesCodeOutsideExecutable(JSC::JSGlobalObject*) { return false; }
 extern "C" bool Bun__isCompiledProgramFile(const BunString*) { return false; }
 extern "C" void Bun__AOT__willReevaluateEntryPoint(JSC::JSGlobalObject*, const BunString*) {}
+extern "C" bool Bun__AOT__hasRunCommonJSFile(JSC::JSGlobalObject*, const BunString*) { return false; }
 extern "C" void Bun__AOT__willRunPreloads(JSC::JSGlobalObject*) {}
 extern "C" void Bun__AOT__didRunPreloads(JSC::JSGlobalObject*) {}
 extern "C" void Bun__AOT__setPluginsSilent(bool) {}

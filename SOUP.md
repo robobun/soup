@@ -9863,6 +9863,328 @@ Files: `src/bundler/plugin_resolve.rs` (new), `src/bundler/bundle_v2.rs`, `src/b
 `test/bake/dev/plugins.test.ts`, `test/js/bun/http/bun-serve-html.test.ts`,
 `test/integration/bun-types/fixture/build.ts`.
 
+### 2026-11-09: in-source tests for `bun test`, `import.meta.vitest` and `includeSource`
+
+A module can keep its tests next to the code they test, the way Rust does with `#[cfg(test)]` and
+Vitest with `if (import.meta.vitest)`. oven-sh/bun#3560 has asked for it since July 2023 and has
+47 thumbs-up and no pull request. Since oven-sh/bun#44833 (2026-10-31) `"vitest"` is a module
+that `bun test` has built in, so a project that comes from Vitest keeps its test files as they
+are. Its in-source tests were the part that did not come along: `import.meta.vitest` was
+`undefined` everywhere, so the blocks never ran, and nothing found the files. Now:
+
+```ts
+// src/math.ts
+export function add(...numbers: number[]) {
+  return numbers.reduce((a, b) => a + b, 0);
+}
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+
+  test("add", () => {
+    expect(add()).toBe(0);
+    expect(add(1, 2, 3)).toBe(6);
+  });
+}
+```
+
+```toml
+# bunfig.toml
+[test]
+includeSource = ["src/**/*.ts"]
+```
+
+```sh
+bun test                 # the test files, and src/math.ts
+bun test ./src/math.ts   # one file, with or without includeSource
+bun build ./src/index.ts --outdir dist --define import.meta.vitest=undefined   # no tests in the bundle
+```
+
+The rules of `import.meta.vitest`:
+
+- It is the `"vitest"` module of `bun test` in the module that runs as the test file. That is
+  Vitest's rule: its `moduleEvaluator.ts` defines the property on the `import.meta` of the module
+  whose file is the current test file. `test`, `expect`, `vi` and the rest are what
+  `import { test, expect, vi } from "vitest"` gives, so a test gets the test context as its
+  argument and not a `done` callback.
+- The answer is one `bool` of the module's `import.meta`, set when that object is made: an ES
+  module gets it when it is linked and a CommonJS module when it starts, both in
+  `ImportMetaObject::create`. It is set for the module under the path of the test file, made
+  after the preloads of the file and before the end of its turn. So it is `undefined` in a
+  module that the test file imports, in a preload, also one that imports the test file, in a
+  `Worker`, and in a second copy of the test file that `import("./math.ts?copy")` or a
+  `Bun.ModuleGraph` loads.
+- A module keeps its answer. The copy of `src/math.ts` that a test file imported reads
+  `undefined` also while `src/math.ts` has its turn.
+- Outside of `bun test` the property does not exist: `"vitest" in import.meta` is `false`, and
+  the `import.meta` of `bun run` is what it was. Under `bun test` the accessor is on the
+  prototype, so `"vitest" in import.meta` is `true` in every module, where Vitest has an own
+  accessor on the `import.meta` of the test file. `Object.keys(import.meta)` is unchanged.
+- The globals of the file come from `"bun:test"` unless `globals = "vitest"` is set, as in any
+  file that does not import from `"vitest"`. A Vitest project that writes a bare `test()` in
+  such a block has `globals: true`, and `globals = "vitest"` is what that becomes in bunfig.toml.
+- `bun test` drops a `define` of `import.meta.vitest`, as Vitest does. A project sets it to
+  `undefined` for its bundles, and `[define]` of bunfig.toml is for every command.
+
+The rules of `includeSource`:
+
+- A string or an array of strings in `[test]` of bunfig.toml. The patterns are read as those of
+  `testMatch` are: matched against the path of a file relative to the project root, a `./` at
+  the start is dropped, and a pattern that starts with `!` takes files away. A list of only
+  negated patterns names no file.
+- A file that a pattern matches is a test file if its text contains `import.meta.vitest`. That
+  is Vitest's test too (`isInSourceTestCode`). The scan reads the file to find out and loads
+  nothing, so a source file without tests does not run because a pattern names it. It reads
+  regular files only, in pieces of 64 KiB up to the first that has the text.
+- The rest of discovery is as it was: the extension needs a loader for code, `node_modules` and
+  hidden directories are not scanned, `root`, `pathIgnorePatterns` and the filters on the command
+  line apply, and a file with a test name is a test file whatever the patterns say. `testMatch`
+  takes no source file away. A path on the command line runs without a pattern, as it did.
+
+The turn of such a file. Without `--isolate` or `--parallel`, all test files share one module
+registry. By the time it is the turn of `src/math.ts`, `math.test.ts` has usually loaded it,
+with `import.meta.vitest` undefined, and loading it once more would do nothing. So the tests run
+in a copy of the file that is of the turn alone:
+
+- The text decides, and no name does. `Environment::of_file` reads each test file for the
+  `@vitest-environment` comment, and looks for `import.meta.vitest` in the same bytes. A
+  `*.test.ts` that has the text is handled as a source file is, and a file without it loads as
+  test files always did.
+- Before the load, and after the preloads, `JSMock__putTestFileAside` puts aside what an earlier
+  load left of the file: the ES module, the CommonJS module of `require.cache`, and every module
+  that imports it. That is the routine that module mocks use to take a module out
+  (`evictModulesAndTheirImporters`), with a flag that keeps what goes, as it has always kept
+  the modules of a preload.
+- The load then evaluates the file as the test file. What it imports is what the other test
+  files have, except a module that imports the file back: that one was put aside, and is
+  evaluated for the turn as well.
+- When the file is done, the copy of the turn goes, with what imported it meanwhile, and what
+  was put aside comes back (`giveBackPreloadModules`). Other test files have the copies that
+  they had: an `instanceof` over two of them holds, a later `mock.module()` of the file reaches
+  every importer, and a test file that imported the file is not evaluated a second time.
+- A later import of a file that nothing had loaded evaluates it as an import. So the top-level
+  code of a file runs once for its tests and once more if something imports it, in every order
+  of the files.
+- A test file that mocks modules is replaced by a copy of its exports when it ends, so that a
+  later import does not run it again. A source file is not: later test files import it as the
+  module that it is.
+- A file that is named twice on the command line has had its turn the second time, and that
+  load is an import.
+- A preload that mocks the file with `mock.module()` fails the file with a message. The load
+  would get the mock, and no test.
+- `--rerun-each` does this on each run, for a CommonJS file too. A test file without the text
+  keeps what `--rerun-each` did: its ES module leaves the registry and nothing else.
+
+The maintainer's answer on the issue, in 2023: "the hard part is it forces the test runner to
+load every single file in the repository searching for tests to run". This loads none of them. A
+project names the directories that have such files, the scan reads what the patterns match and
+looks for one string in the bytes, and a run without `includeSource` reads nothing.
+
+This is the third version. The first answered at the time of the read, with `import.meta.main`,
+and took the file alone out of the registry before the preloads. Six reviews found that a preload
+that imports the file called `test()` in a preload, that a later test file could hold two copies
+of a class, and that a CommonJS file was never evaluated again. The design review that followed
+moved the answer to the making of `import.meta`, which has held since, and had the loader take out
+the importers of the file as well, for good. The second version built that, and five more reviews
+found seven bugs in it: a `mock.module()` in an in-source test left later files a frozen copy of
+the exports, a test file that had imported the file ran again for whoever imported it next, a
+module that a preload hook had loaded kept the copy that was gone, and each turn had the importers
+evaluated again (1,210 evaluations in a fixture where this version has 210). Two plans of the
+design review did not hold either. It had `--rerun-each` share the eviction, and upstream pins the
+opposite in `test/aot/rerun-import-back.test.ts`. And it let a name decide that a file is never
+evaluated again, which silently left out the tests of a `*.test.ts` with the guard, and of a
+source file that `testMatch` names. Three of the reviewers named the same way out, which is this
+one: a copy for the turn, and the earlier ones back. This version ran against 32 reproducers
+of the second round, which it passes but for the limits below. It was not reviewed again.
+
+Tests, in `test/cli/test/bun-test.test.ts` (`in-source tests`, 32 tests). All pass on the
+debug build and all fail on bun 1.4.3:
+
+- the module in the test file, with the test context, and `undefined` in an import, a preload, a
+  `Worker` and under `bun run`;
+- `includeSource` as a string and as a list, next to `testMatch`, with `./` and `!`, under
+  filters, `pathIgnorePatterns`, `node_modules`, hidden directories and a file that is not code,
+  and a file whose text lies across the first 64 KiB that the scan reads;
+- a source file that a test file imported runs its tests in its own copy, and the test files
+  after it load nothing again;
+- the text decides: a `*.test.ts` with the guard that another test file imported runs its
+  tests, a test file without the text is not evaluated for its turn, and a file that is named
+  twice runs its tests once;
+- after the turn, an `instanceof` holds over the test files before and after it, for a module
+  that imports the file, for one that loads it with `import()`, and a test file that imported
+  the file is not evaluated for the file that imports it later;
+- a module that imports the file back is evaluated with it for the turn;
+- a block that throws fails its own file only, in both orders;
+- `mock.module()` of the file in a test file before its turn and in one after;
+- `vi.doMock()` in the tests of the file, a later reader of a live binding, and `--rerun-each`;
+- a preload that mocks the file fails the file;
+- a lazy read in the first copy, a `?query` copy and a `Bun.ModuleGraph` copy read `undefined`,
+  and a later test file has the first copy;
+- a preload that imports the file, in one process and with `--isolate`, `--isolate=modules` and
+  `--parallel`;
+- a CommonJS file that a test file required, also with `--rerun-each`;
+- a path that is not ASCII;
+- `--isolate`, `--isolate=modules`, `--parallel`, `--parallel --no-isolate`, `--rerun-each`;
+- `coverageSkipTestFiles` keeps the file in the report;
+- the three errors of the bunfig.toml key, and the note of a run that finds no test;
+- `[define]` of bunfig.toml on `bun build` and on `bun test`, and `--define` on `bun test`.
+
+`test/cli/test/test-aot.test.ts` has two for `--aot`: an ES module with in-source tests that a
+test file imported gives the same output with and without `--aot`, and a CommonJS file that a
+test file required gives the message. Both pass on the debug build.
+`test/integration/bun-types/fixture/vitest/patterns.ts` and `globals.ts` have the type, one for
+each of the two entries that declare `"vitest"`.
+
+Other suites on the debug build of this commit:
+
+- With a longer timeout, all pass: `test/js/bun/test/mock/mock-module.test.ts` (307),
+  `test/cli/test/global-setup.test.ts` (95), `test/cli/test/test-environment.test.ts` (113) and
+  `test/internal/source-lints/` (199).
+- With the 5 seconds of the default: `test/cli/test/bun-test.test.ts` 305 pass and 2 fail,
+  `test/cli/test/isolation.test.ts` 151 and 1, `test/cli/test/parallel.test.ts` 57 and 1.
+  `test/cli/test/rerun-each.test.ts` (7), `test/aot/rerun-import-back.test.ts` (2),
+  `test/aot/fixed-runs-rerun.test.ts` (5) and the two `--rerun-each` tests of `test-aot.test.ts`
+  pass.
+- The two of `bun-test.test.ts` are "instances of a class nested too deeply to print are a
+  RangeError" and "the data of events nested too deeply to print are a RangeError". They take
+  6.5 and 5.6 seconds on a debug build, and pass with a longer timeout.
+- The one of `isolation.test.ts`, "no other builtin module patches a global class when it
+  loads", starts a `bun test` whose one test loads every builtin module. That took 12 seconds
+  in the run of the whole file and 5.9 alone, against the 5 of the inner run.
+- The one of `parallel.test.ts`, "each worker has a unique JEST_WORKER_ID", gives each of three
+  files 200 ms, and a worker of a debug build starts slower than that. With 3 seconds the three
+  workers each take a file.
+- With the default timeout, `mock-module.test.ts` and `global-setup.test.ts` lose between 1 and
+  17 tests to it from run to run on this machine, which took between 51 and 114 seconds for
+  the second of the two. Those are the tests with `--isolate=modules` and the ones that start
+  three processes.
+- "once per run with --aot" of `global-setup.test.ts` crashed in two runs of the whole file on
+  the builds of this day, and passed in every run alone. The crash is in the compiler of
+  oven-sh/bun#47942, on a compile thread: `WTF::removeIterator` (`HashTable.h:1638`) under
+  `JSC::AOT::Typed::LinkFlow::findWhatSomeLaneWasGiven`, which `tellOnLanes` runs on several
+  threads. That reads like two lanes at one hash table under the iterator check of a debug
+  build. A reviewer saw it in two of three `--aot` runs of a fixture of its own. It was not
+  looked into further, nothing of this stack is on that path, and it is not fixed here.
+
+What a run that has no such file pays:
+
+- Outside of `bun test`: `ImportMetaObject::create` reads `isBunTest` and takes no branch, once
+  per `import.meta` that is made. The prototype has no new property.
+- Under `bun test`: one `CustomGetterSetter` for each global that builds the prototype of
+  `import.meta`. For each `import.meta` that is made, one call that reads a `bool` of the VM and,
+  while a test file has its turn, compares the key of the module with the path of the test
+  file. The new `bool` is at offset 0x49 of the cell, in the padding behind
+  `isOfCompiledModule`, so `sizeof(ImportMetaObject)` is 88 bytes as before (read from the DWARF
+  of the debug object file).
+- For each test file: one search for the text in the bytes of the file, each time that
+  `Environment::of_file` has read it. At the start of its turn two fields are reset, and at the
+  end one `bool` is tested.
+- For each directory entry without a test name, the scanner asks whether `includeSource` is
+  set. No file is opened for it when it is not.
+- The plugin state of a global has three more fields: a map, a string and a `bool`.
+- `bun test --aot` reads each test file once more before it compiles, to look for the text: the
+  compile has to know that an entry point runs again.
+
+None of this is measured. The design review asked for seven measurements on release builds of
+this commit and the one before it: syscalls with the feature unused, cells per global,
+instructions per `import.meta`, work per test file, syscalls of the scan, binary size, and the
+cost of a file that is evaluated again. There is no release build of the fork in the container,
+and `strace`, `perf`, `valgrind` and `bloaty` are not installed. The list above is read from the
+code. One count was taken, on the debug build, for a run that has such files: a chain of 200
+modules over 5 files with in-source tests, and 6 test files that import the chain, with the
+turns of the two kinds in alternation. It evaluates 210 modules, 205 for the test files and one
+more for each of the 5 turns. The second version evaluated 1,210.
+
+What is not done, and what was not run:
+
+- The tests run in a second copy of the file when something has loaded it, so the top-level
+  code of the file runs twice in one process. A file that registers itself under a fixed name in
+  a module that stays fails in its turn (`"plugin" is already registered`), and needs
+  `--isolate`. Vitest with `isolate: false` evaluates such a file twice as well.
+- A preload that imports the file keeps its copy for the turn of the file, and so does a module
+  that loaded the file with `import()`, which no import statement ties to it. A `beforeEach` of
+  the preload that resets the state of the file resets that copy, and the tests inside the file
+  do not see it. Vitest 5.1.0 has two copies there as well, and runs the tests of the file in
+  both: of four runs of two tests, the one that needs the reset in the second copy fails. Here
+  the two tests run once, and that one fails the same way.
+- A test file whose text has `import.meta.vitest` and whose tests are outside of the block:
+  a test file that imports it runs those tests, as it always did, and the turn of the file now
+  runs them too. The docs say to keep the tests in the block.
+- `import.meta.main` is `true` in the file while it runs as the test file, as in any test file,
+  and in the copy that a preload imports. The docs give the guard
+  `import.meta.main && !("vitest" in import.meta)`. In Vitest 5.1.0 `import.meta.main` is
+  `false` there.
+- `reactCompiler` leaves a test entry point alone, so the copy that runs the tests is not
+  compiled. The other test files import a compiled copy.
+- `--aot`: a compiled file has one copy, so the turn of an ES module with in-source tests runs
+  the file again in place, as `--rerun-each` does, and what imported it reads the new exports.
+  A compiled CommonJS file runs once in a realm, so one that has run before its turn fails with
+  a message that says so, where it would have had no tests. The message also comes for the
+  second run of such a file under `--rerun-each`.
+- The text has to be `import.meta.vitest`. A file that writes `import.meta?.vitest` or reads
+  the property through a variable is not found by `includeSource`, and gets no copy of its own
+  when something has loaded it. Vitest has the same test for the first of the two. A file in
+  UTF-16 is not found either.
+- A `vi.mock()` inside the block is not moved above the imports of the file. Vitest hoists it.
+- `assert` and `should` are not on the object, as they are not on `import * as vitest`.
+- A copy of the file that its own tests load under the same path, with `vi.resetModules()` or
+  after `delete require.cache[...]`, is the test file again and calls `test()` inside a test.
+  A `vm.SourceTextModule` that is given the path of the test file as its identifier reads the
+  module too. A plugin that resolves the test file into a namespace leaves it without tests,
+  because the key of the module is no longer the path.
+- There is no flag for `includeSource` on the command line. Vitest has none.
+- A `--rerun-each` of a CommonJS test file without the text still evaluates it once, as
+  upstream pins it.
+- `--watch` ran its first pass by hand, and no pass after a change. macOS and Windows were not
+  built or run.
+- `test/integration/bun-types/bun-types.test.ts`: 29 pass and 1 fails, "promises nothing that a
+  schema of the bindgen breaks", which runs `src/codegen/bindgen.ts` and stops at a directory of
+  the WebKit sources that this container does not have.
+
+To pick this commit onto upstream, these places need a hand, because it sits on other patches
+of this stack:
+
+- `src/runtime/cli/test/Scanner.rs` reads the patterns of `includeSource` with `TestMatch` of
+  the `testMatch` patch (2026-10-13), and the scan asks it beside `test_match`. Without that
+  patch, `includeSource` needs its own list of `bun_glob` patterns.
+- `src/bunfig/bunfig.rs` calls `module_paths()` of the `globalSetup` patch (2026-10-31).
+- `src/jsc/bindings/ImportMetaObject.cpp`: the accessor goes into
+  `ImportMetaObjectPrototype::finishCreation` next to `hot` of the `import.meta.hot` patch
+  (2026-11-05). Without that patch the function has no such block yet.
+- The docs sections refer to `testMatch`, and two tests use it.
+
+Rebase notes: 70 patches onto oven-sh/bun 2596ac5d39, one commit after the base of 2026-11-07.
+That commit is oven-sh/bun#47942, the rewritten ahead-of-time compiler, with 35,875 files.
+Eleven patches had text conflicts, all solved by hand: `--dry-run`, `lines()`,
+`--reporter=json`, `--last-failed`, the `bytes` loader, `kill`/`signal`/`timeout` of the shell,
+`globalName`, `collectCoverageFrom`, `alias`, `globalSetup` and `build.resolve()`. Four needed
+more than the text:
+
+- Web Storage: upstream now fails the build for a table of host functions that nothing reads,
+  so `JSStoragePrototypeTableValues` is in its list of known ones
+  (`src/codegen/builtins/collect-webcore-tables.ts`).
+- The `bytes` loader: `src/aot/load/loaders.rs` has a new error type and a match over every
+  loader.
+- SQL cursors: `PostgresSQLQuery::queue` lost the two lines of a field that upstream removed.
+- `globalSetup`: the `--aot` test compiles for most of a minute on a debug build, so it has a
+  timeout of three minutes.
+
+Nothing dropped. The fork's `bun-types`, `source-lints` and `Packages CI` runs for the push of
+2026-11-08 were green. The work took until the night after, about 02:30 UTC on 2026-11-10, most
+of it for the two rounds of review, the design review and the two rewrites.
+
+Files: `src/jsc/bindings/ImportMetaObject.cpp`, `src/jsc/bindings/ImportMetaObject.h`,
+`src/jsc/bindings/BunPlugin.cpp`, `src/jsc/bindings/BunPlugin.h`,
+`src/jsc/bindings/BunCompiledModules.cpp`, `src/jsc/bindings/headers-handwritten.h`,
+`src/jsc/VirtualMachine.rs`, `src/jsc/compiled_program.rs`, `src/runtime/cli/test_command.rs`,
+`src/runtime/cli/test/Scanner.rs`, `src/runtime/test_runner/environment.rs`,
+`src/runtime/test_runner/jest.rs`, `src/bunfig/bunfig.rs`, `src/options_types/context.rs`,
+`src/aot/load/runtime_types.rs`, `packages/bun-types/vitest.d.ts`,
+`docs/test/writing-tests.mdx`, `docs/test/configuration.mdx`, `docs/test/discovery.mdx`,
+`docs/runtime/bunfig.mdx`, `docs/compiler/debugging.mdx`, `test/cli/test/bun-test.test.ts`,
+`test/cli/test/test-aot.test.ts`, `test/integration/bun-types/fixture/vitest/patterns.ts`,
+`test/integration/bun-types/fixture/vitest/globals.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

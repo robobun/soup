@@ -418,6 +418,7 @@ extern "C" bool Bun__resolveAndFetchBuiltinModule(
 extern "C" bool Bun__VM__useIsolationSourceProviderCache(void* bunVM);
 extern "C" bool Bun__VM__isMainModule(void* bunVM, const BunString* key);
 extern "C" bool Bun__VM__isTestEntryPoint(void* bunVM, const BunString* key);
+extern "C" bool Bun__VM__isEntryOfTestFile(void* bunVM, const BunString* key);
 
 // Used in process.version
 extern "C" const char* Bun__version;

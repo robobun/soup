@@ -51,6 +51,7 @@
 #include "ModuleGraph.h"
 #include <JavaScriptCore/JSPromise.h>
 #include "PathInlines.h"
+#include "RemovableFeatures.h"
 #include "wtf/text/StringView.h"
 
 #include "isBuiltinModule.h"
@@ -96,7 +97,14 @@ ImportMetaObject* ImportMetaObject::create(JSC::JSGlobalObject* globalObject, JS
 
     WTF::String specifier = specifierOrURL.toWTFString(globalObject);
     ASSERT(specifier);
-    return ImportMetaObject::createFromSpecifier(globalObject, specifier);
+    auto* importMeta = ImportMetaObject::createFromSpecifier(globalObject, specifier);
+    // Every module gets its `import.meta` here, an ES module when it is linked and a CommonJS module when it starts.
+    if (isBunTest) [[unlikely]] {
+        auto* zigGlobalObject = uncheckedDowncast<Zig::GlobalObject>(globalObject);
+        auto key = Bun::toString(specifier);
+        importMeta->isEntryOfTestFile = zigGlobalObject->isThreadLocalDefaultGlobalObject && Bun__VM__isEntryOfTestFile(zigGlobalObject->bunVM(), &key);
+    }
+    return importMeta;
 }
 
 ImportMetaObject* ImportMetaObject::createFromSpecifier(JSC::JSGlobalObject* globalObject, const String& specifier)
@@ -766,6 +774,33 @@ JSC_DEFINE_CUSTOM_GETTER(jsImportMetaObjectGetter_hot, (JSGlobalObject*, JSC::En
     RELEASE_AND_RETURN(scope, JSValue::encode(callImportMetaHot(globalObject, hot.getObject(), "contextFor"_s, thisObject->urlProperty.getInitializedOnMainThread(thisObject))));
 }
 
+// `import.meta.vitest` in `bun test`: the "vitest" module in the module that the runner evaluates as the test file, as in Vitest, and
+// undefined in every other module. So the tests that a module keeps under `if (import.meta.vitest)` run in the turn of its file, and not
+// when something imports it.
+
+extern "C" JSC::EncodedJSValue Bun__Jest__vitestModuleObject(Zig::GlobalObject*);
+
+// The test runner goes out of a trimmed executable, and this call with it.
+static JSC::EncodedJSValue vitestModuleOfTestFile(Zig::GlobalObject* globalObject)
+{
+    BUN_BEGIN_REMOVABLE_ENTRY_POINT(Test, ReturnDefault, JSC::EncodedJSValue)
+    return Bun__Jest__vitestModuleObject(globalObject);
+    BUN_END_REMOVABLE_ENTRY_POINT
+}
+
+JSC_DEFINE_CUSTOM_GETTER(jsImportMetaObjectGetter_vitest, (JSGlobalObject*, JSC::EncodedJSValue thisValue, PropertyName))
+{
+    ImportMetaObject* thisObject = dynamicDowncast<ImportMetaObject>(JSValue::decode(thisValue));
+    if (!thisObject || !thisObject->isEntryOfTestFile)
+        return JSValue::encode(jsUndefined());
+
+    auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(thisObject->globalObject());
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+    JSValue vitest = JSValue::decode(vitestModuleOfTestFile(globalObject));
+    RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(vitest ? vitest : jsUndefined());
+}
+
 static const HashTableValue ImportMetaObjectPrototypeValues[] = {
     { "dir"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | PropertyAttribute::DontDelete), NoIntrinsic, { HashTableValue::GetterSetterType, jsImportMetaObjectGetter_dir, 0 } },
     { "dirname"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | PropertyAttribute::DontDelete), NoIntrinsic, { HashTableValue::GetterSetterType, jsImportMetaObjectGetter_dir, 0 } },
@@ -833,6 +868,12 @@ public:
             if (auto* globalObject = uncheckedDowncast<Zig::GlobalObject>(this->globalObject()); globalObject->isThreadLocalDefaultGlobalObject && Bun__VirtualMachine__hasImportMetaHot(globalObject->bunVM())) {
                 this->putDirectCustomAccessor(vm, Identifier::fromString(vm, "hot"_s),
                     JSC::CustomGetterSetter::create(vm, jsImportMetaObjectGetter_hot, nullptr),
+                    JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DontDelete);
+            }
+            // Outside of `bun test` the property does not exist either.
+            if (isBunTest) {
+                this->putDirectCustomAccessor(vm, Identifier::fromString(vm, "vitest"_s),
+                    JSC::CustomGetterSetter::create(vm, jsImportMetaObjectGetter_vitest, nullptr),
                     JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DontDelete);
             }
         }
@@ -949,6 +990,9 @@ void ImportMetaObject::finishCreation(VM& vm)
 void ImportMetaObject::setModuleGraph(JSC::VM& vm, Bun::JSModuleGraph* graph)
 {
     m_moduleGraph.setMayBeNull(vm, this, graph);
+    // The runner loads the test file into its own graph (--isolate=modules) or into none. A `new Bun.ModuleGraph()` of the program is neither.
+    if (isEntryOfTestFile && graph && graph != Bun::testFileModuleGraph(uncheckedDowncast<Zig::GlobalObject>(globalObject())))
+        isEntryOfTestFile = false;
 }
 
 template<typename Visitor>
