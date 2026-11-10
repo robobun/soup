@@ -29,6 +29,9 @@ pub(crate) struct Scanner<'a> {
     /// Glob patterns for paths to ignore. Matched against the path relative to the
     /// project root (top_level_dir). When a file matches any pattern, it is excluded.
     pub(crate) path_ignore_patterns: &'a [bun_glob::Prepared<&'a [u8]>],
+    /// `includeSource`: the source files that can hold their own tests. One that the patterns
+    /// name is a test file if its text says so ([`names_in_source_tests`]).
+    pub(crate) include_source: Option<&'a TestMatch>,
     pub(crate) dirs_to_scan: Fifo,
     /// Paths to test files found while scanning.
     pub(crate) test_files: Vec<Interned>,
@@ -80,6 +83,7 @@ impl<'a> Scanner<'a> {
             filter_names: &[],
             test_match: None,
             path_ignore_patterns: &[],
+            include_source: None,
             dirs_to_scan: Fifo::new(),
             options: &transpiler.options,
             fs: transpiler.resolver.fs(),
@@ -385,7 +389,10 @@ impl<'a> Scanner<'a> {
                     }
                     _ => self.could_be_test_file::<true>(name),
                 };
-                if !has_test_name {
+                // `includeSource` can name a file that has no test name.
+                if !has_test_name
+                    && (self.include_source.is_none() || !self.could_be_test_file::<false>(name))
+                {
                     return;
                 }
 
@@ -401,10 +408,16 @@ impl<'a> Scanner<'a> {
                 };
                 let path = &self.open_dir_buf[..path_len];
 
-                if let Some(test_match) = self.test_match {
-                    if !test_match.matches(path) {
-                        return;
-                    }
+                let is_test_by_name = has_test_name
+                    && self
+                        .test_match
+                        .is_none_or(|test_match| test_match.matches(path));
+                if !is_test_by_name
+                    && !self
+                        .include_source
+                        .is_some_and(|include_source| include_source.matches(path))
+                {
+                    return;
                 }
 
                 if !self.does_absolute_path_match_filter(path) {
@@ -415,6 +428,11 @@ impl<'a> Scanner<'a> {
                 }
 
                 if self.matches_path_ignore_pattern(path) {
+                    return;
+                }
+
+                // Read last: only a file that every other rule lets through is opened.
+                if !is_test_by_name && !file_names_in_source_tests(path) {
                     return;
                 }
 
@@ -431,6 +449,43 @@ impl<'a> Scanner<'a> {
 }
 
 pub(crate) const TEST_NAME_SUFFIXES: [&[u8]; 4] = [b".test", b"_test", b".spec", b"_spec"];
+
+/// What the text of a file with in-source tests has in it. Vitest looks for the same.
+const IN_SOURCE_TESTS: &[u8] = b"import.meta.vitest";
+
+/// Whether `text` is of a file with in-source tests: it names `import.meta.vitest`, which is
+/// the `"vitest"` module in the test file that runs and `undefined` in every other module.
+pub(crate) fn names_in_source_tests(text: &[u8]) -> bool {
+    strings::contains(text, IN_SOURCE_TESTS)
+}
+
+/// [`names_in_source_tests`] of the file at `path`, read in pieces up to the first that has the
+/// text. `includeSource` can match anything that has the name of a source file, so what is not
+/// a regular file is not read: a FIFO has no end, and nothing may be at its other end.
+pub(crate) fn file_names_in_source_tests(path: &[u8]) -> bool {
+    use bun_sys::{File, FileKind, O};
+    let Ok(file) = File::openat(Fd::cwd(), path, O::RDONLY | O::NONBLOCK | O::NOCTTY, 0) else {
+        return false;
+    };
+    if !file.kind().is_ok_and(|kind| kind == FileKind::File) {
+        return false;
+    }
+    let mut piece = vec![0u8; 64 * 1024];
+    let mut kept = 0;
+    loop {
+        let read = match file.read(&mut piece[kept..]) {
+            Ok(0) | Err(_) => return false,
+            Ok(read) => read,
+        };
+        let len = kept + read;
+        if names_in_source_tests(&piece[..len]) {
+            return true;
+        }
+        // The text can lie across two pieces.
+        kept = len.min(IN_SOURCE_TESTS.len() - 1);
+        piece.copy_within(len - kept..len, 0);
+    }
+}
 
 /// Whether the name of the file at `path` ends in one of [`TEST_NAME_SUFFIXES`] before its
 /// extension.
@@ -506,6 +561,16 @@ struct Pattern {
 }
 
 impl TestMatch {
+    /// The patterns of `includeSource`, which are read the way those of `testMatch` are. A
+    /// list that only takes files away names none.
+    pub(crate) fn of_include_source(
+        patterns: &[Box<[u8]>],
+        top_level_dir: &[u8],
+        root: &[u8],
+    ) -> Option<TestMatch> {
+        TestMatch::new(patterns, top_level_dir, root).filter(|list| !list.only_excludes)
+    }
+
     fn new(patterns: &[Box<[u8]>], top_level_dir: &[u8], root: &[u8]) -> Option<TestMatch> {
         if patterns.is_empty() {
             return None;

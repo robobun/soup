@@ -3046,6 +3046,814 @@ describe.concurrent("test file discovery (scanner)", () => {
   });
 });
 
+describe.concurrent("in-source tests", () => {
+  const passing = (name: string) =>
+    `import { test, expect } from "bun:test";\ntest(${JSON.stringify(name)}, () => {\n  expect(1).toBe(1);\n});\n`;
+
+  /** A module that exports `name` and tests it in place, the way the Vitest guide writes it. */
+  const source = (name: string, imports = "") => `${imports}
+console.log("LOAD ${name}");
+export function ${name}(a: number, b: number) {
+  return a + b;
+}
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("${name} in source", () => {
+    expect(${name}(1, 2)).toBe(3);
+  });
+}
+`;
+
+  async function bun(cwd: string, ...cmd: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), ...cmd],
+      cwd,
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  /** Runs `bun test` in `cwd`. `files` is the test files that ran and `passed` the tests that passed, both sorted. */
+  async function run(cwd: string, args: string[] = []) {
+    const { stdout, stderr, exitCode } = await bun(cwd, "test", ...args);
+    const files = Array.from(stderr.matchAll(/^(\S+):$/gm), match => match[1].replaceAll("\\", "/")).sort();
+    const passed = Array.from(stderr.matchAll(/^\(pass\) (.+?)(?: \[[\d.]+m?s\])?$/gm), match => match[1]).sort();
+    return { files, passed, stdout, stderr, exitCode };
+  }
+
+  /** What the modules of a run printed as they were evaluated, in that order. */
+  const loaded = (stdout: string) => stdout.split("\n").filter(line => line.startsWith("LOAD "));
+  const loads = (stdout: string, name: string) => loaded(stdout).filter(line => line === `LOAD ${name}`).length;
+
+  test("import.meta.vitest is the vitest module in the test file that runs", async () => {
+    using dir = tempDir("in-source", {
+      "math.ts": `
+export const add = (a: number, b: number) => a + b;
+
+if (import.meta.vitest) {
+  const { describe, test, expect, vi } = import.meta.vitest;
+  describe("add", () => {
+    test("adds", async context => {
+      expect(add(1, 2)).toBe(3);
+      // A test of "vitest" gets the test context, where one of "bun:test" gets a done callback.
+      expect(context.task.name).toBe("adds");
+      const vitest = await import("vitest");
+      expect(test).toBe(vitest.test);
+      expect(expect).toBe(vitest.expect);
+      expect(vi).toBe(vitest.vi);
+      // The keys of import.meta are what they were.
+      expect(Object.keys(import.meta)).toEqual([]);
+    });
+  });
+}
+`,
+    });
+
+    const { files, passed, stderr, exitCode } = await run(String(dir), ["./math.ts"]);
+    expect(stderr).toContain(" 1 pass");
+    expect({ files, passed }).toEqual({ files: ["math.ts"], passed: ["add > adds"] });
+    expect(exitCode).toBe(0);
+  });
+
+  test("it is undefined in what the test file imports, in a preload, in a Worker and outside of bun test", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\npreload = ["./preload.ts"]\n`,
+      "preload.ts": `console.log("preload:", typeof import.meta.vitest);\n`,
+      "dep.ts": `console.log("dep:", typeof import.meta.vitest);\nexport const dep = 1;\n`,
+      "worker.ts": `postMessage(typeof import.meta.vitest);\n`,
+      "entry.ts": `
+import { dep } from "./dep";
+console.log("entry:", typeof import.meta.vitest, "vitest" in import.meta);
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("in a worker", async () => {
+    const worker = new Worker(new URL("./worker.ts", import.meta.url).href);
+    const { promise, resolve, reject } = Promise.withResolvers();
+    worker.onmessage = event => resolve(event.data);
+    worker.onerror = reject;
+    expect(await promise).toBe("undefined");
+    await worker.terminate();
+    expect(dep).toBe(1);
+  });
+}
+`,
+    });
+
+    const [tested, ran] = await Promise.all([run(String(dir), ["./entry.ts"]), bun(String(dir), "entry.ts")]);
+
+    expect(tested.stderr).toContain(" 1 pass");
+    expect(tested.stdout.split("\n").filter(line => /^(preload|dep|entry):/.test(line))).toEqual([
+      "preload: undefined",
+      "dep: undefined",
+      "entry: object true",
+    ]);
+    expect(tested.exitCode).toBe(0);
+
+    // The import.meta of a program is what it was.
+    expect(ran.stderr).toBe("");
+    expect(ran.stdout).toBe("dep: undefined\nentry: undefined false\n");
+    expect(ran.exitCode).toBe(0);
+  });
+
+  test("includeSource names the source files that can have tests", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\nincludeSource = ["src/**/*.ts", "tools/*.mjs"]\n`,
+      "src/math.ts": source("math"),
+      "src/deep/er/nested.ts": source("nested"),
+      // Named by a pattern, with no test in it: not loaded.
+      "src/plain.ts": `console.log("LOAD plain");\nexport const plain = 1;\n`,
+      // A test in it, named by no pattern.
+      "src/view.tsx": source("view"),
+      "lib/other.ts": source("other"),
+      "tools/gen.mjs": source("gen").replaceAll(": number", ""),
+      "tools/deep/gen.mjs": source("deepgen").replaceAll(": number", ""),
+      // The scan reads a file in pieces of 64 KiB. Here the text begins in the first and ends in the second.
+      "src/late.ts": `// ${Buffer.alloc(65536 - 3 - 1 - source("late").indexOf("import.meta.vitest") - 9, "x").toString()}\n${source("late")}`,
+      "a.test.ts": passing("a"),
+    });
+
+    const { files, passed, stdout, stderr, exitCode } = await run(String(dir));
+    expect(stderr).toContain(" 5 pass");
+    expect({ files, passed }).toEqual({
+      files: ["a.test.ts", "src/deep/er/nested.ts", "src/late.ts", "src/math.ts", "tools/gen.mjs"],
+      passed: ["a", "gen in source", "late in source", "math in source", "nested in source"],
+    });
+    expect(loaded(stdout).sort()).toEqual(["LOAD gen", "LOAD late", "LOAD math", "LOAD nested"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("includeSource as one string, next to testMatch and to a file with a test name", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\nincludeSource = "src/*.ts"\ntestMatch = ["**/*.unit.ts"]\n`,
+      "src/math.ts": source("math"),
+      "src/deep/nested.ts": source("nested"),
+      // A file with a test name can be written the same way.
+      "src/guarded.unit.ts": source("guarded"),
+      "src/plain.unit.ts": passing("plain unit"),
+      "src/old.test.ts": passing("default name"),
+    });
+
+    const { files, passed, stderr, exitCode } = await run(String(dir));
+    expect(stderr).toContain(" 3 pass");
+    expect({ files, passed }).toEqual({
+      files: ["src/guarded.unit.ts", "src/math.ts", "src/plain.unit.ts"],
+      passed: ["guarded in source", "math in source", "plain unit"],
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  test("the patterns of includeSource are read as those of testMatch: ./ and ! have their meaning", async () => {
+    const files = {
+      "src/math.ts": source("math"),
+      "src/gen/out.ts": source("out"),
+      "a.test.ts": passing("a"),
+    };
+    using named = tempDir("in-source", {
+      ...files,
+      "bunfig.toml": `[test]\nincludeSource = ["./src/**/*.ts", "!src/gen/**"]\n`,
+    });
+    // Patterns that only take files away name none.
+    using takenAway = tempDir("in-source", { ...files, "bunfig.toml": `[test]\nincludeSource = ["!src/gen/**"]\n` });
+
+    const [some, none] = await Promise.all([run(String(named)), run(String(takenAway))]);
+    expect(some.stderr).toContain(" 2 pass");
+    expect(some.files).toEqual(["a.test.ts", "src/math.ts"]);
+    expect(some.exitCode).toBe(0);
+    expect(none.stderr).toContain(" 1 pass");
+    expect(none.files).toEqual(["a.test.ts"]);
+    expect(none.exitCode).toBe(0);
+  });
+
+  test("filters, pathIgnorePatterns, node_modules and hidden directories still decide", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\nincludeSource = ["**"]\npathIgnorePatterns = ["vendor/**"]\n`,
+      "src/math.ts": source("math"),
+      "src/text.ts": source("text"),
+      "vendor/lib.ts": source("vendor"),
+      "node_modules/pkg/index.ts": source("pkg"),
+      ".cache/gen.ts": source("gen"),
+      // Not code, though the pattern names it.
+      "src/notes.md": "import.meta.vitest\n",
+    });
+
+    const [all, filtered] = await Promise.all([run(String(dir)), run(String(dir), ["math"])]);
+    expect(all.stderr).toContain(" 2 pass");
+    expect(all.files).toEqual(["src/math.ts", "src/text.ts"]);
+    expect(all.exitCode).toBe(0);
+    expect(filtered.stderr).toContain(" 1 pass");
+    expect(filtered.files).toEqual(["src/math.ts"]);
+    expect(filtered.exitCode).toBe(0);
+  });
+
+  test("a source file that other files imported runs its tests in a copy of its own", async () => {
+    using dir = tempDir("in-source", {
+      "a.test.ts": `
+import { test, expect } from "bun:test";
+import { add } from "./src/add";
+test("a", () => {
+  expect(add(1, 1)).toBe(2);
+});
+`,
+      "src/add.ts": source("add", `import { sub } from "./sub";\nexport { sub };`),
+      "src/sub.ts": source("sub"),
+      "z.test.ts": `
+import { test, expect } from "bun:test";
+import { add, sub } from "./src/add";
+test("z", () => {
+  expect(add(1, 1) + sub(1, 1)).toBe(4);
+});
+`,
+    });
+
+    const { files, passed, stdout, stderr, exitCode } = await run(String(dir), [
+      "./a.test.ts",
+      "./src/add.ts",
+      "./src/sub.ts",
+      "./z.test.ts",
+    ]);
+    expect(stderr).toContain(" 4 pass");
+    expect({ files, passed }).toEqual({
+      files: ["a.test.ts", "src/add.ts", "src/sub.ts", "z.test.ts"],
+      passed: ["a", "add in source", "sub in source", "z"],
+    });
+    // For a.test.ts, then one for the turn of each file. The turn of `add` does not evaluate `sub`, and z.test.ts
+    // evaluates neither: the copies that a.test.ts loaded are back.
+    expect(loaded(stdout)).toEqual(["LOAD sub", "LOAD add", "LOAD add", "LOAD sub"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("the text decides, not the name: a test file with the guard, one without the text, and a file named twice", async () => {
+    using dir = tempDir("in-source", {
+      "a.test.ts": `import "./b.test";\nimport "./guarded.test";\nimport "./helper";\n` + passing("a"),
+      // Without the text, a file that something imported is not evaluated for its turn, as it never was.
+      "b.test.ts": `console.log("LOAD b");\n` + passing("b"),
+      "helper.ts": `console.log("LOAD helper");\n`,
+      "guarded.test.ts": `
+console.log("LOAD guarded");
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("guarded", () => {
+    expect(1).toBe(1);
+  });
+}
+`,
+      "src/zed.ts": source("zed"),
+    });
+
+    // The scan finds the three test files in the order of the directory, and the counts are the same in every order.
+    const [scanned, named] = await Promise.all([
+      run(String(dir)),
+      // `./helper.ts` is a path, so it runs as a test file. `./src/zed.ts` has had its turn when it is named again.
+      run(String(dir), [
+        "./a.test.ts",
+        "./b.test.ts",
+        "./guarded.test.ts",
+        "./helper.ts",
+        "./src/zed.ts",
+        "./src/zed.ts",
+      ]),
+    ]);
+    expect(scanned.stderr).toContain(" 3 pass");
+    expect({ files: scanned.files, passed: scanned.passed }).toEqual({
+      files: ["a.test.ts", "b.test.ts", "guarded.test.ts"],
+      passed: ["a", "b", "guarded"],
+    });
+    expect(loaded(scanned.stdout).sort()).toEqual(["LOAD b", "LOAD guarded", "LOAD guarded", "LOAD helper"]);
+    expect(scanned.exitCode).toBe(0);
+
+    expect(named.stderr).toContain(" 4 pass");
+    expect(named.passed).toEqual(["a", "b", "guarded", "zed in source"]);
+    expect(loaded(named.stdout)).toEqual([
+      "LOAD b",
+      "LOAD guarded",
+      "LOAD helper",
+      "LOAD guarded",
+      "LOAD zed",
+      // The second turn is an import like any other.
+      "LOAD zed",
+    ]);
+    expect(named.exitCode).toBe(0);
+  });
+
+  test("after the turn of the file, other test files have the copies that they had", async () => {
+    const importer = (name: string) => `
+import { test, expect } from "bun:test";
+import { Thing } from "./src/thing";
+import { made } from "./src/factory";
+import { lazily } from "./src/lazy";
+export const fixture = "${name}";
+test("${name}", () => {
+  expect(made()).toBeInstanceOf(Thing);
+  expect(lazily()).toBeInstanceOf(Thing);
+});
+`;
+    using dir = tempDir("in-source", {
+      "src/thing.ts": `
+console.log("LOAD thing");
+export class Thing {}
+export const make = () => new Thing();
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("thing in source", () => {
+    expect(make()).toBeInstanceOf(Thing);
+  });
+}
+`,
+      "src/factory.ts": `import { make } from "./thing";\nconsole.log("LOAD factory");\nexport const made = () => make();\n`,
+      // No import statement ties this one to the file.
+      "src/lazy.ts": `const { Thing } = await import("./thing");\nconsole.log("LOAD lazy");\nexport const lazily = () => new Thing();\n`,
+      "a.test.ts": importer("a"),
+      "z.test.ts": importer("z"),
+      // A test file that had its turn is not evaluated for the file that imports it.
+      "last.test.ts": `
+import { test, expect } from "bun:test";
+import { fixture } from "./a.test";
+test("last", () => {
+  expect(fixture).toBe("a");
+});
+`,
+    });
+
+    const { passed, stdout, stderr, exitCode } = await run(String(dir), [
+      "./a.test.ts",
+      "./src/thing.ts",
+      "./z.test.ts",
+      "./last.test.ts",
+    ]);
+    expect(stderr).toContain(" 4 pass");
+    expect(passed).toEqual(["a", "last", "thing in source", "z"]);
+    expect(loaded(stdout)).toEqual(["LOAD thing", "LOAD factory", "LOAD lazy", "LOAD thing"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a module that imports the file back is evaluated with it for the turn", async () => {
+    using dir = tempDir("in-source", {
+      "src/even.ts": `
+import { isOdd } from "./odd";
+console.log("LOAD even");
+export const calls = { count: 0 };
+export const isEven = (n: number): boolean => {
+  calls.count++;
+  return n === 0 || isOdd(n - 1);
+};
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("even in source", () => {
+    expect(isEven(4)).toBe(true);
+    // 4, 2 and 0 came to this copy: the copy of odd.ts that it imports calls no other.
+    expect(calls.count).toBe(3);
+  });
+}
+`,
+      "src/odd.ts": `import { isEven } from "./even";\nconsole.log("LOAD odd");\nexport const isOdd = (n: number): boolean => n !== 0 && isEven(n - 1);\n`,
+      "a.test.ts": `
+import { test, expect } from "bun:test";
+import { isOdd } from "./src/odd";
+test("a", () => {
+  expect(isOdd(3)).toBe(true);
+});
+`,
+    });
+
+    const { passed, stdout, stderr, exitCode } = await run(String(dir), ["./a.test.ts", "./src/even.ts"]);
+    expect(stderr).toContain(" 2 pass");
+    expect(passed).toEqual(["a", "even in source"]);
+    expect(loaded(stdout).sort()).toEqual(["LOAD even", "LOAD even", "LOAD odd", "LOAD odd"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a block that throws fails its file and no other", async () => {
+    const importer = (name: string) => `
+import { test, expect } from "bun:test";
+import { add } from "./src/math";
+test("${name}", () => {
+  expect(add(1, 2)).toBe(3);
+});
+`;
+    using dir = tempDir("in-source", {
+      "src/math.ts": `
+export const add = (a: number, b: number) => a + b;
+
+if (import.meta.vitest) {
+  throw new Error("thrown in the block");
+}
+`,
+      "a.test.ts": importer("a"),
+      "z.test.ts": importer("z"),
+    });
+
+    for (const { passed, stderr, exitCode } of await Promise.all([
+      run(String(dir), ["./a.test.ts", "./src/math.ts", "./z.test.ts"]),
+      run(String(dir), ["./src/math.ts", "./a.test.ts", "./z.test.ts"]),
+    ])) {
+      expect(stderr).toContain("error: thrown in the block");
+      expect(stderr).toContain(" 2 pass");
+      expect(passed).toEqual(["a", "z"]);
+      expect(exitCode).toBe(1);
+    }
+  });
+
+  test("a test file can mock the file, before its turn and after", async () => {
+    const real = (name: string) => `
+import { test, expect } from "bun:test";
+import { user } from "./src/user";
+test("${name}", () => {
+  expect(user()).toBe("real");
+});
+`;
+    using dir = tempDir("in-source", {
+      "src/api.ts": `
+export const fetchUser = () => "real";
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("api in source", () => {
+    expect(fetchUser()).toBe("real");
+  });
+}
+`,
+      "src/user.ts": `import { fetchUser } from "./api";\nexport const user = () => fetchUser();\n`,
+      "before.test.ts": real("before"),
+      "after.test.ts": real("after"),
+      "mocked.test.ts": `
+import { mock, test, expect } from "bun:test";
+mock.module("./src/api", () => ({ fetchUser: () => "mocked" }));
+const { user } = await import("./src/user");
+test("mocked", () => {
+  expect(user()).toBe("mocked");
+});
+`,
+    });
+
+    const [mockedLater, mockedFirst] = await Promise.all([
+      run(String(dir), ["./before.test.ts", "./src/api.ts", "./mocked.test.ts", "./after.test.ts"]),
+      run(String(dir), ["./mocked.test.ts", "./src/api.ts", "./after.test.ts"]),
+    ]);
+    expect(mockedLater.stderr).toContain(" 4 pass");
+    expect(mockedLater.passed).toEqual(["after", "api in source", "before", "mocked"]);
+    expect(mockedLater.exitCode).toBe(0);
+    expect(mockedFirst.stderr).toContain(" 3 pass");
+    expect(mockedFirst.passed).toEqual(["after", "api in source", "mocked"]);
+    expect(mockedFirst.exitCode).toBe(0);
+  });
+
+  test("the tests of the file can mock a module, and the file is a module like any other afterwards", async () => {
+    using dir = tempDir("in-source", {
+      "src/counter.ts": `
+export let count = 0;
+export const inc = () => ++count;
+export const send = async () => (await import("./transport")).send();
+
+if (import.meta.vitest) {
+  const { test, expect, vi } = import.meta.vitest;
+  test("counter in source", async () => {
+    vi.doMock("./transport", () => ({ send: () => "mocked" }));
+    expect(await send()).toBe("mocked");
+    expect(inc()).toBe(1);
+  });
+}
+`,
+      "src/transport.ts": `export const send = () => "sent";\n`,
+      "z.test.ts": `
+import { test, expect } from "bun:test";
+import { count, inc, send } from "./src/counter";
+test("z", async () => {
+  expect(await send()).toBe("sent");
+  // A binding of the module, and not a copy of what it was.
+  expect([count, inc(), count]).toEqual([0, 1, 1]);
+});
+`,
+    });
+
+    const [once, twice] = await Promise.all([
+      run(String(dir), ["./src/counter.ts", "./z.test.ts"]),
+      run(String(dir), ["--rerun-each=2", "./src/counter.ts"]),
+    ]);
+    expect(once.stderr).toContain(" 2 pass");
+    expect(once.passed).toEqual(["counter in source", "z"]);
+    expect(once.exitCode).toBe(0);
+    expect(twice.stderr).toContain(" 2 pass");
+    expect(twice.passed).toEqual(["counter in source", "counter in source"]);
+    expect(twice.exitCode).toBe(0);
+  });
+
+  test("a preload that mocks the file fails the file, where no test of it would run", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
+      "setup.ts": `import { mock } from "bun:test";\nmock.module("./src/db.ts", () => ({ query: () => "stubbed" }));\n`,
+      "src/db.ts": `
+export const query = () => "real";
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("db in source", () => {
+    expect(query()).toBe("real");
+  });
+}
+`,
+      "a.test.ts": `
+import { test, expect } from "bun:test";
+import { query } from "./src/db";
+test("a", () => {
+  expect(query()).toBe("stubbed");
+});
+`,
+    });
+
+    const { passed, stderr, exitCode } = await run(String(dir), ["./a.test.ts", "./src/db.ts"]);
+    expect(stderr).toContain("error: A preload mocks ");
+    expect(stderr).toContain(`db.ts", so its in-source tests cannot run`);
+    expect(stderr).toContain(" 1 pass");
+    expect(passed).toEqual(["a"]);
+    expect(exitCode).toBe(1);
+  });
+
+  test("a copy of the test file is not the test file", async () => {
+    using dir = tempDir("in-source", {
+      "src/self.ts": `
+const kinds: string[] = ((globalThis as any).kinds ??= []);
+kinds.push(typeof import.meta.vitest);
+export const readLater = () => typeof import.meta.vitest;
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("self in source", async () => {
+    // The copy that first.test.ts imported reads what it read then, also in the turn of its file.
+    const first = (globalThis as any).first;
+    expect(first).not.toBe(readLater);
+    expect([first(), readLater()]).toEqual(["undefined", "object"]);
+    await import("./self.ts?copy");
+    using graph = new Bun.ModuleGraph();
+    await graph.import(import.meta.path);
+    expect(kinds).toEqual(["undefined", "object", "undefined", "undefined"]);
+  });
+}
+`,
+      "first.test.ts": `
+import { test, expect } from "bun:test";
+import { readLater } from "./src/self";
+(globalThis as any).first = readLater;
+test("first", () => {
+  expect(readLater()).toBe("undefined");
+});
+`,
+      // The copy that ran the tests is gone, and the one of first.test.ts is back.
+      "last.test.ts": `
+import { test, expect } from "bun:test";
+import { readLater } from "./src/self";
+test("last", () => {
+  expect(readLater).toBe((globalThis as any).first);
+  expect((globalThis as any).kinds).toHaveLength(4);
+});
+`,
+    });
+
+    const { passed, stderr, exitCode } = await run(String(dir), ["./first.test.ts", "./src/self.ts", "./last.test.ts"]);
+    expect(stderr).toContain(" 3 pass");
+    expect(passed).toEqual(["first", "last", "self in source"]);
+    expect(exitCode).toBe(0);
+  });
+
+  // One at a time: a debug build takes seconds to load each file's modules afresh.
+  test.serial.each([
+    ["in one process", []],
+    ["--isolate", ["--isolate"]],
+    ["--isolate=modules", ["--isolate=modules"]],
+    ["--parallel=2", ["--parallel=2"]],
+  ] as [string, string[]][])(
+    "a preload that imports the file has its own copy, without the tests: %s",
+    async (mode, flags) => {
+      using dir = tempDir("in-source", {
+        "bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
+        "setup.ts": `
+import { beforeEach } from "bun:test";
+import { items } from "./src/store";
+beforeEach(() => {
+  items.length = 0;
+});
+`,
+        "src/store.ts": `
+console.log("LOAD store as", typeof import.meta.vitest);
+export const items: string[] = [];
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("store in source", () => {
+    expect(items).toEqual([]);
+  });
+}
+`,
+        "other.test.ts": `
+import { test, expect } from "bun:test";
+import { items } from "./src/store";
+test("other", () => {
+  items.push("other");
+  expect(items).toEqual(["other"]);
+});
+test("other again", () => {
+  expect(items).toEqual([]);
+});
+`,
+      });
+
+      const { passed, stdout, stderr, exitCode } = await run(String(dir), [
+        ...flags,
+        "./src/store.ts",
+        "./other.test.ts",
+      ]);
+      expect(stderr).toContain(" 3 pass");
+      expect(stderr).toContain(" 0 fail");
+      expect(passed).toEqual(["other", "other again", "store in source"]);
+      // What a worker prints comes out of the stderr of the run.
+      if (mode !== "--parallel=2") {
+        expect(loaded(stdout).filter(line => line === "LOAD store as object")).toHaveLength(1);
+      }
+      expect(exitCode).toBe(0);
+    },
+  );
+
+  test("a CommonJS file that a test file required runs its tests too", async () => {
+    using dir = tempDir("in-source", {
+      "src/add.cjs": `
+console.log("LOAD add");
+exports.add = (a, b) => a + b;
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+  test("add in source", () => {
+    expect(exports.add(1, 2)).toBe(3);
+  });
+}
+`,
+      "a.test.ts": `
+import { test, expect } from "bun:test";
+const { add } = require("./src/add.cjs");
+test("a", () => {
+  expect(add(1, 1)).toBe(2);
+});
+`,
+    });
+
+    const [once, twice] = await Promise.all([
+      run(String(dir), ["./a.test.ts", "./src/add.cjs"]),
+      run(String(dir), ["--rerun-each=2", "./a.test.ts", "./src/add.cjs"]),
+    ]);
+    expect(once.stderr).toContain(" 2 pass");
+    expect(once.passed).toEqual(["a", "add in source"]);
+    expect(loads(once.stdout, "add")).toBe(2);
+    expect(once.exitCode).toBe(0);
+    // The one that a.test.ts required, and one for each run of the file.
+    expect(twice.stderr).toContain(" 4 pass");
+    expect(twice.passed).toEqual(["a", "a", "add in source", "add in source"]);
+    expect(loads(twice.stdout, "add")).toBe(3);
+    expect(twice.exitCode).toBe(0);
+  });
+
+  test("a path that is not ASCII", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\nincludeSource = ["src/**"]\n`,
+      "src/数学-café.ts": source("math"),
+      "a.test.ts": `
+import { test, expect } from "bun:test";
+import { math } from "./src/数学-café";
+test("a", () => {
+  expect(math(1, 1)).toBe(2);
+});
+`,
+    });
+
+    const [scanned, named] = await Promise.all([
+      run(String(dir)),
+      run(String(dir), ["./a.test.ts", "./src/数学-café.ts"]),
+    ]);
+    expect(scanned.stderr).toContain(" 2 pass");
+    expect(scanned.files).toEqual(["a.test.ts", "src/数学-café.ts"]);
+    expect(scanned.exitCode).toBe(0);
+    expect(named.stderr).toContain(" 2 pass");
+    expect(named.passed).toEqual(["a", "math in source"]);
+    expect(loads(named.stdout, "math")).toBe(2);
+    expect(named.exitCode).toBe(0);
+  });
+
+  // One at a time: a debug build takes seconds to load each file's modules afresh.
+  test.serial.each([
+    ["--isolate"],
+    ["--isolate=modules"],
+    ["--parallel=2"],
+    ["--parallel=2 --no-isolate"],
+    ["--rerun-each=2"],
+  ])("with %s", async flags => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\nincludeSource = ["src/**"]\n`,
+      "a.test.ts": `
+import { test, expect } from "bun:test";
+import { add } from "./src/add";
+test("a", () => {
+  expect(add(1, 1)).toBe(2);
+});
+`,
+      "src/add.ts": source("add", `import { sub } from "./sub";\nexport { sub };`),
+      "src/sub.ts": source("sub"),
+    });
+
+    const { passed, stderr, exitCode } = await run(String(dir), flags.split(" "));
+    const twice = flags === "--rerun-each=2";
+    expect(stderr).toContain(twice ? " 6 pass" : " 3 pass");
+    expect(stderr).toContain(" 0 fail");
+    const once = ["a", "add in source", "sub in source"];
+    expect(passed).toEqual(twice ? [...once, ...once].sort() : once);
+    expect(exitCode).toBe(0);
+  });
+
+  test("coverageSkipTestFiles keeps a source file with tests in the report", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\nincludeSource = ["src/**"]\ncoverage = true\ncoverageSkipTestFiles = true\n`,
+      "src/math.ts": source("math"),
+      "src/math.test.ts": `
+import { test, expect } from "bun:test";
+import { math } from "./math";
+test("math", () => {
+  expect(math(2, 2)).toBe(4);
+});
+`,
+    });
+
+    const { files, stderr, exitCode } = await run(String(dir));
+    expect(stderr).toContain(" 2 pass");
+    expect(files).toEqual(["src/math.test.ts", "src/math.ts"]);
+    const covered = stderr
+      .split("\n")
+      .filter(line => line.includes("|"))
+      .map(line => line.split("|")[0].trim().replaceAll("\\", "/"))
+      .filter(file => file !== "File" && file !== "All files" && !/^-+$/.test(file));
+    expect(covered).toEqual(["src/math.ts"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test.each([
+    [`includeSource = 1`, "includeSource must be a string or array of strings"],
+    [`includeSource = ["src/**", 1]`, "includeSource must be a string or array of strings"],
+    [`includeSource = [""]`, "includeSource cannot be an empty string"],
+  ])("bunfig: %s is an error", async (line, message) => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\n${line}\n`,
+      "a.test.ts": passing("a"),
+    });
+
+    const { stderr, exitCode } = await run(String(dir));
+    expect(stderr).toContain(message);
+    expect(stderr).not.toContain(" 1 pass");
+    expect(exitCode).toBe(1);
+  });
+
+  test("a run that finds no test says what makes a source file a test file", async () => {
+    using dir = tempDir("in-source", {
+      "bunfig.toml": `[test]\nincludeSource = ["src/**"]\n`,
+      "src/plain.ts": `export const plain = 1;\n`,
+    });
+
+    const { stderr, exitCode } = await run(String(dir));
+    expect(stderr).toContain("No tests found!");
+    expect(stderr).toContain(
+      `note: A file that includeSource names is a test file if it has "import.meta.vitest" in it`,
+    );
+    expect(exitCode).toBe(1);
+  });
+
+  test("a define of import.meta.vitest keeps the tests out of a bundle, and is not for bun test", async () => {
+    // The [define] of bunfig.toml is for every command, and the flag is for one.
+    using configured = tempDir("in-source", {
+      "bunfig.toml": `[define]\n"import.meta.vitest" = "undefined"\n`,
+      "math.ts": source("math"),
+    });
+    using plain = tempDir("in-source", { "math.ts": source("math") });
+
+    const [built, tested, testedWithFlag] = await Promise.all([
+      bun(String(configured), "build", "./math.ts"),
+      run(String(configured), ["./math.ts"]),
+      run(String(plain), ["--define", "import.meta.vitest=undefined", "./math.ts"]),
+    ]);
+    expect(built.stderr).toBe("");
+    expect(built.stdout).toContain("function math(");
+    expect(built.stdout).not.toContain("in source");
+    expect(built.stdout).not.toContain("vitest");
+    expect(built.exitCode).toBe(0);
+
+    for (const { passed, stderr, exitCode } of [tested, testedWithFlag]) {
+      expect(stderr).toContain(" 1 pass");
+      expect(passed).toEqual(["math in source"]);
+      expect(exitCode).toBe(0);
+    }
+  });
+});
+
 function runFiles(files: Record<string, string>, ...args: string[]) {
   return runFilesWithEnv({}, files, ...args);
 }

@@ -279,6 +279,17 @@ pathIgnorePatterns = ["vendor/**", "submodules/**", "fixtures/**"]
 
 Equivalent CLI flag: `--path-ignore-patterns`. CLI flags override the `bunfig.toml` value entirely.
 
+### `test.includeSource`
+
+Glob patterns for source files that hold their own tests in an `if (import.meta.vitest)` block. `bun test` runs each file that a pattern matches and whose text contains `import.meta.vitest`, next to the files with a test name.
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+includeSource = ["src/**/*.ts"]
+```
+
+See [In-source testing](/test/writing-tests#in-source-testing).
+
 ### `test.smol`
 
 Same as the top-level `smol` field, but only applies to `bun test`.

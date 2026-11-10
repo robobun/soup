@@ -969,6 +969,11 @@ impl<'a> Parser<'a, '_> {
                     }
                 }
 
+                if let Some(expr) = test.get(b"includeSource") {
+                    self.ctx.test_options.include_source =
+                        self.module_paths(&expr, "includeSource")?;
+                }
+
                 // Kept next to `--test-match`, which replaces it for a scan only.
                 if let Some(expr) = test.get(b"testMatch") {
                     match &expr.data {

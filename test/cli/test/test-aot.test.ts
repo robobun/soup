@@ -354,6 +354,52 @@ describe.skipIf(!supported)("bun test --aot", () => {
     expect(exitCode).toBe(1);
   });
 
+  test.concurrent("a source file runs its in-source tests in its own turn, after a test file imported it", async () => {
+    const { stdout, stderr, exitCode } = await expectSameAsBunTest(
+      {
+        "a.test.ts": `
+          import { expect, test } from "bun:test";
+          import { add } from "./src/add";
+          test("a", () => { expect(add(1, 1)).toBe(2); });`,
+        "src/add.ts": `
+          console.log("add is evaluated as", typeof import.meta.vitest);
+          export const add = (a: number, b: number) => a + b;
+          if (import.meta.vitest) {
+            const { expect, test } = import.meta.vitest;
+            test("add in source", () => { expect(add(1, 2)).toBe(3); });
+          }`,
+      },
+      ["./a.test.ts", "./src/add.ts"],
+    );
+    expect(stdout).toContain("add is evaluated as undefined\nadd is evaluated as object\n");
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  // A compiled CommonJS file runs once, so there is no second run to hold the tests.
+  test.concurrent(
+    "a CommonJS file with in-source tests that a test file has required says why they cannot run",
+    async () => {
+      using dir = tempDir("test-aot", {
+        "a.test.ts": `
+        import { expect, test } from "bun:test";
+        const { add } = require("./src/add.cjs");
+        test("a", () => { expect(add(1, 1)).toBe(2); });`,
+        "src/add.cjs": `
+        exports.add = (a, b) => a + b;
+        if (import.meta.vitest) {
+          const { expect, test } = import.meta.vitest;
+          test("add in source", () => { expect(exports.add(1, 2)).toBe(3); });
+        }`,
+      });
+      const { stderr, exitCode } = await runTests(String(dir), true, ["./a.test.ts", "./src/add.cjs"]);
+      expect(stderr).toContain("add.cjs");
+      expect(stderr).toContain("has run, and --aot runs a CommonJS file once, so its in-source tests cannot run");
+      expect(stderr).toContain(" 1 pass");
+      expect(exitCode).toBe(1);
+    },
+  );
+
   test.concurrent("test files with the same name and different extensions", async () => {
     const file = (name: string) =>
       `import { test } from "bun:test"; test("in ${name}", () => { console.log("ran ${name}"); });`;

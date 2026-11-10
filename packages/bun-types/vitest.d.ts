@@ -796,3 +796,23 @@ declare module "vitest" {
   /** Always returns `undefined`, because `bun test` has no `provide` option or global setup file. */
   export function inject<T extends keyof ProvidedContext & string>(key: T): ProvidedContext[T] | undefined;
 }
+
+interface ImportMeta {
+  /**
+   * The `"vitest"` module, in the module that `bun test` runs as the test file. It's `undefined` in every other
+   * module, so a source file can keep its tests in an `if (import.meta.vitest)` block.
+   *
+   * @example
+   * ```ts
+   * export const add = (a: number, b: number) => a + b;
+   *
+   * if (import.meta.vitest) {
+   *   const { test, expect } = import.meta.vitest;
+   *   test("add", () => {
+   *     expect(add(1, 2)).toBe(3);
+   *   });
+   * }
+   * ```
+   */
+  readonly vitest?: typeof import("vitest");
+}

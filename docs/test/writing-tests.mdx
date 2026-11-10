@@ -552,6 +552,52 @@ A directive in one file of your project does the same as the `types` entry:
 - `assert` and `should` get their types from `@types/chai`. Without it, they are `any`. TypeScript accepts them through any kind of import, but only a named import works at run time.
 - `inject()` has the type `ProvidedContext[key] | undefined`, because it returns `undefined`.
 
+## In-source testing
+
+A module can hold its own tests, as in [Vitest](https://vitest.dev/guide/in-source). In the module that `bun test` runs as the test file, `import.meta.vitest` is the [`"vitest"` module](#importing-from-vitest). In every other module it's `undefined`, so the block below runs only when it's the turn of this file:
+
+```ts title="src/math.ts" icon="/icons/typescript.svg"
+export function add(...numbers: number[]) {
+  return numbers.reduce((a, b) => a + b, 0);
+}
+
+if (import.meta.vitest) {
+  const { test, expect } = import.meta.vitest;
+
+  test("add", () => {
+    expect(add()).toBe(0);
+    expect(add(1, 2, 3)).toBe(6);
+  });
+}
+```
+
+`bun test` finds such files through [`includeSource`](/test/configuration#includesource), a list of glob patterns in `bunfig.toml`:
+
+```toml title="bunfig.toml" icon="settings"
+[test]
+includeSource = ["src/**/*.ts"]
+```
+
+A file that a pattern matches is a test file if its text contains `import.meta.vitest`, so write the expression that way. Bun doesn't load the other files that the patterns match. A path on the command line needs no pattern: `bun test ./src/math.ts` runs that file.
+
+- `import.meta.vitest` is `undefined` in the modules that a test file imports, in a preload script and in a `Worker`. It's also `undefined` in a second copy of the test file, which `import("./math.ts?copy")` or a [`Bun.ModuleGraph`](/runtime/module-graph) loads. So the tests of `src/math.ts` run once, when it's the turn of that file, and not every time a test file imports it. Outside of `bun test`, `import.meta` has no such property.
+- The tests run in a copy of the file that lasts for the turn of the file. The other test files don't get that copy: when one of them imports the file, Bun evaluates it as an import, with `import.meta.vitest` undefined. So the top-level code of the file runs once for its tests, and once more if something imports it. If that code can run only once in a process, use [`--isolate`](/test/parallel).
+- Without [`--isolate` or `--parallel`](/test/parallel), all test files share their modules, and a test file has often imported a source file before its turn comes. Bun then puts that copy of the file aside for the turn, with the modules that import it, and brings them back when the file is done. The modules that the file imports are the ones of the other test files, unless they import the file back.
+- A [preload script](/test/configuration#preload-scripts) that imports the file keeps the copy that it loaded, and so does a module that loaded the file with `import()`. A hook of the preload that resets the state of the file resets that copy, and not the one that the tests run in. A preload that replaces the file with `mock.module()` fails the file: its tests are in the file, and the mock has taken its place.
+- Bun goes by the text and not by the name of a file. A `*.test.ts` file that contains `import.meta.vitest` runs in a copy of its own in the same way. Keep its tests inside the block: a test outside of it also runs in each test file that imports the file.
+- `import.meta.main` is `true` in the file while `bun test` runs it, as in every test file. If the file is also a program, start the program under `if (import.meta.main && !("vitest" in import.meta))`. Under `bun test` every module has the property, and outside of it none has.
+- The functions are the ones of `"vitest"`, so they differ from the ones of `"bun:test"` as the table [above](#importing-from-vitest) says. As with `import * as vitest from "vitest"`, `assert` and `should` aren't on the object. The globals of the file still come from `"bun:test"`, unless [`globals = "vitest"`](/test/configuration#globals) is set. Bun doesn't move a `vi.mock()` call of such a block above the imports of the file.
+- `bun test --coverage` reports the file as the source file that it is. [`coverageSkipTestFiles`](/test/configuration#skip-test-files-from-coverage) doesn't leave it out. [`reactCompiler`](/test/configuration#react-compiler) doesn't compile the copy that runs the tests.
+- For the type of `import.meta.vitest`, add `vitest/importMeta` to `types` in `tsconfig.json`. Once you have uninstalled `vitest`, [`bun-types/vitest`](#types) declares it.
+
+`bun build` keeps the block. To leave the tests out of a bundle, define the property as `undefined`:
+
+```sh terminal icon="terminal"
+bun build ./src/index.ts --outdir ./dist --define import.meta.vitest=undefined
+```
+
+`bun test` ignores a `define` of `import.meta.vitest`, so the tests still run in a project that sets it for every command in the [`[define]`](/runtime/bunfig#define) table of `bunfig.toml`.
+
 ## Promises
 
 `.resolves` and `.rejects` run the matcher on the value a promise resolves to or rejects with. They also accept a thenable or a function that returns a promise. The matcher returns a promise, so `await` it:

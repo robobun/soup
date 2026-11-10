@@ -494,6 +494,9 @@ pub struct TestOptions {
     pub test_match_flag: Vec<Box<[u8]>>,
     pub path_ignore_patterns: Vec<Box<[u8]>>,
     pub path_ignore_patterns_from_cli: bool,
+    /// `includeSource` in bunfig.toml: globs of the source files that can
+    /// hold their own tests, under `if (import.meta.vitest)`.
+    pub include_source: Vec<Box<[u8]>>,
     /// `--collect-coverage-from` was passed, so bunfig's `collectCoverageFrom`
     /// does not replace `coverage.collect_from`.
     pub collect_coverage_from_cli: bool,
@@ -686,6 +689,7 @@ impl Default for TestOptions {
             test_match_flag: Vec::new(),
             path_ignore_patterns: Vec::new(),
             path_ignore_patterns_from_cli: false,
+            include_source: Vec::new(),
             collect_coverage_from_cli: false,
             test_filter_pattern: None,
             test_filter_regex: None,

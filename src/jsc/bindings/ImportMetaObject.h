@@ -91,6 +91,10 @@ public:
     // The engine made it for a module of the executable, so its require() is a loader of the executable, whoever calls it.
     bool isOfCompiledModule { false };
 
+    // `bun test` is evaluating the module as the test file, so its `import.meta.vitest` is the "vitest" module. Decided when the cell is
+    // made: the copy of the file that something imported before its turn, a preload too, stays without it.
+    bool isEntryOfTestFile { false };
+
 private:
     static ImportMetaObject* create(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::Structure* structure, const WTF::String& url);
 
