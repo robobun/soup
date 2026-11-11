@@ -10185,6 +10185,403 @@ Files: `src/jsc/bindings/ImportMetaObject.cpp`, `src/jsc/bindings/ImportMetaObje
 `test/cli/test/test-aot.test.ts`, `test/integration/bun-types/fixture/vitest/patterns.ts`,
 `test/integration/bun-types/fixture/vitest/globals.ts`.
 
+### 2026-11-10: `Bun.SMTPClient`, email over SMTP
+
+Bun has a client for Postgres, MySQL, Redis and S3, and none for the oldest of the protocols a
+server speaks: it cannot send an email without a package. oven-sh/bun#1652 has asked for one
+since December 2022 and has 31 thumbs-up. oven-sh/bun#27327 (February 2026) is `Bun.SMTPClient`
+in Zig: 11,599 lines in 28 files, with DKIM and a table of well-known services, without types and
+without docs. It has had conflicts since the move to Rust. This patch takes the name of its
+class, the names of its methods and its result, and is a smaller thing underneath: one TypeScript
+builtin over the sockets of `Bun.connect`, with the types and a docs page.
+
+```ts
+const smtp = new Bun.SMTPClient(
+  "smtp://ada%40example.com:app-password@smtp.example.com:587",
+);
+
+const { messageId, accepted, rejected } = await smtp.send({
+  from: "Ada Lovelace <ada@example.com>",
+  to: ["grace@example.org", "Charles Babbage <charles@example.org>"],
+  subject: "Grüße 👋",
+  text: "It computed the Bernoulli numbers.",
+  html: '<p>It computed the <b>Bernoulli numbers</b>. <img src="cid:plot@example.com"></p>',
+  attachments: [
+    { filename: "notes.pdf", content: Bun.file("./notes.pdf") },
+    {
+      filename: "plot.png",
+      content: Bun.file("./plot.png"),
+      cid: "plot@example.com",
+    },
+  ],
+});
+
+await smtp.verify(); // connect and log in, to find a wrong password at startup
+await smtp.close(); // QUIT. Optional: an idle connection does not keep the process alive
+```
+
+The names of the options and of the message fields are Nodemailer's (`host`, `port`, `secure`,
+`requireTLS`, `ignoreTLS`, `auth: { user, pass }`, `tls`, `from`, `to`, `cc`, `bcc`, `replyTo`,
+`subject`, `text`, `html`, `attachments`, `headers`, `envelope`, `raw`), and the result is its
+`{ messageId, accepted, rejected, envelope, response }`, as in oven-sh/bun#27327. A URL is Bun's
+own addition, as `Bun.SQL` and `Bun.RedisClient` take one: `smtp://` for a port with STARTTLS,
+`smtps://` for a port that starts with TLS.
+
+The connection:
+
+- The client connects when the first message is sent, keeps the connection, and sends one message
+  at a time in the order of the `send()` calls. Before it uses a connection a second time it sends
+  `RSET`, because only a command finds out that the server closed an idle connection, and gives
+  the answer five seconds. Without one the client connects again. Nothing is sent twice: the
+  check comes before `MAIL FROM`.
+- An idle connection does not keep the process alive (the socket is unreferenced between
+  messages), so a script that sends a message exits. After `idleTimeout` (30 s, or `0` for never)
+  the client says `QUIT`. A connection carries 100 messages, and then the client opens a new one.
+  `close()` says `QUIT` after the messages that wait, and `await using` calls it. A closed client
+  connects again when it is used.
+- Port 465 and `smtps://` start with TLS. Every other port starts in clear text, and the client
+  sends `STARTTLS` when the server offers it and asks for the extensions again after the
+  handshake. The certificate and its name are checked, as for `fetch()`. The name is the host that
+  the program asked for unless `tls.serverName` (or `servername`) says otherwise.
+  `rejectUnauthorized: false` takes any certificate. `requireTLS` fails without `STARTTLS`, and
+  `ignoreTLS` never uses it.
+- `auth: { user, pass }` logs in with `AUTH PLAIN`, or with `AUTH LOGIN` where the server has only
+  that, and `auth: { user, accessToken }` with `AUTH XOAUTH2`. A response that does not fit on a
+  command line of 512 octets, such as an access token of 2,000 characters, goes on a line of its
+  own (RFC 4954). A server that offers no method for the credentials is an error. The message
+  does not go out without the login that was asked for.
+- `connectionTimeout` (30 s) covers everything up to a session that can take a message: the
+  connection, TLS, the greeting, `EHLO`, `STARTTLS` and the login. A connection attempt that hangs
+  is called off when the time is up, and the error says how far the attempt got. `socketTimeout`
+  (5 min, the time RFC 5321 gives a server) is for one reply, at any time.
+- The messages that wait while a connection attempt fails are rejected with its error, and are
+  not read or encoded first. A server that cannot be reached costs one timeout and not one per
+  message, and a wrong password costs one refused login.
+- With the code 421 a server says that it is closing the connection. The client says `QUIT` and
+  gives the session up. When the 421 answers `MAIL FROM`, `RCPT TO` or `DATA`, the server has
+  nothing of the message. If the connection was open before the message, the message then goes
+  over a new connection, once. In every other case `send()` rejects with the reply. A message
+  that a server may have is never sent again.
+- A `send()` that nothing waits for and that fails is an unhandled rejection, as it is for every
+  other promise. The client's own bookkeeping is not on the promise that the caller gets.
+
+Where it is stricter than Nodemailer, on purpose:
+
+- **Credentials do not cross a network in clear text.** When the connection is not encrypted and
+  the host is not `localhost`, `127.x.x.x` or `::1`, the client does not log in and `send()`
+  rejects with `ERR_SMTP_TLS`. `net/smtp` of Go has the same rule. Whoever sits between the client
+  and the server can take `STARTTLS` out of the reply to `EHLO`, and Nodemailer then sends the
+  password as base64. `ignoreTLS: true` is how a program says that the server really has no TLS.
+- **A line break in a field is an error.** A CR, an LF or a NUL in an address, a name, a subject,
+  a header name or value, a file name, a content type, a content ID or a message ID is a
+  `TypeError` before a connection is made. Nodemailer strips or folds them. A subject often comes
+  from a form on a web page, and an email that is sent anyway hides the attempt. An ID also takes
+  no other control character, and neither an ID nor the local part of an address may be what a
+  mail program reads as an encoded word.
+- **A name that is not known is an error.** An option, or a field of a message, of an attachment,
+  of an address or of an envelope, that the client does not know is a `TypeError`. `requireTls`
+  for `requireTLS` would be a check that is silently not made, and `priority` or
+  `envelope.sender` a message that differs from what the program meant. The names in `tls` are
+  checked too: `checkServerIdentity` is refused by name, because the socket would never call it.
+- **Only a plain object is read.** Options and fields are the own properties of the object, each
+  read once into an object without a prototype. What pollutes `Object.prototype`
+  (`ignoreTLS = true`, a `bcc`) is not an option and not a recipient. An instance of a class, an
+  object that inherits from another, or `headers: new Headers()` is a `TypeError`: what is on a
+  prototype would be read as if it were not there. It is the rule that `Bun.JWT` of this stack
+  has for a payload.
+- **No method of an object of the caller is called for what goes on the wire.** A list of
+  references is read by index, the time of a `Date` with the `getTime` of `Date.prototype`, and
+  the bytes of a `Blob` with the `bytes` of `Blob.prototype`.
+- **What the server says in clear text after its reply to `STARTTLS` is an error**, not the first
+  reply of the encrypted session (the client side of CVE-2011-0411).
+- **A raw message gets CRLF line ends.** A lone LF or CR becomes a CRLF before the dots are
+  stuffed, so `"\n.\n"` in a raw message cannot end the data for a server that takes a lone LF for
+  a line end (SMTP smuggling, CVE-2023-51764).
+- No error message shows a password, a token or the URL that they were in. An error about the
+  URL, the host or `auth` names the option and the type of the value, never the value, and
+  `Bun.inspect()` of a client shows the host, the port and two booleans.
+
+The message:
+
+- Everything on the wire is ASCII with CRLF line ends. A line has at most 78 characters wherever
+  there is a place to break it, and never more than 998. So a server needs no extension. Text that
+  is not ASCII is an encoded word (RFC 2047, base64, whole characters per word) in a header, and
+  quoted-printable in a body, where a soft line break never parts the bytes of one character and a
+  space at the end of a line is written as `=20`. A body of short ASCII lines is sent as it is
+  (`7bit`).
+- A header that is ASCII is written as it is and folded in front of its own white space, so that
+  unfolding gives it back to the last space, and a header that a program reads
+  (`List-Unsubscribe`) has no encoded word in it. Text that has a whole encoded word is written
+  as one, so that it arrives as it was written. A name with two spaces in a row is in quotes.
+- The tree is the one that mail programs expect: `multipart/mixed` of the body and the
+  attachments, the body a `multipart/alternative` of the text and the HTML, the HTML a
+  `multipart/related` (with `type="text/html"`) with the attachments that have a `cid`. A level
+  with one child is left out.
+- An attachment is a string, bytes, or a `Blob` such as `Bun.file()`. Bytes are copied when
+  `send()` is called, and a `Blob` is read when its message is about to be sent. The type comes
+  from the `Blob` when that says something, and otherwise from the extension of the file name.
+  A file name that is not ASCII, or that is longer than a line, is written twice, as mail
+  programs read one form or the other: `name="=?UTF-8?B?...?="` and `filename*=utf-8''...`
+  (RFC 2231, in numbered pieces of whole characters). An email is attached as `message/rfc822`
+  only when `contentType` says so, and then in `7bit`, as RFC 2046 requires. A `.eml` file
+  without the type is `application/octet-stream`.
+- A domain that is not ASCII is sent in its ASCII form. A local part that is not ASCII is taken
+  in the envelope only (`bcc`, `envelope`, the addresses of a raw message), and only by a server
+  that offers `SMTPUTF8`. In a header it is an error.
+- `bcc` is in the envelope and not in the headers. `envelope` (`from`, `to`, `cc`, `bcc`) sets the
+  sender and the recipients for the server apart from the headers, with `from: ""` for the null
+  sender. Its recipients take the place of those of the message. `raw` sends a message that is
+  already written, with `BODY=8BITMIME` when it has bytes that are not ASCII and the server has
+  the extension.
+- The `Date` header is worked out from the time value with integer arithmetic, for the years 1900
+  to 9999. No method of a `Date` is called, so a program that has put a mock in the place of
+  `Date` sends mail with the time that its `Date.now()` gives. `Message-ID` is a new UUID at the
+  domain of the sender. A boundary has 122 random bits and a counter.
+- The data goes out in one piece. A message with lines that start with a dot is copied once,
+  with the dots doubled, and not written line by line.
+
+Errors have `name: "SMTPError"` and one of eleven codes, from `ERR_SMTP_AUTHENTICATION_FAILED` to
+`ERR_SMTP_UNSUPPORTED`. When a reply of the server is the reason they carry `responseCode`,
+`response` (the reply with its code) and `command` (without its arguments), and
+`ERR_SMTP_RECIPIENTS_REJECTED` carries `rejected`. An error of the socket or of TLS
+(`ECONNREFUSED`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `ERR_TLS_CERT_ALTNAME_INVALID`) is passed on as it
+is. After a refusal of the sender, of every recipient or of the message, the connection takes the
+next message. A refusal that comes with a hang-up is the error, and not the closed connection:
+of the greeting, of `EHLO`, and of a message that is still going up, where the client waits for
+the socket to report its end so that what the server said before is read first.
+
+How it is built. `src/js/internal/smtp.ts` is loaded when `Bun.SMTPClient` is first read, like
+`Bun.Queue` and `Bun.JWT` of this stack. It has two halves that do not know each other: the
+message (addresses, headers, MIME) and the connection (one reply at a time, each read before the
+next command). The native side is the property in `BunObject.cpp` and eleven codes in
+`ErrorCode.ts`.
+
+- The socket is made in two steps, with the `newDetachedSocket` and `doConnect` that `node:net`
+  uses, so that a connection attempt can be called off. `Bun.connect()` gives the socket only
+  when it is connected, and a connect that hangs kept the process for about two minutes after
+  the timeout.
+- The socket is always one for clear text. TLS is put on it with `socket.upgradeTLS()`, for port
+  465 at once and for the others after `STARTTLS`. A detached socket that is made for TLS leaves
+  the check of the certificate name to `node:tls`, and `upgradeTLS()` makes it. The handlers of
+  the plain socket keep getting the encrypted bytes, and ignore them.
+- A write that the socket takes only part of waits for `drain`.
+- A session that the client gives up is ended with `unref()` and then `end()`, in that order: a
+  socket that has been ended is not asked again whether it holds the process, and with TLS it
+  waits up to ten seconds for a server that does not answer the close.
+- A client belongs to the `Bun.ModuleGraph` whose code made it. It takes
+  `AsyncContextFrame.currentGraphFrame()` when it is made and runs everything later in that
+  frame, whoever calls. So a graph that is disposed takes the connections of its own clients
+  along, as it takes every socket of `Bun.connect`, and leaves the connection of a host's client
+  that it only used. A client of a disposed graph rejects with `ERR_SMTP_CONNECTION_CLOSED`, says
+  `connected: false`, and its `close()` resolves.
+
+What changes for a program that does not use it: `Bun` has one more property, which loads
+nothing until it is read, `Object.keys(Bun)` has one more name, and the table of error codes has
+eleven more entries. The module is 61,410 bytes of JavaScript in the debug build. The size in a
+release build is not measured: the container has no release build of the fork.
+
+This is the third version, after two reviews. Each review had seven parts (the protocol, security,
+the message format, the life of a connection, the public surface, the rules for builtin modules,
+the tests), and a second reader tried to refute every finding before it counted.
+
+The first version was reviewed with 50 findings that held, two of them critical:
+
+- Header injection from input that has no CR, LF or NUL. An address with a local part that is
+  not ASCII was written into `From`, `To` or `Cc`, and the message was then turned into bytes one
+  byte per character, so U+010D and U+010A became a real CRLF on the wire. Now such an address
+  is refused in a header, and a message that is not ASCII after it was encoded is never sent.
+- `contentType` of an attachment took a CR or an LF in front of a `;`, the `Date` header was
+  written by the caller's own `toUTCString()`, and the constructor printed the password in some
+  of its errors.
+- A 421 was handled like any refusal. A connection attempt that hung stayed behind its timeout
+  for two minutes. Every message in the queue waited its own timeout for a server that was down.
+  A host's client that a `Bun.ModuleGraph` had used first hung for ever once that graph was
+  disposed. `tls.rejectUnauthorized: false` did not take a certificate for another name, and
+  `tls.servername` was overridden without a word.
+- Options and fields were read through the prototype chain, and names that were not known were
+  ignored, so `envelope.cc` of Nodemailer dropped its recipients silently.
+- Ten tests had `EHLO [127.0.0.1]` in their expectations and failed on a machine with a full
+  host name, and four assertions held with the behaviour they named taken out.
+
+The module and its tests were written again, and reviewed again: 38 findings, none critical,
+about 30 after the ones that more than one part found. The two injections stayed closed. What
+the second review found:
+
+- The door of the `Date` was open for one more object: a `references` array with a `join` or a
+  `map` of its own wrote what it liked into the header, and a `Blob` with a `bytes()` of its own
+  chose what was sent as `raw`.
+- Reading only own properties had opened the opposite hole. An options object that is an
+  instance of a class, or that inherits from its defaults, was read as empty: the client talked
+  to `localhost:587` without `requireTLS` and without a login, and said nothing.
+- A `send()` that nobody awaited failed without a trace, because the client had its own handler
+  on the promise it returned.
+- A body of lines that start with a dot cost two socket writes a line: 4 MB of them took 20 to
+  35 seconds and 480 MB, and over TLS each write was a record of its own, 16 times the size of
+  the message. Now 4 MB of such lines go out in 459 ms (release bun, the module as a file).
+- The refusal that a server sends in the middle of an upload was lost again whenever the
+  client's own write found the connection closed first. Its test sent a one-line message and
+  never reached the code.
+- After the client gave up a TLS session, the process stayed for 12 seconds when the server did
+  not answer the close. `host: ""` next to a URL sent the credentials of the URL to this machine.
+  The errors about `host` and `name` printed the value, which is a URL with a password when the
+  value is wrong in the usual way. Unknown names in `tls` were dropped. An ID took an escape
+  sequence. A header that a program reads was turned into encoded words for a `=?` in a URL. A
+  long access token did not fit on the command line of `AUTH`. A `Blob` whose type was not a
+  media type made `send()` fail for a field that nobody had set.
+- Tests: nothing noticed a message that was sent twice, the rule about credentials had one host
+  name and one kind of credential, and five fixes of the first round were not reached by the
+  tests that came with them.
+
+Every finding of both reviews is dealt with in this version. Most are fixed, each with a test.
+A few are what the docs now say: the retry after 421 on a connection that only a `verify()` had
+used, the white space at the ends of a header that mail programs drop, the list of differences
+from Nodemailer, and where to read the `code` of a socket error in TypeScript. One fix has no
+test: the five seconds that the check of a used connection may take, which a test would have to
+wait for. To see that the tests hold, 36 of the checks were taken out one at a time in a copy of
+the module, and each time at least one test failed. That ran on the released bun with the module
+loaded as a file, where the 12 tests that start a process or need a `Bun.ModuleGraph` cannot
+run. The version after the second round was not reviewed a third time.
+
+Tests, in `test/js/bun/smtp/`: 96 tests in two files, and a scripted mail server
+(`mail-server.ts`, over `node:net` and `node:tls`) that records the commands of each session. All
+pass on the debug build, but for the first run after a link (see below), and all fail on bun
+1.4.3.
+
+- `smtp-message.test.ts` (26): the headers, the body and the result of a message; text and HTML as
+  alternatives; quoted-printable; attachments from strings, bytes and `Bun.file()`, and the type
+  that each gets; a long file name that is not ASCII; an inline image; boundaries where
+  `crypto.randomUUID` is a mock; an attached email; encoded words and folding; headers that
+  arrive as they were written, to the last space; lines of at most 78 characters; `bcc` and
+  `envelope`; lines that start with a dot, and the number of writes that 20,000 of them cost; a
+  lone CR; a raw message and `BODY=8BITMIME`; bytes that change after `send()`; a `Date` whose
+  methods lie, an array and a `Blob` with methods of their own, and a program without the
+  built-in `Date`; a table of 53 fields with a line break, a control character or an encoded
+  word where none may be, none of which makes a connection; names that are not known; objects
+  that are not plain; errors that do not repeat the message; fields that are read once, and a
+  polluted `Object.prototype`.
+- `smtp.test.ts` (70): the commands of a session and their order; `close()` with messages
+  waiting; a connection that the server closed while it was idle, one that does not answer the
+  check, and a reply that nothing asked for; replies of several lines and in pieces; the `HELO`
+  fallback; `await using`; the process that exits with an idle connection (clear text, after
+  `STARTTLS`, with TLS), after a connection attempt that hangs, and after a TLS session that the
+  server leaves open; a `send()` that nobody awaits; `idleTimeout`; the `Bun.ModuleGraph` that
+  owns what it made; 4 MB on the wire with and without TLS; 421 in every place, and a message
+  that is not sent twice; the hundred messages of a connection; the shared error of a failed
+  attempt; `PLAIN`, `LOGIN` and `XOAUTH2`, and a response that is too long for the command line;
+  a refused login without the password in the error; certificates that are not trusted or are
+  for another name; `requireTLS` and `ignoreTLS`; a refused `STARTTLS`; what the server offered
+  before TLS; credentials that stay off a clear-text connection, for five names of this machine
+  and both kinds of credential; clear text behind the reply to `STARTTLS`; a handshake that does
+  not finish, under each of the two timeouts; refusals with and without a hang-up, also in the
+  middle of 6 MB; `SMTPUTF8`; the forms of the constructor, the options it refuses, and what its
+  errors do not show.
+
+Other checks, on the debug build of this commit unless it says otherwise:
+
+- Against a mail server that is not this patch's own: `smtp-server` 3.21.4 of Nodemailer, with
+  `mailparser` 3.14.3 to read what arrived. `STARTTLS` with `AUTH PLAIN` and a message with names
+  that are not ASCII, a domain that is not ASCII, four attachments and an inline image; TLS from
+  the first byte with `AUTH LOGIN`; `XOAUTH2`; a wrong password and a wrong token; three messages
+  over one connection; a raw message; the `SIZE` limit. Everything arrived as it was sent. The
+  script is not in the repository: the tests do not install packages.
+- 2,100 random messages (subjects and names with punctuation, control characters, emoji and
+  right-to-left text, bodies with every kind of line end, dots, `From ` and `=`, attachments of 0
+  to 5,000 bytes under odd names) through the client and `mailparser`: every field and every byte
+  came back. 400 of them through the `email` parser of Python 3.13 with its strict policy: no
+  line over 998, no byte that is not ASCII, and two kinds of defect, both expected. One is the
+  encoded words in the quoted `name` parameter, which is the form that Nodemailer, Thunderbird and
+  Gmail write. The other is the control characters that the input had in a display name. These
+  runs used the released bun with the module loaded as a file, because a debug build is 10 to 50
+  times slower.
+- The date arithmetic against `Date.prototype.toUTCString()`: two million random times between
+  the years 1900 and 9999, and every day from 1899 to 2101. No difference.
+- A text body of 4 MB that is not ASCII goes out in 321 ms, quoted-printable and the socket
+  included, on the released bun with the module as a file. The first version took about 10 s.
+- `test/integration/bun-types/bun-types.test.ts`: 30 pass, with
+  `test/integration/bun-types/fixture/smtp.ts`.
+- `bun lint` has no finding in the new files, and `src/codegen/check-types-of-modules.ts` has
+  none in `src/js/internal/smtp.ts`.
+- `test/internal/source-lints/` (204) and the tables of builtin modules and of second texts in
+  `test/internal/` (156 and one skipped), all with the released bun, because the debug build runs
+  into the timeouts of these. In the last run of the source lints two ran into their timeouts on
+  a busy machine, "no tracked file of the compiler or its tests is ignored" and "C++ sources
+  compiled into Bun do not include <iostream>", and both pass alone. "Every property of Bun is
+  classified" of `module-graph-isolation.test.ts` passes on the debug build.
+
+What is not done, and what was not run:
+
+- No message went to a mail service on the internet. Every server was on `127.0.0.1`: the
+  scripted one and Nodemailer's. Gmail, Outlook, Amazon SES and Postfix were not tried, and
+  `XOAUTH2` has only seen the implementation of `smtp-server`.
+- macOS and Windows were not built or run. The test of a connection attempt that hangs is
+  skipped on Windows and on musl, as the other users of its helper are.
+- There is no pool of connections, no streaming of a message, no DKIM, no `CRAM-MD5` or
+  `OAUTHBEARER`, no `DSN`, no `PIPELINING`, no group syntax in address lists, no `service` table
+  and no `tls.checkServerIdentity`. oven-sh/bun#27327 has DKIM and the table.
+- A local part that is not ASCII is refused in a header. Writing one needs the message itself to
+  be `SMTPUTF8` (RFC 6532), which this client never writes.
+- The names of `tls` are a list in the module, taken from `src/runtime/socket/SSLConfig.bind.ts`.
+  A TLS option that upstream adds there is refused by this client until the list has it.
+- A `Message-ID` of the client's own making is longer than 78 characters when the domain of the
+  sender is longer than 38. There is no place to fold it.
+- The tests of the rule about credentials need a name for this machine that is not a loopback
+  name. Five are tried, and a name that does not reach the machine is a skipped test. All five
+  connect in this container.
+- In the first run after the debug binary was linked, one test ran into the 5 seconds of the
+  default, twice out of the last three links and a different test each time: "an address that
+  needs SMTPUTF8 is only sent to a server that has it", which loads `node:url` for a domain that
+  is not ASCII, and "an idle connection does not keep the process alive in clear text", which
+  starts a process. Such a run takes 60 to 90 seconds, and every later one 30 to 35, with 96
+  passing in eight of them. That reads like a binary of 1.6 GB that is not in the page cache
+  yet. It was not looked into further.
+- Nothing is measured on a release build of the fork: the container has none.
+
+One trap of the build is worth knowing for whoever writes a builtin module. The preprocessor that
+turns `$ERR_...(` and the other `$` intrinsics into calls (`src/codegen/builtin-parser.ts`) reads
+`\\]` in a regex literal as an escaped bracket. After `/["\\]/g` it skipped to the next `]` of the
+file and left eleven `$ERR_INVALID_ARG_VALUE(` calls as they were: no build error, and a
+`ReferenceError` when one of them ran. The class is written `[\\"]` here, every pattern of the
+module is a constant at the top, and a comment there says why. Upstream has the same shape in
+`src/js/internal/fs/glob.ts`, where no intrinsic comes after it. The fix is not in this patch,
+because it is not part of the feature. It was handed off as a separate bug and the hand-off was
+discarded, so this paragraph is the only place where it is written down.
+
+Rebase notes: 71 patches onto oven-sh/bun 98cda0d8b12, four commits after the base of 2026-11-09.
+One of the four is oven-sh/bun#48120, the compiler's new optimizations with a newer WebKit. Three
+patches had text conflicts, all solved by hand: the `bytes` loader (`src/bundler/ParseTask.rs`),
+the `kind` of a CSS import (both tests kept in `test/bundler/bun-build-api.test.ts`) and in-source
+tests (`docs/compiler/debugging.mdx`, `BunPlugin.cpp`, `compiled_program.rs`). Two needed more
+than the text:
+
+- In-source tests: `JSC::AOT::isEvaluatedFile` is gone from WebKit. `Bun__AOT__hasRunCommonJSFile`
+  asks `JSC::AOT::hasRequireCacheEntry` now.
+- Web Locks: `test/internal/second-texts-of-modules.test.ts` failed for
+  `node/worker_threads.ts`, whose first text has the `locks` getter of that patch. The second
+  text in `src/js/ahead-of-time/` has it now, with the new SHA-256 of the first.
+
+Nothing dropped. The fork's `bun-types`, `source-lints` and `Packages CI` runs for the push of
+the rebased stack (6c2f0c17aae) were green. The work took from the morning of 2026-11-10 to about
+00:30 UTC on 2026-11-11, most of it for the two reviews and the two rewrites. The second review
+alone took 3.4 hours.
+
+One more thing was found and fixed on the way. `bun src/codegen/check-types-of-modules.ts` is a
+step of upstream's `lint.yml` that the fork's CI does not run. It reported 27 type errors of this
+stack: 26 in `src/js/internal/sql/postgres.ts`, from the cursors patch of 2026-10-26 (two members
+under symbols that TypeScript takes for one, and a `case` that falls through), and one in
+`src/js/internal/static_server.ts`, from `bun serve` (the `Stats` of `node:fs` where the module
+has one of its own). Both patches have the fix now: casts, a `@ts-expect-error falls through` as
+`src/js/internal/readline/interface.ts` has one, and `$Node.Stats`. The JavaScript that the build
+makes of the two modules is the same to the byte, with the same SHA-256 before and after, so no
+test was run again for them. What the check still reports in this container is three errors
+about `vendor/WebKit`, which the container does not have and the lint job downloads.
+
+Files: `src/js/internal/smtp.ts`, `src/jsc/bindings/BunObject.cpp`,
+`src/jsc/bindings/ErrorCode.ts`, `packages/bun-types/bun.d.ts`,
+`docs/runtime/networking/smtp.mdx`, `docs/runtime/bun-apis.mdx`, `docs/docs.json`,
+`test/js/bun/smtp/smtp.test.ts`, `test/js/bun/smtp/smtp-message.test.ts`,
+`test/js/bun/smtp/mail-server.ts`, `test/js/bun/module-graph/module-graph-isolation.test.ts`,
+`test/integration/bun-types/fixture/smtp.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

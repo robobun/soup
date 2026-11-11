@@ -11108,6 +11108,392 @@ declare module "bun" {
     }
   }
 
+  /**
+   * A client for SMTP: it writes a message (headers, text, HTML, attachments)
+   * and hands it to a mail server.
+   *
+   * A client keeps one connection. It connects when the first message is sent,
+   * sends one message after the other in the order of the calls, and connects
+   * again when the server has closed the connection in between. An idle
+   * connection does not keep the process alive, and is closed after
+   * `idleTimeout`.
+   *
+   * The names of the options and of the message fields are those of
+   * [Nodemailer](https://nodemailer.com/) where it has them. A name that is
+   * not known is a `TypeError`, not something to ignore.
+   *
+   * @example
+   * ```ts
+   * const smtp = new Bun.SMTPClient("smtp://ada%40example.com:app-password@smtp.example.com:587");
+   *
+   * const { messageId, accepted } = await smtp.send({
+   *   from: "Ada Lovelace <ada@example.com>",
+   *   to: "grace@example.org",
+   *   subject: "The engine works",
+   *   text: "It computed the Bernoulli numbers.",
+   *   html: "<p>It computed the <b>Bernoulli numbers</b>.</p>",
+   *   attachments: [{ filename: "notes.pdf", content: Bun.file("./notes.pdf") }],
+   * });
+   * ```
+   *
+   * @category HTTP & Networking
+   */
+  class SMTPClient implements Disposable, AsyncDisposable {
+    /**
+     * @param url `smtp://user:password@host:port`, or `smtps://` for a port
+     * that starts with TLS. Write a user or a password in percent-encoding.
+     */
+    constructor(url: string | URL, options?: Omit<SMTPClient.Options, "url">);
+    constructor(options: SMTPClient.Options);
+
+    /** Whether a connection to the server is open. */
+    readonly connected: boolean;
+
+    /**
+     * Whether what is sent is encrypted: on the open connection, after
+     * STARTTLS too, or from the first byte of the next connection.
+     */
+    readonly secure: boolean;
+
+    /**
+     * Sends one message.
+     *
+     * The promise is fulfilled when the server has taken the message for at
+     * least one recipient, and rejected with an {@link SMTPClient.Error} when
+     * the server refused it, or with a `TypeError` when a field of the message
+     * is not valid. A field with a line break in it is not valid: nothing a
+     * program passes in can add a header or a command.
+     *
+     * The message is checked, and its bytes are copied, before `send()`
+     * returns. The content of a `Blob` such as `Bun.file()` is read when the
+     * message is about to be sent.
+     *
+     * A `send()` that nothing waits for and that fails is an unhandled
+     * rejection, like any other promise.
+     */
+    send(message: SMTPClient.Message | SMTPClient.RawMessage): Promise<SMTPClient.SendResult>;
+
+    /**
+     * Connects and logs in without sending a message, or checks that the open
+     * connection is still there. The promise is rejected with what went wrong.
+     */
+    verify(): Promise<true>;
+
+    /**
+     * Sends the messages that are waiting, says `QUIT` and closes the
+     * connection. The client can be used again and connects again.
+     */
+    close(): Promise<void>;
+
+    /** Calls {@link SMTPClient.close} and does not wait for it. */
+    [Symbol.dispose](): void;
+    /** Calls {@link SMTPClient.close}. */
+    [Symbol.asyncDispose](): Promise<void>;
+  }
+
+  namespace SMTPClient {
+    /**
+     * An option that is not listed here is a `TypeError`. The options are a
+     * plain object: what an instance of a class has, or an object that
+     * inherits from another, is not read, and is a `TypeError` too.
+     */
+    interface Options {
+      /**
+       * `smtp://user:password@host:port` or `smtps://...`, with nothing after
+       * the port. The other options win over what it says.
+       */
+      url?: string | URL;
+
+      /** @default "localhost" */
+      host?: string;
+      /** The same as {@link Options.host}. */
+      hostname?: string;
+
+      /**
+       * @default 465 with `secure: true`, otherwise 587
+       */
+      port?: number;
+
+      /**
+       * Start with TLS, as servers do on port 465. Without it the connection
+       * starts in clear text and is upgraded with `STARTTLS` when the server
+       * offers that, as servers do on port 587 and 25.
+       *
+       * @default true for port 465 and for `smtps://`, otherwise false
+       */
+      secure?: boolean;
+
+      /**
+       * Fail when the server does not offer `STARTTLS`.
+       *
+       * @default false
+       */
+      requireTLS?: boolean;
+
+      /**
+       * Do not use `STARTTLS`, and send the credentials over a connection that
+       * is not encrypted. Without it, a connection to a host other than this
+       * machine has to be encrypted before the client logs in.
+       *
+       * @default false
+       */
+      ignoreTLS?: boolean;
+
+      /**
+       * Options for TLS, from the first byte or after `STARTTLS`. The
+       * certificate is checked against `serverName`, which is the host by
+       * default. `rejectUnauthorized: false` takes any certificate: one that
+       * is not trusted, and one for another name.
+       *
+       * A name that the socket does not read is a `TypeError`, as an option
+       * is. `checkServerIdentity` of `node:tls` is such a name.
+       */
+      tls?: TLSOptions;
+
+      /** The credentials to log in with. A URL with a user has them too. */
+      auth?: Auth;
+
+      /**
+       * What the client calls itself in `EHLO`: a host name, or an address
+       * literal such as `[192.0.2.1]`.
+       *
+       * @default the host name of the machine if it has a dot, otherwise `[127.0.0.1]`
+       */
+      name?: string;
+
+      /**
+       * How many milliseconds it may take until the server is ready for a
+       * message: the connection, TLS, the greeting of the server and the login
+       * together.
+       *
+       * @default 30000
+       */
+      connectionTimeout?: number;
+
+      /**
+       * How many milliseconds the server may take for one reply, for the TLS
+       * handshake, or to take more data. It counts at any time, also while
+       * `connectionTimeout` does.
+       *
+       * @default 300000
+       */
+      socketTimeout?: number;
+
+      /**
+       * How many milliseconds a connection stays open without a message
+       * before the client says `QUIT`. The next message connects again. `0`
+       * keeps the connection until {@link SMTPClient.close}, or until the
+       * server closes it.
+       *
+       * @default 30000
+       */
+      idleTimeout?: number;
+    }
+
+    /**
+     * A user with a password is sent with `AUTH PLAIN`, or with `AUTH LOGIN`
+     * where the server has only that. A user with an OAuth 2.0 access token is
+     * sent with `AUTH XOAUTH2`, which Gmail and Outlook take.
+     */
+    type Auth =
+      | { user: string; pass: string; accessToken?: undefined; method?: "PLAIN" | "LOGIN" }
+      | { user: string; accessToken: string; pass?: undefined; method?: "XOAUTH2" };
+
+    interface Address {
+      /** The name that mail programs show. */
+      name?: string;
+      /** `ada@example.com`, without a name and without angle brackets. */
+      address: string;
+    }
+
+    /**
+     * `"ada@example.com"`, `"Ada Lovelace <ada@example.com>"`, a list of those
+     * with commas between them, an {@link Address}, or an array of any of them.
+     */
+    type Addresses = string | Address | ReadonlyArray<string | Address>;
+
+    interface Attachment {
+      /**
+       * The name of the file. The default is the last part of `path`, or of
+       * the path of a `Bun.file()`.
+       */
+      filename?: string;
+
+      /**
+       * The content of the file. A string is UTF-8 text unless `encoding` says
+       * otherwise. Bytes are copied when `send()` is called, and a `Blob` is
+       * read when its message is about to be sent.
+       *
+       * @example
+       * ```ts
+       * { filename: "report.pdf", content: Bun.file("./report.pdf") }
+       * ```
+       */
+      content?: string | ArrayBufferView | ArrayBufferLike | Blob;
+
+      /** A file to read the content from, in place of `content`. */
+      path?: string;
+
+      /** What a `content` string is written in, for example `"base64"`. */
+      encoding?: BufferEncoding;
+
+      /**
+       * The media type. `"message/rfc822"` attaches an email as a message,
+       * which has to be ASCII in lines of at most 998 characters.
+       *
+       * @default the type of the `Blob` if it says something, or what the extension of `filename` says
+       */
+      contentType?: string;
+
+      /**
+       * An ID to show the attachment with in the HTML of the message:
+       * `<img src="cid:logo@example.com">` for `cid: "logo@example.com"`.
+       * Angle brackets around it are taken off.
+       */
+      cid?: string;
+
+      /**
+       * @default "inline" with a `cid`, otherwise "attachment"
+       */
+      contentDisposition?: "attachment" | "inline";
+    }
+
+    /** What the server is told in `MAIL FROM` and `RCPT TO`. */
+    interface Envelope {
+      /**
+       * Where a message that cannot be delivered is returned to. `""` is the
+       * null sender, `MAIL FROM:<>`, of a bounce or an automatic answer.
+       */
+      from?: string | Address;
+      /**
+       * The recipients, together with `cc` and `bcc`. They take the place of
+       * the recipients of the message, and are not added to them.
+       */
+      to?: Addresses;
+      cc?: Addresses;
+      bcc?: Addresses;
+    }
+
+    interface Message {
+      /** The sender: one address. */
+      from: string | Address;
+      to?: Addresses;
+      cc?: Addresses;
+      /** Recipients that the headers of the message do not name. */
+      bcc?: Addresses;
+      replyTo?: Addresses;
+      subject?: string;
+      /** The message as plain text. */
+      text?: string;
+      /** The message as HTML. With `text` too, a mail program shows the one it prefers. */
+      html?: string;
+      attachments?: readonly Attachment[];
+
+      /**
+       * More headers. An array gives a header once per element. The headers
+       * that have an option of their own, such as `Subject`, are not set here.
+       * A value that is ASCII is written as it is, and folded at its own
+       * white space when it is long.
+       *
+       * @example
+       * ```ts
+       * { "List-Unsubscribe": "<mailto:unsubscribe@example.com>", "X-Tag": ["a", "b"] }
+       * ```
+       */
+      headers?: Record<string, string | readonly string[]>;
+
+      /**
+       * A date in the years 1900 to 9999.
+       *
+       * @default the time of the call
+       */
+      date?: Date;
+
+      /**
+       * @default a new UUID at the domain of the sender
+       */
+      messageId?: string;
+      /** The `Message-ID` of the message this one answers. */
+      inReplyTo?: string;
+      /**
+       * The `Message-ID`s of the thread this message belongs to: an array, or
+       * one string with spaces between them.
+       */
+      references?: string | readonly string[];
+
+      /**
+       * The sender and the recipients for the server, when they are not those
+       * of the headers.
+       */
+      envelope?: Envelope;
+
+      /** A message that is already written is a {@link RawMessage}, and has none of the fields above but the addresses. */
+      raw?: undefined;
+    }
+
+    /**
+     * A message that is already written (RFC 5322), headers and all. Only its
+     * line ends are changed: each one becomes a CRLF. No field of a
+     * {@link Message} other than these goes with `raw`.
+     */
+    interface RawMessage {
+      raw: string | ArrayBufferView | ArrayBufferLike | Blob;
+      /** The sender for the server. `envelope.from` wins over it. */
+      from?: string | Address;
+      /**
+       * The recipients for the server, together with `cc` and `bcc`. The
+       * recipients of `envelope`, when it has any, take their place.
+       */
+      to?: Addresses;
+      cc?: Addresses;
+      bcc?: Addresses;
+      envelope?: Envelope;
+    }
+
+    interface SendResult {
+      /** The `Message-ID` header of the message. `undefined` for a raw message. */
+      messageId: string | undefined;
+      /** The recipients the server took the message for. */
+      accepted: string[];
+      /** The recipients the server refused. */
+      rejected: string[];
+      /** What the server was told in `MAIL FROM` and `RCPT TO`. `from` is `""` for the null sender. */
+      envelope: { from: string; to: string[] };
+      /** The last reply of the server, for example `"250 2.0.0 Ok: queued as 4F2A"`. */
+      response: string;
+    }
+
+    /**
+     * What {@link SMTPClient.send} and {@link SMTPClient.verify} reject with
+     * when the server, or the connection to it, is the reason. An error of the
+     * socket or of TLS is passed on as it is, and is not one of these: its
+     * `code` is a code of its own, such as `"ECONNREFUSED"`.
+     */
+    interface Error extends globalThis.Error {
+      name: "SMTPError";
+      code:
+        | "ERR_SMTP_AUTHENTICATION_FAILED"
+        | "ERR_SMTP_CONNECTION_CLOSED"
+        | "ERR_SMTP_CONNECTION_TIMEOUT"
+        | "ERR_SMTP_INVALID_RESPONSE"
+        | "ERR_SMTP_MESSAGE_REJECTED"
+        | "ERR_SMTP_RECIPIENTS_REJECTED"
+        | "ERR_SMTP_SENDER_REJECTED"
+        | "ERR_SMTP_TIMEOUT"
+        | "ERR_SMTP_TLS"
+        | "ERR_SMTP_UNEXPECTED_RESPONSE"
+        | "ERR_SMTP_UNSUPPORTED";
+      /** The code of the reply that the server refused with, such as `550`. */
+      responseCode?: number;
+      /** That reply, with its code: `"550 5.1.1 No such user here"`. */
+      response?: string;
+      /** The command that was refused, without its arguments: `"MAIL FROM"`, `"AUTH PLAIN"`. */
+      command?: string;
+      /** With `ERR_SMTP_RECIPIENTS_REJECTED`: the recipients, all of which the server refused. */
+      rejected?: string[];
+    }
+  }
+
   /** Utility type for any process from {@link Bun.spawn()} with both stdout and stderr set to `"pipe"` */
   type ReadableSubprocess = Subprocess<any, "pipe", "pipe">;
   /** Utility type for any process from {@link Bun.spawn()} with stdin set to `"pipe"` */

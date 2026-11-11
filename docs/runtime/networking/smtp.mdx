@@ -1,0 +1,345 @@
+---
+title: SMTP
+description: Send email from Bun with the built-in SMTP client, with TLS, authentication, HTML and attachments
+---
+
+`Bun.SMTPClient` sends email through a mail server. It writes the message (headers, text, HTML, attachments), connects with TLS, logs in, and hands the message over. There is nothing to install.
+
+```ts title="mail.ts" icon="/icons/typescript.svg"
+const smtp = new Bun.SMTPClient("smtp://ada%40example.com:app-password@smtp.example.com:587");
+
+const { messageId, accepted } = await smtp.send({
+  from: "Ada Lovelace <ada@example.com>",
+  to: "grace@example.org",
+  subject: "The engine works",
+  text: "It computed the Bernoulli numbers.",
+  html: "<p>It computed the <b>Bernoulli numbers</b>.</p>",
+  attachments: [{ filename: "notes.pdf", content: Bun.file("./notes.pdf") }],
+});
+```
+
+The names of the options and of the message fields are those of [Nodemailer](https://nodemailer.com/) where it has them. [Differences from Nodemailer](#differences-from-nodemailer) lists what is not the same.
+
+---
+
+## Connect
+
+Give the client a URL, an object, or both:
+
+```ts
+// smtp:// starts in clear text and upgrades with STARTTLS. The default port is 587.
+new Bun.SMTPClient("smtp://user:password@smtp.example.com");
+
+// smtps:// starts with TLS. The default port is 465.
+new Bun.SMTPClient("smtps://user:password@smtp.example.com");
+
+new Bun.SMTPClient({
+  host: "smtp.example.com",
+  port: 587,
+  auth: { user: "ada@example.com", pass: process.env.SMTP_PASSWORD! },
+});
+
+// The options win over the URL
+new Bun.SMTPClient(process.env.SMTP_URL!, { requireTLS: true });
+```
+
+In a URL, write a user or a password in percent-encoding: `ada%40example.com` for `ada@example.com`. A URL has a host and nothing after the port: a path or a query is an error, because nothing would read it. An empty `host` option next to a URL is an error too, and not this machine with the credentials of the URL.
+
+The client connects when the first message is sent, and keeps the connection for the next message:
+
+- Before it uses a connection a second time, it asks the server whether the connection is still there (`RSET`), and connects again when it is not.
+- A connection that is idle does not keep the process alive, so a script that sends a message exits when it is done.
+- After `idleTimeout` without a message, the client says `QUIT` and closes the connection. The next message opens a new one.
+- A connection carries 100 messages. Then the client opens a new one, before the server ends the old one at a limit of its own.
+
+```ts
+await smtp.verify(); // connect and log in now, to find a wrong password at startup
+await smtp.close(); // send what is waiting, say QUIT, and close
+```
+
+`close()` is optional. A client that was closed connects again when it is used, and `await using smtp = new Bun.SMTPClient(...)` closes it at the end of the block.
+
+### Options
+
+| Option              | Default                              |                                                                                                                                 |
+| ------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `url`               |                                      | `smtp://` or `smtps://`, with the user, the password, the host and the port                                                     |
+| `host`, `hostname`  | `"localhost"`                        |                                                                                                                                 |
+| `port`              | `465` with `secure`, otherwise `587` |                                                                                                                                 |
+| `secure`            | `true` for port 465 and `smtps://`   | Start with TLS. Without it, the client upgrades the connection with `STARTTLS` when the server offers it                        |
+| `requireTLS`        | `false`                              | Fail when the server does not offer `STARTTLS`                                                                                  |
+| `ignoreTLS`         | `false`                              | Do not use `STARTTLS`, and log in over a connection that is not encrypted                                                       |
+| `tls`               |                                      | [TLS options](/runtime/networking/tcp#create-a-connection-bun-connect): `ca`, `cert`, `key`, `rejectUnauthorized`, `serverName` |
+| `auth`              |                                      | `{ user, pass }` or `{ user, accessToken }`                                                                                     |
+| `name`              | The host name of the machine         | What the client calls itself in `EHLO`. `[127.0.0.1]` when the host name has no dot                                             |
+| `connectionTimeout` | `30000`                              | Milliseconds until the server is ready for a message: the connection, TLS, the greeting of the server and the login together    |
+| `socketTimeout`     | `300000`                             | Milliseconds the server may take for one reply, or for the TLS handshake, at any time                                           |
+| `idleTimeout`       | `30000`                              | Milliseconds a connection stays open without a message. `0` keeps it until `close()`, or until the server closes it             |
+
+An option that is not in this table is a `TypeError`. `requireTls` in place of `requireTLS` would otherwise be a check that is not made, and nobody would notice. For the same reason the options are a plain object. An instance of a class, or an object that inherits its options from another (`Object.create(defaults)`), is a `TypeError`: what is on a prototype would be read as if it were not there. Write `{ ...defaults, host }`.
+
+### TLS
+
+Port 465 starts with TLS (`secure: true`, or `smtps://`). Ports 587 and 25 start in clear text, and the client sends `STARTTLS` as soon as the server offers it. Either way the certificate of the server is checked against the host name, as `fetch()` checks it.
+
+```ts
+// A server with a certificate of your own certificate authority
+new Bun.SMTPClient("smtps://mail.internal", { tls: { ca: await Bun.file("./ca.pem").text() } });
+
+// A server that you reach under another name than its certificate has
+new Bun.SMTPClient("smtps://10.0.0.5", { tls: { serverName: "mail.internal" } });
+
+// A test server with a self-signed certificate
+new Bun.SMTPClient("smtp://localhost:1025", { tls: { rejectUnauthorized: false } });
+```
+
+`rejectUnauthorized: false` takes any certificate: one that nobody signed, and one for another name. The connection is encrypted, but not to a server that you know.
+
+The names in `tls` are checked like the options: one that the socket does not read is a `TypeError`. `checkServerIdentity` of `node:tls` is such a name. The socket checks the name of the certificate itself, and a function that pins a certificate would never be called.
+
+A server that does not offer `STARTTLS` gets the message in clear text, as mail between servers has always travelled. Set `requireTLS: true` to fail instead.
+
+**The credentials are different.** The client does not send a password or a token over a connection that is not encrypted, unless the server is this machine (`localhost`, `127.0.0.1`, `::1`). Somebody between the client and the server can take `STARTTLS` out of what the server offers, and would then read the password. `send()` rejects with `ERR_SMTP_TLS` in that case. For a server that really has no TLS, say so with `ignoreTLS: true`.
+
+### Authentication
+
+```ts
+// A password: AUTH PLAIN, or AUTH LOGIN where the server has only that
+new Bun.SMTPClient({ host: "smtp.example.com", auth: { user: "ada@example.com", pass: "app-password" } });
+
+// An OAuth 2.0 access token: AUTH XOAUTH2, which Gmail and Outlook take
+new Bun.SMTPClient({ host: "smtp.gmail.com", auth: { user: "ada@gmail.com", accessToken } });
+```
+
+The client picks the method from what the server offers. `auth.method` (`"PLAIN"`, `"LOGIN"` or `"XOAUTH2"`) forces one. A server that offers none of them, or does not offer authentication at all, is an error: the message is not sent without the login you asked for.
+
+`accessToken` is the token itself. Getting one, and a new one when it expires, is up to your program.
+
+---
+
+## Write a message
+
+```ts
+await smtp.send({
+  from: { name: "Ada Lovelace", address: "ada@example.com" },
+  to: ["grace@example.org", "Charles Babbage <charles@example.org>"],
+  cc: "mary@example.org, luigi@example.org",
+  bcc: "archive@example.com",
+  replyTo: "support@example.com",
+  subject: "Grüße 👋",
+  text: "The plain text of the message",
+  html: "<p>The <b>HTML</b> of the message</p>",
+});
+```
+
+| Field             |                                                                                                                   |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `from`            | The sender: one address. Required                                                                                 |
+| `to`, `cc`, `bcc` | The recipients. At least one is required. `bcc` recipients get the message and are not named in it                |
+| `replyTo`         | Where an answer goes                                                                                              |
+| `subject`         |                                                                                                                   |
+| `text`, `html`    | The message as plain text, as HTML, or both: two strings. With both, a mail program shows the one it prefers      |
+| `attachments`     | See [Attachments](#attachments)                                                                                   |
+| `headers`         | More headers: `{ "List-Unsubscribe": "<mailto:off@example.com>" }`. An array gives the header once per element    |
+| `date`            | A `Date` for the `Date` header, in the years 1900 to 9999. The default is the time of the call                    |
+| `messageId`       | The `Message-ID` header. The default is a new UUID at the domain of the sender                                    |
+| `inReplyTo`       | The `Message-ID` of the message that this one answers                                                             |
+| `references`      | The `Message-ID`s of the thread: an array, or one string with spaces between them                                 |
+| `envelope`        | `{ from, to, cc, bcc }` for the server, when they are not those of the headers. See [The envelope](#the-envelope) |
+| `raw`             | A message that is already written. See [Raw messages](#raw-messages)                                              |
+
+An address is `"ada@example.com"`, `"Ada Lovelace <ada@example.com>"`, or `{ name, address }`. Where more than one is allowed, it is a string with commas between the addresses, or an array.
+
+Text that is not ASCII works everywhere: in the subject, in names, in the text, in file names. A domain that is not ASCII (`bücher.example`) is sent in its ASCII form.
+
+A field that is not in this table is a `TypeError`, and so is a field of an attachment, of an address or of an envelope that this page does not name. A message that leaves out what you wrote is worse than an error. The message and the objects in it are plain objects, like the options: `headers: new Headers()` or a message that inherits its subject from a template is a `TypeError`.
+
+A header of `headers` that is ASCII is written as it is, and folded at its own spaces when it is long, so a header that a program reads (`List-Unsubscribe`) stays readable for it. Mail programs ignore white space at the start and at the end of a header.
+
+`send()` checks the whole message before it returns, and takes a copy of the bytes you give it. What is sent is what `send()` was called with, also when the message waits behind others and the program changes a buffer in the meantime.
+
+### Attachments
+
+```ts
+await smtp.send({
+  from: "ada@example.com",
+  to: "grace@example.org",
+  subject: "Files",
+  html: '<p>Our logo: <img src="cid:logo@example.com"></p>',
+  attachments: [
+    { filename: "hello.txt", content: "a string" },
+    { filename: "data.bin", content: new Uint8Array([1, 2, 3]) },
+    { content: Bun.file("./report.pdf") }, // the file name is "report.pdf"
+    { path: "./report.pdf" }, // the same
+    { filename: "page.html", content: await fetch("https://example.com").then(r => r.blob()) },
+    { filename: "image.png", content: "iVBORw0KGgo=", encoding: "base64" },
+    { filename: "logo.png", content: Bun.file("./logo.png"), cid: "logo@example.com" },
+  ],
+});
+```
+
+| Field                |                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------- |
+| `content`            | A string, an `ArrayBuffer`, a typed array, or a `Blob` such as `Bun.file()`                          |
+| `path`               | A file to read, in place of `content`                                                                |
+| `filename`           | The default is the last part of `path`, or of the path of the `Bun.file()`                           |
+| `contentType`        | The default is the type of the `Blob` if it says something, or what the extension of `filename` says |
+| `encoding`           | What a `content` string is written in, such as `"base64"` or `"hex"`. The default is UTF-8 text      |
+| `cid`                | An ID for the HTML to show the attachment with: `<img src="cid:...">`                                |
+| `contentDisposition` | `"attachment"` or `"inline"`. The default is `"inline"` with a `cid`                                 |
+
+A file is read when its message is about to be sent, not when `send()` is called.
+
+To attach an email, give it the type: `{ filename: "forwarded.eml", content, contentType: "message/rfc822" }`. Mail programs then show it as a message. It has to be ASCII in lines of at most 998 characters, because the standard allows no encoding for this type. Without the type, a `.eml` file is an ordinary file (`application/octet-stream`) and can hold anything.
+
+### The envelope
+
+A mail server does not read the headers of a message to find out where it goes. It is told in two commands, `MAIL FROM` and `RCPT TO`: the envelope. By default the envelope is the `from` address and every address in `to`, `cc` and `bcc`. Set it when it differs, for example to get bounces at another address:
+
+```ts
+await smtp.send({
+  from: "Newsletter <news@example.com>",
+  to: "Subscribers <list@example.com>",
+  envelope: { from: "bounces+42@example.com", to: ["grace@example.org", "charles@example.org"] },
+  subject: "November",
+  text: "...",
+});
+```
+
+The recipients of an envelope (`to`, `cc` and `bcc` together) take the place of those of the message. They are not added to them. `envelope.from: ""` is the null sender (`MAIL FROM:<>`) of a bounce or an automatic answer, which nothing is returned to.
+
+### Raw messages
+
+`raw` is a message that something else has written, with its headers: a `.eml` file, or the output of a MIME library. It is sent as it is. The addresses come from `from`, `to`, `cc` and `bcc`, or from `envelope`, and no other field goes with `raw`.
+
+```ts
+await smtp.send({
+  envelope: { from: "ada@example.com", to: "grace@example.org" },
+  raw: Bun.file("./message.eml"),
+});
+```
+
+Only the line ends of a raw message are changed: each one becomes a CRLF.
+
+---
+
+## The result
+
+```ts
+const result = await smtp.send(message);
+```
+
+```ts
+{
+  messageId: "<0190f3c8-2f4e-7c3a-9d41-8e5b6a7c1d2e@example.com>",
+  accepted: ["grace@example.org"],
+  rejected: ["nobody@example.org"],
+  envelope: { from: "ada@example.com", to: ["grace@example.org", "nobody@example.org"] },
+  response: "250 2.0.0 Ok: queued as 4F2A1C",
+}
+```
+
+The promise is fulfilled when the server has taken the message for at least one recipient. `rejected` lists the recipients it refused. A server that takes a message may still fail to deliver it later, and tells the envelope sender in a bounce message.
+
+Messages that are sent at the same time go out one after the other, in the order of the `send()` calls:
+
+```ts
+await Promise.all(users.map(user => smtp.send({ from, to: user.email, subject, text })));
+```
+
+When the server cannot be reached, or refuses the login, every message that was waiting at that moment is rejected with that one error. The client does not try once per message. A message that is sent afterwards tries again.
+
+---
+
+## Errors
+
+`send()` and `verify()` reject with an error that has a `code`:
+
+| `code`                           |                                                                                          |
+| -------------------------------- | ---------------------------------------------------------------------------------------- |
+| `ERR_SMTP_AUTHENTICATION_FAILED` | The server refused the login, or offers no method the client can use                     |
+| `ERR_SMTP_SENDER_REJECTED`       | The server refused the sender                                                            |
+| `ERR_SMTP_RECIPIENTS_REJECTED`   | The server refused every recipient. `error.rejected` lists them                          |
+| `ERR_SMTP_MESSAGE_REJECTED`      | The server refused the message: too large, spam, a policy                                |
+| `ERR_SMTP_TLS`                   | No TLS where it is required: `requireTLS`, a login over clear text, a refused `STARTTLS` |
+| `ERR_SMTP_CONNECTION_TIMEOUT`    | The server was not ready for a message within `connectionTimeout`                        |
+| `ERR_SMTP_TIMEOUT`               | No reply within `socketTimeout`                                                          |
+| `ERR_SMTP_CONNECTION_CLOSED`     | The server closed the connection in the middle of something, or said that it will (421)  |
+| `ERR_SMTP_UNEXPECTED_RESPONSE`   | The server refused the connection or the greeting, for example because it is too busy    |
+| `ERR_SMTP_INVALID_RESPONSE`      | What answers is not a mail server                                                        |
+| `ERR_SMTP_UNSUPPORTED`           | The message needs an extension that the server does not have                             |
+
+When a reply of the server is the reason, the error has it:
+
+```ts
+try {
+  await smtp.send(message);
+} catch (cause) {
+  const error = cause as Bun.SMTPClient.Error;
+  error.code; // "ERR_SMTP_RECIPIENTS_REJECTED"
+  error.responseCode; // 550
+  error.response; // "550 5.1.1 No such user here"
+  error.command; // "RCPT TO"
+  error.rejected; // ["nobody@example.org"]
+}
+```
+
+A reply code from 400 to 499 says that the same message may go through later. One from 500 to 599 says that it will not. After a refused sender, recipient or message, the connection takes the next message.
+
+With the code 421 a server says that it is closing the connection. Servers do that to a connection that has been open for long, or that has carried many messages. When the 421 answers `MAIL FROM`, `RCPT TO` or `DATA`, the server does not have the message yet. If the connection was open before this message (it has carried others, or a `verify()`), the client then sends the message over a new connection, once. In every other case `send()` rejects with `ERR_SMTP_CONNECTION_CLOSED` and the reply. The client never sends a message again that a server may already have.
+
+An error of the socket or of TLS is passed on as it is: `ECONNREFUSED`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `ERR_TLS_CERT_ALTNAME_INVALID`. It is not an `SMTPError`, and its `code` is not one of the table. In TypeScript, read it as `(cause as NodeJS.ErrnoException).code`.
+
+A `send()` that nothing waits for and that fails is an unhandled rejection, like any other promise.
+
+A field of a message or an option that is not valid is a `TypeError` with the code `ERR_INVALID_ARG_TYPE` or `ERR_INVALID_ARG_VALUE`, or a `RangeError` with `ERR_OUT_OF_RANGE` for a port or a timeout. That includes every field with a line break in it. A subject or a name often comes from a form on a web page, and a line break in it would otherwise start a new header, or a new command to the server. Such a message is refused before a connection is made. Nothing is stripped from it and sent anyway.
+
+No error message shows a password, a token, or the URL that they were in.
+
+---
+
+## Local development
+
+A mail catcher such as [Mailpit](https://mailpit.axllent.org/) takes every message and shows it in a browser, without delivering anything:
+
+```sh terminal icon="terminal"
+docker run -p 1025:1025 -p 8025:8025 axllent/mailpit
+```
+
+```ts
+const smtp = new Bun.SMTPClient("smtp://localhost:1025");
+```
+
+---
+
+## Differences from Nodemailer
+
+The options of a Nodemailer transport and the fields of a message have the same names here. What differs:
+
+- **Credentials need TLS.** Nodemailer logs in over clear text when the server offers no `STARTTLS`. `Bun.SMTPClient` rejects with `ERR_SMTP_TLS`, except for a server on this machine or with `ignoreTLS: true`. See [TLS](#tls)
+- **A line break in a field is an error.** Nodemailer takes line breaks out of a subject or a name and sends the message
+- **A name that is not known is an error.** Nodemailer ignores an option or a field that it does not know. Here that is a `TypeError`, also for what Nodemailer has and this client does not: `pool`, `dkim`, `logger` and `proxy` of a transport, and `sender`, `priority`, `alternatives` and `icalEvent` of a message. Take them out of an object that you move over
+- **Only a plain object is read.** Options or a message on an instance of a class, or inherited from another object, are a `TypeError`. Nodemailer reads them
+- **A login that cannot be made is an error.** With `auth` and a server that offers no `AUTH`, Nodemailer sends the message without logging in. Here `send()` rejects with `ERR_SMTP_AUTHENTICATION_FAILED`. A mail catcher for development needs a client without `auth`
+- The options win over `url`, also over the `url` option. In Nodemailer the URL wins
+- `error.code` is one of the `ERR_SMTP_` codes above, and not `EAUTH`, `EENVELOPE`, `EMESSAGE`, `ECONNECTION`, `ETIMEDOUT` or `ETLS`. `responseCode`, `response`, `command` and `rejected` are the same
+- An `envelope` without `from` keeps the sender of the message, and one without recipients keeps its recipients. In Nodemailer an envelope stands alone
+- `send()` in place of `sendMail()`, and promises only: there are no callbacks
+- `text` and `html` are strings, and `date` is a `Date`
+- The content of an attachment is a string, bytes or a `Blob`. For a stream, use `new Response(stream).blob()`. `path` is a file on disk, not a URL, and there is no `href`. A `.eml` file is attached as a file unless `contentType` says `message/rfc822`
+- An address is `name <address>` or `{ name, address }`. There are no groups (`Team: ada@example.com, grace@example.org;`)
+- `tls` takes Bun's [TLS options](/runtime/networking/tcp#create-a-connection-bun-connect). The name for the certificate is `serverName`, and `servername` is read too. `checkServerIdentity` is a `TypeError`
+- `rejected` of a result lists addresses, and there is no `rejectedErrors`. When every recipient is refused, the error has the reply for the last one
+- `connectionTimeout` is 30 seconds for everything up to the login. Nodemailer gives the connection 2 minutes and the greeting 30 seconds. `socketTimeout` is 5 minutes (Nodemailer: 10 minutes)
+
+---
+
+## What is not there yet
+
+- A pool of connections. A client has one connection and sends one message at a time
+- Streaming. A message is written in memory, attachments included, before it is sent
+- DKIM signatures. Most mail services sign for you
+- The `CRAM-MD5` and `OAUTHBEARER` methods, and getting an OAuth 2.0 token
+- Addresses with a local part that is not ASCII (`用户@example.com`) in the headers of a message. The envelope takes one, for a server that offers `SMTPUTF8`
+- `tls.checkServerIdentity`, to pin a certificate
+- Delivery status notifications (`DSN`) and `PIPELINING`

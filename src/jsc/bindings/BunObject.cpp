@@ -378,6 +378,12 @@ static JSValue createBunQueue(VM& vm, Zig::GlobalObject* globalObject)
     RELEASE_AND_RETURN(scope, BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalQueue, "Bun.Queue", "Queue"_s));
 }
 
+static JSValue createBunSMTPClient(VM& vm, Zig::GlobalObject* globalObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    RELEASE_AND_RETURN(scope, BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalSmtp, "Bun.SMTPClient"));
+}
+
 JSValue constructBunFetchObject(VM& vm, JSObject* bunObject)
 {
     JSFunction* fetchFn = JSFunction::create(vm, bunObject->globalObject(), 1, "fetch"_s, JSC::removableFunction<Bun::Feature::Fetch, JSC::RemovedFeatureStub::Throw, Bun::Bindgen::Generated::Fetch::jsFetch>(), ImplementationVisibility::Public, NoIntrinsic);
@@ -472,6 +478,7 @@ static JSValue constructBunSQLObject(VM& vm, JSObject* bunObject)
 }
 static JSValue constructBunJWTObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunJWT); }
 static JSValue constructBunQueueObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunQueue); }
+static JSValue constructBunSMTPClientObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunSMTPClient); }
 
 static JSValue constructDNSObject(VM& vm, JSObject* bunObject)
 {
@@ -1073,6 +1080,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     Transpiler                                     Bun::Bindgen::Generated::Transpiler::getTranspilerConstructor       DontDelete|PropertyCallback
     embeddedFiles                                  BunObject_lazyPropCb_wrap_embeddedFiles                             DontDelete|PropertyCallback
     S3Client                                       Bun::Bindgen::Generated::S3Client::getS3ClientConstructor           DontDelete|PropertyCallback
+    SMTPClient                                     constructBunSMTPClientObject                                        DontDelete|PropertyCallback
     s3                                             BunObject_lazyPropCb_wrap_s3                                        DontDelete|PropertyCallback
     CSRF                                           Bun::Bindgen::Generated::CsrfJsc::createCSRF                        DontDelete|PropertyCallback
     JWT                                            constructBunJWTObject                                               DontDelete|PropertyCallback
