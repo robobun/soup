@@ -165,7 +165,7 @@ await ping;
 
 All three stop the whole script, not only one command:
 
-- Every process the script is running gets the signal: each member of a pipeline, command substitutions, subshells.
+- Every process the script is running gets the signal: each member of a pipeline, command substitutions, subshells, [background commands](#background-commands).
 - Nothing else starts. In `` $`sleep 10; echo done` `` the `echo` does not run, nor does the other side of `&&` and `||` or the other branch of an `if`.
 - Builtins that are waiting for input see it end, whether that is the script's stdin or a pipe from another command, and `yes` stops. A builtin that is in the middle of work on the file system, such as `rm -rf` or `cp -r`, finishes that first.
 
@@ -309,6 +309,53 @@ const result = await $`cat < ${response} | wc -w`.text();
 
 console.log(result); // 6\n
 ```
+
+## Background commands (`&`)
+
+A command that ends with `&` starts in the background, and the script goes on to the next command without waiting for it. `wait` waits for the background commands that are still running.
+
+```js
+import { $ } from "bun";
+
+// Both servers run at the same time. The promise settles when both have exited.
+await $`bun run api & bun run web`;
+
+// Three downloads at once, then the command that needs all three.
+await $`
+  curl -sO ${a} &
+  curl -sO ${b} &
+  curl -sO ${c} &
+  wait
+  cat a.json b.json c.json | wc -c
+`;
+
+// One background command for each round of a loop.
+await $`for f in *.png; do bun run optimize.ts $f & done; wait; echo "all done"`;
+```
+
+`&` takes the whole list before it, so `a && b &` runs `a` and then `b` in the background, and `a | b &` runs the pipeline there. A subshell, an `if` and a loop can be background commands too. `&` ends a command the way `;` does: write `a & b`, not `a &; b`.
+
+A background command runs in a copy of the shell's state, like a subshell: what it changes with `cd`, an assignment or `export` stays inside it, and it keeps the working directory and the variables of the moment it started. The exit code of `cmd &` is always `0`.
+
+```js
+await $`cd /tmp & wait; pwd`; // still the directory the script started in
+await $`for i in 1 2 3; do echo $i & done; wait`; // 1, 2 and 3, each from its own copy of $i
+```
+
+`wait` waits for the background commands that its own environment started and exits with `0`. In a subshell, in a pipeline or in `$(...)` that means the ones started there, not the ones of the script around it. `wait` does not take a process id yet, and there is no `$!`.
+
+Some of this is different from `sh`, because a script here is a promise that settles once:
+
+- **The script waits for its background commands.** `` await $`server &` `` settles when `server` exits, not at once, and everything `server` prints is part of the output. `bun exec` does the same, and so does `bun run` where it runs a script with Bun Shell. To leave a process running, start it with [`Bun.spawn`](/runtime/child-process) and `unref()` it.
+- **The exit code is the one of the last command that is not in the background.** A background command that fails does not change it and does not make the promise reject. When the result of each command matters, run them as separate promises: ``await Promise.all([$`a`, $`b`])``.
+- **`$(...)` waits for every background command started inside it**, so their output is part of the substitution. That includes one whose output is redirected, such as `` $`pid=$(server > log & echo started)` ``, which `sh` does not wait for.
+- **Ctrl+C reaches background commands.** `sh` has them ignore it in a script, which is how a dev server ends up running after its script has gone.
+
+The standard input of a background command is empty unless it is redirected (`cmd < file &`), as in `sh`. `.kill()`, `.timeout()` and `.signal()` stop background commands like every other process of the script.
+
+A command takes one redirection. To send both the output and the errors of a background command to a file, write `server &> server.log &`, not `server > server.log 2>&1 &`.
+
+A background command does not make a FIFO work inside one script. Bun Shell opens the file of a redirection itself before the command starts, so `` $`mkfifo pipe; producer > pipe & consumer < pipe` `` stops at `> pipe` to wait for a reader, and `consumer` never starts. `.kill()` and `.timeout()` cannot end a script that is stuck there. Use a pipeline (`producer | consumer`) instead.
 
 ## Loops (`for`)
 
@@ -795,6 +842,7 @@ For cross-platform compatibility, Bun Shell implements a set of builtin commands
 - `mv`
 - `exit`
 - `break`, `continue`: leave a [`for`](#loops-for), [`while` or `until`](#loops-while-and-until) loop, or skip to its next round
+- `wait`: wait for the [background commands](#background-commands) that are still running
 - `true`
 - `false`
 - `yes`

@@ -493,7 +493,7 @@ impl ShellSubprocess {
         let argv = CStrList::from_unterminated(&mut spawn_args.argv);
         let envp = CStrList::from_unterminated(&mut spawn_args.env_array);
 
-        let foreground = !interp.in_background(cmd_parent.id);
+        let foreground = !interp.as_cmd(cmd_parent.id).shell.background;
         let ctrl_c_child = foreground.then(bun_spawn::ctrl_c::Child::enter);
         crate::node::fs::note_process_start();
         let mut spawn_result = match bun_process::spawn_process(&spawn_options, argv, Some(envp)) {

@@ -9,7 +9,7 @@ use crate::shell::ast;
 use crate::shell::interpreter::{
     EventLoopHandle, Interpreter, Node, NodeId, ShellExecEnv, ShellExecEnvKind, StateKind, log,
 };
-use crate::shell::io::{IO, OutKind};
+use crate::shell::io::{IO, InKind, OutKind};
 use crate::shell::states::assigns::AssignCtx;
 use crate::shell::states::base::{Base, Env, InheritedEnv};
 use crate::shell::states::script::Script;
@@ -69,6 +69,9 @@ pub enum ExpansionState {
     Idle,
     Walking,
     CmdSubst,
+    /// The script of a `$(...)` is done with this status, and jobs that it
+    /// launched (`cmd &`) still write to its output.
+    CmdSubstJobs(ExitCode),
     /// The expression of a `$((...))` is being expanded.
     Arith,
     Glob,
@@ -139,7 +142,10 @@ impl Expansion {
                     me.state = ExpansionState::Walking;
                     continue;
                 }
-                ExpansionState::CmdSubst | ExpansionState::Arith | ExpansionState::Glob => {
+                ExpansionState::CmdSubst
+                | ExpansionState::CmdSubstJobs(_)
+                | ExpansionState::Arith
+                | ExpansionState::Glob => {
                     // Re-entered while a child is in flight.
                     return Yield::suspended();
                 }
@@ -221,7 +227,12 @@ impl Expansion {
                 me.cmd_subst_quoted = quoted;
 
                 let io = IO {
-                    stdin: interp.root_io().stdin.clone(),
+                    // A job (`cmd &`) does not read the stdin of the script.
+                    stdin: if me.shell.background {
+                        InKind::Ignore
+                    } else {
+                        interp.root_io().stdin.clone()
+                    },
                     stdout: OutKind::Pipe,
                     stderr: interp.root_io().stderr.clone(),
                 };
@@ -618,6 +629,12 @@ impl Expansion {
         // Child is a Script (command substitution). Its captured stdout lives
         // in the duped `ShellExecEnv` it owns; read it before deinit.
         debug_assert!(matches!(interp.node(child).kind(), StateKind::Script));
+        // As in sh, where a job holds the pipe open: the output is complete when
+        // the jobs launched in here are done. `jobs_done` comes back with the status.
+        if interp.as_script(child).shell.capture_holds > 0 {
+            interp.as_expansion_mut(this).state = ExpansionState::CmdSubstJobs(exit_code);
+            return Yield::suspended();
+        }
         if interp.stopping() {
             // The script failed or was killed: the rest of the word is not expanded.
             {
@@ -679,6 +696,34 @@ impl Expansion {
         }
         interp.deinit_node(child);
         Yield::Next(this)
+    }
+
+    /// Whether this is the `$( )` that owns `env` and waits for the jobs launched in it.
+    pub(crate) fn waits_for_jobs_of(
+        interp: &Interpreter,
+        this: NodeId,
+        env: *mut ShellExecEnv,
+    ) -> bool {
+        let Node::Expansion(me) = interp.node(this) else {
+            return false;
+        };
+        matches!(me.state, ExpansionState::CmdSubstJobs(_))
+            && me
+                .child
+                .is_some_and(|script| interp.as_script(script).shell.as_ptr() == env)
+    }
+
+    /// The last job launched in the `$( )` is done (`Interpreter::job_done`).
+    pub(crate) fn jobs_done(interp: &Interpreter, this: NodeId) -> Yield {
+        let me = interp.as_expansion_mut(this);
+        let ExpansionState::CmdSubstJobs(exit_code) = me.state else {
+            return Yield::suspended();
+        };
+        me.state = ExpansionState::CmdSubst;
+        let script = me
+            .child
+            .expect("a `$( )` that waits for jobs has its script");
+        Self::child_done(interp, this, script, exit_code)
     }
 
     /// In the expression of a `$((...))`, what an expansion added to

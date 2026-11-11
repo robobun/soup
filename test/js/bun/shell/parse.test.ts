@@ -887,117 +887,83 @@ describe("parse shell", () => {
     });
   });
 
-  describe.todo("async", () => {
-    TestBuilder.command`echo foo & && echo hi`
-      .error('"&" is not allowed on the left-hand side of "&&"')
-      .runAsTest("left side of binary not allowed");
+  describe("async", () => {
+    const echo = (...args: string[]) => ({
+      cmd: {
+        assigns: [],
+        name_and_args: [{ simple: { Text: "echo" } }, ...args.map(arg => ({ simple: { Text: arg } }))],
+        redirect: redirect({}),
+        redirect_file: null,
+      },
+    });
 
-    TestBuilder.command`echo hi && echo foo & && echo hi`
-      .error('"&" is not allowed on the left-hand side of "&&"')
-      .runAsTest("left side of binary not allowed 2");
-
-    test("right side of binary works", () => {
-      const expected = {
-        "stmts": [
-          {
-            "exprs": [
-              {
-                "binary": {
-                  "op": "And",
-                  "left": {
-                    "cmd": {
-                      "assigns": [],
-                      "name_and_args": [{ "simple": { "Text": "echo" } }, { "simple": { "Text": "hi" } }],
-                      "redirect": {
-                        "stdin": false,
-                        "stdout": false,
-                        "stderr": false,
-                        "append": false,
-                        "duplicate_out": false,
-                        "__unused": 0,
-                      },
-                      "redirect_file": null,
-                    },
-                  },
-                  "right": {
-                    "async": {
-                      "cmd": {
-                        "assigns": [],
-                        "name_and_args": [{ "simple": { "Text": "echo" } }, { "simple": { "Text": "foo" } }],
-                        "redirect": {
-                          "stdin": false,
-                          "stdout": false,
-                          "stderr": false,
-                          "append": false,
-                          "duplicate_out": false,
-                          "__unused": 0,
-                        },
-                        "redirect_file": null,
-                      },
-                    },
-                  },
-                },
-              },
-            ],
-          },
-        ],
-      };
-
-      const result = JSON.parse(parse`echo hi && echo foo &`);
-      expect(result).toEqual(expected);
+    test("& takes the whole && list", () => {
+      expect(JSON.parse(parse`echo hi && echo foo &`)).toEqual({
+        stmts: [{ exprs: [{ async: { binary: { op: "And", left: echo("hi"), right: echo("foo") } } }] }],
+      });
     });
 
     test("pipeline", () => {
+      expect(JSON.parse(parse`echo hi | echo foo &`)).toEqual({
+        stmts: [{ exprs: [{ async: { pipeline: { items: [echo("hi"), echo("foo")] } } }] }],
+      });
+    });
+
+    test("what follows & is the next statement", () => {
       const expected = {
-        "stmts": [
+        stmts: [{ exprs: [{ async: echo("a") }] }, { exprs: [{ async: echo("b") }] }, { exprs: [echo("c")] }],
+      };
+      expect(JSON.parse(parse`echo a & echo b & echo c`)).toEqual(expected);
+      expect(
+        JSON.parse(parse`
+          echo a &
+          echo b &
+          echo c
+        `),
+      ).toEqual(expected);
+    });
+
+    test("in a subshell and in a command substitution", () => {
+      expect(JSON.parse(parse`(echo a &)`)).toEqual({
+        stmts: [
           {
-            "exprs": [
+            exprs: [
               {
-                "async": {
-                  "pipeline": {
-                    "items": [
-                      {
-                        "cmd": {
-                          "assigns": [],
-                          "name_and_args": [{ "simple": { "Text": "echo" } }, { "simple": { "Text": "hi" } }],
-                          "redirect": {
-                            "stdin": false,
-                            "stdout": false,
-                            "stderr": false,
-                            "append": false,
-                            "duplicate_out": false,
-                            "__unused": 0,
-                          },
-                          "redirect_file": null,
-                        },
-                      },
-                      {
-                        "cmd": {
-                          "assigns": [],
-                          "name_and_args": [{ "simple": { "Text": "echo" } }, { "simple": { "Text": "foo" } }],
-                          "redirect": {
-                            "stdin": false,
-                            "stdout": false,
-                            "stderr": false,
-                            "append": false,
-                            "duplicate_out": false,
-                            "__unused": 0,
-                          },
-                          "redirect_file": null,
-                        },
-                      },
-                    ],
-                  },
+                subshell: {
+                  script: { stmts: [{ exprs: [{ async: echo("a") }] }] },
+                  redirect: null,
+                  redirect_flags: redirect({}),
                 },
               },
             ],
           },
         ],
-      };
-
-      const result = JSON.parse(parse`echo hi | echo foo &`);
-      expect(result).toEqual(expected);
+      });
+      expect(() => parse`echo $(echo a &)`).not.toThrow();
+      expect(() => parse`echo ${{ raw: "`echo a &`" }}`).not.toThrow();
     });
+
+    test("before the word that ends a compound command", () => {
+      expect(() => parse`if echo a & then echo b & fi`).not.toThrow();
+      expect(() => parse`for i in 1 2; do echo $i & done`).not.toThrow();
+      expect(() => parse`while echo a & do echo b & done`).not.toThrow();
+    });
+
+    TestBuilder.command`echo foo & && echo hi`
+      .error('"&" ends a command, so "&&" cannot follow it')
+      .runAsTest("&& cannot follow");
+
+    TestBuilder.command`echo hi && echo foo & || echo hi`
+      .error('"&" ends a command, so "||" cannot follow it')
+      .runAsTest("|| cannot follow");
+
+    TestBuilder.command`echo foo &; echo hi`
+      .error('"&" ends a command, so ";" cannot follow it')
+      .runAsTest("; cannot follow");
+
+    TestBuilder.command`echo foo & | cat`
+      .error('"&" ends a command, so "|" cannot follow it')
+      .runAsTest("| cannot follow");
   });
 
   describe("for_clause", () => {

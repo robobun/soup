@@ -117,6 +117,8 @@ pub(crate) mod builtins {
     pub(crate) mod sort_uniq;
     #[path = "touch.rs"]
     pub(crate) mod touch;
+    #[path = "wait.rs"]
+    pub(crate) mod wait;
     #[path = "wc.rs"]
     pub(crate) mod wc;
     #[path = "which.rs"]

@@ -155,6 +155,48 @@ describe("yield", async () => {
     const external = "rejected TypeError: Blobs are immutable, and cannot be used for stdout/stderr";
     const builtin = "rejected Error: Cannot redirect stdout/stderr to an immutable blob. Expected a file";
 
+    // A job (`cmd &`) that throws ends the script like any other command, and a
+    // throw anywhere ends the jobs: the process would not exit with one alive.
+    describe("with background commands", () => {
+      const idle = "${bun} -e 'setTimeout(() => {}, 30000)'";
+
+      test.concurrent("the job throws as it starts", async () => {
+        await expectRejection("$`echo hi > ${new Blob(['x'])} & echo after`.quiet().nothrow()", builtin);
+      });
+
+      test.concurrent("the job throws while wait waits for it", async () => {
+        await expectRejection(
+          "$`(${bun} --version; echo hi > ${new Blob(['x'])}) & wait; echo after`.quiet().nothrow()",
+          builtin,
+        );
+      });
+
+      test.concurrent("the job throws after the script has ended", async () => {
+        await expectRejection("$`(${bun} --version; echo hi > ${new Blob(['x'])}) &`.quiet().nothrow()", builtin);
+      });
+
+      test.concurrent("the job throws while a command substitution waits for it", async () => {
+        await expectRejection(
+          "$`echo \"<$( (${bun} --version; echo hi > ${new Blob(['x'])}) & echo early)>\"; echo after`.quiet().nothrow()",
+          builtin,
+        );
+      });
+
+      test.concurrent("the job throws while a process runs in the foreground", async () => {
+        await expectRejection(
+          "$`(${bun} --version; echo hi > ${new Blob(['x'])}) & " + idle + "`.quiet().nothrow()",
+          builtin,
+        );
+      });
+
+      test.concurrent("a foreground command throws while a job runs", async () => {
+        await expectRejection(
+          "$`" + idle + " & ${bun} --version; echo hi > ${new Blob(['x'])}`.quiet().nothrow()",
+          builtin,
+        );
+      });
+    });
+
     test.concurrent("external command after another command", async () => {
       await expectRejection("$`${bun} --version; ${bun} --version > ${new Response('r')}`.quiet().nothrow()", external);
     });
