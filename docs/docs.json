@@ -112,7 +112,8 @@
               "/runtime/http/websockets",
               "/runtime/networking/tcp",
               "/runtime/networking/udp",
-              "/runtime/networking/dns"
+              "/runtime/networking/dns",
+              "/runtime/networking/smtp"
             ]
           },
           {
