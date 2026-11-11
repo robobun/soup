@@ -14,7 +14,7 @@ use crate::shell::ast;
 use crate::shell::builtins::batch::Batch;
 use crate::shell::builtins::{
     basename, break_continue, cat, cd, cp, dirname, echo, exit, export, head_tail, ls, mkdir, mv,
-    pwd, rm, seq, sort_uniq, touch, wc, which, yes,
+    pwd, rm, seq, sort_uniq, touch, wait, wc, which, yes,
 };
 use crate::shell::interpreter::{Interpreter, NodeId, is_pollable_from_mode, shell_openat};
 use crate::shell::io::{InKind, OutFd, OutKind};
@@ -51,6 +51,10 @@ pub(crate) enum State {
     HeadTail(Box<head_tail::Common>),
     Mv(mv::Mv),
     SortUniq(Box<sort_uniq::Common>),
+    /// Parked until the jobs of this `ShellExecEnv::job_scope` are done.
+    Wait {
+        parked_on: u32,
+    },
     Wc(Box<wc::Wc>),
     Which {
         next: usize,
@@ -97,6 +101,7 @@ shell_builtins! {
     Break    "break"    |interp, cmd| break_continue::start(interp, cmd, Kind::Break),
     Continue "continue" |interp, cmd| break_continue::start(interp, cmd, Kind::Continue),
     Export   "export"   export::start,
+    Wait     "wait"     wait::start,
     Cat      "cat"      cat::start,
     Mv       "mv"       mv::start,
     Rm       "rm"       rm::start,
@@ -270,7 +275,8 @@ impl MemorySink<'_> {
     /// `ENOSPC` once an ArrayBuffer is full.
     pub(crate) fn write(self, bytes: &[u8]) -> bun_sys::Result<()> {
         match self.0 {
-            // SAFETY: a buffer of the Cmd's env or of an ancestor, which outlive the builtin. Single-threaded.
+            // SAFETY: a buffer of the Cmd's env, of the root env or of a `$( )` around it, which outlive
+            // what writes to them (`ShellExecEnv::capture_holds`). Single-threaded.
             Memory::Captured(captured) => unsafe { (*captured).append_slice(bytes) },
             Memory::ArrayBuf { buf, i } => {
                 // JS can resize the buffer between chunks.
@@ -750,7 +756,7 @@ impl Builtin {
             | (&State::Exiting(code), None) => Self::done(interp, cmd, code),
             (&State::Which { next, missing }, None) => which::print(interp, cmd, next, missing),
             (State::Yes(_), None) => yes::Yes::write(interp, cmd),
-            (State::Idle | State::Mv(_), _) => Yield::suspended(),
+            (State::Idle | State::Mv(_) | State::Wait { .. }, _) => Yield::suspended(),
         }
     }
 }

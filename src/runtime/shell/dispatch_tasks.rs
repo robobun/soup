@@ -10,15 +10,6 @@
 
 use crate::shell::interpreter::{Interpreter, NodeId, PoolTask, ShellTask, ShellWork};
 use crate::shell::yield_::Yield;
-/// Task payload for [`ShellAsync`](crate::shell::states::r#async::Async)'s
-/// bounce back to the main thread. The state lives in `interp.nodes`, so
-/// the enqueued payload is `(interp, node)`.
-#[repr(C)]
-pub(crate) struct ShellAsyncTask {
-    pub interp: *mut Interpreter,
-    pub node: core::cell::Cell<NodeId>,
-}
-
 /// A loop puts itself back on the event loop every so often (`Interpreter::loop_round_should_yield`).
 /// A body of builtins never waits for anything, so without this a long loop would run to its end
 /// before a timer, another promise or anything that wants to stop the script
@@ -44,8 +35,6 @@ impl ShellLoopYieldTask {
                 owner.enqueue_task_after_yield(bun_jsc::Task::init(task))
             }
             EventLoopHandle::Mini(mini) => {
-                // The mini loop only polls when no task is queued, and this one always is.
-                mini.loop_.tick_without_idle();
                 let any = bun_jsc::AnyTaskWithExtraContext::AnyTaskWithExtraContext::from_callback_auto_deinit(
                     task,
                     Self::run_from_main_thread_mini,
@@ -69,6 +58,14 @@ impl ShellLoopYieldTask {
     }
 
     fn run_from_main_thread_mini(this: *mut Self, _: *mut core::ffi::c_void) {
+        // The mini loop only polls when no task is queued, and a loop always has this one
+        // queued. So the poll is here, at the top of a task: inside `enqueue` it ran the I/O
+        // callbacks, and the loops that they resume, in the middle of the loop that yields.
+        // SAFETY: the box `enqueue` allocated, which `run_from_main_thread` frees below.
+        let interp = unsafe { &*(*this).interp };
+        if let crate::shell::interpreter::EventLoopHandle::Mini(mini) = interp.event_loop {
+            mini.loop_.tick_without_idle();
+        }
         Self::run_from_main_thread(this);
     }
 }
