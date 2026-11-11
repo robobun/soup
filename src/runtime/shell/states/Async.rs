@@ -1,230 +1,108 @@
+//! A background job: `list &`.
+//!
+//! The job is a root of the node tree (its parent is the interpreter) and runs
+//! the list in a subshell environment copied when the `&` ran, so nothing the
+//! statement that launched it does afterwards reaches it. The launcher goes on
+//! at once (`Yield::Job`). `Interpreter::job_done` is where a job ends.
+
 use crate::shell::ExitCode;
 use crate::shell::ast;
-use crate::shell::interpreter::{EventLoopHandle, Interpreter, Node, NodeId, ShellExecEnv, log};
+use crate::shell::interpreter::{Interpreter, Node, NodeId, ShellExecEnv, log};
 use crate::shell::io::IO;
 use crate::shell::states::base::Base;
-use crate::shell::states::cmd::Cmd;
-use crate::shell::states::cond_expr::CondExpr;
-use crate::shell::states::r#if::If;
-use crate::shell::states::pipeline::Pipeline;
 use crate::shell::yield_::Yield;
 
 pub(crate) struct Async {
+    /// `shell` is the job's own env.
     pub(crate) base: Base,
     pub node: bun_ptr::BackRef<ast::Expr>,
     pub(crate) io: IO,
-    pub(crate) state: AsyncState,
-    pub(crate) event_loop: EventLoopHandle,
-    /// Heap payload for the main-thread bounce. The node lives in the
-    /// reallocatable `Interpreter::nodes` arena, so the intrusive
-    /// concurrent-task node must live in a stable heap allocation instead.
-    /// Allocated in `init`, freed in `actually_deinit`.
-    task: *mut crate::shell::dispatch_tasks::ShellAsyncTask,
+    pub(crate) child: Option<NodeId>,
+    /// `ShellExecEnv::job_scope` of the env that launched the job: `wait` there waits for it.
+    pub(crate) scope: u32,
+    /// The `$( )` the job was launched in, if any.
+    pub(crate) capture: Option<CaptureOwner>,
 }
 
-#[derive(Default, strum::IntoStaticStr)]
-pub enum AsyncState {
-    #[default]
-    Idle,
-    Exec {
-        child: Option<NodeId>,
-    },
-    Done(ExitCode),
+/// A job writes captured output through raw pointers into the buffer of the
+/// `$( )` env around it, so that `$( )` is not done before its last job is
+/// (`ShellExecEnv::capture_holds`, `Expansion::child_done`).
+#[derive(Clone, Copy)]
+pub(crate) struct CaptureOwner {
+    pub(crate) env: *mut ShellExecEnv,
+    /// The `Expansion` of the `$( )`.
+    pub(crate) collector: NodeId,
 }
 
 impl Async {
+    /// `env` is a copy that the job owns from here on.
     pub(crate) fn init(
         interp: &Interpreter,
-        shell: *mut ShellExecEnv,
+        env: *mut ShellExecEnv,
         node: &ast::Expr,
-        parent: NodeId,
         io: IO,
+        scope: u32,
+        capture: Option<CaptureOwner>,
     ) -> NodeId {
-        interp
-            .async_commands_executing
-            .set(interp.async_commands_executing.get() + 1);
-        let evtloop = interp.event_loop;
         let id = interp.alloc_node(Node::Async(Async {
-            base: Base::new(parent, shell),
+            base: Base::new(NodeId::INTERPRETER, env),
             node: bun_ptr::BackRef::new(node),
             io,
-            state: AsyncState::Idle,
-            event_loop: evtloop,
-            task: core::ptr::null_mut(),
+            child: None,
+            scope,
+            capture,
         }));
-        // The payload needs the NodeId, so it's allocated after the node.
-        interp.as_async_mut(id).task =
-            bun_core::heap::alloc(crate::shell::dispatch_tasks::ShellAsyncTask {
-                interp: interp.as_ctx_ptr(),
-                node: id,
-            });
+        log!("Job {} init", id);
         id
     }
 
     pub(crate) fn start(interp: &Interpreter, this: NodeId) -> Yield {
-        log!("Async {} start", this);
-        Self::enqueue_self(interp, this);
-        let parent = interp.as_async(this).base.parent;
-        // Appear "done" immediately to the parent so it moves on; the async
-        // body runs in the background via `enqueue_self`.
-        interp.child_done(parent, this, 0)
-    }
-
-    pub(crate) fn next(interp: &Interpreter, this: NodeId) -> Yield {
-        log!(
-            "Async {} next {}",
-            this,
-            <&'static str>::from(&interp.as_async(this).state)
-        );
-        let action = {
-            let me = interp.as_async_mut(this);
-            match &mut me.state {
-                AsyncState::Idle => {
-                    me.state = AsyncState::Exec { child: None };
-                    NextAction::Enqueue
-                }
-                AsyncState::Exec { child } => {
-                    if let Some(c) = *child {
-                        NextAction::StartChild(c)
-                    } else {
-                        NextAction::SpawnChild
-                    }
-                }
-                AsyncState::Done(_) => NextAction::Finish,
-            }
+        let (shell, io, node) = {
+            let me = interp.as_async(this);
+            (me.base.shell, me.io.clone(), me.node)
         };
-        match action {
-            NextAction::Enqueue => {
-                Self::enqueue_self(interp, this);
-                Yield::suspended()
-            }
-            NextAction::StartChild(c) => interp.start_node(c),
-            NextAction::SpawnChild => {
-                let (shell, io, node) = {
-                    let me = interp.as_async(this);
-                    (me.base.shell, me.io.clone(), me.node)
-                };
-                // Init the child WITHOUT starting it, store it, enqueue self, return
-                // suspended. The child is started on the NEXT event-loop tick
-                // via the `StartChild` arm above. Restricted to
-                // pipeline/cmd/if/condexpr — other Expr variants panic.
-                let child = match node.get() {
-                    ast::Expr::Pipeline(p) => Pipeline::init(interp, shell, *p, this, io),
-                    ast::Expr::Cmd(c) => Cmd::init(interp, shell, *c, this, io),
-                    ast::Expr::If(i) => If::init(interp, shell, *i, this, io),
-                    ast::Expr::CondExpr(c) => CondExpr::init(interp, shell, *c, this, io),
-                    ast::Expr::Assign(_)
-                    | ast::Expr::Binary(_)
-                    | ast::Expr::Subshell(_)
-                    | ast::Expr::For(_)
-                    | ast::Expr::While(_)
-                    | ast::Expr::Async(_) => panic!(
-                        "Unexpected Expr variant as Async child, this indicates a bug in Bun."
-                    ),
-                };
-                if let AsyncState::Exec { child: slot } = &mut interp.as_async_mut(this).state {
-                    *slot = Some(child);
-                }
-                Self::enqueue_self(interp, this);
-                Yield::suspended()
-            }
-            NextAction::Finish => {
-                interp.async_cmd_done(this);
-                Yield::done()
-            }
-        }
+        let (child, y) = interp.spawn_expr(shell, node.get(), this, io);
+        interp.as_async_mut(this).child = child;
+        y
     }
 
+    /// The list is the only thing a job waits for.
+    pub(crate) fn next(_interp: &Interpreter, _this: NodeId) -> Yield {
+        Yield::suspended()
+    }
+
+    /// The status of a job is dropped: nothing can ask for it yet.
     pub(crate) fn child_done(
         interp: &Interpreter,
         this: NodeId,
         child: NodeId,
-        exit_code: ExitCode,
+        _exit_code: ExitCode,
     ) -> Yield {
-        log!("Async {} childDone", this);
+        interp.as_async_mut(this).child = None;
         interp.deinit_node(child);
-        interp.as_async_mut(this).state = AsyncState::Done(exit_code);
-        Self::enqueue_self(interp, this);
-        Yield::suspended()
+        Self::finish(interp, this)
     }
 
-    /// Bounce `run_from_main_thread` through the event loop so the async body runs on subsequent ticks while the
-    /// parent proceeds.
-    fn enqueue_self(interp: &Interpreter, this: NodeId) {
-        let me = interp.as_async_mut(this);
-        let task = me.task;
-        debug_assert!(!task.is_null());
-        match me.event_loop {
-            // Next loop iteration, after I/O has had a turn. `task` is the live
-            // heap payload allocated in `init` and freed only in `actually_deinit`.
-            EventLoopHandle::Js { owner } => {
-                owner.enqueue_task_after_yield(bun_jsc::Task::init(task))
-            }
-            EventLoopHandle::Mini(mini) => {
-                // The payload embeds only the JS-arm `ConcurrentTask`, so the
-                // mini arm heap-allocates an auto-deinit wrapper per bounce.
-                let any = bun_jsc::AnyTaskWithExtraContext::AnyTaskWithExtraContext::from_callback_auto_deinit(
-                    task,
-                    run_from_main_thread_mini,
-                );
-                mini.enqueue_task_concurrent(core::ptr::NonNull::new(any).expect("heap task"));
-            }
+    /// Also where a job ends whose list did not start (`Interpreter::fail`).
+    pub(crate) fn finish(interp: &Interpreter, this: NodeId) -> Yield {
+        log!("Job {} done", this);
+        let (scope, capture) = {
+            let me = interp.as_async(this);
+            (me.scope, me.capture)
+        };
+        interp.deinit_node(this);
+        interp.job_done(scope, capture)
+    }
+
+    pub(crate) fn deinit(interp: &Interpreter, this: NodeId) {
+        let child = interp.as_async_mut(this).child.take();
+        if let Some(child) = child {
+            interp.deinit_node(child);
         }
-    }
-
-    /// `deinit` is purposefully empty: an `Async` appears "done" to its parent
-    /// immediately (see `start`), so the parent must not free it. Real cleanup
-    /// happens in `actually_deinit` once the background body finishes.
-    pub(crate) fn actually_deinit(interp: &Interpreter, this: NodeId) {
         let me = interp.as_async_mut(this);
-        if !me.task.is_null() {
-            // SAFETY: allocated in `init`; the final bounce that reached
-            // `async_cmd_done` (and thus here) has already been dequeued and
-            // dispatched, so nothing else references the payload.
-            drop(unsafe { bun_core::heap::take(me.task) });
-            me.task = core::ptr::null_mut();
+        if !me.base.shell.is_null() {
+            ShellExecEnv::deinit_impl(me.base.shell);
+            me.base.shell = core::ptr::null_mut();
         }
-    }
-
-    pub(crate) fn run_from_main_thread(interp: &Interpreter, this: NodeId) {
-        Self::next(interp, this).run(interp);
-    }
-}
-
-enum NextAction {
-    Enqueue,
-    StartChild(NodeId),
-    SpawnChild,
-    Finish,
-}
-
-// `runtime::dispatch::run_task`'s `task_tag::ShellAsync` arm casts the
-// enqueued pointer back to `ShellAsyncTask`; both sides MUST agree.
-impl bun_event_loop::Taskable for crate::shell::dispatch_tasks::ShellAsyncTask {
-    const TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::ShellAsync;
-    /// The `Async` node's bounce box, freed only at the end of a chain that
-    /// will not continue: free it here.
-    unsafe fn release_unrun(this: *mut Self) {
-        // SAFETY: fn contract — the box `Async::init` made; nothing else frees an unrun one.
-        drop(unsafe { bun_core::heap::take(this) });
-    }
-    /// See [`ShellTaskCtx`](crate::shell::interpreter::ShellTaskCtx): a step of a shell script always runs.
-    unsafe fn context(_: *const Self) -> bun_event_loop::ContextId {
-        bun_event_loop::ContextId::NONE
-    }
-}
-
-/// Mini-loop trampoline.
-fn run_from_main_thread_mini(
-    task: *mut crate::shell::dispatch_tasks::ShellAsyncTask,
-    _: *mut core::ffi::c_void,
-) {
-    // SAFETY: `task` is the live payload owned by the Async node; it is freed
-    // only in `actually_deinit`, which runs at the tail of this bounce chain
-    // (after the final `next()` dispatch), and `interp` outlives every node.
-    unsafe {
-        let interp = &*(*task).interp;
-        let node = (*task).node;
-        Async::run_from_main_thread(interp, node);
     }
 }

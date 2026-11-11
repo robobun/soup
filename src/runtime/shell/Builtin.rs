@@ -184,6 +184,7 @@ shell_builtins! {
         Export   => (export::Export,    "export",   b""),
         Break    => (break_continue::Break,       "break",    b"usage: break [n]\n"),
         Continue => (break_continue::Continue,    "continue", b"usage: continue [n]\n"),
+        Wait     => (wait::Wait,        "wait",     b"usage: wait\n"),
     }
     boxed: {
         Cat      => (cat::Cat,          "cat",      b"usage: cat [-belnstuv] [file ...]\n"),
@@ -342,7 +343,8 @@ impl BuiltinIO {
                     IoKind::Stderr => shell.buffered_stderr(),
                 };
                 // SAFETY: `captured` points into a live `ShellExecEnv` Bufio: `shell`'s
-                // own, or an ancestor env's, which outlives `shell`. Single-threaded.
+                // own, or that of the root env or of a `$( )` around it, which outlive
+                // what writes to them (`ShellExecEnv::capture_holds`). Single-threaded.
                 unsafe { (*captured).append_slice(buf) };
                 Ok(buf.len())
             }

@@ -16,6 +16,58 @@ describe("bun exec", () => {
     .stderr("bun: command not found: sldkfjslkdjflksdjflj\n")
     .runAsTest("it works on command fail");
 
+  describe("background commands", () => {
+    TestBuilder.command`${BUN} exec ${"echo job & wait; echo after"}`
+      .env(bunEnv)
+      .stdout("job\nafter\n")
+      .runAsTest("& and wait");
+
+    TestBuilder.command`${BUN} exec ${"true & echo foreground"}`
+      .env(bunEnv)
+      .stdout("foreground\n")
+      .runAsTest("a job that ends first does not end the script");
+
+    TestBuilder.command`${BUN} exec ${"true & false"}`
+      .env(bunEnv)
+      .exitCode(1)
+      .runAsTest("the exit code is that of the last foreground command");
+
+    TestBuilder.command`${BUN} exec ${"false & true"}`.env(bunEnv).runAsTest("and not that of a job");
+
+    TestBuilder.command`${BUN} exec ${"(until [[ -e go ]]; do true; done; echo job) & echo foreground; touch go"}`
+      .ensureTempDir()
+      .env(bunEnv)
+      .stdout("foreground\njob\n")
+      .runAsTest("the script ends after a job that outlives it");
+
+    test("jobs run at the same time", async () => {
+      // Answers both requests once both are waiting.
+      const waiting: (() => void)[] = [];
+      using server = Bun.serve({
+        port: 0,
+        async fetch() {
+          const { promise, resolve } = Promise.withResolvers<void>();
+          waiting.push(resolve);
+          if (waiting.length === 2) for (const go of waiting) go();
+          await promise;
+          return new Response("met");
+        },
+      });
+      const meet = `console.log(await (await fetch("http://localhost:${server.port}/")).text())`;
+      const command = `${$.escape(BUN)} -e ${$.escape(meet)}`;
+      await using proc = Bun.spawn({
+        cmd: [BUN, "exec", `${command} & ${command} & wait; echo after`],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout).toBe("met\nmet\nafter\n");
+      expect(exitCode).toBe(0);
+    });
+  });
+
   TestBuilder.command`${BUN} exec`
     .env(bunEnv)
     .stdout(

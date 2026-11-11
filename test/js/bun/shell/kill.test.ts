@@ -105,6 +105,30 @@ describe.concurrent("ShellPromise.kill()", () => {
     expect(result.exitCode).toBe(143);
   });
 
+  test("stops the jobs that are still running", async () => {
+    const p = $`${bunExe()} -e ${idle} & ${bunExe()} -e ${idle} & echo launched`.env(bunEnv).quiet().nothrow().run();
+    p.kill();
+    const result = await p;
+    expect(result.stdout.toString()).toBe("launched\n");
+    expect(result.exitCode).toBe(143);
+  });
+
+  test("stops a wait and the job it waits for", async () => {
+    const p = $`${bunExe()} -e ${idle} & wait; echo after`.env(bunEnv).quiet().nothrow().run();
+    p.kill();
+    const result = await p;
+    expect(result.stdout.toString()).toBe("");
+    expect(result.exitCode).toBe(143);
+  });
+
+  test("stops a command substitution that waits for a job", async () => {
+    const p = $`echo "<$(${bunExe()} -e ${idle} & echo early)>"; echo after`.env(bunEnv).quiet().nothrow().run();
+    p.kill();
+    const result = await p;
+    expect(result.stdout.toString()).toBe("");
+    expect(result.exitCode).toBe(143);
+  });
+
   test("stops a command substitution and the command waiting for it", async () => {
     const p = $`echo before $(${bunExe()} -e ${idle}) after`.env(bunEnv).quiet().nothrow().run();
     p.kill();

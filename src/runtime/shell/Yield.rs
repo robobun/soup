@@ -9,6 +9,7 @@ use core::cell::Cell;
 
 use crate::shell::interpreter::{Interpreter, NodeId, StateKind, log};
 use crate::shell::states::pipeline::Pipeline;
+use crate::shell::states::stmt::Stmt;
 
 /// A "continuation" of the shell interpreter. Shell state-machine functions
 /// return a `Yield`; `Yield::run(&Interpreter)` is the trampoline that
@@ -33,6 +34,12 @@ pub enum Yield {
         // subsystem (IOWriter/IOReader/Builtin); converted to a JS error at
         // the throw boundary.
         err: Option<bun_sys::SystemError>,
+    },
+    /// `list &`: start `job` now. `launcher`, the statement that holds the `&`, goes on as soon
+    /// as the job waits for something or is done (`Stmt::job_launched`).
+    Job {
+        job: NodeId,
+        launcher: NodeId,
     },
     /// Execution is waiting on async IO (epoll/kqueue/uv). The caller's task
     /// callback will resume by calling `.run()` again later.
@@ -96,7 +103,8 @@ impl Yield {
 
         // A pipeline starts multiple "threads" of execution (`cmd1 | cmd2 | cmd3`).
         // We start cmd1, return to the pipeline, start cmd2, etc. — so we keep
-        // a small stack of pipeline NodeIds to resume.
+        // a small stack of pipeline NodeIds to resume. A statement that launched
+        // a job (`cmd &`) is on it as well, and goes on the same way.
         //
         // PERF: profile if hot; smallvec::SmallVec<[NodeId; 4]> would avoid
         // the heap allocation.
@@ -127,6 +135,11 @@ impl Yield {
                     written,
                     err,
                 } => crate::shell::io_writer::on_io_writer_chunk(interp, child, written, err),
+                Yield::Job { job, launcher } => {
+                    pipeline_stack.push(launcher);
+                    interp.job_start_begins();
+                    interp.start_node(job)
+                }
                 Yield::Failed(id) => interp.fail(id, &mut rejection),
                 Yield::Suspended | Yield::Done => {
                     if let Some(y) = Self::drain_pipelines(interp, &mut pipeline_stack) {
@@ -144,6 +157,11 @@ impl Yield {
 
     fn drain_pipelines(interp: &Interpreter, pipeline_stack: &mut Vec<NodeId>) -> Option<Yield> {
         while let Some(&id) = pipeline_stack.last() {
+            if !matches!(interp.node(id).kind(), StateKind::Pipeline) {
+                pipeline_stack.pop();
+                interp.job_start_ends();
+                return Some(Stmt::job_launched(interp, id));
+            }
             if Pipeline::is_starting_cmds(interp, id) {
                 return Some(interp.next_node(id));
             }

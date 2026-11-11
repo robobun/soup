@@ -117,6 +117,8 @@ pub(crate) mod builtins {
     pub(crate) mod touch;
     #[path = "true_.rs"]
     pub(crate) mod true_;
+    #[path = "wait.rs"]
+    pub(crate) mod wait;
     #[path = "wc.rs"]
     pub(crate) mod wc;
     #[path = "which.rs"]

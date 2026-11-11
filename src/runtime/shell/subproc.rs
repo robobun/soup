@@ -638,7 +638,7 @@ impl ShellSubprocess {
 
         spawn_args.env_array.push(core::ptr::null());
 
-        let foreground = !interp.in_background(cmd_parent.id);
+        let foreground = !interp.as_cmd(cmd_parent.id).base.shell().background;
         let ctrl_c_child = foreground.then(bun_spawn::ctrl_c::Child::enter);
         crate::node::fs::note_found_on_disk();
         // SAFETY: `spawn_args.argv` / `env_array` are local null-terminated

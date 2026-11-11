@@ -10582,6 +10582,192 @@ Files: `src/js/internal/smtp.ts`, `src/jsc/bindings/BunObject.cpp`,
 `test/js/bun/smtp/mail-server.ts`, `test/js/bun/module-graph/module-graph-isolation.test.ts`,
 `test/integration/bun-types/fixture/smtp.ts`.
 
+### 2026-11-11: background commands in Bun Shell, `cmd &` and `wait`
+
+`` $`server & client` `` threw `Background commands "&" are not supported yet.` before anything
+ran, and so did `bun exec` and every `package.json` script with a `&` that `bun run` hands to Bun
+Shell, which on Windows is all of them. The interpreter's half of the feature has been in the
+tree since oven-sh/bun#9631 (merged in April 2024), which added an `Async` state and switched it
+off in the parser before it landed. oven-sh/bun#22525 (September 2025) switched the parser back
+on and changed nothing else, and the stale bot closed it. This patch finishes the feature and
+adds the `wait` builtin that it needs.
+
+```ts
+import { $ } from "bun";
+
+// Both run at the same time. The promise settles when both have exited.
+await $`bun run api & bun run web`;
+
+// Three at once, then the command that needs all three.
+await $`
+  curl -sO ${a} &
+  curl -sO ${b} &
+  curl -sO ${c} &
+  wait
+  cat a.json b.json c.json | wc -c
+`;
+
+// One job for each round of a loop. Each has its own copy of $f.
+await $`for f in *.png; do bun run optimize.ts $f & done; wait; echo "all done"`;
+```
+
+What it does:
+
+- `list &` starts the whole and-or list before it as a job, as in sh: `a && b &` runs `a` and
+  then `b` in the background (the parser draft of #9631 took only `b`). A pipeline, a subshell,
+  an `if`, a loop, a `[[ ]]` and an assignment can be jobs. `&` ends a command the way `;` does,
+  so `a & b` is two commands, and `a &; b`, `a & && b` and `a & | b` are errors that name the
+  operator.
+- A job runs in a copy of the shell's state, taken when the `&` runs. Its `cd`, assignments and
+  `export` stay inside it, and it keeps the directory and the variables it started with, which is
+  what makes `for f in ...; do work $f & done` give each job its own `$f`. The status of `cmd &`
+  is 0. The standard input of a job is empty unless it is redirected, as in a shell without job
+  control.
+- `wait` waits for the jobs that its own environment started and exits with 0. In a subshell, a
+  pipeline member, a `$( )` or another job it waits for the jobs started there and for no others,
+  so it cannot wait for itself. `wait <operand>` prints `not a child of this shell` and exits
+  with 127, which is what sh answers for a pid that it did not start.
+
+Where it is not sh, on purpose:
+
+- **The script waits for its jobs.** `` await $`server &` `` settles when `server` has exited,
+  and what it printed is in the output. `bun exec` does the same, and `bun run` where it uses Bun
+  Shell. sh returns at once
+  and leaves the job running. A job that outlives the script would need an owner for the output
+  buffers, the parsed script and, on Windows, a process that is spawned detached, so that shape
+  is not in this patch. It is also what #9631 built, and what `deno task` does.
+- **The exit code is that of the last foreground command.** A job that fails does not change it
+  and does not reject the promise (`deno task` fails fast instead).
+- **`$( )` waits for every job started inside it**, also one that redirects its output. In sh a
+  job holds the pipe open, which comes to the same thing unless it redirects, so
+  `pid=$(server > log & echo $!)` returns at once there. That idiom needs `$!`, which is not in
+  this patch, and the sh rule can come with it.
+- **Jobs do not ignore Ctrl+C.** sh has them ignore it in a script. Here a Ctrl+C with nothing
+  but jobs or a `wait` in the foreground ends `bun run`, and the terminal sends it to the jobs
+  too.
+
+What was wrong with the state that was switched off, and why the parser switch alone was not the
+feature:
+
+1. The job ran on the env of the statement that launched it, by pointer, and started three
+   event-loop turns later. `cd /tmp &` moved the script, a loop's jobs all saw the last value of
+   the variable, and `(cmd &)` and `$(cmd &)` left the job with an env that was freed.
+2. The job reported itself done to its parent at once and kept the parent's node id, which was
+   then reused by another node.
+3. A job inside `$( )` wrote its output through a raw pointer into a buffer that the
+   substitution freed when its own script ended.
+4. `a && b &`, `(a; b) &`, `for ...; done &`, `while ...; done &` and `x=1 &` hit a `panic!`.
+5. On the mini loop (`bun run`, `bun exec`) the exit code was preset to 1 and a job that ended
+   before the script finished it with that.
+
+How it is built now. A job is a root of the node tree that owns its env, made at the one place
+that runs an `&` (`Interpreter::launch_job`, from `spawn_expr`) with `dupe_for_subshell`, the
+copy that `( )`, `$( )` and pipeline members already use. It starts in the same trampoline run:
+`Yield::Job` puts the launching statement on the stack that pipelines use to start their members,
+runs the job until it waits for something, and then goes on with the statement. The old state
+took four event-loop hops and a heap box per job. `Interpreter::job_done` is the one place a job
+ends, and it continues at most one thing: the `wait` of the env that launched the job, the `$( )`
+around it, or the end of the script. A `$( )` counts the jobs that write into its buffer
+(`capture_holds`) and is not done before the last of them, also when the script is killed in
+between.
+
+A job is the first thing in the shell that runs beside the env it was copied from, and two
+things that had been safe were not any more. Both were found by the review of the first version
+of this commit, with a use-after-free under ASAN:
+
+- `cd` stored `PWD` and `OLDPWD` as slices into the env's own path buffers, and a copy of the env
+  shared those values. A job read the launcher's next `cd` as its `$PWD`, or freed memory once
+  the launcher was gone. They are refcounted copies now, as `export` already made them.
+- A loop asks for the event loop's turn every 128 rounds, and on the mini loop (`bun exec`,
+  `bun run`) it polled for I/O in the middle of that request. With a second loop running
+  beside it, the poll ran that loop inside the first one, and so on: an assertion in debug
+  builds, a hang in one shape. The poll is at the top of the resumed task now, where nothing of
+  the shell is on the stack. This is a fix to the loops of 2026-09-23 and 2026-10-16, and one of
+  the new `bun exec` tests needs no `&` to show it.
+
+A loop that starts jobs which loop themselves gives the thread up with the first job that asks
+for it (`job_start_ends`): otherwise the jobs would reset the round count that the loop around
+them shares, and that loop would start every job before the event loop got a turn.
+
+As in bash, a job that is a simple command or a pipeline is still in the loops around it, so
+`break &` says nothing, and a compound job starts outside of them like `( )`.
+
+Removed on the way: the `ShellAsync` task tag with its three dispatch arms (88 tags, was 89),
+`ShellAsyncTask`, the parent walk that every spawned process made to ask whether it was in the
+background (a flag on the env now), the check for an `Async` child after every statement, and
+the `panic!` table. A `$( )` inside a job does not read the script's stdin.
+
+What a script without `&` runs that it did not run before: one more name in the builtin table,
+three small fields in each env copy, a count that is read once when a `$( )` ends, one allocation
+for each `cd` (the copies of `PWD` and `OLDPWD`), and on the mini loop the moved poll.
+
+Not in this patch: `$!`, `wait <pid>`, `jobs`, a `kill` builtin, `$?`. The status of a job is
+dropped until one of them can ask for it. Two limits of the shell that a job runs into and that
+are upstream's, both in the docs now: a command takes one redirection, so a job that sends both
+streams to a file is `cmd &> log &` and not `cmd > log 2>&1 &` (oven-sh/bun#9455), and a
+redirection target is opened on the shell's own thread, so `producer > fifo & consumer < fifo`
+stops at the first open and cannot be killed (`src/io/openForWriting.rs` says "this should be
+concurrent").
+
+The gate that this removes was a decision of the review of #9631 and not an oversight:
+"It'd probably be reasonable to ship if else separately from &", "This seems very sketchy" on the
+teardown of the old `Async` node, and `wait` was missing. This is `&` shipped on its own, with
+`wait`, a job env of its own and an ordinary teardown.
+
+It needs three patches of this stack under it: `.kill()` and `.timeout()` of 2026-09-15
+(666582ff9a3), the only way to end a script from JavaScript whose job does not end, and the loops
+of 2026-09-23 (e89e964cdd5) and 2026-10-16 (abf7bccf11a), for the round count above and for the
+`until [[ -e go ]]` gate that most of the tests use. A cherry-pick onto upstream is the four
+commits. Of the open pull requests of upstream, oven-sh/bun#46168 (stop builtins when a script is
+stopped) is the one that meets this: when it lands, a parked `wait` needs an arm in its stop path.
+
+Measured: `size_of` with a temporary assertion under `cargo check`, on the first version of the
+commit. `Node` stays at 176 bytes, `ShellExecEnv` goes from 376 to 392, `Interpreter` from 600
+to 640, and the job node is 120.
+Not measured: instruction counts, syscall counts and the binary size from release builds of the
+base and of this patch. The container had time for the debug build only, so none of those
+numbers exist.
+
+Tests: `background.test.ts` is new and is a table: ten ways to write a job, each also held back
+behind a gate that only opens after the `&`, in nine places where a job can start, 189 rows
+whose output follows from their parts. 27 of the rows run under `bun exec` as well, with four
+scripts that cross the 128 rounds with several loops at once. `bunshell.test.ts` has a
+"background commands" block (jobs that need each other's HTTP request to finish, so a script
+that ran them one after the other would hang; the env copy with `$PWD`; stdin; `break`; `$( )`;
+the syntax errors). `commands/wait.test.ts` is new. `kill.test.ts` kills a script with jobs, with
+a parked `wait` and with a `$( )` that waits for a job, and `yield.test.ts` throws a JavaScript
+error in each of those states. `exec.test.ts` has six cases for the mini loop, with the one of
+point 5. `shell-worker-terminate-leak.test.ts` ends a worker with jobs in flight under
+LeakSanitizer. `run_command.test.ts` sends a Ctrl+C to a script that waits for a job. No test
+sleeps.
+
+Files: `src/shell_parser/parse.rs`, `src/runtime/shell/states/Async.rs` (rewritten),
+`src/runtime/shell/interpreter.rs` (`launch_job`, `capture_owner`, `job_done`, `park_wait`,
+`job_start_ends`, the env fields, `PWD` in `change_cwd_impl`), `src/runtime/shell/Yield.rs`,
+`src/runtime/shell/states/Stmt.rs`, `src/runtime/shell/states/Expansion.rs`,
+`src/runtime/shell/builtin/wait.rs` (new), `src/runtime/shell/Builtin.rs`,
+`src/runtime/shell/mod.rs`, `src/runtime/shell/subproc.rs`,
+`src/runtime/shell/dispatch_tasks.rs` (the poll of the mini loop), `src/runtime/dispatch.rs`,
+`src/event_loop/ConcurrentTask.rs`, `docs/runtime/shell.mdx`,
+`test/js/bun/shell/background.test.ts` (new), `test/js/bun/shell/bunshell.test.ts`,
+`test/js/bun/shell/commands/wait.test.ts` (new), `test/js/bun/shell/parse.test.ts`,
+`test/js/bun/shell/lex.test.ts`, `test/js/bun/shell/kill.test.ts`,
+`test/js/bun/shell/yield.test.ts`, `test/js/bun/shell/exec.test.ts`,
+`test/js/bun/shell/shell-worker-terminate-leak.test.ts`, `test/cli/run/run_command.test.ts`.
+
+The commit was written twice. A design pass came first and a review of the finished commit
+after it, 8.4 hours each, which is why a feature of 2026-11-11 was pushed on the morning of
+2026-11-12. The review found the two faults above, a debug assertion in `job_done` that was
+false for `x=$(a & b & wait)`, a counter change of the first version that hung pipelines of
+loops under `bun exec`, and a path for freeing a `$( )` env late that nothing could reach and
+that is gone. Of its 17 findings one is not taken up: a separate env kind for jobs, which it
+called optional.
+
+The stack was rebased onto oven-sh/bun 447ff870b60 first: 72 patches, nothing dropped, five
+conflicts of one line each (the "Not supported" table of `docs/compiler/compatibility.mdx`
+twice, `docs/compiler/size.mdx`, `docs/compiler/debugging.mdx`, and the `Bun.JWT` line next to
+the rewritten `Bun.sql` getters in `src/jsc/bindings/BunObject.cpp`).
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

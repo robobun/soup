@@ -39,7 +39,7 @@ pub(crate) use crate::generated_bindgen::interpreter::js_ShellInterpreter as js;
 pub(crate) use crate::shell::env_map::EnvMap;
 use crate::shell::io::IO;
 use crate::shell::states::assigns::Assigns;
-use crate::shell::states::r#async::Async;
+use crate::shell::states::r#async::{Async, CaptureOwner};
 use crate::shell::states::base::Base;
 use crate::shell::states::binary::Binary;
 pub(crate) use crate::shell::states::cmd::Cmd;
@@ -303,10 +303,19 @@ pub(crate) struct Interpreter {
     /// child the script spawns belongs to it, and once it stops the script runs no further.
     pub(crate) context: Cell<Option<bun_jsc::ContextId>>,
 
-    pub(crate) async_commands_executing: Cell<u32>,
+    /// Background jobs (`list &`) that have not ended. The script ends after the last one.
+    pub(crate) jobs_running: Cell<u32>,
+    /// The root script is done and `exit_code` is its status.
+    foreground_done: Cell<bool>,
+    /// One entry for each env whose jobs are still running.
+    job_scopes: JsCell<Vec<JobScope>>,
+    /// The last `ShellExecEnv::job_scope` given out. None is used twice.
+    last_job_scope: Cell<u32>,
     /// Rounds that the loops of the script, nested ones included, ran since one of them last
     /// gave the event loop a turn.
     loop_rounds_since_yield: Cell<u32>,
+    /// A loop asked for the event loop's turn since the last `job_start_begins`.
+    loop_yielded_in_job_start: Cell<bool>,
 
     // JSC_BORROW: always borrowed, never owned. Stored raw because the struct
     // is heap-allocated and outlives any single &JSGlobalObject borrow scope.
@@ -571,6 +580,9 @@ impl Interpreter {
                 cwd_fd,
                 loop_depth: 0,
                 loop_jump: None,
+                background: false,
+                job_scope: 0,
+                capture_holds: 0,
             }),
             root_io: JsCell::new(IO {
                 stdin: crate::shell::io::InKind::Fd(stdin_reader),
@@ -583,12 +595,14 @@ impl Interpreter {
             }),
             keep_alive: JsCell::new(bun_io::KeepAlive::default()),
             context: Cell::new(None),
-            async_commands_executing: Cell::new(0),
+            jobs_running: Cell::new(0),
+            foreground_done: Cell::new(false),
+            job_scopes: JsCell::new(Vec::new()),
+            last_job_scope: Cell::new(0),
             loop_rounds_since_yield: Cell::new(0),
+            loop_yielded_in_job_start: Cell::new(false),
             global_this: Cell::new(core::ptr::null_mut()),
             flags: Cell::new(InterpreterFlags::default()),
-            // Starts at `None` so `async_cmd_done` only finishes once
-            // `on_root_child_done` has recorded the real exit code.
             exit_code: Cell::new(None),
             default_kill_signal: Cell::new(bun_sys::SignalCode::DEFAULT),
             killed_by: Cell::new(None),
@@ -708,7 +722,6 @@ impl Interpreter {
         };
 
         // ── run ────────────────────────────────────────────────────────────
-        interp.exit_code.set(Some(1));
         if let Err(e) = interp.run() {
             let name = e.name();
             drop(interp);
@@ -904,10 +917,25 @@ impl Interpreter {
         let rounds = self.loop_rounds_since_yield.get();
         if rounds >= ROUNDS_PER_YIELD {
             self.loop_rounds_since_yield.set(0);
+            self.loop_yielded_in_job_start.set(true);
             return true;
         }
         self.loop_rounds_since_yield.set(rounds + 1);
         false
+    }
+
+    /// A job starts on the thread of the statement that launches it (`Yield::Job`).
+    pub(crate) fn job_start_begins(&self) {
+        self.loop_yielded_in_job_start.set(false);
+    }
+
+    /// The job waits for something and its launcher goes on. If that something is the event
+    /// loop's turn that a loop of the job asked for, a loop around the launcher asks for one at
+    /// its next round too: otherwise a loop that launches loops would never give the thread up.
+    pub(crate) fn job_start_ends(&self) {
+        if self.loop_yielded_in_job_start.replace(false) {
+            self.loop_rounds_since_yield.set(u32::MAX);
+        }
     }
 
     /// The event loop had its turn and the loop that asked for it goes on. The count starts
@@ -959,21 +987,6 @@ impl Interpreter {
         false
     }
 
-    /// Inside an `&` command: not a foreground job.
-    pub(crate) fn in_background(&self, mut id: NodeId) -> bool {
-        while id != NodeId::INTERPRETER {
-            let node = self.node(id);
-            if node.kind() == StateKind::Async {
-                return true;
-            }
-            id = match node.base() {
-                Some(b) => b.parent,
-                None => return false,
-            };
-        }
-        false
-    }
-
     #[inline]
     pub(crate) fn node(&self, id: NodeId) -> &Node {
         &self.nodes.get()[id.idx()]
@@ -1006,9 +1019,7 @@ impl Interpreter {
 
     /// Init + start a child state node for an `ast::Expr`. For `.subshell`,
     /// dupes the parent shell env first; all other variants borrow `shell`.
-    ///
-    /// Note: `Async` must NOT call this — `Async` restricts its child to
-    /// pipeline/cmd/if/condexpr and inits without starting (see `Async::next`).
+    /// `.async` launches a job, which is no child of `parent` (`launch_job`).
     pub(crate) fn spawn_expr(
         &self,
         shell: *mut ShellExecEnv,
@@ -1044,10 +1055,157 @@ impl Interpreter {
                     }
                 }
             }
-            ast::Expr::Async(e) => Async::init(self, shell, *e, parent, io),
+            ast::Expr::Async(list) => return self.launch_job(shell, list, parent, io),
         };
         let y = self.start_node(child);
         (Some(child), y)
+    }
+
+    /// `list &`: start `list` as a job and let `launcher` go on (`Yield::Job`).
+    ///
+    /// The job gets what a subshell gets, now: a copy of the env, so that the
+    /// `cd`, the assignments and the loop variable of the launcher are the ones
+    /// at the `&`. Its stdin is empty, as in a shell without job control.
+    fn launch_job(
+        &self,
+        shell: *mut ShellExecEnv,
+        list: &ast::Expr,
+        launcher: NodeId,
+        io: IO,
+    ) -> (Option<NodeId>, Yield) {
+        let io = IO {
+            stdin: crate::shell::io::InKind::Ignore,
+            stdout: io.stdout,
+            stderr: io.stderr,
+        };
+        // SAFETY: `shell` is the live env of `launcher`, which is running.
+        let env = match unsafe { (*shell).dupe_for_subshell(&io, ShellExecEnvKind::Subshell) } {
+            Ok(env) => env,
+            Err(e) => {
+                self.throw(ShellErr::new_sys(&e));
+                return (None, Yield::Failed(launcher));
+            }
+        };
+        // SAFETY: `env` was allocated above and nothing else refers to it yet; `shell` as above.
+        unsafe {
+            (*env).background = true;
+            // As in bash, and as for the members of a pipeline: a simple command is
+            // still in the loops around it, so `break &` says nothing (and breaks
+            // nothing, the loop being the launcher's). A compound job starts outside.
+            if matches!(
+                list,
+                ast::Expr::Cmd(_) | ast::Expr::Assign(_) | ast::Expr::Pipeline(_)
+            ) {
+                (*env).loop_depth = (*shell).loop_depth;
+            }
+        }
+
+        let capture = self.capture_owner(launcher);
+        if let Some(owner) = capture {
+            // SAFETY: the `$( )` that owns `owner.env` is running `launcher`.
+            unsafe { (*owner.env).capture_holds += 1 };
+        }
+
+        // SAFETY: see above; the copy is made, so this is the only borrow.
+        let scope = unsafe { &mut (*shell).job_scope };
+        if *scope == 0 {
+            self.last_job_scope.set(self.last_job_scope.get() + 1);
+            *scope = self.last_job_scope.get();
+        }
+        let scope = *scope;
+        self.job_scopes
+            .with_mut(|scopes| match scopes.iter_mut().find(|s| s.id == scope) {
+                Some(entry) => entry.running += 1,
+                None => scopes.push(JobScope {
+                    id: scope,
+                    running: 1,
+                    waiter: None,
+                }),
+            });
+        self.jobs_running.set(self.jobs_running.get() + 1);
+
+        let job = Async::init(self, env, list, io, scope, capture);
+        (None, Yield::Job { job, launcher })
+    }
+
+    /// The `$( )` that `id` runs in, if any: the owner of the buffer that the
+    /// captured output of a job launched by `id` goes to.
+    fn capture_owner(&self, mut id: NodeId) -> Option<CaptureOwner> {
+        while id != NodeId::INTERPRETER {
+            let parent = match self.node(id) {
+                // A job is a root, and what it launches writes where it writes.
+                Node::Async(job) => return job.capture,
+                Node::Script(script) => {
+                    let parent = script.base.parent;
+                    if parent != NodeId::INTERPRETER
+                        && matches!(self.node(parent), Node::Expansion(_))
+                    {
+                        return Some(CaptureOwner {
+                            env: script.base.shell,
+                            collector: parent,
+                        });
+                    }
+                    parent
+                }
+                node => node.base()?.parent,
+            };
+            id = parent;
+        }
+        None
+    }
+
+    /// `wait` in the env with this `scope` goes on when the jobs of the env
+    /// have ended. False when there are none to wait for.
+    pub(crate) fn park_wait(&self, scope: u32, cmd: NodeId) -> bool {
+        self.job_scopes
+            .with_mut(|scopes| match scopes.iter_mut().find(|s| s.id == scope) {
+                Some(entry) => {
+                    entry.waiter = Some(cmd);
+                    true
+                }
+                None => false,
+            })
+    }
+
+    /// A job ended. This is the only place that continues what waited for it,
+    /// and at most one thing did: the `wait` of the env that launched it, the
+    /// `$( )` around it, or the end of the script.
+    pub(crate) fn job_done(&self, scope: u32, capture: Option<CaptureOwner>) -> Yield {
+        self.jobs_running.set(self.jobs_running.get() - 1);
+
+        let waiter = self.job_scopes.with_mut(|scopes| {
+            let i = scopes.iter().position(|s| s.id == scope)?;
+            scopes[i].running -= 1;
+            if scopes[i].running > 0 {
+                return None;
+            }
+            scopes.swap_remove(i).waiter
+        });
+        // The `$( )` whose last job this was, if its script is done and it waits for the jobs.
+        // While a `wait` of that script is parked the script is not done, so not both are set.
+        let collector = capture.filter(|owner| {
+            // SAFETY: the `$( )` is not done before its last job is (`Expansion::child_done`),
+            // so the env that it owns is there.
+            let holds = unsafe {
+                (*owner.env).capture_holds -= 1;
+                (*owner.env).capture_holds
+            };
+            holds == 0 && Expansion::waits_for_jobs_of(self, owner.collector, owner.env)
+        });
+
+        if let Some(cmd) = waiter {
+            if crate::shell::builtins::wait::Wait::is_parked(self, cmd, scope) {
+                debug_assert!(collector.is_none());
+                return crate::shell::builtin::Builtin::done(self, cmd, 0);
+            }
+        }
+        if let Some(owner) = collector {
+            return Expansion::jobs_done(self, owner.collector);
+        }
+        if self.foreground_done.get() && self.jobs_running.get() == 0 {
+            return self.finish(self.exit_code.get().unwrap_or(0));
+        }
+        Yield::done()
     }
 
     /// Run the per-state cleanup, then recycle the slot.
@@ -1058,7 +1216,7 @@ impl Interpreter {
         if id == NodeId::NONE || id == NodeId::INTERPRETER {
             return;
         }
-        // NOTE: keep in sync with shell_state_dispatch! table (irregular Async/Free arms keep this hand-rolled for v1).
+        // NOTE: keep in sync with shell_state_dispatch! table (the irregular Free arm keeps this hand-rolled for v1).
         match self.nodes.get()[id.idx()].kind() {
             StateKind::Script => Script::deinit(self, id),
             StateKind::Stmt => Stmt::deinit(self, id),
@@ -1071,7 +1229,7 @@ impl Interpreter {
             StateKind::ForClause => For::deinit(self, id),
             StateKind::WhileClause => While::deinit(self, id),
             StateKind::Condexpr => CondExpr::deinit(self, id),
-            StateKind::Async => return, // Async deinit is purposefully empty; freed later by async_cmd_done → actually_deinit.
+            StateKind::Async => Async::deinit(self, id),
             StateKind::Subshell => Subshell::deinit(self, id),
             StateKind::Free => return,
         }
@@ -1081,27 +1239,21 @@ impl Interpreter {
     // ── root (Interpreter-as-parent) ───────────────────────────────────────
 
     fn on_root_child_done(&self, child: NodeId, exit_code: ExitCode) -> Yield {
-        // Only `Script` can be a direct child of the interpreter.
+        // A job whose list could not start (`fail`).
+        if matches!(self.nodes.get()[child.idx()], Node::Async(_)) {
+            return Async::finish(self, child);
+        }
+        // Besides a job, only the root `Script` is a direct child of the interpreter.
         debug_assert!(matches!(self.nodes.get()[child.idx()], Node::Script(_)));
         log!("Interpreter script finish {}", exit_code);
         self.free_node(child);
         self.exit_code.set(Some(exit_code));
-        if self.async_commands_executing.get() == 0 {
+        self.foreground_done.set(true);
+        if self.jobs_running.get() == 0 {
             return self.finish(exit_code);
         }
+        // `job_done` finishes the script after the last job.
         Yield::suspended()
-    }
-
-    pub(crate) fn async_cmd_done(&self, async_id: NodeId) {
-        Async::actually_deinit(self, async_id);
-        self.free_node(async_id);
-        self.async_commands_executing
-            .set(self.async_commands_executing.get() - 1);
-        if self.async_commands_executing.get() == 0 {
-            if let Some(exit) = self.exit_code.get() {
-                self.finish(exit).run(self);
-            }
-        }
     }
 
     #[inline]
@@ -1752,8 +1904,9 @@ impl Drop for Interpreter {
                             (base.shell != parent_shell).then_some(base.shell)
                         })
                         .collect();
+                    // A job that writes into one of them does not run again.
                     for env in owned_envs {
-                        ShellExecEnv::deinit_impl(env);
+                        ShellExecEnv::free(env);
                     }
                 }
                 self.root_io.set(IO::default());
@@ -1843,6 +1996,23 @@ pub(crate) struct ShellExecEnv {
     /// The sequencing states between the two finish early on it (see
     /// `Interpreter::interrupted`).
     pub(crate) loop_jump: Option<LoopJump>,
+    /// The env of a job (`list &`), or a copy made inside one. What runs in it is
+    /// not a foreground child, and a `$( )` in it does not read the script's stdin.
+    pub(crate) background: bool,
+    /// Names the jobs this env launched, for `wait`. 0 until it launches one.
+    pub(crate) job_scope: u32,
+    /// Jobs launched inside the `$( )` that owns this env and still running. They
+    /// write into its buffers, so the `$( )` is not done before they are
+    /// (`Expansion::child_done`).
+    pub(crate) capture_holds: u32,
+}
+
+/// The running jobs of one env. See `ShellExecEnv::job_scope`.
+struct JobScope {
+    id: u32,
+    running: u32,
+    /// The `Cmd` of a `wait` that is waiting for them.
+    waiter: Option<NodeId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1873,8 +2043,10 @@ impl Bufio {
     pub(crate) fn memory_cost(&self) -> usize {
         match self {
             Bufio::Owned(o) => o.memory_cost(),
-            // SAFETY: borrowed buffer points into a live parent `ShellExecEnv`
-            // (set by `dupe_for_subshell`); the parent outlives the child.
+            // SAFETY: borrowed buffer points into the `ShellExecEnv` that owns it
+            // (set by `dupe_for_subshell`), which outlives every env that writes to
+            // it: the root env is there until the script ends, and the env of a
+            // `$( )` until the last job launched in it is done (`capture_holds`).
             Bufio::Borrowed(b) => unsafe { (**b).memory_cost() },
         }
     }
@@ -2021,7 +2193,8 @@ impl ShellExecEnv {
             // a `break` from in here. As in bash, `( )` starts out of any loop,
             // so `break` there only warns, while `$( )` and a pipeline member
             // are still in their loops and `break` ends what is left of them.
-            // `Pipeline` takes a member that is a compound command out again.
+            // `Pipeline` takes a member that is a compound command out again,
+            // and `launch_job` puts a job that is a simple command back in.
             loop_depth: match kind {
                 ShellExecEnvKind::Subshell => 0,
                 ShellExecEnvKind::Normal
@@ -2029,6 +2202,9 @@ impl ShellExecEnv {
                 | ShellExecEnvKind::Pipeline => self.loop_depth,
             },
             loop_jump: None,
+            background: self.background,
+            job_scope: 0,
+            capture_holds: 0,
         });
         Ok(bun_core::heap::into_raw(duped))
     }
@@ -2039,8 +2215,16 @@ impl ShellExecEnv {
     /// `this` must have been returned by `dupe_for_subshell` (or otherwise
     /// `heap::alloc`'d) and not yet freed.
     pub(crate) fn deinit_impl(this: *mut ShellExecEnv) {
+        // SAFETY: precondition above.
+        debug_assert_eq!(unsafe { (*this).capture_holds }, 0);
+        Self::free(this);
+    }
+
+    /// `deinit_impl` for `Interpreter::drop`, where the jobs that write into
+    /// the buffers of this env do not run again.
+    fn free(this: *mut ShellExecEnv) {
         log!("[ShellExecEnv] deinit 0x{:x}", this as usize);
-        // SAFETY: precondition above. Reclaim the Box; `Drop` for the env
+        // SAFETY: precondition of `deinit_impl`. Reclaim the Box; `Drop` for the env
         // maps / vecs / owned `Bufio` runs on drop. Only `cwd_fd` needs an
         // explicit close.
         let boxed = unsafe { bun_core::heap::take(this) };
@@ -2190,14 +2374,20 @@ impl ShellExecEnv {
         // Note: reshaped for borrowck — materialize the EnvStr (which
         // erases the slice lifetime into a packed ptr) before taking
         // `&mut self.export_env`.
+        //
+        // The values are copies: a copy of this env (`dupe_for_subshell`) shares
+        // the map's values and not `__cwd` / `__prev_cwd`, and a job's copy is
+        // still read after this env has moved on or is gone.
         use crate::shell::env_str::EnvStr;
         if !in_init {
-            let oldpwd = EnvStr::init_slice(self.prev_cwd());
+            let oldpwd = EnvStr::dupe_ref_counted(self.prev_cwd());
             self.export_env
                 .insert(EnvStr::init_slice(b"OLDPWD"), oldpwd);
+            oldpwd.deref();
         }
-        let pwd = EnvStr::init_slice(self.cwd());
+        let pwd = EnvStr::dupe_ref_counted(self.cwd());
         self.export_env.insert(EnvStr::init_slice(b"PWD"), pwd);
+        pwd.deref();
 
         Ok(())
     }

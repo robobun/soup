@@ -1,6 +1,6 @@
 use crate::shell::ExitCode;
 use crate::shell::ast;
-use crate::shell::interpreter::{Interpreter, Node, NodeId, ShellExecEnv, StateKind, log};
+use crate::shell::interpreter::{Interpreter, Node, NodeId, ShellExecEnv, log};
 use crate::shell::io::IO;
 use crate::shell::states::base::Base;
 use crate::shell::yield_::Yield;
@@ -70,16 +70,22 @@ impl Stmt {
         exit_code: ExitCode,
     ) -> Yield {
         log!("Stmt {} childDone exit={}", this, exit_code);
+        interp.as_stmt_mut(this).currently_executing = None;
+        interp.deinit_node(child);
+        Self::advance(interp, this, exit_code)
+    }
+
+    /// `list &` launched its job, which is no child of this statement. The status of `&` is 0.
+    pub(crate) fn job_launched(interp: &Interpreter, this: NodeId) -> Yield {
+        log!("Stmt {} job launched", this);
+        Self::advance(interp, this, 0)
+    }
+
+    fn advance(interp: &Interpreter, this: NodeId, exit_code: ExitCode) -> Yield {
         {
             let me = interp.as_stmt_mut(this);
             me.last_exit_code = Some(exit_code);
             me.idx += 1;
-            me.currently_executing = None;
-        }
-        // Async children are *not* freed here (they outlive their parent's
-        // notion of "done"); see `Async`'s empty `deinit`.
-        if !matches!(interp.node(child).kind(), StateKind::Async) {
-            interp.deinit_node(child);
         }
         if interp.interrupted(this) {
             let me = interp.as_stmt_mut(this);

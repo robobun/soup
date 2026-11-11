@@ -6,7 +6,7 @@
  */
 import { $ } from "bun";
 import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
-import { chmodSync, linkSync, mkdirSync, symlinkSync, utimesSync } from "fs";
+import { chmodSync, linkSync, mkdirSync, realpathSync, symlinkSync, utimesSync } from "fs";
 import { mkdir, rm, stat } from "fs/promises";
 import {
   bunExe,
@@ -1783,9 +1783,8 @@ describe("deno_task", () => {
 
     TestBuilder.command`echo 1 | echo 2 && echo 3`.stdout("2\n3\n").runAsTest("pipe in conditional");
 
-    TestBuilder.command`echo $(sleep 0.1 && echo 2 & echo 1) | BUN_DEBUG_QUIET_LOGS=1 BUN_TEST_VAR=1 ${BUN} -e 'await process.stdin.pipe(process.stdout)'`
-      .stdout("1 2\n")
-      .todo("& not supported")
+    TestBuilder.command`echo $(${BUN} -e 'console.log(2)' && echo 3 & echo 1) | BUN_DEBUG_QUIET_LOGS=1 BUN_TEST_VAR=1 ${BUN} -e 'await process.stdin.pipe(process.stdout)'`
+      .stdout("1 2 3\n")
       .runAsTest("complicated pipeline");
 
     TestBuilder.command`echo 2 | echo 1 | BUN_TEST_VAR=1 ${BUN} -e 'process.stdin.pipe(process.stdout)'`
@@ -1893,10 +1892,9 @@ describe("deno_task", () => {
         .stdout("b\nd\n")
         .runAsTest("interleaved pipelines and conditionals");
 
-      // Test pipeline with background process (when supported)
+      // The job holds the pipe open, so the reader gets what it prints.
       TestBuilder.command`echo foreground | echo pipe && (echo background &) | BUN_TEST_VAR=1 ${BUN} -e 'process.stdin.pipe(process.stdout)'`
-        .stdout("pipe\n")
-        .todo("background processes not fully supported")
+        .stdout("pipe\nbackground\n")
         .runAsTest("pipeline with background process");
 
       // Test rapid pipeline creation and destruction
@@ -2702,13 +2700,11 @@ fi`
     // test_oE 'command ending with asynchronous command (after if)'
     TestBuilder.command`if echo foo&then wait;fi`
       .stdout("foo\n")
-      .todo("wait not implemented")
       .runAsTest("command ending with asynchronous command (after if)");
 
     // test_oE 'command ending with asynchronous command (after then)'
     TestBuilder.command`if echo foo;then echo bar&fi;wait`
       .stdout("foo\nbar\n")
-      .todo("wait not implementeeed")
       .runAsTest("command ending with asynchronous command (after then)");
 
     // test_oE 'command ending with asynchronous command (after elif)'
@@ -4583,7 +4579,9 @@ mkfifo fifo1
 cat fifo1
 `
       .stdout("foo\n")
-      .todo("async commands not implemented yet")
+      .todo(
+        "a redirect target is opened on the shell's thread, so `>fifo1` waits there for a reader that `cat` never gets to be",
+      )
       .runAsTest("subshell ending with asynchronous list");
 
     // test_oE 'newlines in subshell'
@@ -4685,19 +4683,322 @@ describe("ShellError constructor", () => {
   });
 });
 
-describe.todo("async", () => {
-  TestBuilder.command`echo hi && BUN_DEBUG_QUIET_LOGS=1 ${BUN} -e ${/* ts */ `await Bun.sleep(500); console.log('noice')`} &; echo hello`
-    .stdout("hi\nhello\nnoice\n")
-    .runAsTest("basic");
+describe("background commands", () => {
+  // Answers every request once `count` of them are waiting, so commands that
+  // run one after the other never get an answer.
+  function rendezvous(count: number) {
+    const waiting: (() => void)[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch() {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        waiting.push(resolve);
+        if (waiting.length === count) for (const go of waiting) go();
+        await promise;
+        return new Response("met");
+      },
+    });
+    return { server, url: `http://localhost:${server.port}/` };
+  }
+  const meet = (url: string) => `console.log(await (await fetch(${JSON.stringify(url)})).text())`;
 
-  TestBuilder.command`BUN_DEBUG_QUIET_LOGS=1 ${BUN} -e ${/* ts */ `await Bun.sleep(500); console.log('noice')`} | cat &; echo hello`
-    .stdout("hello\nnoice\n")
-    .runAsTest("pipeline");
+  test("a job runs at the same time as the command after it", async () => {
+    const { server, url } = rendezvous(2);
+    using _ = server;
+    const { stdout, stderr, exitCode } = await $`${BUN} -e ${meet(url)} & ${BUN} -e ${meet(url)}`.quiet();
+    expect(stderr.toString()).toBe("");
+    expect(stdout.toString()).toBe("met\nmet\n");
+    expect(exitCode).toBe(0);
+  });
 
-  TestBuilder.command`echo start > output.txt & cat output.txt`
-    .file("output.txt", "hey")
-    .stdout(s => expect(s).toBeOneOf(["hey", "start\n"]))
-    .runAsTest("background_execution_with_output_redirection");
+  test("jobs run at the same time as each other, and wait waits for all of them", async () => {
+    const { server, url } = rendezvous(3);
+    using _ = server;
+    const { stdout, stderr, exitCode } =
+      await $`${BUN} -e ${meet(url)} & ${BUN} -e ${meet(url)} & ${BUN} -e ${meet(url)} & wait; echo after`.quiet();
+    expect(stderr.toString()).toBe("");
+    expect(stdout.toString()).toBe("met\nmet\nmet\nafter\n");
+    expect(exitCode).toBe(0);
+  });
+
+  TestBuilder.command`echo job & wait; echo after`.stdout("job\nafter\n").runAsTest("wait: the job is done first");
+
+  TestBuilder.command`echo job &`.stdout("job\n").runAsTest("the script ends after its jobs");
+
+  TestBuilder.command`echo job & echo main`
+    .stdout(out => expect(sortedShellOutput(out)).toEqual(["job", "main"]))
+    .runAsTest("the command after & runs too");
+
+  TestBuilder.command`echo one &
+echo two &
+wait
+echo three`
+    .stdout(out => {
+      const lines = out.split("\n");
+      expect(lines.slice(0, 2).sort()).toEqual(["one", "two"]);
+      expect(lines.slice(2)).toEqual(["three", ""]);
+    })
+    .runAsTest("a newline after &");
+
+  describe("exit code", () => {
+    TestBuilder.command`false &`.exitCode(0).runAsTest("the status of & is 0");
+    TestBuilder.command`false & wait`.exitCode(0).runAsTest("wait answers 0 whatever the jobs did");
+    TestBuilder.command`true & false`.exitCode(1).runAsTest("the last foreground command decides");
+    TestBuilder.command`false & true`.exitCode(0).runAsTest("a failed job does not");
+    TestBuilder.command`false && true &`.exitCode(0).runAsTest("& takes the whole && list");
+
+    test("a failed job does not reject the promise", async () => {
+      const { exitCode } = await $`false & wait`.throws(true);
+      expect(exitCode).toBe(0);
+    });
+  });
+
+  describe("the job has an environment of its own", () => {
+    TestBuilder.command`x=launcher; x=job & wait; echo $x`.stdout("launcher\n").runAsTest("an assignment stays in it");
+
+    TestBuilder.command`export X=job & wait; echo "[$X]"`.stdout("[]\n").runAsTest("an export stays in it");
+
+    TestBuilder.command`cd sub & wait; pwd`.directory("sub").stdout("$TEMP_DIR\n").runAsTest("cd stays in it");
+
+    TestBuilder.command`cd sub; pwd & cd ..; wait; pwd`
+      .directory("sub")
+      .stdout("$TEMP_DIR/sub\n$TEMP_DIR\n")
+      .runAsTest("it keeps the directory it started in");
+
+    // The job waits for `go` before it reads $x, and the launcher writes `go`
+    // after it has changed $x.
+    TestBuilder.command`x=before; (until [[ -e go ]]; do true; done; echo $x) & x=after; touch go; wait; echo $x`
+      .ensureTempDir()
+      .stdout("before\nafter\n")
+      .runAsTest("it keeps the variables of the moment it started");
+
+    TestBuilder.command`for i in 1 2 3; do (until [[ -e go ]]; do true; done; echo $i) & done; touch go; wait; echo end`
+      .ensureTempDir()
+      .stdout(out => {
+        const lines = out.split("\n");
+        expect(lines.slice(0, 3).sort()).toEqual(["1", "2", "3"]);
+        expect(lines.slice(3)).toEqual(["end", ""]);
+      })
+      .runAsTest("each job of a loop has its own value of the variable");
+
+    // As in bash: a simple command is still in the loops around it, so its
+    // `break` says nothing. The loop is the launcher's and goes on.
+    TestBuilder.command`for i in 1 2; do break & done; wait; echo $i`
+      .stdout("2\n")
+      .runAsTest("break in it does not leave the loop around the &");
+
+    TestBuilder.command`for i in 1 2; do continue & echo $i; done; wait`
+      .stdout("1\n2\n")
+      .runAsTest("nor does continue skip a round of it");
+
+    TestBuilder.command`for i in 1 2; do break | cat & wait; echo $i; done`
+      .stdout("1\n2\n")
+      .runAsTest("nor does a break in a pipeline");
+
+    TestBuilder.command`for i in 1 2; do echo "[$(echo a; break; echo never)]" & wait; done`
+      .stdout("[a]\n[a]\n")
+      .runAsTest("break ends what is left of a command substitution in it");
+
+    TestBuilder.command`for i in 1 2; do true && break & done; wait; echo $i`
+      .stdout("2\n")
+      .stderr("break: only meaningful in a loop\nbreak: only meaningful in a loop\n")
+      .runAsTest("a compound job starts outside of the loop, as a subshell does");
+
+    test("it keeps $PWD and $OLDPWD of the moment it started", async () => {
+      using dir = tempDir("shell-job-pwd", { "a/x": "", "bb/x": "", "ccc/x": "" });
+      const root = realpathSync(String(dir)).replaceAll("\\", "/");
+      const go = `${root}/go`;
+      // `bb` and `ccc`: the launcher moves on to a longer path, in a new buffer.
+      const { stdout, stderr, exitCode } =
+        await $`cd a; cd ../bb; (until [[ -e ${go} ]]; do true; done; echo "$OLDPWD $PWD"; pwd) & cd ../ccc; touch ${go}; wait; echo "$OLDPWD $PWD"`
+          .cwd(root)
+          .quiet();
+      expect(stderr.toString()).toBe("");
+      expect(stdout.toString()).toBe(`${root}/a ${root}/bb\n${root}/bb\n${root}/bb ${root}/ccc\n`);
+      expect(exitCode).toBe(0);
+    });
+
+    test("it keeps the $PWD of .cwd()", async () => {
+      using dir = tempDir("shell-job-cwd", { "api/x": "", "web/x": "" });
+      const root = realpathSync(String(dir)).replaceAll("\\", "/");
+      const go = `${root}/go`;
+      const { stdout, stderr, exitCode } =
+        await $`(until [[ -e ${go} ]]; do true; done; echo $PWD; pwd) & cd ../web; touch ${go}; wait`
+          .cwd(`${root}/api`)
+          .quiet();
+      expect(stderr.toString()).toBe("");
+      expect(stdout.toString()).toBe(`${root}/api\n${root}/api\n`);
+      expect(exitCode).toBe(0);
+    });
+
+    test("it keeps the $PWD of a subshell that is gone", async () => {
+      using dir = tempDir("shell-job-subshell-pwd", { "a/x": "" });
+      const root = realpathSync(String(dir)).replaceAll("\\", "/");
+      const go = `${root}/go`;
+      const { stdout, stderr, exitCode } =
+        await $`(cd a; until [[ -e ${go} ]]; do true; done && echo "job $PWD" &); echo main; touch ${go}`
+          .cwd(root)
+          .quiet();
+      expect(stderr.toString()).toBe("");
+      expect(stdout.toString()).toBe(`main\njob ${root}/a\n`);
+      expect(exitCode).toBe(0);
+    });
+  });
+
+  describe("what can be a job", () => {
+    TestBuilder.command`echo a && echo b & wait; echo c`.stdout("a\nb\nc\n").runAsTest("an && list");
+    TestBuilder.command`false || echo b & wait; echo c`.stdout("b\nc\n").runAsTest("an || list");
+    TestBuilder.command`echo hi | cat & wait; echo after`.stdout("hi\nafter\n").runAsTest("a pipeline");
+    TestBuilder.command`(echo a; echo b) & wait; echo c`.stdout("a\nb\nc\n").runAsTest("a subshell");
+    TestBuilder.command`if true; then echo yes; else echo no; fi & wait; echo after`
+      .stdout("yes\nafter\n")
+      .runAsTest("an if");
+    TestBuilder.command`for i in 1 2; do echo $i; done & wait; echo after`
+      .stdout("1\n2\nafter\n")
+      .runAsTest("a for loop");
+    TestBuilder.command`i=0; while [[ $i -lt 2 ]]; do echo $i; i=$((i + 1)); done & wait; echo "after $i"`
+      .stdout("0\n1\nafter 0\n")
+      .runAsTest("a while loop");
+    TestBuilder.command`[[ -n x ]] & wait; echo after`.stdout("after\n").runAsTest("a [[ ]]");
+    TestBuilder.command`x=1 & wait; echo "[$x]"`.stdout("[]\n").runAsTest("an assignment");
+    TestBuilder.command`echo hi > out.txt & wait; cat out.txt`
+      .ensureTempDir()
+      .stdout("hi\n")
+      .runAsTest("a command with a redirect");
+    TestBuilder.command`${BUN} -e ${"console.log('process')"} & wait; echo after`
+      .stdout("process\nafter\n")
+      .runAsTest("a process");
+  });
+
+  describe("where a job can start", () => {
+    TestBuilder.command`if true; then echo a & fi; wait; echo b`.stdout("a\nb\n").runAsTest("in an if");
+    TestBuilder.command`for i in 1 2 3; do echo $i & done; wait; echo end`
+      .stdout(out => {
+        const lines = out.split("\n");
+        expect(lines.slice(0, 3).sort()).toEqual(["1", "2", "3"]);
+        expect(lines.slice(3)).toEqual(["end", ""]);
+      })
+      .runAsTest("in a for loop");
+    TestBuilder.command`(echo a & wait; echo b)`.stdout("a\nb\n").runAsTest("in a subshell");
+    // The job reads its variables after the subshell that started it is gone.
+    TestBuilder.command`(x=sub; until [[ -e go ]]; do true; done && echo "job $x" &); echo main; touch go`
+      .ensureTempDir()
+      .stdout("main\njob sub\n")
+      .runAsTest("in a subshell that ends first");
+    TestBuilder.command`(echo a & wait; echo b) & wait; echo c`.stdout("a\nb\nc\n").runAsTest("in a job");
+    TestBuilder.command`(echo a & echo b) | cat`
+      .stdout(out => expect(sortedShellOutput(out)).toEqual(["a", "b"]))
+      .runAsTest("in a pipeline");
+    TestBuilder.command`for i in $(seq 1 100); do echo $i & done; wait`
+      .stdout(out =>
+        expect(
+          out
+            .split("\n")
+            .filter(Boolean)
+            .map(Number)
+            .sort((a, b) => a - b),
+        ).toEqual(Array.from({ length: 100 }, (_, i) => i + 1)),
+      )
+      .runAsTest("a hundred at once");
+  });
+
+  describe("in a command substitution", () => {
+    TestBuilder.command`echo "<$(echo a & wait; echo b)>"`.stdout("<a\nb>\n").runAsTest("wait");
+
+    // The job writes after the script of the substitution has ended.
+    TestBuilder.command`echo "<$( (until [[ -e go ]]; do true; done; echo late) & echo early; touch go)>"`
+      .ensureTempDir()
+      .stdout("<early\nlate>\n")
+      .runAsTest("the substitution waits for its jobs");
+
+    TestBuilder.command`echo $(echo a &) $(echo b & wait)`
+      .stdout("a b\n")
+      .runAsTest("& before the closing parenthesis");
+
+    // The `wait` is parked in the substitution when its last job ends.
+    TestBuilder.command`x=$( (until [[ -e go ]]; do true; done; echo a) & (until [[ -e go ]]; do true; done; echo b) & touch go; wait; echo c); echo "[$x]"`
+      .ensureTempDir()
+      .stdout(out => expect(["[a\nb\nc]\n", "[b\na\nc]\n"]).toContain(out))
+      .runAsTest("wait for jobs that are still running");
+
+    TestBuilder.command`echo "<$( (until [[ -e go ]]; do true; done && echo a & touch go; wait; echo b); echo c)>"`
+      .ensureTempDir()
+      .stdout("<a\nb\nc>\n")
+      .runAsTest("wait in a subshell of it");
+
+    // sh waits only while a job still holds the pipe. Here every job is waited for.
+    TestBuilder.command`x=$( (until [[ -e go ]]; do true; done; echo done > marker) & echo started; touch go); cat marker; echo "[$x]"`
+      .ensureTempDir()
+      .stdout("done\n[started]\n")
+      .runAsTest("also for a job whose output goes elsewhere");
+
+    TestBuilder.command`x=$( (until [[ -e go ]]; do true; done; echo late) & touch go); echo "<$x>"`
+      .ensureTempDir()
+      .stdout("<late>\n")
+      .runAsTest("also in an assignment");
+
+    TestBuilder.command`echo "<$( ( (until [[ -e go ]]; do true; done; echo late) &) & touch go)>"`
+      .ensureTempDir()
+      .stdout("<late>\n")
+      .runAsTest("and for the job of a job");
+
+    TestBuilder.command`echo "<$( (until [[ -e go ]]; do true; done; echo late) &)>" & touch go; wait; echo end`
+      .ensureTempDir()
+      .stdout("<late>\nend\n")
+      .runAsTest("and inside a job");
+  });
+
+  describe("stdin", () => {
+    // `cat` gets the pipe, the job does not.
+    TestBuilder.command`echo piped | (cat & wait)`.stdout("").runAsTest("is empty for a job");
+    TestBuilder.command`echo piped | (echo "<$(cat)>" & wait)`.stdout("<>\n").runAsTest("and for a $( ) in it");
+    TestBuilder.command`cat < in.txt & wait`
+      .file("in.txt", "from a file\n")
+      .stdout("from a file\n")
+      .runAsTest("a redirect still gives it one");
+
+    test("a job does not wait for the stdin of the script", async () => {
+      // The stdin of this process stays open: a `cat` that read it would not end.
+      await using proc = Bun.spawn({
+        cmd: [
+          BUN,
+          "-e",
+          `const { stdout } = await Bun.$\`cat & wait; echo after\`.quiet(); process.stdout.write(stdout);`,
+        ],
+        env: bunEnv,
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout).toBe("after\n");
+      expect(exitCode).toBe(0);
+    });
+  });
+
+  describe("syntax", () => {
+    TestBuilder.command`echo a &; echo b`.error('"&" ends a command, so ";" cannot follow it').runAsTest("& then ;");
+    TestBuilder.command`echo a & && echo b`
+      .error('"&" ends a command, so "&&" cannot follow it')
+      .runAsTest("& then &&");
+    TestBuilder.command`echo a & || echo b`
+      .error('"&" ends a command, so "||" cannot follow it')
+      .runAsTest("& then ||");
+    TestBuilder.command`echo a & | cat`.error('"&" ends a command, so "|" cannot follow it').runAsTest("& then |");
+    TestBuilder.command`echo a & & echo b`.error('"&" ends a command, so "&" cannot follow it').runAsTest("& then &");
+    TestBuilder.command`& echo a`.error(true).runAsTest("& with no command");
+    TestBuilder.command`echo a &> out.txt; cat out.txt`
+      .ensureTempDir()
+      .stdout("a\n")
+      .runAsTest("&> is still a redirect");
+
+    // A command takes one redirect, so this is how a job sends both streams to a file.
+    TestBuilder.command`echo a &> out.txt & wait; cat out.txt`
+      .ensureTempDir()
+      .stdout("a\n")
+      .runAsTest("&> and & together");
+  });
 });
 
 function stringifyBuffer(buffer: Uint8Array): string {

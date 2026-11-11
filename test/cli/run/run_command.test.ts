@@ -345,6 +345,28 @@ for (const mode of ctrlCModes) {
   });
 }
 
+// A background command (`cmd &`) is not the foreground child that a Ctrl+C is left to. A script
+// with nothing but `wait` in the foreground ends with the Ctrl+C, whatever the command does with it.
+test.skipIf(isWindows)("Ctrl+C ends a bun shell script that waits for a background command", async () => {
+  using dir = tempDir("run-ctrl-c-wait", {
+    "package.json": JSON.stringify({
+      name: "t",
+      scripts: { go: `bun child.js & wait; bun -e "console.log(String.fromCharCode(78,79,80,69))"` },
+    }),
+    "child.js": `${raiseCtrlC}
+      process.on("SIGINT", () => process.exit(0));
+      setInterval(() => {}, 1000);
+      console.log("ready");
+      raiseCtrlC();
+    `,
+  });
+
+  const { text, signalCode } = await runInTerminal([bunExe(), "run", "--shell=bun", "go"], String(dir));
+  expect(text).toContain("ready");
+  expect(text).not.toContain("NOPE");
+  expect(signalCode).toBe("SIGINT");
+});
+
 // A signal that arrives before `bun run` knows the script's pid is forwarded once the spawn returns.
 // `bun run` blocks every signal during the spawn, which is visible in /proc/<pid>/status.
 test.skipIf(!isLinux)(

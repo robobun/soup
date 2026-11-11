@@ -70,6 +70,32 @@ test.skipIf(!isASAN || isWindows)(
   LEAK_TEST_TIMEOUT,
 );
 
+for (const [name, script] of [
+  ["a background job and a parked wait", `sh -c "echo ok > flag.txt && exec sleep 100" & wait`],
+  ["a job of a subshell that has ended", `(sh -c "echo ok > flag.txt && exec sleep 100" &); echo after`],
+  [
+    "a command substitution that waits for a job",
+    `echo "$(sh -c "echo ok > flag.txt && exec sleep 100" & echo early)"`,
+  ],
+]) {
+  test.skipIf(!isASAN || isWindows)(
+    `worker.terminate() with ${name} does not leak`,
+    async () => {
+      await runTerminateScenario(`
+        const running = Bun.$\`\${{ raw: ${JSON.stringify(script)} }}\`.quiet().nothrow();
+        (async () => {
+          await running;
+        })();
+        while (!(await Bun.file("flag.txt").exists())) {
+          await Bun.sleep(5);
+        }
+        postMessage("ok");
+      `);
+    },
+    LEAK_TEST_TIMEOUT,
+  );
+}
+
 test.skipIf(!isASAN || isWindows)(
   "worker.terminate() with a live Bun.$ subprocess does not leak a pending buffer-stdin writer",
   async () => {

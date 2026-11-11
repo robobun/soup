@@ -76,10 +76,8 @@ pub mod ast {
         For(&'arena For<'arena>),
         While(&'arena While<'arena>),
         CondExpr(&'arena CondExpr<'arena>),
-        /// Valid async (`&`) expressions: pipeline, cmd, subshell, if, condexpr.
-        /// Note that commands in a pipeline cannot be async.
-        /// TODO: Extra indirection for essentially a boolean feels bad for performance
-        /// could probably find a more efficient way to encode this information.
+        /// `list &`: the whole and-or list before the `&` runs in the background,
+        /// in a subshell environment of its own. Only a statement holds one.
         Async(&'arena Expr<'arena>),
     }
 
@@ -928,10 +926,36 @@ impl<'bump> Parser<'bump> {
         } {
             let expr = self.parse_expr()?;
             if self.r#match(TokenTag::Ampersand) {
-                self.add_error(format_args!(
-                    "Background commands \"&\" are not supported yet."
-                ))?;
-                return Err(ParseError::Unsupported.into());
+                exprs.push(ast::Expr::Async(self.allocate(expr)));
+                // The end of a `$(...)` leaves one before its closing token.
+                let _ = self.r#match(TokenTag::Delimit);
+                // `&` ends the list the way `;` does, so nothing of the list can follow it.
+                let operator = match self.peek().tag() {
+                    TokenTag::Semicolon => Some(";"),
+                    TokenTag::DoubleAmpersand => Some("&&"),
+                    TokenTag::DoublePipe => Some("||"),
+                    TokenTag::Pipe => Some("|"),
+                    TokenTag::Ampersand => Some("&"),
+                    _ => None,
+                };
+                if let Some(operator) = operator {
+                    self.add_error(format_args!(
+                        "\"&\" ends a command, so \"{operator}\" cannot follow it"
+                    ))?;
+                    return Err(ParseError::Unexpected.into());
+                }
+                // A newline, the end of the script or of the subshell ends the statement as
+                // usual. Anything else starts the next one: `a & b`, or the `done` of a loop.
+                let ends_statement = match self.peek().tag() {
+                    TokenTag::Newline | TokenTag::Eof => true,
+                    tag => self
+                        .inside_subshell
+                        .is_some_and(|kind| kind.closing_tok() == tag),
+                };
+                if ends_statement {
+                    continue;
+                }
+                break;
             }
             exprs.push(expr);
         }

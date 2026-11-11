@@ -88,7 +88,6 @@ use crate::shell::dispatch_tasks::{ShellCondExprStatTask, ShellGlobTask, ShellRm
 use crate::shell::interpreter::ShellTask;
 #[cfg(not(windows))]
 use crate::shell::io_writer::Poll as ShellBufferedWriterPoll;
-use crate::shell::states::r#async::Async as ShellAsync;
 
 use crate::webcore::fetch::fetch_tasklet::FetchTasklet;
 use crate::webcore::file_sink::FlushPendingTask as FlushPendingFileSinkTask;
@@ -546,8 +545,7 @@ pub(crate) fn run_task(
         }
 
         // ── shell interpreter (cold — hoisted to `run_task_cold`) ────────
-        task_tag::ShellAsync
-        | task_tag::ShellCondExprStatTask
+        task_tag::ShellCondExprStatTask
         | task_tag::ShellCpTask
         | task_tag::ShellTouchTask
         | task_tag::ShellMkdirTask
@@ -858,13 +856,6 @@ fn run_task_cold(task: Task) {
 
     match task.tag {
         // ── shell interpreter ────────────────────────────────────────────
-        task_tag::ShellAsync => {
-            // SAFETY: §Dispatch — tag identifies pointee.
-            let t = unsafe { &mut *cast_ptr!(crate::shell::dispatch_tasks::ShellAsyncTask) };
-            // SAFETY: `interp` set at enqueue; outlives task.
-            let interp = unsafe { &*t.interp };
-            ShellAsync::run_from_main_thread(interp, t.node);
-        }
         task_tag::ShellCondExprStatTask => {
             shell_dispatch!(nested ShellCondExprStatTask);
         }
@@ -909,7 +900,7 @@ fn run_task_cold(task: Task) {
 /// `release_task_unrun` track `bun_event_loop::task_tag::COUNT`. Bump when
 /// adding a variant — and give it an arm in both.
 const _: () = assert!(
-    task_tag::COUNT == 89,
+    task_tag::COUNT == 88,
     "dispatch::run_task / release_task_unrun arm count out of sync with bun_event_loop::task_tag",
 );
 
@@ -1826,7 +1817,6 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
         task_tag::ServerAllConnectionsClosedTask => {
             release_in!([Serve], ServerAllConnectionsClosedTask)
         }
-        task_tag::ShellAsync => release_in!([Shell], crate::shell::dispatch_tasks::ShellAsyncTask),
         task_tag::ShellCondExprStatTask => release_in!([Shell], ShellCondExprStatTask),
         task_tag::ShellCpTask => release_in!([Shell], ShellCpTask),
         task_tag::ShellGlobTask => release_in!([Shell], ShellGlobTask),
