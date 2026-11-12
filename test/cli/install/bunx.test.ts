@@ -3614,6 +3614,30 @@ console.log("scripts ran: tool " + ran(".") + ", dep " + ran("../dep"));
     });
   });
 
+  // The install of bunx reads no bunfig.toml of a project, so the flag is how one run switches the setting on.
+  it.concurrent("--block-exotic-subdeps is passed on to the install, in a separate tree", async () => {
+    const dep = await githubTarball("package", { "package.json": JSON.stringify({ name: "dep", version: "1.0.0" }) });
+    using tarballs = fixtureServer(pathname => (pathname === "/dep.tgz" ? dep : undefined));
+    const url = `${tarballs.url}/dep.tgz`;
+    using registry = await localRegistry({ ...fixturePackage("tool", "1.0.0", "tool"), dependencies: { dep: url } });
+    using box = sandbox(registry);
+    const refusal = `error: refusing to resolve "dep@${url}" declared by tool@1.0.0: blockExoticSubdeps allows git and tarball URL dependencies only in this project's package.json files`;
+
+    const refused = await box.run(["--block-exotic-subdeps", "tool"]);
+    expect(refused.stderr).toContain(refusal);
+    expect(refused).toMatchObject({ stdout: "", exitCode: 1 });
+    expect(tarballs.requests).toEqual([]);
+
+    expect(await box.run(["tool"])).toMatchObject({ stdout: "tool 1.0.0\n", exitCode: 0 });
+    expect(tarballs.requests).toEqual(["/dep.tgz"]);
+
+    // The tree that was installed without the flag is not the one that a run with the flag uses.
+    const again = await box.run(["--block-exotic-subdeps", "tool"]);
+    expect(again.stderr).toContain(refusal);
+    expect(again).toMatchObject({ stdout: "", exitCode: 1 });
+    expect(tarballs.requests).toEqual(["/dep.tgz"]);
+  });
+
   it.concurrent("--env-file, --minimum-release-age and --cwd together", async () => {
     using registry = await localRegistry(
       {

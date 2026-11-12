@@ -33,6 +33,10 @@ Execute an npm package executable (CLI). If the package isn't installed in `node
   Only install packages published at least N seconds ago (security feature)
 </ParamField>
 
+<ParamField path="--block-exotic-subdeps" type="boolean">
+  Refuse git and tarball URL dependencies that an installed package declares
+</ParamField>
+
 <ParamField path="--use-system-ca" type="boolean">
   Use the system's trusted certificate authorities during installation
 </ParamField>

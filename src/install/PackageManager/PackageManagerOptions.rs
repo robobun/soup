@@ -117,6 +117,9 @@ pub struct Options {
     // Packages and package versions to exclude from minimum release age checking
     pub minimum_release_age_excludes: Option<&'static Npm::MinimumReleaseAgeExcludes>,
 
+    /// `--block-exotic-subdeps` / `install.blockExoticSubdeps`, see `dependency::EXOTIC_SOURCE_RULE`.
+    pub block_exotic_subdeps: bool,
+
     /// Override CPU architecture for optional dependencies filtering
     pub cpu: Npm::Architecture,
     /// Override OS for optional dependencies filtering
@@ -191,6 +194,7 @@ impl Default for Options {
             security_scanner: None,
             minimum_release_age_ms: None,
             minimum_release_age_excludes: None,
+            block_exotic_subdeps: false,
             cpu: Npm::Architecture::CURRENT,
             os: Npm::OperatingSystem::CURRENT,
             libc: Npm::Libc::CURRENT,
@@ -928,6 +932,10 @@ impl Options {
                 )));
             }
 
+            if let Some(block_exotic_subdeps) = config.block_exotic_subdeps {
+                self.block_exotic_subdeps = block_exotic_subdeps;
+            }
+
             // `PnpmMatcher` is move-only; `config` is `&` here so the matchers
             // are taken by the owning caller (`PackageManager::init`) right
             // after `load()` returns. The runtime auto-install path never uses
@@ -1158,6 +1166,10 @@ impl Options {
             self.minimum_release_age_excludes = Some(&*bun_core::heap::release(Box::new(
                 Npm::MinimumReleaseAgeExcludes::parse(&entries, log),
             )));
+        }
+
+        if cli.block_exotic_subdeps {
+            self.block_exotic_subdeps = true;
         }
 
         self.lockfile_only = cli.lockfile_only;

@@ -1647,6 +1647,7 @@ fn overlay_bunfig_install(install: &mut Api::BunInstall, bunfig: Api::BunInstall
         hoist_pattern,
         hoist,
         offline,
+        block_exotic_subdeps,
     } = bunfig;
 
     if let Some(registry) = default_registry {
@@ -1709,6 +1710,7 @@ fn overlay_bunfig_install(install: &mut Api::BunInstall, bunfig: Api::BunInstall
         hoist_pattern,
         hoist,
         offline,
+        block_exotic_subdeps,
     );
 }
 

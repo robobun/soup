@@ -1630,6 +1630,12 @@ impl<'a> Parser<'a, '_> {
         install: &mut api::BunInstall,
         install_obj: &Expr,
     ) -> crate::Result<()> {
+        if let Some(block) = install_obj.get(b"blockExoticSubdeps") {
+            // Read first, and on for a value that is not a boolean: `bun run` drops the error of an invalid key and goes on with what was read.
+            install.block_exotic_subdeps = Some(block.as_bool().unwrap_or(true));
+            self.expect(&block, ExprTag::EBoolean)?;
+        }
+
         let cafile = install_obj.get(b"cafile");
         let ca = install_obj.get(b"ca");
         // `ca` and `cafile` are one setting, so a file that sets either one replaces both.
