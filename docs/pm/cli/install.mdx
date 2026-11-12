@@ -349,6 +349,60 @@ For more advanced security scanning, including integration with services and cus
 
 ---
 
+## Block exotic subdependencies
+
+A dependency does not have to come from the registry. `"left-pad": "github:example/left-pad"`, a git URL and a tarball URL are dependencies too. pnpm calls such a source _exotic_. The registry has no say about it: there is no publish time for [minimum release age](#minimum-release-age) to read, and nothing that the registry can take down. A compromised package can use one to bring in code that nobody has seen.
+
+`blockExoticSubdeps` lets only your own project ask for such a dependency. It is off by default.
+
+```toml bunfig.toml icon="settings"
+[install]
+blockExoticSubdeps = true
+```
+
+```bash terminal icon="terminal"
+bun install --block-exotic-subdeps
+```
+
+With the setting on, Bun resolves a git, GitHub or tarball URL dependency only where the project asks for it:
+
+- in the `package.json` of the root, of a workspace, or of a `file:` folder or tarball that they depend on
+- in [`overrides`](/pm/overrides) or `resolutions`, in a [catalog](/pm/catalogs), or in [`packageExtensions`](/pm/package-extensions)
+- in an installed package, if the project asks for the same source itself: in the `package.json` of the root or of a workspace, in `overrides`, in a catalog or in `packageExtensions`, under any name
+
+A dependency that an installed package declares on its own stops the install with exit code 1. Bun refuses it before it asks anything of the source, so no request reaches the git host or the server of the tarball.
+
+```txt
+error: refusing to resolve "left-pad@github:example/left-pad" declared by some-package@1.4.0: blockExoticSubdeps allows git and tarball URL dependencies only in this project's package.json files
+
+note: add "left-pad": "github:example/left-pad" to the root package.json to install it for some-package too
+```
+
+There are two ways to go on. To accept the source, add it to your own `package.json`, as the note says: `bun add github:example/left-pad`. To replace it, add an override for its name:
+
+```json package.json icon="file-json"
+{
+  "overrides": {
+    "left-pad": "^1.3.0"
+  }
+}
+```
+
+Without the setting, Bun asks the source for the name of its package and looks for an override under that name. With the setting, Bun looks under the name in the dependency's key first, so the source of a dependency that it would refuse is not asked.
+
+When the setting is on:
+
+- An optional dependency that is refused is left uninstalled, and the install goes on.
+- A peer dependency takes the package of that name that the tree has. It is refused only if no package provides it. An optional peer dependency is never installed from its own source.
+- `bun.lock` is held to the same rule. A git or tarball package that it has for such a dependency is refused, whether the dependency is optional or not. That includes `--frozen-lockfile`, `bun ci` and `bun pm fetch`. The command stops before it asks anything of that source and before it links a package. If an override now replaces the dependency, the note names `bun update <name>`, which resolves it again.
+- The package that you add yourself is not affected: `bun add github:user/repo` installs it as before. What that package depends on is held to the rule.
+- `file:`, `link:` and `workspace:` dependencies are not exotic, and the setting does not change how Bun treats them.
+- `bunx --block-exotic-subdeps <package>` passes the flag to its install. The install of `bunx` does not read the `bunfig.toml` of a project.
+
+The setting reads what `package.json` files declare. It does not check that `bun.lock` resolves a version range to a package from the registry, so review changes to `bun.lock` as before. It applies to the commands that install. [Auto-install](/runtime/auto-install) does not apply it to every `package.json` that it reads.
+
+---
+
 ## Required Bun version
 
 To require a version of Bun for a project, add a `"bun"` entry to the `"engines"` field of its `package.json`. The value is a semver range, in the same syntax as a dependency version.
@@ -478,6 +532,9 @@ linker = "hoisted"
 # minimum age config
 minimumReleaseAge = 259200 # seconds
 minimumReleaseAgeExcludes = ["@types/node", "typescript"]
+
+# refuse git and tarball URL dependencies that an installed package declares
+blockExoticSubdeps = false
 ```
 
 ### Configuring with environment variables

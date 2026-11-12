@@ -175,6 +175,10 @@ bun install <name>@<version>
   Add to trustedDependencies in the project's package.json and install the package(s)
 </ParamField>
 
+<ParamField path="--block-exotic-subdeps" type="boolean">
+  Refuse git and tarball URL dependencies that an installed package declares
+</ParamField>
+
 ### Concurrency & Performance
 
 <ParamField path="--concurrent-scripts" type="number">
