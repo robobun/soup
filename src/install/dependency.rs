@@ -640,6 +640,18 @@ pub(crate) fn is_link_path(target: &[u8]) -> bool {
 pub(crate) const LINK_PATH_RULE: &str =
     "only the root package.json, a workspace, or a top-level override may link to a path";
 
+/// A git repository, a GitHub repository or a tarball URL: a source that the registry and `minimumReleaseAge` have no say about. A `file:` tarball is not one.
+pub(crate) fn is_exotic_source(version: &Version) -> bool {
+    match version.tag {
+        Tag::Git | Tag::Github => true,
+        Tag::Tarball => matches!(version.tarball().uri, URI::Remote(_)),
+        _ => false,
+    }
+}
+
+/// Why `install.blockExoticSubdeps` refuses one (`Lockfile::foreign_declarer`, `Lockfile::names_exotic_source`).
+pub(crate) const EXOTIC_SOURCE_RULE: &str = "blockExoticSubdeps allows git and tarball URL dependencies only in this project's package.json files";
+
 /// The `./` keeps `is_link_path` true when the directory is read back.
 pub(crate) fn link_path_for_lockfile(folder: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if folder.is_empty() {

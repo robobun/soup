@@ -124,6 +124,8 @@ pub(crate) struct Options {
     pub(crate) trust: bool,
     /// Passes `--ignore-scripts` to `bun add`, which wins over `--trust`.
     pub(crate) ignore_scripts: bool,
+    /// Passes `--block-exotic-subdeps` to `bun add`. It's part of the cache directory's name.
+    pub(crate) block_exotic_subdeps: bool,
     /// In seconds, as typed. It's forwarded to `bun add` and is part of the cache directory's name.
     pub(crate) minimum_release_age: Option<&'static [u8]>,
     /// Forwarded to `bun add`, like `ca` and `cafile`. It's part of the cache directory's name.
@@ -225,6 +227,8 @@ impl Options {
                     opts.trust = true;
                 } else if matches!(positional, b"--ignore-scripts" | b"--ignore-scripts=true") {
                     opts.ignore_scripts = true;
+                } else if positional == b"--block-exotic-subdeps" {
+                    opts.block_exotic_subdeps = true;
                 } else if let Some(file) = Self::flag_value(argv, &mut i, "--env-file") {
                     ctx.args.env_files.push(Box::<[u8]>::from(file));
                 } else if let Some(dir) = Self::flag_value(argv, &mut i, "--cwd") {
@@ -1035,6 +1039,9 @@ impl BunxCommand {
         if opts.ignore_scripts {
             package_fmt.extend_from_slice(b"+ignore-scripts");
         }
+        if opts.block_exotic_subdeps {
+            package_fmt.extend_from_slice(b"+block-exotic-subdeps");
+        }
         if let Some(age) = opts.minimum_release_age {
             package_fmt.extend_from_slice(b"+min-age=");
             package_fmt.extend_from_slice(age);
@@ -1368,6 +1375,9 @@ impl BunxCommand {
         }
         if opts.ignore_scripts {
             args.push(b"--ignore-scripts");
+        }
+        if opts.block_exotic_subdeps {
+            args.push(b"--block-exotic-subdeps");
         }
         args.extend(Global::ca_store_flag().map(|flag| flag.as_bytes()));
         args.extend(flags_with_value.iter().map(Vec::as_slice));

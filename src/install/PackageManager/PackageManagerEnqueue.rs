@@ -1015,6 +1015,42 @@ pub(crate) fn may_refresh_in_place(dependency: &Dependency) -> bool {
         )
 }
 
+/// Returns true if `locked` is a package of the git repository or of the tarball that `version` names.
+fn is_from_source(
+    lockfile: &Lockfile::Lockfile,
+    version: &dependency::Version,
+    locked: &Resolution,
+) -> bool {
+    use dependency::version::Tag;
+    let buf = lockfile.buffers.string_bytes.as_slice();
+    match version.tag {
+        Tag::Github => {
+            let asks = version.github();
+            locked.tag == ResolutionTag::Github
+                && locked.github().owner.eql(asks.owner, buf, buf)
+                && locked.github().repo.eql(asks.repo, buf, buf)
+        }
+        Tag::Git => {
+            let asks = version.git().repo.slice(buf);
+            // bun.lock has `host:path` as a URL.
+            let recorded = crate::repository_real::locked_scp_like(asks);
+            locked.tag == ResolutionTag::Git
+                && locked.git().repo.slice(buf) == recorded.as_deref().unwrap_or(asks)
+        }
+        Tag::Tarball => match &version.tarball().uri {
+            dependency::tarball::Uri::Remote(url) => {
+                locked.tag == ResolutionTag::RemoteTarball
+                    && locked.remote_tarball().eql(*url, buf, buf)
+            }
+            dependency::tarball::Uri::Local(path) => {
+                locked.tag == ResolutionTag::LocalTarball
+                    && locked.local_tarball().eql(*path, buf, buf)
+            }
+        },
+        _ => false,
+    }
+}
+
 /// Returns true if `dependency` of `declarer` keeps `locked` while this run reads its source again.
 pub(crate) fn refreshes_in_place(
     this: &PackageManager,
@@ -1022,7 +1058,6 @@ pub(crate) fn refreshes_in_place(
     dependency: &Dependency,
     locked: PackageID,
 ) -> bool {
-    use dependency::version::Tag;
     if !may_refresh_in_place(dependency) {
         return false;
     }
@@ -1030,34 +1065,10 @@ pub(crate) fn refreshes_in_place(
     let Some(locked_res) = lockfile.packages.items_resolution().get(locked as usize) else {
         return false;
     };
-    let buf = lockfile.buffers.string_bytes.as_slice();
     // An older bun.lock binds a dependency that never resolved to any package of its name.
-    let is_from_source = match dependency.version.tag {
-        Tag::Github => {
-            let asks = dependency.version.github();
-            locked_res.tag == ResolutionTag::Github
-                && locked_res.github().owner.eql(asks.owner, buf, buf)
-                && locked_res.github().repo.eql(asks.repo, buf, buf)
-        }
-        Tag::Git => {
-            let asks = dependency.version.git().repo.slice(buf);
-            // bun.lock has `host:path` as a URL.
-            let recorded = crate::repository_real::locked_scp_like(asks);
-            locked_res.tag == ResolutionTag::Git
-                && locked_res.git().repo.slice(buf) == recorded.as_deref().unwrap_or(asks)
-        }
-        _ => match &dependency.version.tarball().uri {
-            dependency::tarball::Uri::Remote(url) => {
-                locked_res.tag == ResolutionTag::RemoteTarball
-                    && locked_res.remote_tarball().eql(*url, buf, buf)
-            }
-            dependency::tarball::Uri::Local(path) => {
-                locked_res.tag == ResolutionTag::LocalTarball
-                    && locked_res.local_tarball().eql(*path, buf, buf)
-                    && may_name_local_tarball(lockfile, declarer, dependency)
-            }
-        },
-    };
+    let is_from_source = is_from_source(lockfile, &dependency.version, locked_res)
+        && (locked_res.tag != ResolutionTag::LocalTarball
+            || may_name_local_tarball(lockfile, declarer, dependency));
     let has_rule = |name_hash: PackageNameHash| {
         lockfile.overrides.has_rule_for_name(name_hash)
             || this
@@ -1344,6 +1355,11 @@ fn request_remote_package_ahead(
         || this.options.runtime_auto_install
         // A deferred peer doesn't request anything, because the tree may provide it.
         || (dependency.behavior.is_peer() && !install_peer)
+        // `blockExoticSubdeps`: whether another package may name the source is decided at its turn.
+        || (this.options.block_exotic_subdeps
+            && !asked.version_was_replaced
+            && dependency::is_exotic_source(asked.version)
+            && this.lockfile.foreign_declarer(id).is_some())
         || (asked.version.tag == dependency::version::Tag::Tarball
             && match &asked.version.tarball().uri {
                 // Whether another package may name a tarball in the project is decided at its turn.
@@ -1827,14 +1843,29 @@ fn asked_version<'a>(
         if !dependency.behavior.is_workspace() {
             let is_alias = dependency.version.tag == dependency::version::Tag::Npm
                 && dependency.version.npm().is_alias;
+            // With `blockExoticSubdeps`, the source of another package's git or tarball dependency is not asked for the name of its package, so the rule for the name in the key decides, as in npm.
+            let is_keyed_exotic = this.options.block_exotic_subdeps
+                && dependency::is_exotic_source(&dependency.version)
+                && this.lockfile.foreign_declarer(id).is_some();
             // Rules for an alias are keyed by the alias, not by the package it points at.
-            let rule_name_hash = if is_alias {
+            let rule_name_hash = if is_alias || is_keyed_exotic {
                 dependency.name_hash
             } else {
                 name_hash
             };
             let rule = (this.lockfile.overrides)
                 .lookup_declared(&this.lockfile, id, rule_name_hash, &dependency.version)
+                .or_else(|| {
+                    // Once a source that the project allowed has told the name, its rule applies too.
+                    let is_named = is_keyed_exotic && !name.is_empty();
+                    is_named.then_some(())?;
+                    (this.lockfile.overrides).lookup_declared(
+                        &this.lockfile,
+                        id,
+                        name_hash,
+                        &dependency.version,
+                    )
+                })
                 .map(|rule| rule.dep())
                 // Auto-install only follows an override that points to the registry. Others, such
                 // as `file:`, are ignored.
@@ -2232,6 +2263,16 @@ fn bind_row_without_manifest(
         }
     };
 
+    // `install.blockExoticSubdeps`: in front of every task for the dependency, so nothing is asked of a source that is refused. `refuse_exotic_subdependencies` reports it if it is still in the tree.
+    if this.options.block_exotic_subdeps
+        && !version_was_replaced
+        && dependency::is_exotic_source(version)
+        && this.lockfile.foreign_declarer(id).is_some()
+        && !this.lockfile.names_exotic_source(dependency)
+    {
+        return Ok(());
+    }
+
     match version.tag {
         dependency::version::Tag::Git => {
             let dep: Repository = *version.git();
@@ -2447,8 +2488,15 @@ fn bind_row_without_manifest(
                 && let Some(declarer) = this.lockfile.get_parent_pkg_of_dependency(id)
                 && !may_name_local_tarball(&this.lockfile, declarer, dependency)
             {
+                // `enqueue_local_tarball` would read the path relative to the project, not to the declarer.
                 if dependency.behavior.is_required() {
-                    reject_local_tarball_of_remote_package(this, declarer, dependency);
+                    reject_dependency_of_remote_package(
+                        this,
+                        declarer,
+                        dependency,
+                        "local tarballs are only allowed in this project's package.json files",
+                        false,
+                    );
                 }
                 return Ok(());
             }
@@ -2772,13 +2820,15 @@ fn warn_unmet_peer_dependency(
     }
 }
 
-/// `enqueue_local_tarball` would read the path relative to the project, not to the declarer.
+/// Reports a dependency whose source only a package.json of the project may name. `rule` says which sources those are. `is_locked_against_rule`: bun.lock has it from before a rule of the project that replaces it.
 #[cold]
 #[inline(never)]
-fn reject_local_tarball_of_remote_package(
+fn reject_dependency_of_remote_package(
     this: &PackageManager,
     declarer: PackageID,
     dependency: &Dependency,
+    rule: &str,
+    is_locked_against_rule: bool,
 ) {
     let buf = this.lockfile.buffers.string_bytes.as_slice();
     let packages = this.lockfile.packages.slice();
@@ -2788,7 +2838,15 @@ fn reject_local_tarball_of_remote_package(
         bun_fmt::escape_control_chars(packages.items_name()[declarer as usize].slice(buf));
     // A bundled dependency ships inside the package that declares it, so adding it to the root
     // wouldn't help.
-    let notes: Box<[bun_ast::Data]> = if dependency.behavior.is_bundled() {
+    let notes: Box<[bun_ast::Data]> = if is_locked_against_rule {
+        Box::new([bun_ast::range_data(
+            None,
+            bun_ast::Range::NONE,
+            bun_ast::alloc_print(format_args!(
+                "the root package.json has a rule for \"{name}\" that bun.lock does not follow: run `bun update {name}` to resolve it again",
+            )),
+        )])
+    } else if dependency.behavior.is_bundled() {
         Box::new([])
     } else {
         Box::new([bun_ast::range_data(
@@ -2804,12 +2862,88 @@ fn reject_local_tarball_of_remote_package(
         bun_ast::Range::NONE,
         notes,
         format_args!(
-            "refusing to resolve \"{name}@{literal}\" declared by {declarer_name}@{}: local tarballs are only allowed in this project's package.json files",
+            "refusing to resolve \"{name}@{literal}\" declared by {declarer_name}@{}: {rule}",
             bun_fmt::for_terminal(
                 packages.items_resolution()[declarer as usize].fmt(buf, bun_fmt::PathSep::Posix)
             ),
         ),
     );
+}
+
+/// `install.blockExoticSubdeps` on the resolved tree, before anything is linked: reports each git or tarball URL dependency of a package outside the project that the install needs and the project did not ask for, and ends the install. The resolver left those unresolved. bun.lock can have one bound, and that is not resolved again.
+pub(crate) fn refuse_exotic_subdependencies(this: &mut PackageManager) {
+    if !this.options.block_exotic_subdeps {
+        return;
+    }
+    let mut refused = false;
+    for declarer in 0..this.lockfile.packages.len() as PackageID {
+        let rows = this.lockfile.packages.items_dependencies()[declarer as usize];
+        for id in rows.begin()..rows.end() {
+            let row = &this.lockfile.buffers.dependencies[id as usize];
+            if !dependency::is_exotic_source(&row.version) {
+                continue;
+            }
+            let resolutions = this.lockfile.packages.items_resolution();
+            let bound_id = this.lockfile.buffers.resolutions[id as usize];
+            let bound = resolutions.get(bound_id as usize).copied();
+            let is_needed = match &bound {
+                // A package of the registry or of the project stands in for it, as for a peer that the tree provides.
+                Some(found) => matches!(
+                    found.tag,
+                    ResolutionTag::Git | ResolutionTag::Github | ResolutionTag::RemoteTarball
+                ),
+                // An optional peer is never resolved from its own source.
+                None => {
+                    let features =
+                        (this.options).dependency_features(resolutions[declarer as usize].tag);
+                    !row.behavior.is_optional()
+                        && !row.behavior.is_optional_peer()
+                        && row.behavior.is_enabled(features)
+                }
+            };
+            if !is_needed || this.lockfile.is_project_package(declarer) {
+                continue;
+            }
+            let dependency = row.clone();
+            let mut replacement = None;
+            let has_rule = asked_version(this, id, &dependency, false, &mut replacement)
+                .is_ok_and(|asked| asked.version_was_replaced);
+            let lockfile = &*this.lockfile;
+            let (is_allowed, is_locked_against_rule) = match &bound {
+                // bun.lock has the package that the dependency itself asks for.
+                Some(found) if is_from_source(lockfile, &dependency.version, found) => {
+                    let is_named = lockfile.names_exotic_source(&dependency);
+                    (is_named, has_rule && !is_named)
+                }
+                // Another package stands in: what a rule of the project names, or for a peer what a dependency that is not a peer brings into the tree.
+                Some(found) => {
+                    let mut rules = lockfile.overrides.values();
+                    let is_named = rules.any(|rule| is_from_source(lockfile, &rule.version, found));
+                    let bindings = lockfile.buffers.resolutions.iter();
+                    let is_provided = dependency.behavior.is_peer()
+                        && (bindings.zip(&lockfile.buffers.dependencies)).any(
+                            |(&target, other)| target == bound_id && !other.behavior.is_peer(),
+                        );
+                    (is_named || is_provided, false)
+                }
+                None => (has_rule || lockfile.names_exotic_source(&dependency), false),
+            };
+            if is_allowed {
+                continue;
+            }
+            reject_dependency_of_remote_package(
+                this,
+                declarer,
+                &dependency,
+                dependency::EXOTIC_SOURCE_RULE,
+                is_locked_against_rule,
+            );
+            refused = true;
+        }
+    }
+    if refused {
+        this.crash();
+    }
 }
 
 /// `version` is the declared specifier, or the one that a scoped override supplied.

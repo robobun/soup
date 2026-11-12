@@ -305,6 +305,8 @@ pub mod api {
         pub hoist: Option<bool>,
         /// `offline = true`: `bun install` never touches the network.
         pub offline: Option<bool>,
+        /// `blockExoticSubdeps = true`: a package that the project installs cannot ask for a dependency from git or from a tarball URL.
+        pub block_exotic_subdeps: Option<bool>,
     }
 
     impl BunInstall {

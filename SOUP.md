@@ -10768,6 +10768,215 @@ conflicts of one line each (the "Not supported" table of `docs/compiler/compatib
 twice, `docs/compiler/size.mdx`, `docs/compiler/debugging.mdx`, and the `Bun.JWT` line next to
 the rewritten `Bun.sql` getters in `src/jsc/bindings/BunObject.cpp`).
 
+### 2026-11-12: `blockExoticSubdeps`, no git or tarball URL dependency that the project did not ask for
+
+A dependency does not have to come from the registry. `"left-pad": "github:someone/left-pad"`, a
+git URL and a tarball URL are dependencies too, and pnpm calls such a source _exotic_. Nothing that
+bun has for the supply chain reaches it: `minimumReleaseAge` reads a publish time that a git
+repository does not have, and the registry cannot take down what it does not host. A package that
+is taken over can add one line to its manifest, and every install of it then fetches code from a
+server of the attacker's choice. pnpm added `blockExoticSubdeps` for this in 10.26.0, and its
+current docs have it on by default. oven-sh/bun#30336 asks for it (15 upvotes). With the setting,
+only the project itself can ask for a dependency from such a source:
+
+```toml
+[install]
+blockExoticSubdeps = true
+```
+
+```
+$ bun install
+error: refusing to resolve "left-pad@github:someone/left-pad" declared by some-package@1.4.0: blockExoticSubdeps allows git and tarball URL dependencies only in this project's package.json files
+
+note: add "left-pad": "github:someone/left-pad" to the root package.json to install it for some-package too
+```
+
+`bun install --block-exotic-subdeps` switches it on for one command, and `bunx` passes the flag
+to its install. It is off by default.
+
+The rule. A dependency is exotic when the version that a `package.json` declares for it is a git
+repository, a GitHub repository or a tarball at a URL (`dependency::is_exotic_source`). `file:`,
+`link:` and `workspace:` are not: upstream already has rules for those, without an option. With
+the setting on, an exotic dependency is resolved only where the project asks for it:
+
+- The package that declares it is part of the project: the root, a workspace, or a `file:` folder
+  or tarball that they depend on (`Lockfile::foreign_declarer`, on top of the
+  `is_local_declarer` that upstream has for its own rule about `file:` tarballs).
+- `overrides` or `resolutions` of the root put the source there.
+- The project asks for the same source itself, under any name: in the `package.json` of the root
+  or of a workspace, in `overrides`, in a catalog or in `packageExtensions`
+  (`Lockfile::names_exotic_source`). That is the way to accept what a package asks for. The note
+  of the error names the entry, and `bun add github:someone/left-pad` writes one. It is the shape
+  of `Lockfile::is_tarball_url_of_project`, with which upstream decides who gets the credentials
+  of a tarball URL.
+
+Everything else is refused, in two steps:
+
+1. The resolver does not ask. `bind_row_without_manifest` is the one function that starts the
+   clone, the `git ls-remote` and the download for a git, GitHub or tarball dependency, and the
+   check is its first statement: a dependency that is not allowed stays unresolved, and nothing is
+   printed yet. The tests count the requests that reach the git host, the GitHub API and the
+   tarball server: there are none. That also holds for a version that the resolver tries first and
+   that the tree does not keep, where an install without the setting downloads the tarball of a
+   dependency that it then does not install.
+2. `refuse_exotic_subdependencies` reports, once, on the tree that is left after the lockfile is
+   cleaned and before anything is linked. `verify_resolutions` calls it first, so every path of
+   `install_with_manager` to the linkers passes it, also the second resolve after a changed
+   override. It reports a dependency that the install needs and that the project did
+   not ask for. One that the resolver left unresolved. One that `bun.lock` has bound to the
+   package of its own source, which is not resolved again: `--frozen-lockfile`, `bun ci` and
+   `bun pm fetch` pass through here, with both linkers. And one that `bun.lock` has bound to
+   another git or tarball package that no override names (`is_from_source`, which
+   `refreshes_in_place` had inline).
+
+What follows from the second step:
+
+- An optional dependency that is refused is left uninstalled and the install goes on, as upstream
+  does with a `file:` tarball that a registry package names.
+- A peer takes the package of that name that another dependency brings into the tree, whatever
+  its source. It is refused only if nothing provides it, which is known after the tree is made.
+  An optional peer is never installed from its own source.
+- A dependency of a version that dedupe drops is not in the tree, so it is not reported.
+- When `bun.lock` has a package from before an override that now replaces the dependency, the
+  note says so and names `bun update <name>`, which resolves the dependency again.
+
+An override has to work without the source. The package of a git or tarball dependency has no
+name until it is fetched, and upstream looks an override up by that name: it downloads the tarball
+first and finds the rule after. With the setting on, `asked_version` looks under the name in the
+dependency's key first, as npm does, so `"overrides": { "left-pad": "^1.3.0" }` replaces the git
+dependency and the git host is never asked. The rule for the package's own name still applies
+where that name is known. This is the one place where the setting changes more than a refusal,
+and only for a dependency that it would refuse otherwise.
+
+How this relates to oven-sh/bun#30340. That pull request (from this account, open since May) adds
+the same option as a walk over the resolved packages. The package manager consolidation
+(oven-sh/bun#44968) lists it under "Not taken" with the reason `checks after the fetch, fails
+open`. Its thread has a design note of 2026-10-17 and a correction of 2026-10-18 that come to a
+shape in three parts: the resolver refuses what a `package.json` declares before the fetch, the
+linkers check what they are about to place, and a plain install resolves a stale row again. The
+correction also fixes the surface and the rules: bunfig and a flag and no `.npmrc` key, git,
+GitHub and http(s) tarballs only, and the project's word is what upstream's own rules already
+take for it. This commit is the first part of that shape, written new on the resolver that
+upstream has now. It takes no code from the pull request. Where the note says "the root names
+the identical dependency", this commit compares the source and not the name, in the resolver and
+in the check alike: with the name in the rule, `bun add <specifier>` worked or not by the name of
+the package that came back, and a lockfile gave another answer than a fresh resolve.
+
+Where it is not pnpm. pnpm decides by depth: only what an importer lists may be exotic. Here a
+`file:` folder and a `file:` tarball of the project count as the project, an override and a
+package extension are the project's word, and the project can accept a source by naming it. pnpm
+trusts three GitHub repositories for runtimes (node, bun, deno). bun has no such dependencies and
+trusts none.
+
+Not in this patch, and what it means:
+
+- A `bun.lock` row that binds a plain range to a git or tarball package. The setting reads what
+  `package.json` files declare. A lockfile that is edited by hand, or by a pull request, to send
+  `"lib": "^1.0.0"` to a tarball is not caught. That is the second part of the shape above (the
+  check of what a linker places). The docs say that `bun.lock` has to be reviewed as before.
+- The repair. A dependency that `bun.lock` has bound against the rule is an error, also an
+  optional one, and a plain install does not resolve it again by itself. So `bun remove` of the
+  entry that accepted a source is refused while a package still asks for that source, and
+  `package.json` stays as it was.
+- Auto-install (`bun file.ts` without `node_modules`). The dependencies of the packages that it
+  resolves go through the resolver's check. A dependency that it reads from a `package.json`
+  inside an installed package has no declarer in the lockfile and is not refused.
+- `bun patch <name>` and `bun pm scan` download or link what `bun.lock` has without the second
+  step: a package that was installed before the setting was switched on, and the dependencies of
+  the security scanner.
+- "The project asks for the same source" reads what is known before anything is resolved: the
+  root, the workspaces, the overrides, the catalogs and the package extensions. The
+  `package.json` of a `file:` folder or tarball does not count there. The committish is part of
+  the source: `github:a/b` and `github:a/b#main` are two.
+- A bundled dependency with an exotic specifier is refused like any other, as upstream does for a
+  bundled `file:` tarball.
+- A lockfile that is migrated from `pnpm-lock.yaml` holds pnpm's resolved references and not the
+  specifiers that the packages declare, so the comparison of sources may not match there.
+- An allow list, and a key in `.npmrc`. The way to accept a source is to name it.
+
+What an install without the setting runs that it did not run before: one test of a flag in
+`bind_row_without_manifest`, in `request_remote_package_ahead`, in `asked_version` and at the
+start of `refuse_exotic_subdependencies`. With the setting on, the walk over the rows is one
+pass, and the search for the declarer runs only for a row that is exotic.
+Not measured: instruction counts and the size of the binary, from release builds of the base and
+of this commit. The container had time for the debug build only. Not built: the targets other
+than linux-x64. The change has no code behind a `cfg`.
+
+`reject_local_tarball_of_remote_package` is now `reject_dependency_of_remote_package` and takes
+the rule as text, so both refusals print through one function. Its old message is unchanged, and
+the tests of that rule pass.
+
+Tests: a `blockExoticSubdeps` block of 62 cases in `test/cli/install/bun-install.test.ts`, next to
+the tests of upstream's rule for `file:` tarballs, and one case in `bunx.test.ts`. One local server
+stands in for a tarball URL, a git repository over dumb HTTP and GitHub's tarball API, and records
+each request. For each of the three sources: refused as the dependency of a registry package with
+no request made and with the exact text on stderr, installed without the setting, installed as a
+dependency of the project, installed when the root asks for the source too, left out when it is
+optional, and refused from `bun.lock` with both linkers, with and without `--frozen-lockfile`.
+Then peers (required, optional, provided by the project from the registry and from another
+source, and two `bun.lock` files that are edited by hand), the same source under another name,
+`overrides` and `resolutions` in both directions, a rule under the name of the package, a
+`bun.lock` that has not followed a rule (and `bun update <name>` after it), `packageExtensions`,
+a workspace, a catalog, a `file:` folder, a `file:` tarball, a dependency of a tarball URL
+dependency, a version that dedupe drops, whitespace in front of the specifier, `bun add` in three
+forms, `bun pm fetch`, the flag, and a value in bunfig.toml that is not a boolean. Every case that
+installs is installed again from its `bun.lock`, plain and frozen from an empty cache. On bun
+1.4.3 without the change, 38 of the 62 fail and the 24 that only install pass. The debug build
+passes 3,442 tests of thirteen files of `test/cli/install`. Two more of `bun-install-git-deps`
+run into the 5 second limit when the file runs whole and pass alone. Three of the source lints
+run into the same limit with the debug build, and all 204 pass with the release build.
+
+Files: `src/install/PackageManager/PackageManagerEnqueue.rs` (the gate in
+`bind_row_without_manifest`, `refuse_exotic_subdependencies`, `is_from_source`, the lookup in
+`asked_version`, `reject_dependency_of_remote_package`),
+`src/install/PackageManager/PackageManagerResolution.rs`, `src/install/lockfile.rs`,
+`src/install/dependency.rs`, `src/install/PackageManager/PackageManagerOptions.rs`,
+`src/install/PackageManager/CommandLineArguments.rs`, `src/install/PackageManager.rs`,
+`src/bunfig/bunfig.rs`, `src/options_types/schema.rs`, `src/runtime/cli/bunx_command.rs`,
+`src/runtime/cli/mod.rs`, `docs/pm/cli/install.mdx`, `docs/runtime/bunfig.mdx`,
+`docs/snippets/cli/install.mdx`, `docs/snippets/cli/bunx.mdx`,
+`test/cli/install/bun-install.test.ts`, `test/cli/install/bunx.test.ts`.
+
+The commit was written four times, with three read-only reviews of the finished commit between
+them (nine, five and three reviewers, and one skeptic for each finding). 32, 14 and 7 findings
+held up. The ones that changed the code: `bunx` took the new flag and dropped it. An override for
+a git dependency was lost when its source told another package name than the key. The check of
+`bun.lock` excused a row as soon as any rule existed for its name, and later as soon as a rule
+named any git or tarball source. A refused peer did not stop the install before the linkers ran.
+A refusal that the resolver printed for a version that dedupe then dropped failed an install
+whose tree had nothing to refuse, which is why the resolver is silent now. The check did not run
+after the second resolve pass of a changed override, which is why it is in `verify_resolutions`.
+A rule under the package's own name was followed by the resolver and refused by the check. And
+the rule for "the project asks for it too" went from a name and a source to the source alone.
+Not taken up: auto-install, `bun patch` and `bun pm scan`, which are in the list above, and a
+test for the path of `bun run` that drops an error of bunfig.toml (the key is read first, and a
+value that is not a boolean leaves it on, by reading the code only). No design pass ran before
+the code. The first version was written before the thread of #30340 was read, which has a design
+note for this option. The versions after it follow that note.
+
+The stack was rebased onto oven-sh/bun f33631841f6, three commits behind main: 73 patches,
+nothing dropped, no conflict. `bun bd` does not build on main (ccb3611f2ad).
+`src/jsc/bindings/BunPlugin.cpp` uses `JSC::SuspendExceptionScope` in
+`evictOriginalOfCommonJSFile` (from oven-sh/bun#48617) and does not include
+`<JavaScriptCore/FrameTracers.h>`, and in the debug profile no file in front of it in its unified
+bundle does. The release lanes of CI compile it. A worktree of main without any patch of this
+stack fails the same way, and that one translation unit compiles with the header. Nobody has the
+fix yet. The next rebase onto main meets four conflicts, which a first rebase of today resolved
+before the build error showed:
+
+- `src/runtime/shell/states/CondExpr.rs` (the `[[ ]]` tests of 2026-08-20). Upstream's
+  `on_stat_task_done` asks `stat_embedded_shell_operand` for an operand that the disk lacks. Keep
+  the two stats, pass the paths of the task to it, and ask for each operand that is not empty.
+- `src/runtime/webcore/Blob.rs` (`append` of 2026-08-29). Upstream calls `refuse_open_for_write`
+  and `note_opened_for_write` around the open of the writer. Keep both, with `O_APPEND` in the
+  flags. An append is not a whole write: `!append` for `note_opened_for_write` in the two fast
+  paths, in `write_file.rs` and in `copy_file.rs`.
+- `src/runtime/shell/builtin/mv.rs` (the empty operands of 2026-10-31). Both sides add a check at
+  the start of `do_rename`. Keep both, the empty path first.
+- `src/jsc/bindings/BunPlugin.cpp` (the in-source tests of 2026-11-09). In `keepPreloadModule`,
+  keep `comesBack(key)` in the first condition, then upstream's check for a compiled module,
+  then `rememberTestFile(key)`. This resolution was not built.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

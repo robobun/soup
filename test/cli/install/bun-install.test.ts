@@ -14612,6 +14612,1003 @@ describe.concurrent("file: tarballs declared by a package installed from the cac
   });
 });
 
+// `blockExoticSubdeps`. A dependency can come from git or from a tarball URL instead of the registry, and then neither
+// the registry nor `minimumReleaseAge` has a say about it. With the setting, only a package.json of the project can ask
+// for such a dependency. A package that the project installs cannot bring one in, and nothing is asked of the source
+// that it names.
+describe.concurrent("blockExoticSubdeps", () => {
+  const quxManifest = { name: "qux", version: "1.0.0" };
+  const RULE = "blockExoticSubdeps allows git and tarball URL dependencies only in this project's package.json files";
+  const kinds = ["a tarball URL", "a git repository", "a GitHub repository"] as const;
+  type Kind = (typeof kinds)[number];
+
+  // Packs `manifest` as the package.json of an otherwise empty package into `tarball`.
+  async function packManifest(tarball: string, manifest: object) {
+    const archive = new Bun.Archive({ "package/package.json": JSON.stringify(manifest) }, { compress: "gzip" });
+    await write(tarball, await archive.bytes());
+  }
+
+  // One server stands in for the three sources of `qux` and records every path that is asked of it:
+  //   /qux.tgz                         a tarball URL
+  //   /repo.git/...                    a git repository, over dumb HTTP. It is made for `kind` alone.
+  //   /repos/exotic/qux/tarball/       GitHub's tarball API, which an install with `env` uses (GITHUB_API_URL)
+  // Whatever else is in `root` is served too.
+  async function serveQux(root: string, kind: Kind = "a tarball URL") {
+    const hasRepository = kind === "a git repository";
+    if (hasRepository) await write(join(root, "work", "package.json"), JSON.stringify(quxManifest));
+    const [sha, github] = await Promise.all([
+      hasRepository ? createDumbHttpGitRepo(root, {}) : "",
+      githubTarball("exotic-qux-abc1234", { "package.json": JSON.stringify(quxManifest) }),
+      packManifest(join(root, "qux.tgz"), quxManifest),
+    ]);
+    const requests: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { pathname } = new URL(request.url);
+        requests.push(pathname);
+        if (pathname.startsWith("/repos/")) return new Response(github);
+        const path = join(root, decodeURIComponent(pathname));
+        if (!statSync(path, { throwIfNoEntry: false })?.isFile()) return new Response(null, { status: 404 });
+        return new Response(file(path));
+      },
+    });
+    const origin = `http://localhost:${server.port}`;
+    const specs: Record<Kind, string> = {
+      "a tarball URL": `${origin}/qux.tgz`,
+      "a git repository": `git+${origin}/repo.git`,
+      "a GitHub repository": "github:exotic/qux",
+    };
+    // What bun.lock has for each of them.
+    const locked: Record<Kind, string> = {
+      "a tarball URL": `qux@${origin}/qux.tgz`,
+      "a git repository": `qux@git+${origin}/repo.git#${sha}`,
+      "a GitHub repository": "qux@github:exotic/qux#abc1234",
+    };
+    return {
+      origin,
+      requests,
+      specs,
+      locked,
+      env: { ...env, GITHUB_API_URL: origin },
+      [Symbol.dispose]: () => server.stop(true),
+    };
+  }
+
+  // <root>/project depends on `bar@0.0.2` from the dummy registry, whose manifest for it carries `barManifest`, plus
+  // whatever `root` adds to its package.json. `config` is the rest of the [install] section of its bunfig.toml.
+  async function writeProject(
+    ctx: TestContext,
+    root: string,
+    barManifest: object,
+    { dependencies = {}, ...rootExtra }: { dependencies?: Record<string, string>; [field: string]: unknown } = {},
+    config = "blockExoticSubdeps = true",
+  ) {
+    setContextHandler(ctx, dummyRegistryForContext(ctx, [], { "0.0.2": barManifest }));
+    await Promise.all([
+      write(
+        join(root, "project", "package.json"),
+        JSON.stringify({
+          name: "my-app",
+          version: "1.0.0",
+          dependencies: { bar: "0.0.2", ...dependencies },
+          ...rootExtra,
+        }),
+      ),
+      write(join(root, "project", "bunfig.toml"), `[install]\nregistry = "${ctx.registry_url}"\n${config}\n`),
+    ]);
+  }
+
+  async function run(root: string, runEnv: Record<string, string | undefined>, ...cmd: string[]) {
+    await using proc = spawn({
+      cmd: [bunExe(), ...cmd],
+      cwd: join(root, "project"),
+      env: { ...runEnv, BUN_INSTALL_CACHE_DIR: join(root, "cache") },
+      stdout: "pipe",
+      stdin: "ignore",
+      stderr: "pipe",
+    });
+    const [err, out, exitCode] = await Promise.all([proc.stderr.text(), proc.stdout.text(), proc.exited]);
+    return { err, out, exitCode };
+  }
+
+  function install(root: string, installEnv: Record<string, string | undefined>, ...args: string[]) {
+    return run(root, installEnv, "install", ...args);
+  }
+
+  // What Bun prints for a dependency on `qux` that it refuses.
+  function refusal(spec: string, declarer = "bar@0.0.2") {
+    return [
+      `error: refusing to resolve "qux@${spec}" declared by ${declarer}: ${RULE}`,
+      `note: add "qux": "${spec}" to the root package.json to install it for ${declarer.slice(0, declarer.indexOf("@"))} too`,
+    ];
+  }
+
+  // The rest of stderr is progress output ("Resolving dependencies", ...).
+  function diagnostics(stderr: string) {
+    return stderr.split(/\r?\n/).filter(line => line.startsWith("error:") || line.startsWith("note:"));
+  }
+
+  async function installedPackages(root: string) {
+    return (await readdirSorted(join(root, "project", "node_modules"))).filter(name => !name.startsWith("."));
+  }
+
+  // What the setting allowed when it was resolved, it allows again when bun.lock has it: in the next install, and in a
+  // frozen one of a checkout that has nothing installed and nothing cached.
+  async function expectAllowedFromLockfile(root: string, installEnv: Record<string, string | undefined>) {
+    const lockfile = await file(join(root, "project", "bun.lock")).text();
+    const again = await install(root, installEnv);
+    expect(diagnostics(again.err)).toEqual([]);
+    expect(again.exitCode).toBe(0);
+
+    const installed = await installedPackages(root);
+    await Promise.all([
+      rm(join(root, "project", "node_modules"), { recursive: true, force: true }),
+      rm(join(root, "cache"), { recursive: true, force: true }),
+    ]);
+    const frozen = await install(root, installEnv, "--frozen-lockfile");
+    expect(diagnostics(frozen.err)).toEqual([]);
+    expect(await installedPackages(root)).toEqual(installed);
+    expect(await file(join(root, "project", "bun.lock")).text()).toBe(lockfile);
+    expect(frozen.exitCode).toBe(0);
+  }
+
+  describe.each(kinds)("%s", kind => {
+    it("is refused as the dependency of a registry package, and nothing is asked of it", async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-subdep-refused", {});
+        const root = String(dir);
+        using qux = await serveQux(root, kind);
+        const spec = qux.specs[kind];
+        await writeProject(ctx, root, { dependencies: { qux: spec } });
+
+        const { err, out, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual(refusal(spec));
+        // One message with its note, and nothing about the dependency after it.
+        expect(err.replaceAll("\r\n", "\n")).toEndWith(`${refusal(spec).join("\n\n")}\n`);
+        expect(out).not.toContain("installed");
+        expect(qux.requests).toEqual([]);
+        expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+        expect(await exists(join(root, "project", "bun.lock"))).toBe(false);
+        expect(exitCode).toBe(1);
+      });
+    });
+
+    // The same project installs when the setting is off, so what the case above sees is the setting.
+    it("is installed as the dependency of a registry package without the setting", async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-subdep-setting-off", {});
+        const root = String(dir);
+        using qux = await serveQux(root, kind);
+        await writeProject(ctx, root, { dependencies: { qux: qux.specs[kind] } }, {}, "");
+
+        const { err, out, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual([]);
+        expect(out).toContain("2 packages installed");
+        expect(qux.requests).not.toEqual([]);
+        expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+        expect(await file(join(root, "project", "node_modules", "qux", "package.json")).json()).toEqual(quxManifest);
+        expect(await file(join(root, "project", "bun.lock")).text()).toContain(`"qux": ["${qux.locked[kind]}"`);
+        expect(exitCode).toBe(0);
+      });
+    });
+
+    it("is installed as a dependency of the project", async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-direct-dep", {});
+        const root = String(dir);
+        using qux = await serveQux(root, kind);
+        await writeProject(ctx, root, {}, { dependencies: { qux: qux.specs[kind] } });
+
+        const { err, out, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual([]);
+        expect(out).toContain("2 packages installed");
+        expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+        expect(exitCode).toBe(0);
+      });
+    });
+
+    // The note of the refusal says this. The project asks for the same source under the same name, so the registry
+    // package brings in nothing that the project has not named.
+    it("is installed for a registry package when the root package.json declares it too", async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-subdep-root-declared", {});
+        const root = String(dir);
+        using qux = await serveQux(root, kind);
+        const spec = qux.specs[kind];
+        await writeProject(ctx, root, { dependencies: { qux: spec } }, { dependencies: { qux: spec } });
+
+        const { err, out, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual([]);
+        expect(out).toContain("2 packages installed");
+        expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+        const lockfile = await file(join(root, "project", "bun.lock")).text();
+        expect(lockfile).toContain(`"qux": ["${qux.locked[kind]}"`);
+        expect(lockfile).not.toContain('"bar/qux"');
+        expect(exitCode).toBe(0);
+        await expectAllowedFromLockfile(root, qux.env);
+      });
+    });
+
+    it("is left uninstalled as the optional dependency of a registry package", async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-optional-subdep", {});
+        const root = String(dir);
+        using qux = await serveQux(root, kind);
+        await writeProject(ctx, root, { optionalDependencies: { qux: qux.specs[kind] } });
+
+        const { err, out, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual([]);
+        expect(out).toContain("1 package installed");
+        expect(qux.requests).toEqual([]);
+        expect(await installedPackages(root)).toEqual(["bar"]);
+        expect(await file(join(root, "project", "bun.lock")).text()).not.toContain("qux@");
+        expect(exitCode).toBe(0);
+      });
+    });
+
+    // A dependency that bun.lock has resolved is not resolved again, so the resolver's check never sees it.
+    for (const linker of ["hoisted", "isolated"] as const) {
+      for (const args of [[], ["--frozen-lockfile"]]) {
+        it(`is refused as a dependency that bun.lock has for a registry package (${linker} linker${args.length ? `, ${args[0]}` : ""})`, async () => {
+          await withContext({ linker }, async ctx => {
+            using dir = tempDir("exotic-subdep-locked", {});
+            const root = String(dir);
+            using qux = await serveQux(root, kind);
+            const spec = qux.specs[kind];
+            const bar = { dependencies: { qux: spec } };
+            await writeProject(ctx, root, bar, {}, `linker = "${linker}"`);
+            const first = await install(root, qux.env);
+            expect(diagnostics(first.err)).toEqual([]);
+            expect(first.exitCode).toBe(0);
+            const lockfile = await file(join(root, "project", "bun.lock")).text();
+            expect(lockfile).toContain(`["${qux.locked[kind]}"`);
+
+            // The setting is switched on for a checkout that has nothing installed and nothing cached.
+            await Promise.all([
+              rm(join(root, "project", "node_modules"), { recursive: true, force: true }),
+              rm(join(root, "cache"), { recursive: true, force: true }),
+            ]);
+            await writeProject(ctx, root, bar, {}, `linker = "${linker}"\nblockExoticSubdeps = true`);
+            qux.requests.length = 0;
+
+            const { err, out, exitCode } = await install(root, qux.env, ...args);
+            expect(diagnostics(err)).toEqual(refusal(spec));
+            expect(out).not.toContain("installed");
+            expect(qux.requests).toEqual([]);
+            expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+            expect(await file(join(root, "project", "bun.lock")).text()).toBe(lockfile);
+            expect(exitCode).toBe(1);
+          });
+        });
+      }
+    }
+  });
+
+  // A peer that no package of the tree provides is installed from its own source, so it is refused the same way, and
+  // nothing is linked.
+  it("refuses the peer dependency of a registry package", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-peer-subdep", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      await writeProject(ctx, root, { peerDependencies: { qux: spec } });
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual(refusal(spec));
+      expect(out).not.toContain("installed");
+      expect(qux.requests).toEqual([]);
+      expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+      expect(await exists(join(root, "project", "bun.lock"))).toBe(false);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // A peer that a package of the project provides is not installed from its own source, and an optional peer never
+  // is. Nothing is asked of the source for either, so neither is refused.
+  for (const [what, meta, rootDependencies, installed] of [
+    ["a peer dependency that the project provides", {}, { baz: "0.0.3" }, ["bar", "baz"]],
+    [
+      "an optional peer dependency that the project provides",
+      { baz: { optional: true } },
+      { baz: "0.0.3" },
+      ["bar", "baz"],
+    ],
+    ["an optional peer dependency that nothing provides", { baz: { optional: true } }, {}, ["bar"]],
+  ] as const) {
+    it(`installs a registry package with ${what}`, async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-peer-provided", {});
+        const root = String(dir);
+        using qux = await serveQux(root);
+        await writeProject(ctx, root, {}, { dependencies: rootDependencies });
+        // Every name has both versions in the dummy registry. `bar@0.0.2` is the one with the peer.
+        const bar = { peerDependencies: { baz: qux.specs["a tarball URL"] }, peerDependenciesMeta: meta };
+        setContextHandler(ctx, dummyRegistryForContext(ctx, [], { "0.0.2": bar, "0.0.3": {} }));
+
+        const { err, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual([]);
+        expect(await installedPackages(root)).toEqual([...installed]);
+        expect(exitCode).toBe(0);
+        await expectAllowedFromLockfile(root, qux.env);
+        expect(qux.requests).toEqual([]);
+      });
+    });
+  }
+
+  // The refusal is about the tree that is installed. The resolver takes `dep@1.2.0` for `^1.0.0` first, and then
+  // gives both packages the `dep@1.1.5` that one of them pins. The version that is gone asked for the tarball, and
+  // it is not asked either. The dummy registry gives every name the same versions, so this case has its own.
+  it("installs when the version that depends on it does not stay in the tree", async () => {
+    using dir = tempDir("exotic-subdep-of-collapsed-version", {});
+    const root = String(dir);
+    using qux = await serveQux(root);
+    const packages: Record<string, Record<string, object>> = {
+      a: { "1.0.0": { dependencies: { dep: "^1.0.0" } } },
+      b: { "1.0.0": { dependencies: { dep: "1.1.5" } } },
+      dep: { "1.1.5": {}, "1.2.0": { dependencies: { qux: qux.specs["a tarball URL"] } } },
+    };
+    using registry = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const { pathname, origin } = new URL(request.url);
+        const [, tarballOf, tarballVersion] = /^\/(\w+)-([\d.]+)\.tgz$/.exec(pathname) ?? [];
+        if (tarballOf) {
+          const manifest = { name: tarballOf, version: tarballVersion };
+          return new Response(
+            await new Bun.Archive({ "package/package.json": JSON.stringify(manifest) }, { compress: "gzip" }).bytes(),
+          );
+        }
+        const name = pathname.slice(1);
+        if (!(name in packages)) return new Response(null, { status: 404 });
+        const versions: Record<string, object> = {};
+        for (const [version, manifest] of Object.entries(packages[name])) {
+          versions[version] = { name, version, ...manifest, dist: { tarball: `${origin}/${name}-${version}.tgz` } };
+        }
+        return Response.json({ name, versions, "dist-tags": { latest: Object.keys(versions).at(-1) } });
+      },
+    });
+    await Promise.all([
+      write(
+        join(root, "project", "package.json"),
+        JSON.stringify({ name: "my-app", version: "1.0.0", dependencies: { a: "1.0.0", b: "1.0.0" } }),
+      ),
+      write(
+        join(root, "project", "bunfig.toml"),
+        `[install]\nregistry = "http://localhost:${registry.port}/"\nblockExoticSubdeps = true\n`,
+      ),
+    ]);
+
+    const { err, exitCode } = await install(root, qux.env);
+    expect(diagnostics(err)).toEqual([]);
+    expect(qux.requests).toEqual([]);
+    expect(await installedPackages(root)).toEqual(["a", "b", "dep"]);
+    expect(await file(join(root, "project", "node_modules", "dep", "package.json")).json()).toEqual({
+      name: "dep",
+      version: "1.1.5",
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  // A peer takes the package of that name that the tree has, also one that the project took from another source.
+  it("installs a registry package with a peer dependency that the project provides from another source", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-peer-provided-from-source", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(
+        ctx,
+        root,
+        { peerDependencies: { qux: "github:exotic/other" } },
+        { dependencies: { qux: qux.specs["a tarball URL"] } },
+      );
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(qux.requests).toEqual(["/qux.tgz"]);
+      expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+      expect(qux.requests.filter(path => path !== "/qux.tgz")).toEqual([]);
+    });
+  });
+
+  // bun never installs an optional peer from its own source, and a peer takes another package only if the tree has
+  // it for another dependency. A bun.lock can say otherwise. These are made from the bun.lock of a required peer.
+  for (const [what, edit, peer] of [
+    [
+      "an optional peer dependency that bun.lock has from its own source",
+      (entry: string) => `${entry}, "optionalPeers": ["qux"]`,
+      (spec: string) => spec,
+    ],
+    [
+      "a peer dependency that bun.lock has from a source that nothing else asks for",
+      (entry: string, spec: string) => entry.replace(spec, spec.replace("qux.tgz", "other.tgz")),
+      (spec: string) => spec.replace("qux.tgz", "other.tgz"),
+    ],
+  ] as const) {
+    it(`refuses ${what}`, async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-peer-locked", {});
+        const root = String(dir);
+        using qux = await serveQux(root);
+        const spec = qux.specs["a tarball URL"];
+        await writeProject(ctx, root, { peerDependencies: { qux: spec } }, {}, "");
+        const first = await install(root, qux.env);
+        expect(diagnostics(first.err)).toEqual([]);
+        expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+        expect(first.exitCode).toBe(0);
+
+        const lockfile = join(root, "project", "bun.lock");
+        const entry = `"peerDependencies": { "qux": "${spec}" }`;
+        const locked = await file(lockfile).text();
+        expect(locked).toContain(entry);
+        await write(lockfile, locked.replace(entry, edit(entry, spec)));
+        await Promise.all([
+          rm(join(root, "project", "node_modules"), { recursive: true, force: true }),
+          rm(join(root, "cache"), { recursive: true, force: true }),
+        ]);
+        await writeProject(ctx, root, {});
+        qux.requests.length = 0;
+
+        const { err, exitCode } = await install(root, qux.env, "--frozen-lockfile");
+        expect(diagnostics(err)).toEqual(refusal(peer(spec)));
+        expect(qux.requests).toEqual([]);
+        expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+        expect(exitCode).toBe(1);
+      });
+    });
+  }
+
+  // bun.lock is not resolved again, so an optional dependency that it has cannot be left out: it is refused.
+  it("refuses an optional dependency that bun.lock has for a registry package", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-optional-subdep-locked", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      const bar = { optionalDependencies: { qux: spec } };
+      await writeProject(ctx, root, bar, {}, "");
+      const first = await install(root, qux.env);
+      expect(diagnostics(first.err)).toEqual([]);
+      expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+      expect(first.exitCode).toBe(0);
+
+      await Promise.all([
+        rm(join(root, "project", "node_modules"), { recursive: true, force: true }),
+        rm(join(root, "cache"), { recursive: true, force: true }),
+      ]);
+      await writeProject(ctx, root, bar);
+      qux.requests.length = 0;
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual(refusal(spec));
+      expect(qux.requests).toEqual([]);
+      expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // What the project accepts is the source. Another source under the same name is not it.
+  it("still refuses it when the root package.json declares another source under the same name", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-other-source-in-root", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await packManifest(join(root, "other.tgz"), { name: "other", version: "1.0.0" });
+      const spec = qux.specs["a tarball URL"];
+      await writeProject(
+        ctx,
+        root,
+        { dependencies: { qux: spec } },
+        { dependencies: { qux: `${qux.origin}/other.tgz` } },
+      );
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual(refusal(spec));
+      expect(qux.requests).not.toContain("/qux.tgz");
+      expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+      expect(await exists(join(root, "project", "bun.lock"))).toBe(false);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // The same source under another name is.
+  it("installs it when the root package.json declares the same source under another name", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-same-source-in-root", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      await writeProject(ctx, root, { dependencies: { qux: spec } }, { dependencies: { other: spec } });
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(await installedPackages(root)).toEqual(["bar", "other", "qux"]);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+    });
+  });
+
+  // `overrides` and `resolutions` are written in the root package.json, so the source that one of them puts on the
+  // dependency of a registry package is one that the project asked for.
+  for (const field of ["resolutions", "overrides"]) {
+    it(`installs the one that a root "${field}" entry puts on the dependency of a registry package`, async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir(`exotic-subdep-${field}`, {});
+        const root = String(dir);
+        using qux = await serveQux(root);
+        await writeProject(
+          ctx,
+          root,
+          { dependencies: { qux: "0.0.1" } },
+          { [field]: { qux: qux.specs["a tarball URL"] } },
+        );
+
+        const { err, out, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual([]);
+        expect(out).toContain("2 packages installed");
+        expect(await file(join(root, "project", "node_modules", "qux", "package.json")).json()).toEqual(quxManifest);
+        expect(exitCode).toBe(0);
+        await expectAllowedFromLockfile(root, qux.env);
+      });
+    });
+  }
+
+  // So is a dependency that `packageExtensions` of the root package.json adds to a registry package.
+  it("installs the one that packageExtensions adds to a registry package", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-package-extension", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(
+        ctx,
+        root,
+        {},
+        { packageExtensions: { bar: { dependencies: { qux: qux.specs["a tarball URL"] } } } },
+      );
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(out).toContain("2 packages installed");
+      expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+    });
+  });
+
+  // The package.json of a workspace and of a `file:` folder are files of the project, like the root's.
+  it("installs the one that a workspace depends on", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-dep-of-workspace", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(ctx, root, {}, { workspaces: ["packages/*"] });
+      await write(
+        join(root, "project", "packages", "app", "package.json"),
+        JSON.stringify({ name: "app", version: "1.0.0", dependencies: { qux: qux.specs["a tarball URL"] } }),
+      );
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(await file(join(root, "project", "bun.lock")).text()).toContain(`["qux@${qux.origin}/qux.tgz"`);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+    });
+  });
+
+  it("installs the one that a file: folder of the project depends on", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-dep-of-folder", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(ctx, root, {}, { dependencies: { lib: "file:./vendor/lib" } });
+      await write(
+        join(root, "project", "vendor", "lib", "package.json"),
+        JSON.stringify({ name: "lib", version: "1.0.0", dependencies: { qux: qux.specs["a tarball URL"] } }),
+      );
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(out).toContain("3 packages installed");
+      expect(await installedPackages(root)).toEqual(["bar", "lib", "qux"]);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+    });
+  });
+
+  // A tarball in the project is part of the project, like a `file:` folder.
+  it("installs the one that a file: tarball of the project depends on", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-dep-of-local-tarball", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(ctx, root, {}, { dependencies: { lib: "file:./lib.tgz" } });
+      await packManifest(join(root, "project", "lib.tgz"), {
+        name: "lib",
+        version: "1.0.0",
+        dependencies: { qux: qux.specs["a tarball URL"] },
+      });
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(out).toContain("3 packages installed");
+      expect(await installedPackages(root)).toEqual(["bar", "lib", "qux"]);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+    });
+  });
+
+  // A dependency that the project itself takes from a tarball URL is its own, and what that package depends on is not.
+  it("refuses the one that a tarball URL dependency of the project depends on", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-of-exotic-dep", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      await packManifest(join(root, "outer.tgz"), { name: "outer", version: "1.0.0", dependencies: { qux: spec } });
+      const outer = `${qux.origin}/outer.tgz`;
+      await writeProject(ctx, root, {}, { dependencies: { outer } });
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual(refusal(spec, `outer@${outer}`));
+      expect(qux.requests).toEqual(["/outer.tgz"]);
+      expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // An override to a registry version takes the place of the source that the package names.
+  it("installs the registry version that a root override puts in its place", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-overridden-to-registry", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(ctx, root, {}, { overrides: { baz: "0.0.3" } });
+      // Every name has both versions in the dummy registry. `bar@0.0.2` is the one that names the tarball URL.
+      const bar = { dependencies: { baz: qux.specs["a tarball URL"] } };
+      setContextHandler(ctx, dummyRegistryForContext(ctx, [], { "0.0.2": bar, "0.0.3": {} }));
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(out).toContain("2 packages installed");
+      expect(qux.requests).toEqual([]);
+      expect(await file(join(root, "project", "node_modules", "baz", "package.json")).json()).toMatchObject({
+        name: "baz",
+        version: "0.0.3",
+      });
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+      expect(qux.requests).toEqual([]);
+    });
+  });
+
+  // The package of a git or tarball dependency has no name before its source is asked. The override is found under the
+  // name in the key, and the source that the registry package names is never asked.
+  it("installs the source that a root override puts in the place of another source", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-overridden-to-source", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(
+        ctx,
+        root,
+        { dependencies: { qux: "github:exotic/other" } },
+        { overrides: { qux: qux.specs["a tarball URL"] } },
+      );
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(out).toContain("2 packages installed");
+      expect(qux.requests).toEqual(["/qux.tgz"]);
+      expect(await file(join(root, "project", "node_modules", "qux", "package.json")).json()).toEqual(quxManifest);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+      expect(qux.requests.filter(path => path !== "/qux.tgz")).toEqual([]);
+    });
+  });
+
+  // The rule is found under the key again after its source is fetched and has told another name.
+  it("installs the source of a root override whose package has another name than the key", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-overridden-renamed", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const fork = { name: "not-qux", version: "1.0.0" };
+      await packManifest(join(root, "fork.tgz"), fork);
+      await writeProject(
+        ctx,
+        root,
+        { dependencies: { qux: "github:exotic/other" } },
+        { overrides: { qux: `${qux.origin}/fork.tgz` } },
+      );
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(out).toContain("2 packages installed");
+      expect(qux.requests).toEqual(["/fork.tgz"]);
+      expect(await file(join(root, "project", "node_modules", "qux", "package.json")).json()).toEqual(fork);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+      expect(qux.requests.filter(path => path !== "/fork.tgz")).toEqual([]);
+    });
+  });
+
+  // The project accepts the source of the registry package, whose package is named `qux`, and has a rule for that
+  // name. The rule is found once the source has told the name, as without the setting, and bun.lock has what it names.
+  it("installs the source of a root override for the name of the package of a source that the project accepts", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-overridden-by-own-name", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const fork = { name: "qux", version: "2.0.0" };
+      await packManifest(join(root, "fork.tgz"), fork);
+      const spec = qux.specs["a tarball URL"];
+      await writeProject(
+        ctx,
+        root,
+        { dependencies: { lp: spec } },
+        { dependencies: { lp: spec }, overrides: { qux: `${qux.origin}/fork.tgz` } },
+      );
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(await file(join(root, "project", "node_modules", "lp", "package.json")).json()).toEqual(fork);
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+    });
+  });
+
+  // Without the setting, an override is found under the name that the source tells, so a rule for the key does not
+  // reach a package with another name and bun.lock keeps the tarball. With the setting the rule is found, and what
+  // bun.lock has is not what the rule names.
+  for (const [what, override, followed] of [
+    ["a registry version", () => "0.0.3", { name: "baz", version: "0.0.3" }],
+    ["another source", (origin: string) => `${origin}/fork.tgz`, { name: "not-qux", version: "1.0.0" }],
+  ] as const) {
+    it(`refuses what bun.lock has when a root override for the key names ${what}`, async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-subdep-locked-against-override", {});
+        const root = String(dir);
+        using qux = await serveQux(root);
+        await packManifest(join(root, "fork.tgz"), { name: "not-qux", version: "1.0.0" });
+        const spec = qux.specs["a tarball URL"];
+        const versions = { "0.0.2": { dependencies: { baz: spec } }, "0.0.3": {} };
+        const rootExtra = { overrides: { baz: override(qux.origin) } };
+        await writeProject(ctx, root, {}, rootExtra, "");
+        setContextHandler(ctx, dummyRegistryForContext(ctx, [], versions));
+        const first = await install(root, qux.env);
+        expect(diagnostics(first.err)).toEqual([]);
+        expect(await file(join(root, "project", "node_modules", "baz", "package.json")).json()).toEqual(quxManifest);
+        expect(first.exitCode).toBe(0);
+
+        const refusal = [
+          `error: refusing to resolve "baz@${spec}" declared by bar@0.0.2: ${RULE}`,
+          'note: the root package.json has a rule for "baz" that bun.lock does not follow: run `bun update baz` to resolve it again',
+        ];
+        for (const args of [[], ["--frozen-lockfile"]]) {
+          await Promise.all([
+            rm(join(root, "project", "node_modules"), { recursive: true, force: true }),
+            rm(join(root, "cache"), { recursive: true, force: true }),
+          ]);
+          await writeProject(ctx, root, {}, rootExtra);
+          setContextHandler(ctx, dummyRegistryForContext(ctx, [], versions));
+          qux.requests.length = 0;
+
+          const refused = await install(root, qux.env, ...args);
+          expect(diagnostics(refused.err)).toEqual(refusal);
+          expect(qux.requests).toEqual([]);
+          expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+          expect(refused.exitCode).toBe(1);
+        }
+
+        // Resolved again, the dependency follows the override, and the tarball of the registry package is not asked.
+        const again = await run(root, qux.env, "update", "baz");
+        expect(diagnostics(again.err)).toEqual([]);
+        expect(qux.requests).not.toContain("/qux.tgz");
+        expect(await file(join(root, "project", "node_modules", "baz", "package.json")).json()).toMatchObject(followed);
+        expect(again.exitCode).toBe(0);
+        await expectAllowedFromLockfile(root, qux.env);
+      });
+    });
+  }
+
+  // The parser decides what a specifier is, and it skips leading whitespace.
+  it("refuses a specifier with whitespace in front of it", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-whitespace", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const url = qux.specs["a tarball URL"];
+      await writeProject(ctx, root, { dependencies: { qux: ` \t${url}` } });
+
+      const { err, exitCode } = await install(root, qux.env);
+      // The messages show the specifier as it was written, with the tab escaped.
+      const shown = ` \\t${url}`;
+      expect(diagnostics(err)).toEqual(refusal(shown));
+      expect(qux.requests).toEqual([]);
+      expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  it("is off with blockExoticSubdeps = false", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-false", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(
+        ctx,
+        root,
+        { dependencies: { qux: qux.specs["a tarball URL"] } },
+        {},
+        "blockExoticSubdeps = false",
+      );
+
+      const { err, out, exitCode } = await install(root, qux.env);
+      expect(diagnostics(err)).toEqual([]);
+      expect(out).toContain("2 packages installed");
+      expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+      expect(exitCode).toBe(0);
+    });
+  });
+
+  it("stops bun add, which leaves package.json as it was", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-bun-add", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      await writeProject(ctx, root, { dependencies: { qux: spec } });
+      const packageJson = JSON.stringify({ name: "my-app", version: "1.0.0" });
+      await write(join(root, "project", "package.json"), packageJson);
+
+      const { err, exitCode } = await run(root, qux.env, "add", "bar@0.0.2");
+      expect(diagnostics(err)).toEqual(refusal(spec));
+      expect(qux.requests).toEqual([]);
+      expect(await file(join(root, "project", "package.json")).text()).toBe(packageJson);
+      expect(await exists(join(root, "project", "node_modules"))).toBe(false);
+      expect(await exists(join(root, "project", "bun.lock"))).toBe(false);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // The note of the refusal asks for this. `bun add <specifier>` has no name for the package before it is fetched.
+  for (const kind of ["a tarball URL", "a GitHub repository"] as const) {
+    it(`lets bun add accept ${kind} that a registry package asks for`, async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-subdep-bun-add-source", {});
+        const root = String(dir);
+        using qux = await serveQux(root);
+        const spec = qux.specs[kind];
+        await writeProject(ctx, root, { dependencies: { qux: spec } });
+
+        const { err, exitCode } = await run(root, qux.env, "add", spec);
+        expect(diagnostics(err)).toEqual([]);
+        expect(await installedPackages(root)).toEqual(["bar", "qux"]);
+        expect((await file(join(root, "project", "package.json")).json()).dependencies).toEqual({
+          bar: "0.0.2",
+          qux: spec,
+        });
+        expect(exitCode).toBe(0);
+        await expectAllowedFromLockfile(root, qux.env);
+      });
+    });
+  }
+
+  // `bun add <specifier>` writes the dependency under the name of the package. The registry package has it under
+  // another key. The source is what the project accepts, so the name does not matter.
+  it("lets bun add accept a source that the registry package has under another key", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-bun-add-other-key", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      await writeProject(ctx, root, { dependencies: { lp: spec } });
+
+      const { err, exitCode } = await run(root, qux.env, "add", spec);
+      expect(diagnostics(err)).toEqual([]);
+      expect(await installedPackages(root)).toEqual(["bar", "lp", "qux"]);
+      expect((await file(join(root, "project", "package.json")).json()).dependencies).toEqual({
+        bar: "0.0.2",
+        qux: spec,
+      });
+      expect(exitCode).toBe(0);
+      await expectAllowedFromLockfile(root, qux.env);
+    });
+  });
+
+  // A workspace is a package.json of the project like the root, and so is the catalog that the workspace reads.
+  for (const [what, rootExtra, version] of [
+    ["a workspace declares it too", {}, (spec: string) => spec],
+    ["the catalog of a workspace has it too", (spec: string) => ({ catalog: { qux: spec } }), () => "catalog:"],
+  ] as const) {
+    it(`installs the one of a registry package when ${what}`, async () => {
+      await withContext(defaultOpts, async ctx => {
+        using dir = tempDir("exotic-subdep-workspace-declared", {});
+        const root = String(dir);
+        using qux = await serveQux(root);
+        const spec = qux.specs["a tarball URL"];
+        const extra = typeof rootExtra === "function" ? rootExtra(spec) : rootExtra;
+        await writeProject(ctx, root, { dependencies: { qux: spec } }, { workspaces: ["packages/*"], ...extra });
+        await write(
+          join(root, "project", "packages", "app", "package.json"),
+          JSON.stringify({ name: "app", version: "1.0.0", dependencies: { qux: version(spec) } }),
+        );
+
+        const { err, exitCode } = await install(root, qux.env);
+        expect(diagnostics(err)).toEqual([]);
+        expect(await file(join(root, "project", "bun.lock")).text()).toContain(`["qux@${spec}"`);
+        expect(exitCode).toBe(0);
+        await expectAllowedFromLockfile(root, qux.env);
+      });
+    });
+  }
+
+  // `bun pm fetch` downloads what bun.lock has and links nothing.
+  it("stops bun pm fetch for a dependency that bun.lock has", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-pm-fetch", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      const bar = { dependencies: { qux: spec } };
+      await writeProject(ctx, root, bar, {}, "");
+      const first = await install(root, qux.env);
+      expect(diagnostics(first.err)).toEqual([]);
+      expect(first.exitCode).toBe(0);
+
+      await Promise.all([
+        rm(join(root, "project", "node_modules"), { recursive: true, force: true }),
+        rm(join(root, "cache"), { recursive: true, force: true }),
+      ]);
+      await writeProject(ctx, root, bar);
+      qux.requests.length = 0;
+
+      const { err, exitCode } = await run(root, qux.env, "pm", "fetch");
+      expect(diagnostics(err)).toEqual(refusal(spec));
+      expect(qux.requests).toEqual([]);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  it("is switched on by --block-exotic-subdeps", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-flag", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      const spec = qux.specs["a tarball URL"];
+      await writeProject(ctx, root, { dependencies: { qux: spec } }, {}, "");
+
+      const { err, exitCode } = await install(root, qux.env, "--block-exotic-subdeps");
+      expect(diagnostics(err)).toEqual(refusal(spec));
+      expect(qux.requests).toEqual([]);
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // Ignored, a value of the wrong type would leave the check off without a word.
+  it("must be a boolean in bunfig.toml", async () => {
+    await withContext(defaultOpts, async ctx => {
+      using dir = tempDir("exotic-subdep-bunfig-type", {});
+      const root = String(dir);
+      using qux = await serveQux(root);
+      await writeProject(
+        ctx,
+        root,
+        { dependencies: { qux: qux.specs["a tarball URL"] } },
+        {},
+        'blockExoticSubdeps = "true"',
+      );
+
+      const { err, exitCode } = await install(root, qux.env);
+      expect(err).toContain("expected boolean but received string");
+      expect(exitCode).toBe(1);
+    });
+  });
+});
+
 for (const field of ["resolutions", "overrides"]) {
   const installsFromRoot = `installs a file: dependency pointing outside the project when it came from root package.json "${field}"`;
   const installsFromRootWithLockfile = `${installsFromRoot} (existing lockfile)`;

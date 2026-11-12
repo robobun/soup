@@ -1141,6 +1141,36 @@ impl Lockfile {
         }
     }
 
+    /// `install.blockExoticSubdeps`: the package that declares dependency `id`, unless it is part of the project, as a local tarball is. A dependency that no package declares is what a command asked for.
+    pub(crate) fn foreign_declarer(&self, id: DependencyID) -> Option<PackageID> {
+        self.get_parent_pkg_of_dependency(id)
+            .filter(|&declarer| !self.is_project_package(declarer))
+    }
+
+    pub(crate) fn is_project_package(&self, id: PackageID) -> bool {
+        self.is_local_declarer(id)
+            || self.packages.items_resolution()[id as usize].tag == ResolutionTag::LocalTarball
+    }
+
+    /// `install.blockExoticSubdeps`: whether the project asks for the git repository or the tarball URL of `dependency` itself, under any name: in `overrides`, a catalog, `packageExtensions`, or the package.json of the root or of a workspace. Those are read before anything is resolved, so the answer does not depend on the order of the resolve.
+    pub(crate) fn names_exotic_source(&self, dependency: &Dependency) -> bool {
+        use dependency::VersionExt as _;
+        let buf = self.buffers.string_bytes.as_slice();
+        let dependencies = self.buffers.dependencies.as_slice();
+        let names = |named: &Dependency| named.version.eql(&dependency.version, buf, buf);
+        let literal = dependency::trim_literal(dependency.version.literal.slice(buf));
+        self.package_extensions.has_specifier(literal)
+            || (self.overrides.values().chain(self.catalogs.values())).any(names)
+            || (self.packages.items_resolution().iter())
+                .zip(self.packages.items_dependencies())
+                .any(|(resolution, declared)| {
+                    matches!(
+                        resolution.tag,
+                        ResolutionTag::Root | ResolutionTag::Workspace
+                    ) && declared.get(dependencies).iter().any(names)
+                })
+    }
+
     /// May the folder path of dependency `id` leave its package directory? Yes
     /// when a local package declares the dependency, or when a plain override or
     /// resolution supplies the path (those are only ever parsed from the root

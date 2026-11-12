@@ -176,6 +176,9 @@ const SHARED_TAIL_PARAMS: &[ParamType] = &[
         "--minimum-release-age-excludes <STR>...  Packages exempt from --minimum-release-age (comma-separated or repeated; replaces the bunfig.toml list)"
     ),
     clap::param!(
+        "--block-exotic-subdeps                Refuse git and tarball URL dependencies that an installed package declares (security feature)"
+    ),
+    clap::param!(
         "--cpu <STR>...                        Override CPU architecture for optional dependencies (e.g., x64, arm64, * for all)"
     ),
     clap::param!(
@@ -886,6 +889,7 @@ pub struct CommandLineArguments {
     pub(crate) minimum_release_age_ms: Option<f64>,
     /// As typed. Each value is a comma-separated list.
     pub(crate) minimum_release_age_excludes: &'static [&'static [u8]],
+    pub(crate) block_exotic_subdeps: bool,
 
     // `bun pm version` options
     pub(crate) no_git_tag_version: bool,
@@ -1656,6 +1660,7 @@ Full documentation is available at <magenta>https://bun.com/docs/pm/cli/prune<r>
             cli.minimum_release_age_ms = Some(secs * MS_PER_S);
         }
         cli.minimum_release_age_excludes = args.options(b"--minimum-release-age-excludes");
+        cli.block_exotic_subdeps = args.flag(b"--block-exotic-subdeps");
 
         let omit_values = args.options(b"--omit");
 

@@ -2000,6 +2000,7 @@ Flags:
   <cyan>--use-system-ca<r>, <cyan>--use-openssl-ca<r>, <cyan>--use-bundled-ca<r>  Choose the CA store to trust during installation
   <cyan>--trust<r>                Run the lifecycle scripts of the package and of ALL of its dependencies during installation
   <cyan>--ignore-scripts<r>       Run no lifecycle scripts during installation
+  <cyan>--block-exotic-subdeps<r> Refuse git and tarball URL dependencies that an installed package declares
   <cyan>--verbose<r>              Enable verbose output during installation
   <cyan>--silent<r>               Suppress output during installation
 

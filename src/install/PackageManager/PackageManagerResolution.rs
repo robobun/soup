@@ -118,6 +118,7 @@ impl PackageManager {
     }
 
     pub(crate) fn verify_resolutions(&mut self, log_level: LogLevel) {
+        super::enqueue::refuse_exotic_subdependencies(self);
         let lockfile = &self.lockfile;
         let resolutions_lists: &[DependencyIDSlice] = lockfile.packages.items_resolutions();
         let dependency_lists: &[DependencySlice] = lockfile.packages.items_dependencies();

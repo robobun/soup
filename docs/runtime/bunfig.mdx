@@ -1346,6 +1346,17 @@ minimumReleaseAgeExcludes = ["@types/bun", "typescript@5.4.5"]
 
 See [Minimum release age](/pm/cli/install#minimum-release-age).
 
+### `install.blockExoticSubdeps`
+
+Whether to refuse a dependency from git or from a tarball URL that an installed package declares. Only the `package.json` files of the project, its `overrides` and its `packageExtensions` can ask for such a dependency then. Default `false`. The `--block-exotic-subdeps` flag switches it on for one command.
+
+```toml title="bunfig.toml" icon="settings"
+[install]
+blockExoticSubdeps = true
+```
+
+See [Block exotic subdependencies](/pm/cli/install#block-exotic-subdependencies).
+
 ## `bun run`
 
 The `[run]` section configures the `bun run` command. These settings also apply to the `bun` command when running a file, script, or executable.
