@@ -631,6 +631,70 @@ pub fn set_thread_name(name: &ZStr) {
     }
 }
 
+/// Shows `title` to the OS as the title of this process and returns how many of its bytes the OS kept.
+/// SAFETY: the caller is the main thread, no other call runs at the same time, and `title` has no NUL.
+#[cfg(not(windows))]
+pub unsafe fn set_process_title(title: &[u8]) -> usize {
+    debug_assert!(!crate::strings::contains_char(title, 0));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let Some((block, len, _)) = crate::util::os_argv_block() else {
+            return title.len();
+        };
+        // libuv's rule: https://github.com/nodejs/node/blob/b7e6a5d37e7a14ef0f2cc95214b95d66c4081415/deps/uv/src/unix/proctitle.c#L110-L119
+        let kept = title.len().min(len - 1);
+        // SAFETY: the block is `len` bytes that live for the process, and Bun's own code reads only its
+        // copies of them. `kept < len`, so the last byte stays NUL, and `/proc/<pid>/cmdline` ends there.
+        unsafe {
+            core::ptr::copy_nonoverlapping(title.as_ptr(), block, kept);
+            core::ptr::write_bytes(block.add(kept), 0, len - kept);
+        }
+        let mut comm = [0u8; 16];
+        let shown = kept.min(comm.len() - 1);
+        comm[..shown].copy_from_slice(&title[..shown]);
+        // SAFETY: `gettid` and `getpid` cannot fail. PR_SET_NAME reads a NUL-terminated string, and `comm[15]`
+        // is 0. It names the calling thread, and the name of the main thread is `/proc/<pid>/comm`.
+        unsafe {
+            debug_assert_eq!(
+                libc::syscall(libc::SYS_gettid) as libc::pid_t,
+                libc::getpid()
+            );
+            let _ = libc::prctl(libc::PR_SET_NAME, comm.as_ptr() as usize);
+        }
+        kept
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some((block, len, argc)) = crate::util::os_argv_block() else {
+            return title.len();
+        };
+        // Not libuv's `len - 1`: `ps` reads `argc` strings, and prints the environment where the block has fewer NULs.
+        let room = len - argc;
+        let kept = title.len().min(room);
+        // `ps` skips leading NULs, so an empty title would show the environment too.
+        let shown: &[u8] = if kept == 0 && room > 0 {
+            b" "
+        } else {
+            &title[..kept]
+        };
+        // SAFETY: as on Linux, and `shown.len() <= room <= len`. `ps` can read the block during the
+        // write, so the tail is NUL before the title replaces the old terminators.
+        unsafe {
+            core::ptr::write_bytes(block.add(room), 0, len - room);
+            core::ptr::copy_nonoverlapping(shown.as_ptr(), block, shown.len());
+            core::ptr::write_bytes(block.add(shown.len()), 0, room - shown.len());
+        }
+        kept
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let title = crate::ZBox::from_bytes(title);
+        // SAFETY: both strings are NUL-terminated, and setproctitle(3) copies what it formats.
+        unsafe { libc::setproctitle(c"%s".as_ptr(), title.as_ptr()) };
+        title.len()
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Exit callbacks
 // ──────────────────────────────────────────────────────────────────────────

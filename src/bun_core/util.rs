@@ -3603,6 +3603,31 @@ fn raw_os_argv() -> Option<&'static [*const core::ffi::c_char]> {
     Some(unsafe { core::slice::from_raw_parts(p, n) })
 }
 
+/// The block that `/proc/<pid>/cmdline` and `KERN_PROCARGS2` show: `(start, length, argc)` from `argv[0]` through the NUL of the last argument.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+pub(crate) fn os_argv_block() -> Option<(*mut u8, usize, usize)> {
+    static BLOCK: Once<Option<(usize, usize, usize)>> = Once::new();
+    let (start, len, argc) = (*BLOCK.get_or_init(|| {
+        let raw = raw_os_argv()?;
+        let start = *raw.first()? as usize;
+        // The lengths are those of Bun's copies: the block may have been written since the process started.
+        let copies = argv_storage();
+        if copies.len() != raw.len() {
+            return None;
+        }
+        let mut end = start;
+        for (&argument, copy) in raw.iter().zip(copies) {
+            if argument as usize != end {
+                return None;
+            }
+            end += copy.as_bytes().len() + 1;
+        }
+        Some((start, end - start, raw.len()))
+    }))?;
+    Some((start as *mut u8, len, argc))
+}
+
+#[allow(clippy::disallowed_methods)]
 fn argv_storage() -> &'static [ZBox] {
     ARGV_STORAGE.get_or_init(|| {
         // Windows: the CRT-provided `char** argv` captured by `init_argv` is

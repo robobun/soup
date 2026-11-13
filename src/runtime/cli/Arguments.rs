@@ -1947,10 +1947,10 @@ pub(crate) fn parse(cmd: CommandTag, ctx: Context<'_>) -> crate::Result<api::Tra
             let _ = cli::Bun__Node__LocalStorageFile.set(location);
         }
         if let Some(title) = args.option(b"--title") {
-            // Static is `Mutex<Option<Box<[u8]>>>` so `process.title = "..."`
-            // can drop the previous value; box the argv-borrowed slice up
-            // front.
-            *cli::Bun__Node__ProcessTitle.lock() = Some(title.into());
+            // An empty title sets none: https://github.com/nodejs/node/blob/b7e6a5d37e7a14ef0f2cc95214b95d66c4081415/src/node.cc#L998-L1000
+            if !title.is_empty() {
+                cli::process_title::set(title.to_vec());
+            }
         }
         if args.flag(b"--zero-fill-buffers") {
             Bun__Node__ZeroFillBuffers.store(true, core::sync::atomic::Ordering::Relaxed);

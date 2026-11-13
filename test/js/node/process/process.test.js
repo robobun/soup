@@ -1,7 +1,7 @@
 import { spawnSync, which } from "bun";
 import { CString, dlopen, ptr } from "bun:ffi";
 import { memoryUsage as jscMemoryUsage } from "bun:jsc";
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import { familySync } from "detect-libc";
 import { bunEnv, bunExe, isASAN, isDebug, isLinux, isMacOS, isRoot, isWindows, tempDir, tmpdirSync } from "harness";
 import { basename, join, resolve } from "path";
@@ -88,25 +88,352 @@ it("process", () => {
   expect(cwd).toEqual(process.cwd());
 });
 
-it("process.title with UTF-16 characters", () => {
-  // Test with various UTF-16 characters
-  process.title = "Hello, 世界! 🌍";
-  expect(process.title).toBe("Hello, 世界! 🌍");
+it("process.title with UTF-16 characters", async () => {
+  // In a process of its own: the title is the OS's too, and it has the room of the command line.
+  const titles = ["Hello, 世界! 🌍", "🌍🌎🌏", "Test 测试 тест", "Bun 🐰", "bun"];
+  const { stdout, stderr, exitCode } = await runTitleFixture(
+    `console.log(JSON.stringify(JSON.parse(process.argv[3]).map(title => ((process.title = title), process.title))));`,
+    { args: [titlePadding, JSON.stringify(titles)] },
+  );
+  expect(stderr).toBe("");
+  expect(JSON.parse(stdout)).toEqual(titles);
+  expect(exitCode).toBe(0);
+});
 
-  // Test with emoji only
-  process.title = "🌍🌎🌏";
-  expect(process.title).toBe("🌍🌎🌏");
+// What the OS shows for the process: on Linux the command line and the name, on macOS the command line that ps prints.
+const readTitleOfOS = `
+  const fs = require("node:fs");
+  function titleOfOS() {
+    if (process.platform === "linux") {
+      return {
+        cmdline: fs.readFileSync("/proc/self/cmdline", "latin1"),
+        comm: fs.readFileSync("/proc/self/comm", "latin1").slice(0, -1),
+      };
+    }
+    const ps = Bun.spawnSync(["ps", "-ww", "-o", "command=", "-p", String(process.pid)]);
+    if (ps.exitCode !== 0) throw new Error("ps: " + ps.stderr.toString());
+    return { ps: ps.stdout.toString() };
+  }
+  const shown = () => ({ title: process.title, ...titleOfOS() });
+`;
+// An argument that gives the title room: on Linux and macOS a title has the length of the command line.
+const titlePadding = Buffer.alloc(128, "-").toString();
+// The kernel's block of arguments: each one and its NUL.
+const blockOf = cmd => cmd.reduce((length, argument) => length + Buffer.byteLength(argument) + 1, 0);
+// Linux keeps the NUL that ends the block. macOS keeps one for each argument: ps reads that many strings.
+const roomOf = cmd => blockOf(cmd) - (isLinux ? 1 : cmd.length);
 
-  // Test with mixed ASCII and UTF-16
-  process.title = "Test 测试 тест";
-  expect(process.title).toBe("Test 测试 тест");
+async function runTitleFixture(body, { flags = [], args = [titlePadding], env = {} } = {}) {
+  using dir = tempDir("process-title", { "title.js": readTitleOfOS + body });
+  const cmd = [bunExe(), ...flags, join(String(dir), "title.js"), ...args];
+  // `env` comes first and last: its first key is the first variable of the environment, and its values win.
+  await using proc = Bun.spawn({ cmd, env: { ...env, ...bunEnv, ...env }, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  return { stdout, stderr, exitCode, cmd };
+}
 
-  // Test with emoji and text
-  process.title = "Bun 🐰";
-  expect(process.title).toBe("Bun 🐰");
+// What the OS shows once `title` is set, in a process that was started with `cmd`. macOS ps prints one string for each
+// argument, so spaces follow the title.
+function expectShown(shown, title, cmd) {
+  if (isLinux) {
+    expect(shown).toEqual({
+      title,
+      cmdline: Buffer.from(title).toString("latin1").padEnd(blockOf(cmd), "\0"),
+      comm: Buffer.from(title).subarray(0, 15).toString("latin1"),
+    });
+  } else {
+    expect({ ...shown, ps: shown.ps.trimEnd() }).toEqual({ title, ps: title });
+  }
+}
 
-  process.title = "bun";
-  expect(process.title).toBe("bun");
+// What the OS shows for a process that has set no title: the command it was started with.
+function expectLaunch(shown, cmd) {
+  if (isLinux) {
+    expect(shown).toEqual({
+      title: cmd[0],
+      cmdline: cmd.map(argument => Buffer.from(argument + "\0").toString("latin1")).join(""),
+      comm: Buffer.from(basename(cmd[0])).subarray(0, 15).toString("latin1"),
+    });
+  } else {
+    expect({ ...shown, ps: shown.ps.trimEnd() }).toEqual({ title: cmd[0], ps: cmd.join(" ").trimEnd() });
+  }
+}
+
+describe.skipIf(!isLinux && !isMacOS)("process.title is the title that the OS shows", () => {
+  it.concurrent("after an assignment, and a shorter title leaves nothing of a longer one", async () => {
+    const { stdout, stderr, exitCode, cmd } = await runTitleFixture(`
+      const titles = ["bun-process-title-test", "short", "Bun 🐰 测试"];
+      // macOS pgrep leaves out its own ancestors unless -a is given, and this process starts it.
+      const pgrep = () => Bun.spawnSync(["pgrep", "-a", "-f", "bun-process-title-test"]).stdout.toString().split("\\n");
+      const all = titles.map(title => ((process.title = title), shown()));
+      process.title = titles[0];
+      console.log(JSON.stringify({ all, pgrepFinds: process.platform === "linux" || pgrep().includes(String(process.pid)) }));
+    `);
+    expect(stderr).toBe("");
+    const { all, pgrepFinds } = JSON.parse(stdout);
+    expectShown(all[0], "bun-process-title-test", cmd);
+    expectShown(all[1], "short", cmd);
+    // ps prints bytes that are not ASCII in its own way, so macOS has no check of the OS for this one.
+    if (isLinux) expectShown(all[2], "Bun 🐰 测试", cmd);
+    expect(all[2].title).toBe("Bun 🐰 测试");
+    expect(pgrepFinds).toBe(true);
+    expect(exitCode).toBe(0);
+  });
+
+  it.concurrent("a title has the room of the command line, and process.title reads what fits", async () => {
+    const { stdout, stderr, exitCode, cmd } = await runTitleFixture(`
+      // The environment lies behind the block.
+      const environment = () => (process.platform === "linux" ? fs.readFileSync("/proc/self/environ", "latin1") : "");
+      const before = environment();
+      process.title = Buffer.alloc(4096, "x").toString();
+      console.log(JSON.stringify({ shown: shown(), isEnvironmentSame: environment() === before }));
+    `);
+    expect(stderr).toBe("");
+    const { shown, isEnvironmentSame } = JSON.parse(stdout);
+    expectShown(shown, Buffer.alloc(roomOf(cmd), "x").toString(), cmd);
+    expect(isEnvironmentSame).toBe(true);
+    expect(exitCode).toBe(0);
+  });
+
+  // The name of the process is cut with the title, as in Node.js: the kernel would keep 15 bytes of a longer one.
+  it.concurrent("a command line that is shorter than the name of a process", async () => {
+    using dir = tempDir("process-title-short", {
+      "t.js": readTitleOfOS + `process.title = "a-title-of-more-than-15-bytes"; console.log(JSON.stringify(shown()));`,
+    });
+    const cmd = ["b", "t.js"];
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "t.js"],
+      argv0: "b",
+      cwd: String(dir),
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expectShown(JSON.parse(stdout), "a-title-of-more-than-15-bytes".slice(0, roomOf(cmd)), cmd);
+    expect(exitCode).toBe(0);
+  });
+
+  it.concurrent("a title that is cut inside a character reads back as in Node.js", async () => {
+    // The second process has one byte more of room, so one of the two cuts the title inside a character.
+    const runs = await Promise.all(
+      [titlePadding, titlePadding + "-"].map(padding =>
+        runTitleFixture(
+          `
+          process.title = "é".repeat(4096);
+          console.log(JSON.stringify(process.title));
+        `,
+          { args: [padding] },
+        ),
+      ),
+    );
+    for (const { stdout, stderr, exitCode, cmd } of runs) {
+      expect(stderr).toBe("");
+      const room = roomOf(cmd);
+      expect(JSON.parse(stdout)).toBe("é".repeat(room >> 1) + (room & 1 ? "\ufffd" : ""));
+      expect(exitCode).toBe(0);
+    }
+    expect(runs.map(({ cmd }) => roomOf(cmd) & 1).sort()).toEqual([0, 1]);
+  });
+
+  it.concurrent("an empty title, and a title with a NUL in it", async () => {
+    const { stdout, stderr, exitCode, cmd } = await runTitleFixture(
+      `
+      const titles = ["", "before\\0after", "again"];
+      console.log(JSON.stringify(titles.map(title => ((process.title = title), shown()))));
+    `,
+      { env: { BUN_TEST_TITLE_CANARY: "in-the-environment" } },
+    );
+    expect(stderr).toBe("");
+    // ps prints the environment behind a command line that it finds empty, so an empty title is a space on macOS.
+    expect(stdout).not.toContain("in-the-environment");
+    const [empty, cut, again] = JSON.parse(stdout);
+    expectShown(empty, "", cmd);
+    expectShown(cut, "before", cmd);
+    expectShown(again, "again", cmd);
+    expect(exitCode).toBe(0);
+  });
+
+  // The first variable of the environment lies right behind the block, and the title of the flag is set before the
+  // environment is read.
+  it.concurrent("a title that is longer than the room leaves the environment alone", async () => {
+    const { stdout, stderr, exitCode, cmd } = await runTitleFixture(
+      `console.log(JSON.stringify({ first: process.env.A_BUN_TEST_TITLE_CANARY, shown: shown() }));`,
+      { env: { A_BUN_TEST_TITLE_CANARY: "still-here", BUN_OPTIONS: "--title=" + Buffer.alloc(4096, "x") } },
+    );
+    expect(stderr).toBe("");
+    const { first, shown } = JSON.parse(stdout);
+    expect(first).toBe("still-here");
+    expectShown(shown, Buffer.alloc(roomOf(cmd), "x").toString(), cmd);
+    expect(exitCode).toBe(0);
+  });
+
+  // The title is written over the place where the OS keeps the arguments. Nothing has read these four before that.
+  it.concurrent("process.argv, argv0, execArgv and execPath are the ones of the start", async () => {
+    const { stdout, stderr, exitCode, cmd } = await runTitleFixture(
+      `
+      process.title = "bun-process-title-test";
+      const child = Bun.spawnSync([process.execPath, "-e", "console.log(process.title)"], { env: process.env });
+      const { argv, argv0, execArgv, execPath } = process;
+      console.log(JSON.stringify({ argv, argv0, execArgv, execPath, child: child.stdout.toString().trim() }));
+    `,
+      { flags: ["--smol"] },
+    );
+    expect(stderr).toBe("");
+    const { execPath, ...rest } = JSON.parse(stdout);
+    expect(rest).toEqual({
+      argv: [execPath, cmd[2], titlePadding],
+      argv0: cmd[0],
+      execArgv: ["--smol"],
+      // A child starts with its own title.
+      child: execPath,
+    });
+    expect(basename(execPath)).toBe(basename(cmd[0]));
+    expect(exitCode).toBe(0);
+  });
+
+  // A restart runs the arguments of the start again, and the title was written over the place where the OS keeps them.
+  const watchers = [];
+  afterAll(() => {
+    for (const watcher of watchers) watcher.kill("SIGKILL");
+  });
+  for (const [name, flags, titleOfStart] of [
+    ["process.title", [], undefined],
+    ["--title", ["--title=bun-title-from-flag"], "bun-title-from-flag"],
+  ]) {
+    it.concurrent(`a --watch restart behind ${name} has the arguments of the start`, async () => {
+      using dir = tempDir("process-title-watch", {
+        "watched.js":
+          readTitleOfOS +
+          `
+          try {
+            const run = fs.existsSync(__dirname + "/ran") ? 2 : 1;
+            fs.writeFileSync(__dirname + "/ran", "");
+            const start = shown();
+            if (run === 1) process.title = "title-before-the-restart";
+            console.log(JSON.stringify({ run, argv: process.argv.slice(2), start, set: shown() }));
+            if (run === 2) process.exit(0);
+          } catch (error) {
+            // Under --watch a process that throws waits for the next change. This one ends.
+            console.error(error);
+            process.exit(1);
+          }
+        `,
+      });
+      const file = join(String(dir), "watched.js");
+      const cmd = [bunExe(), ...flags, "--watch", file, "one", "two"];
+      await using proc = Bun.spawn({ cmd, env: bunEnv, stdout: "pipe", stderr: "inherit", stdin: "ignore" });
+      watchers.push(proc);
+      let stdout = "";
+      const decoder = new TextDecoder();
+      const restarted = (async () => {
+        for await (const chunk of proc.stdout) {
+          const isFirst = !stdout.includes("\n");
+          stdout += decoder.decode(chunk, { stream: true });
+          // The first run has printed, so its title is set. A change of the file starts the process again.
+          if (isFirst && stdout.includes("\n")) await Bun.write(file, (await Bun.file(file).text()) + "\n");
+        }
+      })();
+      const [exitCode] = await Promise.all([proc.exited, restarted]);
+      const [first, second] = stdout
+        .trim()
+        .split("\n")
+        .map(line => JSON.parse(line));
+      expect({ run: first.run, argv: first.argv }).toEqual({ run: 1, argv: ["one", "two"] });
+      expect({ run: second.run, argv: second.argv }).toEqual({ run: 2, argv: ["one", "two"] });
+      for (const { start } of [first, second]) {
+        if (titleOfStart) expectShown(start, titleOfStart, cmd);
+        else expectLaunch(start, cmd);
+      }
+      expectShown(first.set, "title-before-the-restart", cmd);
+      expect(second.set).toEqual(second.start);
+      expect(exitCode).toBe(0);
+    });
+  }
+
+  // The name in /proc/self/stat is the title, in parentheses. process.memoryUsage() reads the fields behind it.
+  it.concurrent.skipIf(!isLinux)("process.memoryUsage() reads past a title with a parenthesis", async () => {
+    const { stdout, stderr, exitCode } = await runTitleFixture(`
+      const before = process.memoryUsage().rss;
+      process.title = "app (dev) main";
+      const after = process.memoryUsage().rss;
+      console.log(JSON.stringify({ comm: titleOfOS().comm, isClose: after > before / 8 && after < before * 8 }));
+    `);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({ comm: "app (dev) main", isClose: true });
+    expect(exitCode).toBe(0);
+  });
+
+  for (const [name, flags, env] of [
+    ["--title=<title>", ["--title=bun-title-from-flag"], {}],
+    ["--title <title>", ["--title", "bun-title-from-flag"], {}],
+    ["bun run --title=<title>", ["run", "--title=bun-title-from-flag"], {}],
+    ["BUN_OPTIONS", [], { BUN_OPTIONS: "--title=bun-title-from-flag" }],
+  ]) {
+    it.concurrent(`with ${name}`, async () => {
+      const { stdout, stderr, exitCode, cmd } = await runTitleFixture(`console.log(JSON.stringify(shown()));`, {
+        flags,
+        env,
+      });
+      expect(stderr).toBe("");
+      expectShown(JSON.parse(stdout), "bun-title-from-flag", cmd);
+      expect(exitCode).toBe(0);
+    });
+  }
+
+  // https://github.com/nodejs/node/blob/b7e6a5d37e7a14ef0f2cc95214b95d66c4081415/src/node.cc#L998-L1000
+  for (const flags of [["--title="], ["--title", ""]]) {
+    it.concurrent(`${JSON.stringify(flags.join(" "))} sets no title`, async () => {
+      const { stdout, stderr, exitCode, cmd } = await runTitleFixture(`console.log(JSON.stringify(shown()));`, {
+        flags,
+      });
+      expect(stderr).toBe("");
+      expectLaunch(JSON.parse(stdout), cmd);
+      expect(exitCode).toBe(0);
+    });
+  }
+
+  // bun build runs a macro on a thread of its own, in a VM that does not own the title of the process.
+  it.concurrent.skipIf(!isLinux)("a title that a macro of bun build assigns stays in the macro", async () => {
+    using dir = tempDir("process-title-macro", {
+      "macro.js": `
+        import fs from "node:fs";
+        export function titleInMacro() {
+          const read = path => fs.readFileSync(path, "latin1");
+          const thread = read("/proc/thread-self/comm");
+          process.title = "title-of-the-macro";
+          return {
+            title: process.title,
+            cmdline: read("/proc/self/cmdline").split("\\0"),
+            comm: read("/proc/self/comm").trim(),
+            isThreadNameSame: read("/proc/thread-self/comm") === thread,
+          };
+        }
+      `,
+      "main.js": `
+        import { titleInMacro } from "./macro.js" with { type: "macro" };
+        console.log(JSON.stringify(titleInMacro()));
+      `,
+    });
+    const bundle = join(String(dir), "out.js");
+    const build = [bunExe(), "build", join(String(dir), "main.js"), "--outfile", bundle];
+    await using bundler = Bun.spawn({ cmd: build, env: bunEnv, stdout: "ignore", stderr: "pipe" });
+    expect({ stderr: await bundler.stderr.text(), exitCode: await bundler.exited }).toEqual({
+      stderr: "",
+      exitCode: 0,
+    });
+    await using proc = Bun.spawn({ cmd: [bunExe(), bundle], env: bunEnv, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({
+      title: "title-of-the-macro",
+      cmdline: [...build, ""],
+      comm: basename(bunExe()).slice(0, 15),
+      isThreadNameSame: true,
+    });
+    expect(exitCode).toBe(0);
+  });
 });
 
 it("process.loadEnvFile can set accessor-backed keys and respects empty values", async () => {

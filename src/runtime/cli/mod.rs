@@ -264,12 +264,41 @@ fn start_time() -> i128 {
     bun_core::start_time()
 }
 
+/// The title of the process. Its value is private: every writer goes through `set`, which on Linux, macOS and FreeBSD also shows it to the OS.
+pub(crate) mod process_title {
+    static TITLE: bun_threading::Guarded<Option<Box<[u8]>>> = bun_threading::Guarded::new(None);
+
+    pub(crate) struct Reader;
+
+    impl Reader {
+        pub(crate) fn lock(&self) -> impl core::ops::Deref<Target = Option<Box<[u8]>>> {
+            TITLE.lock()
+        }
+    }
+
+    /// For `--title` and for the `process.title` setter of the main thread's VM. Keeps what the OS kept, so `process.title` reads what `ps` shows.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn set(mut title: Vec<u8>) {
+        if let Some(nul) = bun_core::strings::index_of_char_usize(&title, 0) {
+            title.truncate(nul);
+        }
+        let mut stored = TITLE.lock();
+        // Not on Windows: the title there is the console's, and the `process.title` setter sets it in C++.
+        #[cfg(not(windows))]
+        {
+            // SAFETY: both callers run on the main thread, `stored` keeps a second call out, and the title
+            // ends before its first NUL.
+            let kept = unsafe { bun_core::set_process_title(&title) };
+            title.truncate(kept);
+        }
+        *stored = Some(title.into_boxed_slice());
+    }
+}
+
+/// The title that `--title` or `process.title` last set, for reading.
 #[allow(non_upper_case_globals)]
-// Owned `Box<[u8]>` so
-// `process.title = "..."` (set_title) drops the previous value instead of
-// leaking. The mutex provides exclusion between `get_title`/`set_title`.
-pub(crate) static Bun__Node__ProcessTitle: bun_threading::Guarded<Option<Box<[u8]>>> =
-    bun_threading::Guarded::new(None);
+pub(crate) static Bun__Node__ProcessTitle: process_title::Reader = process_title::Reader;
 
 #[allow(non_upper_case_globals)]
 /// `--redirect-warnings=<path>` — process warnings are appended to this file

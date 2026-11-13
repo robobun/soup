@@ -4891,6 +4891,7 @@ void Process::visitChildrenImpl(JSCell* cell, Visitor& visitor)
     visitor.append(thisObject->m_uncaughtExceptionCaptureCallback);
     visitor.append(thisObject->m_nextTickFunction);
     visitor.append(thisObject->m_cachedCwd);
+    visitor.append(thisObject->m_titleOfThisVM);
     visitor.append(thisObject->m_onWarning);
     visitor.append(thisObject->m_runsWhenProcessExits);
 
@@ -5255,7 +5256,8 @@ extern "C" int getRSS(size_t* rss)
     if (*s != '(')
         goto err;
 
-    s = strchr(s, ')');
+    // The name can have a ')' of its own: it is the title that process.title set.
+    s = strrchr(s, ')');
     if (s == NULL)
         goto err;
 
@@ -5878,6 +5880,8 @@ JSC_DEFINE_CUSTOM_GETTER(processTitle, (JSC::JSGlobalObject * globalObject, JSC:
 {
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
+    if (auto* title = defaultGlobalObject(globalObject)->processObject()->titleOfThisVM())
+        return JSValue::encode(title);
 #if !OS(WINDOWS)
     auto* result = jsString(globalObject->vm(), Bun__Process__getTitle(globalObject).transferToWTFString());
     RETURN_IF_EXCEPTION(scope, {});
@@ -5916,6 +5920,11 @@ JSC_DEFINE_CUSTOM_SETTER(setProcessTitle, (JSC::JSGlobalObject * globalObject, J
     }
     WTF::String wtfStr = jsString->value(globalObject);
     RETURN_IF_EXCEPTION(scope, false);
+    // Only the VM that owns the state of the process sets its title: https://github.com/nodejs/node/blob/b7e6a5d37e7a14ef0f2cc95214b95d66c4081415/src/node_process_object.cc#L167-L177
+    if (!Bun__isMainThreadVM()) {
+        defaultGlobalObject(globalObject)->processObject()->setTitleOfThisVM(vm, jsString);
+        return true;
+    }
 #if !OS(WINDOWS)
     BunString str = Bun::toString(wtfStr);
     Bun__Process__setTitle(globalObject, &str);

@@ -10977,6 +10977,382 @@ before the build error showed:
   keep `comesBack(key)` in the first condition, then upstream's check for a compiled module,
   then `rememberTestFile(key)`. This resolution was not built.
 
+### 2026-11-13: `process.title` and `--title` set the title that `ps`, `top` and `pgrep` show
+
+Node's documentation says: "Assigning a new value to `process.title` modifies the current value of
+`ps`." In Bun on Linux and macOS an assignment changed only what `process.title` read back. `ps`,
+`top`, `htop` and `pgrep` kept the command line that the process was started with, and
+`bun --title=name` did the same. oven-sh/bun#44319 is open for it, and the compatibility page said
+"Setting `process.title` is a no-op on macOS & Linux". On oven-sh/bun#14255 Jarred Sumner wrote:
+"We cannot mark this issue as fixed until `process.title` does what it was designed to do". Now
+the OS shows the title:
+
+```js
+// server.js
+process.title = "api-server";
+setInterval(() => {}, 1000);
+```
+
+```
+$ bun server.js --port 3000 &
+$ ps -o pid,args -p $!
+    PID COMMAND
+  41235 api-server
+$ pgrep -f api-server      # reads the command line
+41235
+$ pgrep -x api-server      # reads the name, which top shows (Linux)
+41235
+$ bun --title=worker-7 job.js --queue mail &     # the same from the command line
+```
+
+How the OS gets it.
+
+- Linux and Android. `/proc/<pid>/cmdline` is the block of memory in which the kernel put the
+  arguments. The title is written over that block, as libuv's `uv_set_process_title` does: cut to
+  the length of the block minus one, with the rest filled with NUL. So a title has the room of
+  the command line that the process was started with. `prctl(PR_SET_NAME)` sets the name
+  (`/proc/<pid>/comm`, 15 bytes), which `top`, `ps -o comm=` and `pgrep` without `-f` read.
+- macOS. The same block, which `ps` and `pgrep -f` read. The room is the length of the block
+  minus one byte for each argument, where libuv keeps one byte in all: `ps` reads as many strings
+  as the process had arguments, and behind a title that fills the block it prints the
+  environment. An empty title is written as one space, because `ps` skips leading NULs and then
+  prints the environment too. Both rules are from oven-sh/bun#44318. `top` and Activity Monitor
+  do not change. libuv sets the second with private LaunchServices calls, and this patch has
+  none.
+- FreeBSD. `setproctitle(3)`, as libuv does.
+- Windows. Unchanged: the setter already set the title of the console through libuv, and
+  `--title` still only stores the title.
+
+The length of the block comes from the copies of the arguments that Bun makes when it starts, and
+not from the block as it is at the first write: a native addon can have written into it since.
+Where the copies do not pair with the arguments one to one, or the arguments do not lie one
+behind the other, nothing is written, and `process.title` keeps what was assigned.
+`process.argv`, `process.argv0`, `process.execPath`, crash reports and the restart of `--watch` and
+`--hot` read the copies.
+
+What a program can see besides `ps`. Node.js does each of these.
+
+- `process.title` reads what the OS kept. A title that is longer than the room is cut, and
+  `process.title` then reads the cut title. Before, it read back what was assigned, whatever the
+  OS showed. `bun a.js` has a block of 9 bytes, so `process.title = "my-server"` reads back
+  `"my-serve"`. `node a.js` has 10 bytes and keeps all 9. A cut inside a character reads back
+  with U+FFFD at the end. A test file under a plain `bun test` has room for 8 bytes, and an
+  executable of `bun build --compile` that is started as `./app` has room for 5. On Windows
+  nothing is cut.
+- The name of the process is cut with the title. `bun a.js` with the title `my-server-1` has the
+  name `my-serve`, where the kernel would keep 15 bytes of it. Node.js passes the cut title to
+  `prctl` too.
+- What a Worker assigns stays in the Worker. Before, the title was one value for the process, so
+  the main thread read what a Worker had assigned. Now a Worker reads the title of the process
+  until it assigns one, and then its own. Neither the main thread nor the OS sees that. Node.js
+  gives the setter only to the thread that owns the state of the process (`owns_process_state`
+  in `src/node_process_object.cc`). The same holds for every VM that is not the main thread's: a
+  Web Worker, the VM in which `bun build` runs a macro, the debugger's VM.
+- A title ends at its first NUL.
+- An empty `--title` sets no title. Before, `--title=` and `--title ""` set an empty one.
+- A package that assigns `process.title` when it starts now renames the process: npm and the
+  server of Next.js do. `pgrep -f "bun server.js"` no longer finds a Next.js server that was
+  started that way, and `pkill bun` misses it.
+- libc keeps the name of the program as a pointer into the block. After a title is set,
+  `program_invocation_short_name`, the prefix of a loader error and the default tag of
+  `syslog()` show bytes of the title.
+
+Where it lives. The title had two writers that stored it and told the OS nothing: the setter
+(`set_title` in `node_process.rs`) and the arm of `--title` in `Arguments.rs`. A call to the OS
+in each would be two places to keep equal, and a third writer could skip it again. So the stored
+title is now private to a small module, `cli::process_title`. Its `set` is the only function that
+can change it, and `set` is what calls `bun_core::set_process_title`. A writer that stores the
+title and does not show it does not compile. The readers keep their text: the old name,
+`Bun__Node__ProcessTitle`, is now a handle that can lock the title for reading and nothing else.
+"Which VM may set it" is answered one layer up, in the setter in `BunProcess.cpp`: a VM that is
+not the main thread's keeps the string in a slot of its own `Process` object, and the getter
+reads that slot first. The test is `Bun__isMainThreadVM()`, the one that `process.execve` has,
+and not "is this a Worker": the VM in which `bun build` runs a macro and the debugger's VM are no
+Workers, and they do not own the title either. A macro of `bun run` runs in the main VM, and its
+assignment is the main VM's.
+
+Two more things changed with it.
+
+- `process.memoryUsage().rss` on Linux. `getRSS` reads `/proc/self/stat`, where the name stands
+  in parentheses in front of the numbers, and it looked for the first `)`. With the title
+  `app (dev) main` it read the wrong field. It now looks for the last one, as libuv and the two
+  other readers of that file in Bun do. The same misreading was reachable before through an
+  executable whose file name has a `)`.
+- `clippy.toml` bans `std::env::args` and `std::env::args_os`. libstd reads the arguments from the
+  block each time, so after a title is set they give bytes of the title. `bun_core::argv()` has
+  the copies. The two places that may call them say so: `argv_storage`, which makes the copies,
+  and the `main` of the sema tool, which is a program of its own. The compile loop of the fuzzer
+  now asks `bun_core::argv()`.
+
+Earlier work, and what is whose. Eight pull requests tried the OS write before, and none was
+turned down for its design. This commit takes from four of them:
+
+- oven-sh/bun#44318 by tnrich, which its author closed after a month without a review: the helper
+  that measures the block once and behind the copies, the two macOS rules, and the order of the
+  writes on macOS. Its author ran it on macOS arm64. tnrich is a co-author of this commit.
+- oven-sh/bun#34618 (this account's, closed by the stale sweep): the Linux rule, the length of
+  the block minus one.
+- oven-sh/bun#33842 and oven-sh/bun#39673 (this account's, the second is open): the slot on
+  `Process` for the title of a VM that is not the main one. #39673 fills it behind
+  `isWorkerVM()`. Here the test is `Bun__isMainThreadVM()`, so the VM of a `bun build` macro and
+  the debugger's VM have the slot too. This commit is the `process.title` half of #39673.
+
+New here: the private store with one writer, the title that is stored as the OS kept it, the
+name that is cut with it, the FreeBSD arm, the length of the block from the copies, the fix of
+`getRSS` and the ban in `clippy.toml`.
+
+A question for whoever takes this. On oven-sh/bun#28051 Jarred Sumner wrote: "Don't set the
+threadname when you set the process title, just the process title." That pull request called
+`pthread_setname_np` on macOS and `prctl(PR_SET_NAME)` on Linux. Its next version took out the
+first and kept the second, and no review followed. This commit calls no `pthread_setname_np`. On
+Linux it does call `prctl(PR_SET_NAME)`, which is the call that names a thread: the name of the
+main thread is the name of the process (`/proc/<pid>/comm`), and it is what `top`,
+`ps -o comm=` and `pgrep` without `-f` show. Node.js sets it. Only the main thread reaches the
+call: the setter stops every other VM, and a debug assertion checks that the caller is the
+thread group leader. If the sentence is meant to cover this call too, it is one statement in
+`bun_core::set_process_title`, and the `comm` assertions of the tests go with it. `ps -o args=`
+and `pgrep -f` follow the title without it. A second part of the same question: the name is cut
+with the title here, as in Node.js. To give the name 15 bytes of the title that was asked for is
+one more line, and it is not what Node.js does.
+
+Not in this patch.
+
+- The name in macOS Activity Monitor. The comment in `node_process.rs` that points at libuv's
+  `darwin-proctitle.c` stays for it. No open issue tracks it: #14255 is closed, and #44319 is
+  about `ps` and `pgrep`.
+- An assignment of a value that is not a string. Bun ignores it, where Node.js sets
+  `String(value)`, and for a Symbol clears the title and throws. In a Worker Node.js keeps the
+  value as it is. oven-sh/bun#44556 (open) has the first change, and the descriptor of
+  `process.title`, which is an accessor in Bun and a data property in Node.js. It edits the lines
+  under the new check in the setter, so the two meet there.
+- `--title=` as an error. Node.js refuses `--flag=` for every option that takes a value (exit 9),
+  and takes `--title ""`. Bun's parser gives both to `Arguments.rs` as one empty value.
+  oven-sh/bun#32622 (open) puts the rule into the parser, where the two can be told apart. An
+  earlier version of this commit refused both forms, which stopped `bun --title "$EMPTY" app.js`,
+  a command that starts under Node.js and under Bun 1.4.3.
+- `bun --title=x` on Windows stores the title and does not set the console's. Only the setter
+  does that, as before. oven-sh/bun#47776 ("Remove libuv on Windows") rewrites that half of the
+  setter: this commit leaves the `#if` arms of the setter and `has_title` and `get_title` as
+  they are.
+- The other things that a Worker can still do to the whole process: `process.chdir()`,
+  `process.umask(mask)`, `process.setuid()` and its family, `process.abort()`. #39673 has them.
+- `uv_set_process_title` and `uv_get_process_title` for native addons on Linux and macOS. They
+  still end the process with "unsupported uv function".
+- `NODE_OPTIONS=--title=x`, which Node.js reads and Bun does not, and
+  `new Worker(file, { execArgv: ["--title=x"] })`, which Node.js refuses and Bun ignores.
+
+What it costs.
+
+- A process that never sets a title runs none of the new Rust code. With gdb breakpoints on
+  `set_process_title`, `os_argv_block`, `process_title::set` and `set_title`, `bun -e 0` on the
+  debug build hits none of them. A script with ten assignments hits each ten times, and
+  `--title=x` hits the first three once each. `main` and `init_argv` are untouched, and the block
+  is measured at the first write (a `Once`).
+- A read of `process.title` has one more load and one more branch: the getter looks at the slot
+  of its `Process` first. `Process` grows by one pointer.
+- `Arguments::parse` tests for `--title` with the `if let` that was there. Its body is now a
+  test for an empty value and a call, where it was a lock and a copy inline.
+- One assignment on the main thread: one `prctl(PR_SET_NAME)` on Linux, and a write of the whole
+  block, which has the length of the original command line. gdb with `catch syscall prctl` sees
+  10 such calls on the main thread for 10 assignments, one for `--title=x`, and none on any
+  thread for `bun -e 0`. The allocations are the two that were there: a copy of the title as
+  UTF-8, and the previous title is freed. A title that is cut is also shrunk to what is kept.
+  That part is from the code, not measured.
+- An assignment in a Worker no longer calls into Rust and no longer copies the title as UTF-8.
+  The slot keeps the string that was assigned, so the assignment allocates nothing. A Worker that
+  assigns ten titles hits none of the breakpoints, and the process makes the same 13
+  `prctl(PR_SET_NAME)` calls as with a Worker that assigns none: one for each thread that names
+  itself at its start, none on the main thread.
+- The AOT compiler's table of built-ins is untouched. A first version of this commit kept a
+  Worker's title as a data property on its `process`, as Node.js does, and the row of
+  `process.title` then had to say that the setter defines a property and that the getter returns
+  anything. A review measured that: `bun check --aot --explain=trim` kept 119 features where it
+  kept 20 for a server that sets a title. The slot costs a Worker the raw value (`42` stays
+  ignored where Node.js keeps the number) and keeps the row as it is.
+- Not measured: instruction counts and the size of the binary. They need release builds of the
+  base and of this commit, and the container had time for the debug build only. Only gdb was
+  there to count with: no strace, perf or valgrind.
+
+Tests.
+
+- `test/js/node/process/process.test.js` has 18 tests of the title. Each starts processes of its
+  own. On Linux they read `/proc/self/cmdline` and `/proc/self/comm`. On macOS they read
+  `ps -ww -o command=`, and one asks `pgrep -f`, which is what #44319 asks. The cases:
+  - a title and then a shorter one, with the whole block compared: the title, then NULs, and the
+    length of the block unchanged;
+  - a title of 4096 bytes, which reads back as the room, with `/proc/self/environ` the same before
+    and after: the environment lies right behind the block;
+  - the same title from `BUN_OPTIONS`, with the first variable of the environment still there;
+  - a command line of 7 bytes (`argv0: "b"`), where the title and the name are cut to 6 bytes on
+    Linux and 5 on macOS;
+  - a title that is cut inside a character: two processes whose rooms differ by one byte, so
+    that one of the two cuts it there;
+  - an empty title and one with a NUL, with a variable in the environment that the output must
+    not show;
+  - `process.argv`, `argv0`, `execArgv` and `execPath`, read for the first time after the title
+    is set and compared with the command of the test, and a child that starts with its own title;
+  - a `--watch` restart behind `process.title` and behind `--title`: the first run shows the
+    title, and the second has the arguments and the command line of the start;
+  - `process.memoryUsage().rss` with the title `app (dev) main`;
+  - `--title=x`, `--title x`, `bun run --title=x` and `BUN_OPTIONS`;
+  - `--title=` and `--title ""`, which start under the command line of the start;
+  - a macro of `bun build` that assigns a title: `bun build` runs it on one of its own threads, in
+    a VM that is not the main thread's. The command line and the name of the process stay, and
+    so does the name of that thread.
+- On bun 1.4.3, 15 of the 18 fail. Two of the three that pass guard what must not change, which
+  1.4.3 does not change either: the four values of `process`, and the macro. The third is the
+  test that assigned titles with characters outside ASCII inside the test runner. It now does
+  that in a child, because the runner's own title has the room of the runner's command line.
+- `test/js/node/worker_threads/worker_threads.test.ts`: a `node:worker_threads` Worker and a Web
+  Worker read the title of the process, follow a later title of the main thread, and keep what
+  they assign. A second Worker that starts after that reads the title of the process. The main
+  thread's title, the command line, the name of the process and the name of the Worker's own
+  thread stay. Both fail on 1.4.3.
+- Node's `test/parallel/test-setproctitle.js` (v26.3.0) is vendored unchanged. It sets the title
+  and looks for it in `ps`. It fails on 1.4.3 and passes here.
+- `compile/CompileExecArgvDualBehavior` in `test/bundler/compile-argv.test.ts` now also reads
+  `/proc/self/cmdline` of an executable that was built with `--title`. That fails on 1.4.3.
+
+The files that already had tests of the title, on the debug build: `process.test.js` (216 pass,
+with one failure that is the container's: it has Node.js v26.3.0 and the test asks for
+v26.12.1), `worker_threads.test.ts` (166), `compile-argv.test.ts` (15),
+`system-library-calls.test.ts` (36), `regression/issue/23183.test.ts` (2),
+`test/aot/title-a-process-starts-with.test.ts` (1), `test/aot/compile-exec-argv.test.ts` (5), and
+the vendored `test-process-title-cli.js`, `test-trace-events-metadata.js`,
+`test-worker-unsupported-things.js` and `sequential/test-process-title.js`.
+`cli/test/isolation.test.ts` passes 153 in one run and 152 in two: there the `bun test` that it
+starts loads every built-in module in 5.3 s with the debug build, and has 5 s. The 18 tests of
+the title and the two Worker tests also pass with `BUN_JSC_validateExceptionChecks=1` in the
+environment of the runner and of the processes that it starts. Apart from this file, which
+oven-sh/bun does not have, the commit cherry-picks onto oven-sh/bun main (a62cc285621) without a
+conflict (`git merge-tree`). The result was not built: see below.
+
+Not run, and not checked.
+
+- macOS, FreeBSD, Android and Windows. The container is Linux x64. `bun_core` and `bun_runtime`
+  type-check for `aarch64-apple-darwin`, `x86_64-unknown-freebsd`, `aarch64-linux-android`,
+  `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-musl`. The macOS arm has the rules of #44318,
+  which its author ran on macOS arm64. The text of the arm here is new and was never run, and
+  neither was the macOS branch of the new tests, `pgrep -a -f` among them. No CI lane runs
+  FreeBSD. The first thing to do with this commit upstream is to run the new tests on the macOS
+  lanes.
+- Release builds, so no sizes and no instruction counts (above).
+- The one place that `clippy.toml` now sends to `bun_core::argv()` is compiled only for the
+  fuzzer (`cfg(bun_fuzzilli)`). It type-checks with that cfg set
+  (`RUSTFLAGS=--cfg=bun_fuzzilli cargo check -p bun_runtime`). It was not built and not run.
+
+How it was made. A design review ran before the code. It picked the shape above, one writer that
+owns the call to the OS and a check for the VM in the setter, over a call to the OS at each of
+the two writers. A review of the finished commit then asked for a rework, and this is the
+reworked commit. It raised 15 points, and all 15 are taken up:
+
+- `--title=` as an error is out (above). It was not needed for the title to reach the OS.
+- A Worker's title is a slot and not a data property, and the row of the AOT table is as it was
+  (above). The design review had picked the data property.
+- The block is measured from the copies. The first version measured it with `strlen` at the first
+  write, and a program whose addon had taken the NUL off the last argument would have had the
+  title written into its environment.
+- Two additions that no target and no caller reached are gone: a second check for the VM in
+  `set_title`, and an arm of `set_process_title` for a platform that Bun does not build for. A
+  new platform now fails to compile there.
+- Six tests were too weak. One compared values that were cached before the title was set, and
+  could not fail. The `--watch` test passed on a bun without the change. No test read the
+  environment behind the block, no test had a block shorter than the name of a process, macOS had
+  one way to look and not the one of the issue, and no test had a VM that is neither the main one
+  nor a Worker.
+- The comments are one line each and link to the lines of Node.js and libuv that they speak of.
+  Two of them said "as in Node.js" and "as libuv does" about things that are not so.
+- The docs line and the commit message now say what each OS shows and what was run.
+
+Two parts of those points are not taken: the review would drop this entry from the commit, since
+the file is not in oven-sh/bun, and the fork keeps each entry with its commit. And it would ask
+for #14255 to be opened again for Activity Monitor, which this fork does not do upstream.
+
+A second read of the reworked commit, of the source and of the tests, found no defect and
+changed six small things:
+
+- `os_argv_block` gives no block when the number of copies is not the number of arguments.
+  Nothing reaches that today. Without it the length would be 0 there, and the write would run
+  over the end.
+- The debug assertion of the Linux arm asks the kernel for the thread. It asked Bun's cache,
+  which a `fork` leaves stale.
+- `ps` runs with `-ww`, and a `ps` that fails now fails the test. Before, it read as an empty
+  title.
+- The fixture of the two `--watch` tests ends its process when it throws, where `--watch` would
+  wait for the next change, and the tests kill a watcher that is left.
+- The test of the cut character ran one process, and the parity of the room decided whether the
+  cut was inside a character. It now runs both parities.
+- The fixture of the Worker test lost two branches that never ran: a Web Worker has `parentPort`
+  too.
+
+Rebase notes. The stack is on oven-sh/bun 7f964e69651: 74 patches before this one, nothing
+dropped. When this run synced, main was d0f4fdd65fb, nine commits ahead, and `bun bd` did not
+build there. `src/jsc/bindings/BunPlugin.cpp` uses `JSC::SuspendExceptionScope` and does not
+include `<JavaScriptCore/FrameTracers.h>`: oven-sh/bun#48617 added the include with the use, and
+oven-sh/bun#48677 (ccb3611f2ad) took the include out. In the debug build no file in front of it
+in its unified source has the header. Upstream's own file fails the same way with only
+upstream's five files in front of it, so it is not a patch of this stack. oven-sh/bun#48722 and
+oven-sh/bun#48812 are open with the fix. 7f964e69651 is the newest commit that has the include,
+and it builds. At the push, main is a62cc285621, 20 commits ahead of 7f964e69651. Its
+`BunPlugin.cpp` is the same file, and it was not built again. The rebase onto 7f964e69651 met
+the four conflicts that the entry of 2026-11-12 lists, and they are resolved as it says:
+
+- `src/runtime/shell/states/CondExpr.rs`: `on_stat_task_done` takes the paths of the task beside
+  the two stats, and asks `stat_embedded_shell_operand` for each operand that the disk lacks and
+  that is not empty.
+- `src/runtime/webcore/Blob.rs`: upstream's `refuse_open_for_write` and `note_opened_for_write`
+  around the open of the writer, with `O_APPEND` in the flags. An append is not a whole write, so
+  `note_opened_for_write` gets `!append` in the two fast paths, in `write_file.rs` and in
+  `copy_file.rs`.
+- `src/runtime/shell/builtin/mv.rs`: both checks at the start of `do_rename`, the empty path
+  first.
+- `src/jsc/bindings/BunPlugin.cpp`: `comesBack(key)` in the first condition of
+  `keepPreloadModule`, then upstream's check for a compiled module, then `rememberTestFile(key)`.
+
+On the stack as it is pushed, these pass on the debug build: `bunshell.test.ts` (767, with the
+`[[ ]]` file tests), the shell commands `cp` (18), `ls` (34), `mkdir` (8), `mv` (20), `rm` (18)
+and `touch` (5), `bun-write.test.js` (118), `filesink.test.ts` (87) and the in-source tests of
+`bun-test.test.ts` (32). `cp`, `ls` and `bun-write` ran with `--timeout 30000`: a few of their
+tests take 5 to 7 s with the debug build. Two of the files did not pass every time. One run of
+`filesink.test.ts` in six had a failure: the check for a leaked descriptor of one case counted
+12 where it started with 11. And the rest of `bun-test.test.ts` passes too (307 in all), but in
+one run of three a case that takes 4.8 s alone took 5.05 s, and it has 5 s. The source lints
+(204) pass with the released binary, as the fork's workflow runs them, and so does the bun-types
+test (30, the bindgen case with the engine's generators in reach, as the workflow fetches them).
+
+`test-aot.test.ts` passes 24 of 26, the two in-source cases among them. The two that fail, fail
+the same way on a build of the stack without this commit, which was made to find that out:
+
+- `a matcher after .resolves or .rejects waits for a pending promise`. Under a failing `expect`,
+  `bun test --aot` prints one stack frame less than `bun test`.
+- `a build error`. `bun test --aot` of a file whose import does not resolve ends with a SEGV in
+  the AOT linker in most runs: 4 of 5 without this commit, 8 of 10 with it. The function of
+  `JSC::AOT::Typed::LinkFlow` under which it happens changes from run to run. The frame on top
+  is the debug check of hash table iterators (`WTF::removeIterator`), which trips when one
+  thread changes a map while another holds an iterator of it. A run that does not crash names
+  the import, as the test expects.
+
+Whether 7f964e69651 alone has the two was not checked: that takes a build of upstream's tree
+without the stack. Upstream's CI passed at that commit (build 140544), and no annotation of the
+build names the file. CI has the profiles release, asan and hardened, and no debug build.
+
+For a later day: `bun run rust:clippy` has three findings in `bun_runtime`, each in lines that an
+earlier patch of this stack changed: `cli/test/GlobalSetup.rs:490` (2026-10-31, `globalSetup`),
+`shell/builtin/export.rs:99` (2026-10-31, `"$VAR"`) and `api/JSBundler.rs:2300` (2026-11-07,
+`build.resolve()`). The workflow that runs clippy runs on pull requests only, so the fork does
+not show them. This commit adds none. Also for a later day: the two cases of `test-aot.test.ts`
+above, on a build of 7f964e69651 alone, to know whether they are upstream's or the stack's.
+
+Files: `src/bun_core/util.rs` (`os_argv_block`), `src/bun_core/Global.rs`
+(`set_process_title`), `src/runtime/cli/mod.rs` (`process_title`), `src/runtime/cli/Arguments.rs`,
+`src/runtime/node/node_process.rs`, `src/jsc/bindings/BunProcess.cpp` (`processTitle`,
+`setProcessTitle`, `getRSS`), `src/jsc/bindings/BunProcess.h`, `clippy.toml`,
+`src/runtime/cli/fuzzilli_compile_loop.rs`, `src/sema/standalone/main.rs`,
+`docs/runtime/nodejs-compat.mdx`, `test/js/node/process/process.test.js`,
+`test/js/node/worker_threads/worker_threads.test.ts`,
+`test/js/node/test/parallel/test-setproctitle.js` (new, from Node.js),
+`test/bundler/compile-argv.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

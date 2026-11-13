@@ -3357,3 +3357,74 @@ test("a ShadowRealm in a worker can import node:worker_threads", async () => {
   expect(stdout).toBe("true\n");
   expect(exitCode).toBe(0);
 });
+
+// The title is the process's. A worker reads it, and what a worker assigns stays in that worker: Node.js gives the
+// setter only to the thread that owns the state of the process. The OS shows the title that the main thread set.
+describe.each(["node:worker_threads", "Web"])("process.title in a %s Worker", kind => {
+  test.concurrent("reads the title of the process, and keeps what it assigns to itself", async () => {
+    using dir = tempDir("worker-process-title", {
+      "main.js": /* js */ `
+        const fs = require("node:fs");
+        const shown = () =>
+          process.platform === "linux"
+            ? [fs.readFileSync("/proc/self/cmdline", "latin1").split("\\0")[0], fs.readFileSync("/proc/self/comm", "latin1").trim()]
+            : [];
+        process.title = "title-of-main";
+        const isWeb = process.argv[2] === "Web";
+        const file = __dirname + "/worker.js";
+        const start = () => (isWeb ? new Worker(file) : new (require("node:worker_threads").Worker)(file));
+        const listen = (worker, heard) => (isWeb ? (worker.onmessage = event => heard(event.data)) : worker.on("message", heard));
+        const steps = [];
+        const first = start();
+        listen(first, message => {
+          steps.push(message);
+          if (message.step === "start") {
+            process.title = "later-title-of-main";
+            first.postMessage("assign");
+            return;
+          }
+          // A worker that starts now reads the title of the process, not what the first worker assigned.
+          const second = start();
+          listen(second, ({ title }) => {
+            console.log(JSON.stringify({ first: steps, second: title, main: process.title, os: shown() }));
+            first.terminate();
+            second.terminate();
+          });
+        });
+      `,
+      "worker.js": /* js */ `
+        const fs = require("node:fs");
+        const { parentPort } = require("node:worker_threads");
+        const threadName = () =>
+          process.platform === "linux" ? fs.readFileSync("/proc/thread-self/comm", "latin1").trim() : "";
+        const name = threadName();
+        parentPort.on("message", () => {
+          const later = process.title;
+          process.title = "title-of-worker";
+          parentPort.postMessage({ step: "done", later, own: process.title, isThreadNameSame: threadName() === name });
+        });
+        parentPort.postMessage({ step: "start", title: process.title });
+      `,
+    });
+    await using proc = Bun.spawn({
+      // The last argument gives the titles room: a title has the length of the command line.
+      cmd: [bunExe(), "main.js", kind, Buffer.alloc(64, "-").toString()],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({
+      first: [
+        { step: "start", title: "title-of-main" },
+        { step: "done", later: "later-title-of-main", own: "title-of-worker", isThreadNameSame: true },
+      ],
+      second: "later-title-of-main",
+      main: "later-title-of-main",
+      os: process.platform === "linux" ? ["later-title-of-main", "later-title-of-"] : [],
+    });
+    expect(exitCode).toBe(0);
+  });
+});
