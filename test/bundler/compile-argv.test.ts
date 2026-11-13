@@ -136,6 +136,15 @@ describe("bundler", () => {
           process.exit(1);
         }
 
+        // The title that ps shows is the one that the executable was built with.
+        if (process.platform === "linux") {
+          const shown = require("node:fs").readFileSync("/proc/self/cmdline", "latin1").split("\\0")[0];
+          if (shown !== "CompileExecArgvDualBehavior") {
+            console.error("FAIL: the OS shows another title. Expected: CompileExecArgvDualBehavior, Got:", shown);
+            process.exit(1);
+          }
+        }
+
         console.log("SUCCESS: process.title and process.execArgv are both set correctly");
       `,
     },

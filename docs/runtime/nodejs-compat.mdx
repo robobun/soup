@@ -377,7 +377,7 @@ The following list covers the globals implemented by Node.js and Bun's compatibi
 
 ### [`process`](https://nodejs.org/api/process.html)
 
-🟡 Mostly implemented. `process.binding` (internal Node.js bindings some packages rely on) is partially implemented: `buffer`, `config`, `constants`, `crypto/x509`, `fs`, `http_parser`, `natives`, `tty_wrap`, `util` and `uv` are available, the rest throw. Setting `process.title` is a no-op on macOS & Linux. `getActiveResourcesInfo()`, `_getActiveHandles()` and `_getActiveRequests()` always return an empty array, `setSourceMapsEnabled()` is a no-op, and `process.report.writeReport()` writes nothing. Missing `sourceMapsEnabled` and `addUncaughtExceptionCaptureCallback`.
+🟡 Mostly implemented. `process.binding` (internal Node.js bindings some packages rely on) is partially implemented: `buffer`, `config`, `constants`, `crypto/x509`, `fs`, `http_parser`, `natives`, `tty_wrap`, `util` and `uv` are available, the rest throw. Setting `process.title` replaces the command line that `ps` and `pgrep -f` show, and on Linux the name that `top` shows. As in Node.js, the title keeps at most as many bytes as the command line that the process started with. It does not set the name in macOS Activity Monitor. `getActiveResourcesInfo()`, `_getActiveHandles()` and `_getActiveRequests()` always return an empty array, `setSourceMapsEnabled()` is a no-op, and `process.report.writeReport()` writes nothing. Missing `sourceMapsEnabled` and `addUncaughtExceptionCaptureCallback`.
 
 ### [`queueMicrotask()`](https://developer.mozilla.org/en-US/docs/Web/API/queueMicrotask)
 
