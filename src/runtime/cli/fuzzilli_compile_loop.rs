@@ -169,8 +169,9 @@ pub(crate) fn compile_programs(ctx: Context<'_>) -> ! {
             path: &program_path,
             text: &File::read_from(Fd::cwd(), &program_path).unwrap_or_default(),
             graph: write_to_unnamed_file(&graph),
-            hides_function_source: std::env::args()
-                .any(|argument| argument == "--no-compile-function-source"),
+            hides_function_source: bun_core::argv()
+                .iter()
+                .any(|argument| argument == b"--no-compile-function-source"),
             limits: &run_limits,
         }
         .compare_with_plain_bun(),

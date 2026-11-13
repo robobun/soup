@@ -10,6 +10,7 @@ fn variable(name: &bun_core::ZStr) -> Option<String> {
 #[global_allocator]
 static ALLOC: bun_alloc::Mimalloc = bun_alloc::Mimalloc;
 
+#[allow(clippy::disallowed_methods)]
 fn main() {
     bun_core::output::stdio::init();
     let _flush = bun_core::output::flush_guard();

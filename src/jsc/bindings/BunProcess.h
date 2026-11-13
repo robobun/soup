@@ -32,6 +32,8 @@ class Process : public WebCore::JSEventEmitter {
     WriteBarrier<JSObject> m_nextTickFunction;
     // https://github.com/nodejs/node/blob/2eff28fb7a93d3f672f80b582f664a7c701569fb/lib/internal/bootstrap/switches/does_own_process_state.js#L113-L116
     WriteBarrier<JSString> m_cachedCwd;
+    // What this VM assigned to process.title, when it is not the main thread's VM: the title of the process is not its to set.
+    WriteBarrier<JSString> m_titleOfThisVM;
     // The JS warning printer (ProcessObjectInternals createOnWarning), built on the first warning.
     WriteBarrier<JSObject> m_onWarning;
     // A function of the library: it hands native code what it kept for a tick. No tick runs once the process exits.
@@ -90,6 +92,9 @@ public:
     JSString* cachedCwd() { return m_cachedCwd.get(); }
     void setCachedCwd(JSC::VM& vm, JSString* cwd) { m_cachedCwd.set(vm, this, cwd); }
     void clearCachedCwd() { m_cachedCwd.clear(); }
+
+    JSString* titleOfThisVM() { return m_titleOfThisVM.get(); }
+    void setTitleOfThisVM(JSC::VM& vm, JSString* title) { m_titleOfThisVM.set(vm, this, title); }
 
     JSValue getArgv(JSGlobalObject* globalObject);
     JSValue getExecArgv(JSGlobalObject* globalObject);
