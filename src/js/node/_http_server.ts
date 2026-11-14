@@ -81,6 +81,28 @@ const {
 } = require("node:_http_outgoing");
 const OutgoingMessagePrototype = OutgoingMessage.prototype;
 const { kIncomingMessage } = require("node:_http_common");
+// What node:diagnostics_channel has for an http.Server. That module is loaded when the first server listens or the
+// first response is made, and not with this one.
+type DiagnosticsChannel = typeof import("./diagnostics_channel").default;
+// https://github.com/nodejs/node/blob/v26.3.0/lib/_http_server.js#L107-L109
+let onRequestStartChannel: ReturnType<DiagnosticsChannel["channel"]>;
+let onResponseCreatedChannel: ReturnType<DiagnosticsChannel["channel"]> | undefined;
+let onResponseFinishChannel: ReturnType<DiagnosticsChannel["channel"]>;
+// Node's http.Server is a net.Server, so its connections and its listen() are announced on the channels of node:net.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L162-L163
+let netServerSocketChannel: ReturnType<DiagnosticsChannel["channel"]>;
+let netServerListen: ReturnType<DiagnosticsChannel["tracingChannel"]> | undefined;
+// The request that the dispatcher makes a response for at this moment. The dispatcher announces that response, and
+// not the constructor: it makes one before it knows that the request is no upgrade, and node makes none for an upgrade.
+let requestInDispatch: unknown;
+function loadDiagnosticsChannels() {
+  const dc = require("node:diagnostics_channel");
+  onRequestStartChannel = dc.channel("http.server.request.start");
+  onResponseCreatedChannel = dc.channel("http.server.response.created");
+  onResponseFinishChannel = dc.channel("http.server.response.finish");
+  netServerSocketChannel = dc.channel("net.server.socket");
+  return (netServerListen = dc.tracingChannel("net.server.listen"));
+}
 let http1Fallback;
 const kConnectionsCheckingInterval = Symbol("http.server.connectionsCheckingInterval");
 const kTrackedConnections = Symbol("http.server.trackedConnections");
@@ -619,6 +641,11 @@ Server.prototype.address = function () {
 Server.prototype.listen = function () {
   // Before anything is registered, like net.Server: https://github.com/nodejs/node/blob/v26.5.0/lib/net.js#L2270-L2272
   if (this[serverSymbol]) throw $ERR_SERVER_ALREADY_LISTEN();
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2115-L2117
+  const listenChannel = netServerListen ?? loadDiagnosticsChannels();
+  if (listenChannel.hasSubscribers) {
+    listenChannel.asyncStart.publish({ server: this, options: normalizedListenOptions(arguments) });
+  }
   const server = this;
   let port, host;
   let socketPath;
@@ -701,11 +728,31 @@ Server.prototype.listen = function () {
 
     server[kRealListen](tls, port, host, socketPath, true);
   } catch (err) {
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2012-L2014
+    if (listenChannel.hasSubscribers) {
+      listenChannel.error.publish({ server, error: err });
+    }
     process.nextTick(emitListenErrorNextTick, server, err);
   }
 
   return this;
 };
+
+// The options that node's normalizeArgs() makes of the arguments of listen(), for the message of asyncStart.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L285-L318
+function normalizedListenOptions(args: IArguments) {
+  const arg0 = args[0];
+  if (typeof arg0 === "object" && arg0 !== null) return arg0;
+  const options: { path?: unknown; port?: unknown; host?: string } = {};
+  if (args.length === 0) return options;
+  if (typeof arg0 === "string" && !(Number(arg0) >= 0)) {
+    options.path = arg0;
+  } else {
+    options.port = arg0;
+    if (args.length > 1 && typeof args[1] === "string") options.host = args[1];
+  }
+  return options;
+}
 
 Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort) {
   {
@@ -857,6 +904,7 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
         // subclasses (options.ServerResponse) might retain options, so they
         // keep getting a fresh object.
         let http_res;
+        requestInDispatch = http_req;
         if (ResponseClass === ServerResponse) {
           scratchResponseOptions[kHandle] = handle;
           scratchResponseOptions.highWaterMark = socket.writableHighWaterMark;
@@ -870,6 +918,7 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
             [kRejectNonStandardBodyWrites]: server.rejectNonStandardBodyWrites,
           });
         }
+        requestInDispatch = undefined;
         http_res._keepAliveTimeout = server.keepAliveTimeout;
         // Only stamp the symbol when the server actually set `uniqueHeaders`:
         // unconditionally adding it (even as undefined) forced a hidden-class
@@ -925,6 +974,7 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
 
         if (isSocketNew) {
           server.emit("connection", socket);
+          if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket });
         }
 
         // Target of the socket 'timeout' handler until this request's response detaches.
@@ -949,6 +999,17 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
         // 'upgrade' listener and false for a declined upgrade that falls
         // through to 'request'.
         http_req.upgrade = is_upgrade;
+        // Node makes no response for an upgrade, so it announces none and no request.
+        if (!is_upgrade) {
+          // What the constructor of http_res left to this place.
+          if (onResponseCreatedChannel!.hasSubscribers) {
+            onResponseCreatedChannel!.publish({ request: http_req, response: http_res });
+          }
+          // https://github.com/nodejs/node/blob/v26.3.0/lib/_http_server.js#L1296-L1303
+          if (onRequestStartChannel.hasSubscribers) {
+            onRequestStartChannel.publish({ request: http_req, response: http_res, socket, server });
+          }
+        }
         if (isPipelined) {
           // A previous response on this connection has not finished yet: like
           // Node.js, this response is queued (res.socket === null) and its
@@ -1154,6 +1215,11 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
       this[serverSymbol]?.unref?.();
     }
 
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2024-L2026
+    if (netServerListen!.hasSubscribers) {
+      netServerListen!.asyncEnd.publish({ server: this });
+    }
+
     // A tick, not a timer, as in node: a timer never fires on its own under jest.useFakeTimers().
     process.nextTick(emitListeningNextTick, this, this[serverSymbol]?.hostname, this[serverSymbol]?.port);
   }
@@ -1294,6 +1360,8 @@ function onServerConnection(this: Server, listenerGeneration, socketHandle) {
   // emitting 'connection'; expose the shim here so listeners see it populated.
   socket.parser = createServerParserShim(socket);
   this.emit("connection", socket);
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2371-L2375
+  if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket });
   if (isTLS && socketHandle.secureEstablished) {
     this.emit("secureConnection", socket);
   }
@@ -1369,6 +1437,7 @@ function onServerClientError(
   if (!existingDuplex) {
     nodeSocket.parser = createServerParserShim(nodeSocket);
     self.emit("connection", nodeSocket);
+    if (netServerSocketChannel.hasSubscribers) netServerSocketChannel.publish({ socket: nodeSocket });
   }
 
   if (errorCode === HttpParserError.HTTP_PARSER_ERROR_MISSING_HOST_HEADER) {
@@ -2427,8 +2496,16 @@ function ServerResponse(req, options): void {
   this.statusCode = 200;
   this.statusMessage = undefined;
   this.chunkedEncoding = false;
+
+  if (req !== requestInDispatch) publishResponseCreated(req, this);
 }
 $toClass(ServerResponse, "ServerResponse", OutgoingMessage);
+
+// https://github.com/nodejs/node/blob/v26.3.0/lib/_http_server.js#L236-L241
+function publishResponseCreated(req, res) {
+  if (onResponseCreatedChannel === undefined) loadDiagnosticsChannels();
+  if (onResponseCreatedChannel!.hasSubscribers) onResponseCreatedChannel!.publish({ request: req, response: res });
+}
 // A response whose own statusCode was deleted sends 200, as in Node.js.
 ServerResponse.prototype.statusCode = 200;
 
@@ -2690,6 +2767,7 @@ function stopServerResponsePerf(this: any) {
 // read pre-detach state, then detach the socket and advance the pipeline.
 function emitResponseFinish() {
   const req = this.req;
+  if (onResponseFinishChannel.hasSubscribers) publishResponseFinish(this, req);
   // Node's resOnFinish: dump a body that nobody consumed or resumed.
   if (req && !req._consuming && !req._readableState?.resumeScheduled) {
     req._dump();
@@ -2708,6 +2786,13 @@ function emitResponseFinish() {
   if (detachedFrom !== undefined) return;
   if (socket != null) this.detachSocket(socket);
   advanceResponsePipeline(socket?.server, socket);
+}
+
+// The first thing that Node.js's resOnFinish does: https://github.com/nodejs/node/blob/v26.3.0/lib/_http_server.js#L1187-L1194
+function publishResponseFinish(res, req) {
+  // The socket of the connection, found the way emitResponseFinish finds it.
+  const socket = res[kDetachedFrom] ?? req?.socket ?? res.socket;
+  onResponseFinishChannel.publish({ request: req, response: res, socket, server: socket?.server });
 }
 
 // Runs when a response has finished, like the transport-related half of

@@ -11353,6 +11353,269 @@ Files: `src/bun_core/util.rs` (`os_argv_block`), `src/bun_core/Global.rs`
 `test/js/node/test/parallel/test-setproctitle.js` (new, from Node.js),
 `test/bundler/compile-argv.test.ts`.
 
+### 2026-11-14: the built-in channels of `node:diagnostics_channel` for HTTP servers, sockets, child processes and workers
+
+A tracing library does not patch `http.Server` any more. It subscribes to a channel of
+`node:diagnostics_channel`, and Node.js publishes to that channel from inside its own modules. Bun
+had the module and published from the HTTP client, from `node:http2` and from `node:dgram`. Its
+HTTP server, `node:net`, `node:child_process` and `node:worker_threads` published nothing, so a
+subscriber of their channels was never called, and nothing said so. oven-sh/bun#29586 is
+open for the HTTP server ("This silently breaks any observability library that relies on these
+channels") and oven-sh/bun#32472 for `node:child_process` ("breaks Sentry childProcessIntegration
+and OpenTelemetry"). The compatibility page listed the `http.server.*`, `net`, `child_process` and
+`worker_threads` channels as missing. Now Bun publishes them:
+
+```js
+import dc from "node:diagnostics_channel";
+import http from "node:http";
+
+dc.subscribe("http.server.request.start", ({ request }) => {
+  console.log("start ", request.method, request.url);
+});
+dc.subscribe("http.server.response.finish", ({ request, response }) => {
+  console.log("finish", response.statusCode, request.url);
+});
+
+http.createServer((req, res) => res.end("ok")).listen(3000);
+// $ curl localhost:3000/users
+// start  GET /users
+// finish 200 /users
+```
+
+The channels, and where each one is published. Every place is the place where Node.js v26.3.0
+publishes, and the code names the lines of Node.js that it follows.
+
+| channel                                | message                                 | published                                                                                        |
+| -------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `http.server.response.created`         | `{ request, response }`                 | when a `ServerResponse` is made, by the server or by `new http.ServerResponse(req)`              |
+| `http.server.request.start`            | `{ request, response, socket, server }` | before `'request'`, `'checkContinue'` and the 400, 417 and 503 answers of the server itself      |
+| `http.server.response.finish`          | `{ request, response, socket, server }` | in front of the `'finish'` listeners of the response                                             |
+| `net.client.socket`                    | `{ socket }`                            | at the start of `socket.connect()`, so for `net.connect()`, `tls.connect()` and `http.request()` |
+| `net.server.socket`                    | `{ socket }`                            | behind the `'connection'` event of a `net.Server`, a `tls.Server` and an `http.Server`           |
+| `tracing:net.server.listen:asyncStart` | `{ server, options }`                   | in `server.listen()`                                                                             |
+| `tracing:net.server.listen:asyncEnd`   | `{ server }`                            | when the server is bound, in front of `'listening'`                                              |
+| `tracing:net.server.listen:error`      | `{ server, error }`                     | when the bind fails, in front of `'error'`                                                       |
+| `child_process`                        | `{ process }`                           | when a `ChildProcess` is made, so for `spawn()`, `exec()`, `execFile()` and `fork()`             |
+| `tracing:child_process.spawn:start`    | `{ process, options }`                  | in front of the spawn                                                                            |
+| `tracing:child_process.spawn:end`      | `{ process }`                           | behind a spawn that worked                                                                       |
+| `tracing:child_process.spawn:error`    | `{ process, error }`                    | behind a spawn that failed                                                                       |
+| `worker_threads`                       | `{ worker }`                            | at the end of `new Worker()`                                                                     |
+
+`tracingChannel.hasSubscribers` is new too. Node.js asks it before it publishes to a tracing
+channel, and so does this patch.
+
+A subscription now holds its channel. This is the second half of the patch, and without it the
+first half would not be worth much. `diagnostics_channel.subscribe(name, fn)` makes the channel
+object and returns nothing, so the caller has no reference to keep. The module kept channels
+weakly, and a garbage collection dropped the channel with its subscribers. The compatibility
+page said "Subscribers do not keep a `Channel` alive, so hold a reference to it", which is not
+what a library written for Node.js does:
+
+```js
+dc.subscribe("http.server.request.start", onRequest); // tracing setup, first thing in the program
+Bun.gc(true); // or any collection before node:http is loaded
+dc.hasSubscribers("http.server.request.start"); // was false, is true, as in Node.js
+```
+
+Node.js holds a channel strongly while it has a subscriber or a bound store (`WeakReference` in
+`lib/internal/util.js`), and so does Bun now. A channel that nobody subscribes to is still
+collected. The finalizer that removes a collected channel from the table now looks first whether
+a later channel of the same name is there, as the one of Node.js does. Without that check a late
+finalizer removed a live channel from the table, and the next `subscribe()` went to a new object
+that no publisher had.
+
+What it costs when nobody subscribes. `hasSubscribers` of a channel with no subscriber is a
+getter that returns `false`. A request to an `http.Server` reads it three times and makes no
+object. An accepted connection, a `connect()` and a `Worker` read it once, and a `ChildProcess`
+eleven times (a tracing channel asks its five channels). Measured on Linux x64 with release
+builds of the stack with and without this commit: requests over one kept-alive connection, client
+and server in one process, counted in instructions of user space (`perf_event_open`, concurrent
+JIT and GC off so that a count repeats). The count for 100,000 requests is taken from the count
+for 300,000. A request with its response takes 25,230 instructions without the commit and
+25,248 with it: 18 more, 0.07%. Three runs of one build differ by 0.03% to 0.14%
+among themselves, so the difference is at the edge of what the count shows.
+
+`node:diagnostics_channel` is not loaded when `node:http`, `node:net`, `node:child_process` or
+`node:worker_threads` is. On the pull request that ports the whole module (oven-sh/bun#32628)
+Jarred Sumner wrote "Do not load node:diagnostics_channel on start." on `_http_server.ts` and on
+`worker_threads.ts`. Here each module asks for its channels at the first
+`listen()`, the first `connect()`, the first `ChildProcess`, the first `Worker` or the first
+`ServerResponse` that a program makes itself, as `node:dgram` does at the first socket.
+
+Where Bun does something of its own.
+
+- A request that is an upgrade. Node.js makes no `ServerResponse` for an upgrade that the server
+  takes, so it publishes nothing for it. Bun's dispatcher makes the response before it knows. So
+  the constructor of `ServerResponse` announces every response but the one that the dispatcher
+  makes at that moment (the dispatcher names its request in a variable of the module), and the
+  dispatcher publishes `created` and `start` once it knows that the request is no upgrade. A
+  response class of the program that passes its parent the request alone
+  (`constructor(req) { super(req); }`) is announced once, like any other.
+- `socket.connect()` is also how Bun hands a socket a descriptor that is open already (a
+  connection that a cluster worker takes from the primary, an extra pipe of a child process) and
+  the stream that `tls.connect({ socket })` runs over. Node.js calls no `connect()` in those
+  places, so `net.client.socket` is not published there.
+- Node.js's `http.Server` is a `net.Server`. Bun's is not, so `_http_server.ts` publishes
+  `net.server.socket` and the three `net.server.listen` events itself.
+- `fetch()` does not connect through `node:net`, so it publishes no `net.client.socket`. In
+  Node.js it does. `http.request()` connects through `node:net` in both.
+- The second text of `_http_server.ts`, which `bun build --compile --aot` compiles, has a short
+  road for a plain request and a finish that emits nothing when nobody listens. Both now ask the
+  channels first: a subscriber sends the request down the full road, and a subscriber of
+  `http.server.response.finish` is a listener of `'finish'`. That text also makes one response of
+  its own, which stands in for the responses of other classes. Nothing is announced for it.
+
+Tests. Eleven test files of Node.js v26.3.0 are new in `test/js/node/test/parallel`, as they
+are in Node.js: `test-diagnostic-channel-http-response-created.js` and
+`test-diagnostics-channel-` with `http-server-start`, `http`, `net`, `net-client-socket-tls`,
+`child-process`, `process`, `worker-threads`, `tracing-channel-has-subscribers`,
+`gc-maintains-subcriptions` and `gc-race-condition`. All eleven fail on a release build of the
+stack without this commit and pass with it. `test-diagnostics-channel-memory-leak.js` is not
+taken: it needs `v8.queryObjects()`.
+
+Two fixtures in `test/js/node/diagnostics_channel` print every message in the order in which it
+comes. `builtin-channels-fixture.js` has a subscription that outlives a collection, an
+`http.Server` with a request, an upgrade, a response that the program makes itself and a
+response class of the program, a server that reads HTTP from a stream of the program, a
+`net.Server` with a `listen()` that fails, a `spawn()` that works and one that does not, a
+`Worker`, and `tracingChannel.hasSubscribers`. `builtin-channels-cluster-fixture.js` has a
+`net.Server` in a cluster worker. Both run under Node.js too, and the 55 and 5 lines that
+`diagnostics_channel.test.ts` expects are the lines that Node.js v26.3.0 prints. On the debug
+build the file passes (13 cases), and the three new cases fail on a build without the commit.
+
+The third new case is there because of a defect that the first version of this commit had. A
+case of `worker_threads.test.ts` puts throwing functions on `Map.prototype` and then makes a
+Worker. The table of channels in `diagnostics_channel.ts` is a subclass of `Map`, and it called
+`super.get()`. Before this commit `dgram.createSocket()` threw in that state for this reason.
+With the first version of the commit the first `new Worker()` and the first `spawn()` did too. The table now reads and
+writes under the private names of `Map` (`$get`, `$set`, `$delete`), which a program cannot
+replace. Node.js has a `SafeMap` there. `http.Server` and `net.Server` do not work with such a
+`Map.prototype` with or without this commit (they read `size`), so they are as they were.
+
+The second text was run as an executable. A script with 57 lines of output (no subscriber,
+subscribers, a response class that passes the options on and one that drops them, an upgrade, a
+subscriber of the finish alone, `node:net`, a Worker) prints the same lines under Node.js, under
+`bun` and as the executable that `bun build --compile --aot` makes of it. The frame that calls
+the `'request'` listener shows the road that a request takes in the executable: the short road
+with no subscriber, the full road while `http.server.request.start` or
+`http.server.response.created` has a subscriber, the short road again after `unsubscribe()`, and
+the short road with a subscriber of the finish, which is told all the same.
+
+Other suites, on release builds of the stack with and without this commit:
+
+- 1,203 test files of Node.js (`test-http-*`, `https`, `net`, `tls`, `child-process`, `worker`,
+  `cluster` and `diagnostics-channel` in `parallel` and `sequential`), eight at a time. The
+  eleven new files are the only ones that differ every time. 13 files fail on both builds. Nine
+  more failed in one run on one build or the other, and each passes five times of five alone on
+  both.
+- 135 `bun test` files of `test/js/node` for `http`, `https`, `net`, `tls`, `child_process`,
+  `worker_threads`, `cluster` and `diagnostics_channel`. Four files fail the same eight cases on
+  both builds.
+- 287 more files of `test/js/node` and `test/js/web/workers`. `node-dns.test.js` (28 cases, it
+  asks name servers) and one case of `process.test.js` (the version of the host's `node`) fail
+  on both builds. Two snapshot tests failed: `members-of-prototype-objects-for-any-receiver.test.ts`
+  lists the members of every prototype object, so its snapshot has four lines for the new getter
+  of `TracingChannel` now. The other lines that it and `visible-surface.test.ts` lacked are those
+  of an earlier patch (below). Both pass on the release build now. On a debug build they fail
+  on lines that only a debug build has (an `$assert`, the `__id__` of an `AsyncLocalStorage`).
+- `test/internal`: `second-texts-of-modules`, `export-lists-of-both-texts-of-modules` and
+  `arms-of-modules-for-compiled-programs` pass on the release build. On the debug build one case
+  of the second takes 6.3 s and has 5 s. The source lints (`test/internal/source-lints`) pass
+  with the released binary, as the fork's workflow runs them: 204 cases.
+
+Earlier work, and what is whose. This is not the first time these channels are written for Bun.
+
+- oven-sh/bun#32628 by Ciro Spaciari, open since June, ports all of
+  `lib/diagnostics_channel.js` from Node.js v26.3.0 and publishes these channels and the
+  `module` ones, with 32 test files of Node.js. It is the pull request to take if the whole
+  module is wanted. It conflicts with `main` today. This commit is the part of it that the two
+  issues ask for, written on the module as `main` has it, and it touches no C++.
+- This account's pull requests for single channels were closed in favor of #32628 or by the
+  stale sweep, none with an objection: oven-sh/bun#29588 (`http.server.*`), oven-sh/bun#30080
+  (`child_process`), oven-sh/bun#34209 (`net`) and oven-sh/bun#33449
+  (`tracingChannel.hasSubscribers`). oven-sh/bun#46991 (a subscription holds its channel) and
+  oven-sh/bun#43088 (the finalizer) are open.
+- The review of #32628 is where the rules of this commit come from: no load of the module on
+  start, no listener or bound function per request, the check of `hasSubscribers` at the time
+  of `'finish'` and not at the time of the request, the second HTTP/1 path
+  (`internal/http1_server_fallback.ts`), the cluster worker, and the descriptors that come
+  through `connect()`.
+
+Not in this patch.
+
+- `boundedChannel()` and `channel.withStoreScope()`.
+- The `console.*`, `tracing:module.require`, `tracing:module.import` and `process.execve`
+  channels.
+- `net.client.socket` for `fetch()`.
+- `Bun.spawn()` and `Bun.spawnSync()` publish nothing, and neither does `child_process.spawnSync()`,
+  which publishes nothing in Node.js either. The channels are those of a `ChildProcess`.
+
+Four earlier patches, repaired. On the fork's `main`, `Bun.Queue`, `FileReader`, `ProgressEvent`
+and `navigator.locks` were `undefined` and `Bun.build({ watch: true })` threw
+`Bun.build: watch is not a function`, since the rebase onto oven-sh/bun#47942 that the entry of
+2026-11-09 describes. Native code reads a built-in module through
+`BUN_REQUIRE_INTERNAL_MODULE(global, module, reader, "name"_s)`. With oven-sh/bun#45631 the macro
+returned the module, and the name declared which export the caller reads. #47942 made it return
+that export, and changed upstream's callers in the same commit. The five callers of this stack
+are lines that only the stack has. The rebase met no conflict in them, they compiled, and they
+read the export off the export. The fork's workflows run the source lints, the types and the
+package checks, and no test of the runtime, so nothing showed it. This run saw it by chance, in
+a probe of `navigator.locks` for the docs line above. Of the 168 tests of the four features 165
+failed on a debug build: `queue.test.ts` passed 0 of 50, `filereader.test.ts` 2 of 44,
+`bun-build-watch.test.ts` 1 of 38 and `locks.test.ts` 0 of 36. Each of the four patches now
+returns what the macro gives, in its own commit (`createBunQueue` in `BunObject.cpp`,
+`Bun__watchBuild` in `BundlerWatch.cpp`, and the getters of `FileReader`, `ProgressEvent` and
+`navigator.locks` in `ZigGlobalObject.cpp`), and all 168 pass.
+
+The Web Locks patch (2026-09-21) also has the 17 lines now that two snapshots of upstream lacked
+for `worker_threads.locks`: `visible-surface.test.ts` and
+`members-of-prototype-objects-for-any-receiver.test.ts` in `test/js/node`. The two tests came
+with #45631 and oven-sh/bun#47836 and failed on the stack since.
+
+So nothing runs the tests of the earlier patches after a rebase, and a patch can lose its
+feature without a conflict. To see how much else is in that state, the test files of the stack
+ran on the release build of today's stack:
+
+- Of the 34 test files that the stack added, 32 pass. `caseChange.test.ts` does not load:
+  `test/package.json` names the package `change-case`, and this machine has not installed it.
+  Three MySQL cases of `sql-debug.test.ts` fail with `Access denied for user 'root'@'localhost'`,
+  which is the database of this machine.
+- Of the 85 test files that the stack changes, 80 pass. `semver.test.ts` does not load (the
+  package `semver` is not installed). Nine PostgreSQL cases of `sql.test.ts` fail, all of them
+  cases of upstream. `process.test.js` fails the one case that knows the version of the host's
+  `node`. `bun-types.test.ts` fails the bindgen case, which needs the generators of the engine.
+  `serve-types.test.ts` is a fixture of the types and no test.
+
+So no other feature of the stack is lost. Why the nine PostgreSQL cases fail here was not looked
+into.
+
+For a later day: a run of these 119 files after every rebase.
+
+Rebase notes. The stack stays on oven-sh/bun 7f964e69651: 75 patches before this one, nothing
+dropped. Upstream `main` is 9098897a173, 21 commits ahead of that base, and `bun bd` does not
+build there, for the reason that the entry of 2026-11-13 gives: `BunPlugin.cpp` uses
+`JSC::SuspendExceptionScope` and has not included `<JavaScriptCore/FrameTracers.h>` since
+oven-sh/bun#48677. oven-sh/bun#48812 and oven-sh/bun#48858 are open with the include, and
+oven-sh/bun#48722 is closed. This run rebased the stack onto 9098897a173 before it knew that,
+and the result is not pushed. For the next rebase, what it took: 35 of the 75 patches have another
+diff after it, from a conflict, from a line that `cargo check` asked for, or only from other
+lines around theirs. The 21 commits change who owns what. A file descriptor is owned by a `File`
+that closes it when it is dropped (`append` in `Bun.write()`, the archives), the working
+directory of a shell builtin is an owned descriptor too (`[[ ]]`), fields of the VM and of the
+test runner are `Cell` and `JsCell` (`globalSetup` and its hook at the exit of the process), and
+the environment of a shell command is an owned value that a background job has to keep alive
+(`cmd &` and `wait`). With those resolved every crate type-checks, and the build then stops in
+upstream's `BunPlugin.cpp`.
+
+Files: `src/js/node/diagnostics_channel.ts`, `src/js/node/_http_server.ts`,
+`src/js/internal/http1_server_fallback.ts`, `src/js/node/net.ts`, `src/js/node/child_process.ts`,
+`src/js/node/worker_threads.ts`, the second texts of four of them in `src/js/ahead-of-time`,
+`docs/runtime/nodejs-compat.mdx`, `test/js/node/diagnostics_channel/diagnostics_channel.test.ts`,
+`test/js/node/diagnostics_channel/builtin-channels-fixture.js`,
+`test/js/node/diagnostics_channel/builtin-channels-cluster-fixture.js`,
+`test/js/node/__snapshots__/members-of-prototype-objects-for-any-receiver.test.ts.snap`, and the
+eleven files from Node.js in `test/js/node/test/parallel`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

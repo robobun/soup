@@ -1,6 +1,6 @@
 // Hardcoded module "node:child_process"
 const EventEmitter = require("node:events");
-const { kHandle } = require("internal/shared");
+const { kHandle, ErrnoException } = require("internal/shared");
 const {
   validateBoolean,
   validateFunction,
@@ -1145,6 +1145,12 @@ function parseEnvPairs(envPairs: string[] | undefined): Record<string, string> |
 //------------------------------------------------------------------------------
 type StdioStream = $Node.Readable | $Node.Writable | $Node.Socket;
 
+// What node:diagnostics_channel has for this module, loaded with the first ChildProcess.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/child_process.js#L62-L64
+type DiagnosticsChannel = typeof import("./diagnostics_channel").default;
+let childProcessChannel: ReturnType<DiagnosticsChannel["channel"]> | undefined;
+let childProcessSpawn: ReturnType<DiagnosticsChannel["tracingChannel"]> | undefined;
+
 class ChildProcess extends EventEmitter {
   #handle: $Bindgen.Subprocess | null | undefined;
   #closesNeeded = 1;
@@ -1160,6 +1166,17 @@ class ChildProcess extends EventEmitter {
   pid;
   channel;
   killed = false;
+
+  constructor() {
+    super();
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/child_process.js#L307-L311
+    if (childProcessChannel === undefined) {
+      const dc = require("node:diagnostics_channel");
+      childProcessChannel = dc.channel("child_process");
+      childProcessSpawn = dc.tracingChannel("child_process.spawn");
+    }
+    if (childProcessChannel.hasSubscribers) childProcessChannel.publish({ process: this });
+  }
 
   [Symbol.dispose]() {
     if (!this.killed) {
@@ -1469,6 +1486,11 @@ class ChildProcess extends EventEmitter {
       return;
     }
 
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/child_process.js#L396-L398
+    const spawnChannel = childProcessSpawn!;
+    if (spawnChannel.hasSubscribers) spawnChannel.start.publish({ process: this, options });
+    let spawned = false;
+
     // normalizeSpawnargs has already prepended argv0 to the spawnargs array
     // Bun.spawn() expects cmd[0] to be the command to run, and argv0 to replace the first arg when running the command,
     // so we have to set argv0 to spawnargs[0] and cmd[0] to file
@@ -1510,6 +1532,9 @@ class ChildProcess extends EventEmitter {
         windowsHide: !!options.windowsHide,
         windowsVerbatimArguments: !!options.windowsVerbatimArguments,
       }) as unknown as $Bindgen.Subprocess;
+      spawned = true;
+      // Before the child has its pid, as in node: https://github.com/nodejs/node/blob/v26.3.0/lib/internal/child_process.js#L442-L449
+      if (spawnChannel.hasSubscribers) spawnChannel.end.publish({ process: this });
       this.pid = this.#handle!.pid;
 
       $debug("ChildProcess: spawn", this.pid, spawnargs);
@@ -1541,6 +1566,14 @@ class ChildProcess extends EventEmitter {
     } catch (ex) {
       const exCode =
         ex != null && typeof ex === "object" && Object.hasOwn(ex, "code") ? (ex as SystemError).code : undefined;
+      if (!spawned && spawnChannel.hasSubscribers) {
+        // Node makes an error of its own for the channel, from the errno and "spawn" alone.
+        // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/child_process.js#L408-L413
+        // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/child_process.js#L433-L438
+        const errno = (ex as SystemError | null)?.errno;
+        const error = typeof errno === "number" ? new ErrnoException(errno, "spawn") : ex;
+        spawnChannel.error.publish({ process: this, error });
+      }
       if (
         // node sends these errors on the next tick rather than throwing
         exCode === "EACCES" ||

@@ -6686,6 +6686,10 @@ node:diagnostics_channel.Channel.prototype runStores()
   throws TypeError: what is called is not a function <- every receiver
 node:diagnostics_channel.Channel.prototype runStores("a", 1)
   throws TypeError: what is called is not a function <- every receiver
+what is above object 1 hasSubscribers, read
+  undefined <- every object, a number, a string
+  throws TypeError: undefined is not an object <- undefined
+  throws TypeError: null is not an object <- null
 what is above object 1 subscribe()
   throws TypeError: undefined is not an object <- every receiver
 what is above object 1 subscribe("a", 1)

@@ -1,5 +1,5 @@
 // What the compiler reads in place of src/js/node/net.ts, which `bun run` evaluates. The two do the same.
-// Written against that file with the SHA-256 d6861dbd59c52394231c89ff7bae0bcff81e31756f79b40db9ee7cee0562b4a5.
+// Written against that file with the SHA-256 d772c6c19c5dbad9154c6f0dd15bed2fc76997059ccfe6a6db2e194121cb9ad9.
 // When that file changes, bring the change here and write the new hash: test/internal/second-texts-of-modules.test.ts.
 
 // Hardcoded module "node:net"
@@ -28,6 +28,22 @@ const Duplex = require("internal/streams/duplex");
 const { isUint8Array } = require("node:util/types");
 const { getDefaultHighWaterMark } = require("internal/streams/state");
 const EventEmitter = require("node:events");
+
+// What node:diagnostics_channel has for this module, loaded when the first socket connects or the first server listens.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L160-L163
+type DiagnosticsChannel = typeof import("./diagnostics_channel").default;
+let netClientSocketChannel: ReturnType<DiagnosticsChannel["channel"]> | undefined;
+let netServerSocketChannel: ReturnType<DiagnosticsChannel["channel"]> | undefined;
+let netServerListen: ReturnType<DiagnosticsChannel["tracingChannel"]> | undefined;
+function clientSocketChannel() {
+  return (netClientSocketChannel ??= require("node:diagnostics_channel").channel("net.client.socket"));
+}
+function serverSocketChannel() {
+  return (netServerSocketChannel ??= require("node:diagnostics_channel").channel("net.server.socket"));
+}
+function serverListenChannel() {
+  return (netServerListen ??= require("node:diagnostics_channel").tracingChannel("net.server.listen"));
+}
 
 const normalizedArgsSymbol = Symbol("normalizedArgs");
 const {
@@ -2044,6 +2060,9 @@ function onconnection(this: ListenerHandle, err: number, clientHandle: $Node.Soc
   } catch (e) {
     reportError(e);
   }
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2371-L2375
+  const socketChannel = serverSocketChannel();
+  if (socketChannel.hasSubscribers) socketChannel.publish({ socket: _socket });
   if (!pauseOnConnect && !isTLS) {
     _socket.read(0);
   }
@@ -2707,6 +2726,13 @@ Socket.prototype.connect = function connect(this: $Node.Socket, ...args) {
     let connection = this[ksocket];
     let upgradeDuplex = false;
     let { port, host, path, socket, rejectUnauthorized, checkServerIdentity, session, fd, pauseOnConnect } = options;
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L1295-L1299
+    // Not where bun comes through here and node calls no connect(): for a descriptor that is open already, and for
+    // the stream that tls.connect() was given.
+    if (fd == null && !socket) {
+      const socketChannel = clientSocketChannel();
+      if (socketChannel.hasSubscribers) socketChannel.publish({ socket: this });
+    }
     // A session over a transport the caller handed in has no connection of its own to dial again.
     if (!socket && this[kupgraded] && !this.destroyed) {
       const ex = new ExceptionWithHostPort(uv().UV_EISCONN, "connect", path || host || "localhost", port);
@@ -4504,6 +4530,13 @@ Server.prototype.listen = function listen(this: $Node.NetServer, port, hostname,
     throw $ERR_SERVER_ALREADY_LISTEN();
   }
 
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2115-L2117
+  const listenChannel = serverListenChannel();
+  if (listenChannel.hasSubscribers) {
+    const options = normalizeArgs(Array.prototype.slice.$call(arguments))[0];
+    listenChannel.asyncStart.publish({ server: this, options });
+  }
+
   if (onListen != null) {
     this.once("listening", onListen);
   }
@@ -4561,11 +4594,10 @@ Server.prototype.listen = function listen(this: $Node.NetServer, port, hostname,
     );
   } catch (err) {
     const isUnix = path != null;
-    process.nextTick(
-      emitErrorNextTick,
-      this,
-      formatListenError(err, isUnix ? path : hostname, isUnix ? undefined : port),
-    );
+    const error = formatListenError(err, isUnix ? path : hostname, isUnix ? undefined : port);
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2012-L2014
+    if (listenChannel.hasSubscribers) listenChannel.error.publish({ server: this, error });
+    process.nextTick(emitErrorNextTick, this, error);
   }
   return this;
 };
@@ -4672,6 +4704,10 @@ Server.prototype[kRealListen] = function (
 
   // Unref the handle if the server was unref'ed prior to listening
   if (this._unref) this.unref();
+
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2024-L2026
+  const listenChannel = serverListenChannel();
+  if (listenChannel.hasSubscribers) listenChannel.asyncEnd.publish({ server: this });
 
   // A tick, not a timer, so a close() from 'listening' runs before the loop accepts anything (as in Node).
   process.nextTick(emitListeningNextTick, this);
@@ -4863,6 +4899,8 @@ function listenInCluster(
           server[kClusterUnixPath] = undefined;
           handle[kClusterOwner] = null;
           handle.close();
+          const listenChannel = serverListenChannel();
+          if (listenChannel.hasSubscribers) listenChannel.error.publish({ server, error: err });
           process.nextTick(emitErrorNextTick, server, err);
         }
         return;
@@ -4893,6 +4931,8 @@ Server.prototype[kClusterFauxListen] = function (
   handle[kClusterOwner] = this;
   handle.listen(backlog || 511);
   if (this._unref) this.unref();
+  const listenChannel = serverListenChannel();
+  if (listenChannel.hasSubscribers) listenChannel.asyncEnd.publish({ server: this });
   process.nextTick(emitListeningNextTick, this);
 };
 
@@ -4936,6 +4976,8 @@ function onClusterConnection(this: ClusterFauxHandle, err: number, clientHandle:
   socket._server = self;
   self._connections++;
   self.emit("connection", socket);
+  const socketChannel = serverSocketChannel();
+  if (socketChannel.hasSubscribers) socketChannel.publish({ socket });
 }
 
 function createServer(
