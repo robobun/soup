@@ -1,5 +1,5 @@
 // What the compiler reads in place of src/js/internal/http1_server_fallback.ts, which `bun run` evaluates. The two do the same.
-// Written against that file with the SHA-256 e4b8dcbaf1c5f417b364123f622fca1dc49854b6315f6d837dae2b57bdd08251.
+// Written against that file with the SHA-256 08456acb4a1933621400a512a5b55166eefcfb3f75e53c6ec06b3b0a7816d903.
 // When that file changes, bring the change here and write the new hash: test/internal/second-texts-of-modules.test.ts.
 
 // JS HTTP/1 server path over an arbitrary Duplex with a JS stand-in for NodeHTTPResponse.
@@ -8,6 +8,12 @@
 const { STATUS_CODES, kPendingCallbacks } = require("internal/http");
 const { SafeSet } = require("internal/primordials");
 const AsyncContextFrame = require("internal/async_context_frame");
+// What node:diagnostics_channel has for the requests of a server, loaded with the first connection that comes here.
+// (The constructor of ServerResponse publishes "http.server.response.created".)
+// https://github.com/nodejs/node/blob/v26.3.0/lib/_http_server.js#L107-L109
+type DiagnosticsChannel = typeof import("../node/diagnostics_channel").default;
+let onRequestStartChannel: ReturnType<DiagnosticsChannel["channel"]> | undefined;
+let onResponseFinishChannel: ReturnType<DiagnosticsChannel["channel"]>;
 
 const kHttp1Connections = Symbol("http1Connections");
 const kHttp1ActiveRequests = Symbol("http1ActiveRequests");
@@ -402,6 +408,11 @@ function connectionListenerHTTP1(
   },
 ) {
   const http = require("node:http");
+  if (onRequestStartChannel === undefined) {
+    const dc = require("node:diagnostics_channel");
+    onRequestStartChannel = dc.channel("http.server.request.start");
+    onResponseFinishChannel = dc.channel("http.server.response.finish");
+  }
   const {
     HTTPParser,
     prepareError,
@@ -544,6 +555,10 @@ function connectionListenerHTTP1(
     res._keepAliveTimeout = keepAliveTimeout;
     const { maxRequestsPerSocket } = server;
     res._maxRequestsPerSocket = maxRequestsPerSocket;
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/_http_server.js#L1296-L1303
+    if (onRequestStartChannel!.hasSubscribers) {
+      onRequestStartChannel!.publish({ request: req, response: res, socket, server });
+    }
     const handle = createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTimeout);
     handle.onfinished = function () {
       socket[kHttp1ActiveRequests] = Math.max(0, (socket[kHttp1ActiveRequests] || 1) - 1);
@@ -571,6 +586,10 @@ function connectionListenerHTTP1(
     // response, replaying whatever it buffered.
     res.on("finish", function onFallbackResponseFinish(this: $Node.ServerResponse) {
       const finishedReq = this.req;
+      // https://github.com/nodejs/node/blob/v26.3.0/lib/_http_server.js#L1187-L1194
+      if (onResponseFinishChannel.hasSubscribers) {
+        onResponseFinishChannel.publish({ request: finishedReq, response: this, socket, server });
+      }
       if (!finishedReq._consuming && !finishedReq._readableState.resumeScheduled) finishedReq._dump();
       this.detachSocket(socket);
       // `_last`: onHttp1SocketEnd saw the client's FIN while this response owned the socket.

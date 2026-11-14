@@ -810,6 +810,10 @@ function moveMessagePortToContext(port, _context) {
   throwNotImplemented("worker_threads.moveMessagePortToContext");
 }
 
+// The channel that node:diagnostics_channel has for this module, loaded with the first Worker.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/worker.js#L110-L111
+let workerThreadsChannel: ReturnType<typeof import("./diagnostics_channel").default.channel> | undefined;
+
 class Worker extends EventEmitter {
   #worker: WebWorker;
   #performance;
@@ -1000,6 +1004,10 @@ class Worker extends EventEmitter {
       }
       urlRevokeRegistry.register(this.#worker, this.#urlToRevoke);
     }
+
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/worker.js#L386-L390
+    workerThreadsChannel ??= require("node:diagnostics_channel").channel("worker_threads");
+    if (workerThreadsChannel.hasSubscribers) workerThreadsChannel.publish({ worker: this });
   }
 
   get threadId() {

@@ -30,45 +30,58 @@ type Traced = (...args: any[]) => unknown;
 /** One object: `markActive` and `maybeMarkInactive` move it from one prototype to the other. */
 type AnyChannel = Channel | ActiveChannel;
 
-// TODO: https://github.com/nodejs/node/blob/fb47afc335ef78a8cef7eac52b8ee7f045300696/src/node_util.h#L13
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/util.js#L865-L896
 class WeakReference<T extends WeakKey> extends WeakRef<T> {
   #refs = 0;
+  // Set while the channel has a subscriber or a bound store: they hold the channel, whoever else lets go of it.
+  #strong: T | undefined = undefined;
 
   get() {
     return this.deref();
   }
 
   incRef() {
-    return ++this.#refs;
+    if (++this.#refs === 1) this.#strong = this.deref();
+    return this.#refs;
   }
 
   decRef() {
-    return --this.#refs;
+    if (--this.#refs === 0) this.#strong = undefined;
+    return this.#refs;
   }
 }
 
 // Can't delete when weakref count reaches 0 as it could increment again.
 // Only GC can be used as a valid time to clean up the channels map.
+// Read and written under the private names of Map, where Node.js has a SafeMap: node:net, node:child_process and the
+// others come here at their first use, which can be after a program has put functions of its own on Map.prototype.
 class WeakRefMap extends SafeMap {
-  #finalizers = new SafeFinalizationRegistry(key => {
-    this.delete(key);
+  #finalizers = new SafeFinalizationRegistry((key: ChannelName) => {
+    // The entry can be that of a later channel of this name: the callback runs some time after the collection.
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/diagnostics_channel.js#L42-L46
+    if (!this.has(key)) this.$delete(key);
   });
 
   set(key: ChannelName, value: AnyChannel) {
     this.#finalizers.register(value, key);
-    return super.set(key, new WeakReference(value));
+    this.$set(key, new WeakReference(value));
+    return this;
   }
 
   get(key: ChannelName) {
-    return (super.get(key) as WeakReference<AnyChannel> | undefined)?.get();
+    return (this.$get(key) as WeakReference<AnyChannel> | undefined)?.get();
+  }
+
+  has(key: ChannelName) {
+    return !!this.get(key);
   }
 
   incRef(key: ChannelName) {
-    return (super.get(key) as WeakReference<AnyChannel> | undefined)?.incRef();
+    return (this.$get(key) as WeakReference<AnyChannel> | undefined)?.incRef();
   }
 
   decRef(key: ChannelName) {
-    return (super.get(key) as WeakReference<AnyChannel> | undefined)?.decRef();
+    return (this.$get(key) as WeakReference<AnyChannel> | undefined)?.decRef();
   }
 }
 
@@ -304,6 +317,16 @@ class TracingChannel {
     } else {
       throw $ERR_INVALID_ARG_TYPE("nameOrChannels", ["string, object, or Channel"], nameOrChannels);
     }
+  }
+
+  get hasSubscribers() {
+    return (
+      this.start?.hasSubscribers ||
+      this.end?.hasSubscribers ||
+      this.asyncStart?.hasSubscribers ||
+      this.asyncEnd?.hasSubscribers ||
+      this.error?.hasSubscribers
+    );
   }
 
   subscribe(handlers: TraceHandlers) {

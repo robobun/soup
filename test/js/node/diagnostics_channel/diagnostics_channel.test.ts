@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { bunEnv, bunExe } from "harness";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { channel, Channel, hasSubscribers, subscribe, unsubscribe } from "node:diagnostics_channel";
+import { join } from "node:path";
 
 describe("Channel", () => {
   // test-diagnostics-channel-has-subscribers.js
@@ -450,6 +451,138 @@ describe("Channel", () => {
     // all 1000 alive.
     const alive = refs.filter(ref => ref.deref() !== undefined).length;
     expect(alive).toBeLessThan(refs.length / 10);
+  });
+});
+
+// Each fixture runs under node as well, and what node v26.3.0 prints is what is expected here.
+describe("built-in channels", () => {
+  async function run(fixture: string) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(import.meta.dir, fixture)],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout: stdout.trim().split(/\r?\n/), stderr: exitCode === 0 ? "" : stderr, exitCode };
+  }
+
+  test.concurrent("of node:http servers, node:net, node:child_process and node:worker_threads", async () => {
+    expect(await run("builtin-channels-fixture.js")).toEqual({
+      stdout: [
+        "# a subscription holds its channel",
+        "hasSubscribers: true",
+        "received after a collection",
+        "# http.Server",
+        'net.server.listen asyncStart {"port":0,"host":"127.0.0.1","fixtureOption":true}',
+        "net.server.listen asyncEnd",
+        "net.server.socket",
+        "http.server.response.created header=undefined",
+        "http.server.request.start /plain header=undefined",
+        "'request' GET /plain",
+        "http.server.response.finish /plain header=1",
+        "the subscriber from before node:http was loaded saw 1 request",
+        "net.server.socket",
+        "'upgrade' /upgrade",
+        "http.server.response.created header=undefined",
+        "standalone response made: true",
+        "# http.Server with a ServerResponse class of the program",
+        "http.server.response.created ResponseOfTheProgram",
+        "http.server.request.start ResponseOfTheProgram",
+        "'request' ResponseOfTheProgram",
+        "http.server.response.finish ResponseOfTheProgram",
+        "# http.Server over a stream of the program",
+        "http.server.response.created /over-a-stream",
+        "http.server.request.start /over-a-stream",
+        "'request' /over-a-stream",
+        "http.server.response.finish /over-a-stream",
+        "answered HTTP/1.1 200 OK",
+        "# net.Server",
+        "net.server.listen asyncStart server port=number",
+        "net.server.listen asyncEnd server",
+        "net.client.socket connecting=false",
+        "'connection'",
+        "net.server.socket",
+        "net.server.listen asyncStart other port=number",
+        "net.server.listen error EADDRINUSE",
+        "'error' EADDRINUSE",
+        "# child_process",
+        "child_process pid=undefined",
+        "child_process.spawn start pid=undefined file=string",
+        "child_process.spawn end pid=undefined",
+        "spawn() returned pid=number",
+        "spawnSync() returned",
+        "child_process pid=undefined",
+        "child_process.spawn start pid=undefined file=string",
+        "child_process.spawn error ENOENT syscall=spawn message=spawn ENOENT",
+        "spawn() of a missing command returned",
+        "'error' ENOENT syscall=spawn fixture-command-that-does-not-exist",
+        "# worker_threads",
+        "worker_threads",
+        "new Worker() returned",
+        "'worker' of process",
+        "# TracingChannel#hasSubscribers",
+        "before: false",
+        "subscribed: true",
+        "unsubscribed: false",
+      ],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // A module asks for its channels at its first use. The table of channels does not go through Map.prototype then.
+  test.concurrent("of modules that are first used after a program has changed Map.prototype", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const dc = require("node:diagnostics_channel");
+         const { spawn } = require("node:child_process");
+         const { Worker } = require("node:worker_threads");
+         const dgram = require("node:dgram");
+         const seen = [];
+         for (const name of ["udp.socket", "child_process", "worker_threads"]) dc.subscribe(name, () => seen.push(name));
+
+         const thrower = name => function () { throw new Error("Map.prototype." + name + " was called"); };
+         for (const name of ["get", "set", "delete", "has", "keys", "values", "entries", "forEach", "clear"]) {
+           Map.prototype[name] = thrower(name);
+         }
+         Map.prototype[Symbol.iterator] = thrower("Symbol.iterator");
+         Object.defineProperty(Map.prototype, "size", { get: thrower("size"), configurable: true });
+
+         dgram.createSocket("udp4").close();
+         spawn(process.execPath, ["-e", "0"]).on("exit", () => {
+           new Worker("", { eval: true }).on("exit", () => {
+             seen.push(dc.channel("made after the change").hasSubscribers);
+             console.log(JSON.stringify(seen));
+           });
+         });`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), stderr: exitCode === 0 ? "" : stderr, exitCode }).toEqual({
+      stdout: JSON.stringify(["udp.socket", "child_process", "worker_threads", false]),
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test.concurrent("of node:net in a cluster worker", async () => {
+    expect(await run("builtin-channels-cluster-fixture.js")).toEqual({
+      stdout: [
+        "net.server.listen asyncStart server",
+        "net.server.listen asyncEnd server",
+        "'listening'",
+        "'connection'",
+        "net.server.socket net.Socket",
+      ],
+      stderr: "",
+      exitCode: 0,
+    });
   });
 });
 

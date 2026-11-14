@@ -1,5 +1,5 @@
 // What the compiler reads in place of src/js/node/worker_threads.ts, which `bun run` evaluates. The two do the same.
-// Written against that file with the SHA-256 fee2586bb3c0e3d907ce0a83ff715fa56ff563afb407cc10eab13aed110b879d.
+// Written against that file with the SHA-256 7bbe3e3d0a4a0bf57a7a9145e8d2dc8c2622734bcf794d0be386085514835c84.
 // When that file changes, bring the change here and write the new hash: test/internal/second-texts-of-modules.test.ts.
 
 declare const self: EventTarget & {
@@ -847,6 +847,10 @@ function moveMessagePortToContext(port, _context) {
   throwNotImplemented("worker_threads.moveMessagePortToContext");
 }
 
+// The channel that node:diagnostics_channel has for this module, loaded with the first Worker.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/worker.js#L110-L111
+let workerThreadsChannel: ReturnType<typeof import("./diagnostics_channel").default.channel> | undefined;
+
 class Worker extends EventEmitter {
   #worker: WebWorker;
   #performance;
@@ -1039,6 +1043,10 @@ class Worker extends EventEmitter {
       }
       urlRevokeRegistry.register(this.#worker, this.#urlToRevoke);
     }
+
+    // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/worker.js#L386-L390
+    workerThreadsChannel ??= require("node:diagnostics_channel").channel("worker_threads");
+    if (workerThreadsChannel.hasSubscribers) workerThreadsChannel.publish({ worker: this });
   }
 
   get threadId() {
