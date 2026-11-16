@@ -11059,6 +11059,243 @@ Files: `src/bun_core/util.rs` (`os_argv_block`), `src/bun_core/Global.rs`
 `test/js/node/test/parallel/test-setproctitle.js` (new, from Node.js),
 `test/bundler/compile-argv.test.ts`.
 
+### 2026-11-15: `cut` shell builtin
+
+One more line of the list in oven-sh/bun#9716 ("commands that we should implement as builtins in
+the Bun shell"). A machine with Windows and no coreutils answered `bun: command not found: cut`.
+Now the shell has a `cut` of its own.
+
+```ts
+import { $ } from "bun";
+
+const names = await $`cut -d: -f1 /etc/passwd`.text();
+await $`git branch | cut -c3-`; // branch names without the two marker columns
+await $`cut -d, -f1,3 --output-delimiter=${"\t"} data.csv | sort -u`;
+```
+
+`cut -b LIST | -c LIST | -f LIST [-d CHAR] [-s] [-n] [-z] [--complement]
+[--output-delimiter=STRING] [file ...]` prints the selected bytes, characters or fields of every
+line.
+
+- A `LIST` is made of `N`, `N-M`, `N-` and `-M`, separated by commas or blanks. What is selected
+  is printed once and in the order of the line, whatever the order of the list.
+- `-f` splits at a tab or at the character of `-d`. A line without the delimiter is printed whole,
+  or not at all with `-s`.
+- `--output-delimiter` joins the fields, and for `-b` and `-c` it stands between the ranges of the
+  list. Ranges that overlap are one range, and ranges that only touch stay two
+  (`cut -b1-3,4-6 --output-delimiter=:` prints `abc:def`).
+- Operands are read one at a time, stdin for none and for `-`. A last line without a newline gets
+  one, also in front of the next file. A file that cannot be read is reported when its turn
+  comes, the exit code is 1, and the other operands are still cut.
+- A stdout that fails with anything but a closed pipe is reported
+  (`cut: write error: No space left on device`), and the exit code is 1 for both, not the errno.
+- Text is UTF-8, and the locale is not read. `-c` counts characters (`cut -c2` of `héllo` is
+  `é`), `-d` takes one character, and `-n` keeps `-b` from splitting a character (it goes with
+  its last byte, as POSIX says). A byte that is not part of a well-formed sequence is a character
+  of its own, so a file in Windows-1252 keeps its columns. That is GNU cut since 9.11 in a UTF-8
+  locale. GNU cut 9.7, which this machine has, counts bytes for `-c` and ignores `-n`.
+
+What it prints is what GNU cut prints. 54 rows of `cut.test.ts` are output that `/usr/bin/cut` of
+GNU coreutils 9.7 gives for the same arguments and input, among them the corners: an empty
+`-d` or `--output-delimiter` is the NUL byte, and with a delimiter that is the line terminator
+(`cut -d $'\n' -f2`) the lines of a file are the fields of one record. One case runs the 54 rows
+through the `cut` of the system where that is GNU cut 9.7, as it is on this machine, and is
+skipped elsewhere. So "GNU" is a claim about those rows. Where the builtin differs, and a row
+says so:
+
+- The options come in front of the operands, as in POSIX and in every builtin of the shell.
+  `cut file -f1` reads a file named `-f1`. GNU cut takes options anywhere.
+- A long option is written in full. GNU cut takes `--delim=:`.
+- A bad list or delimiter has GNU's message without its "Try 'cut --help'" line. A bad option
+  has the message of the other builtins (`cut: illegal option -- q`).
+- `-w` (BSD) is reported as not supported.
+
+Off by default on Linux and macOS. `cut` is in `posix_disabled` beside `cat` and `cp`. There the
+name runs the program of the system, and the builtin runs when the process starts with
+`BUN_ENABLE_EXPERIMENTAL_SHELL_BUILTINS=1`. On Windows the builtin is the default. The rule is
+upstream's, from oven-sh/bun#10174 for `cp` ("Not all options are supported so it is only enabled
+on Windows right now"), and it is a comment at `posix_disabled` now. The first version of this
+commit had the builtin on everywhere. A review of it ran `cut c.txt -d: -f1` and `cut --delim=:`,
+which work with cut(1) and failed with the builtin in its place, and that settled it.
+
+How it is built. One file, `src/runtime/shell/builtin/cut.rs`, one row in the `shell_builtins!`
+table and one `ReaderTag` with its three arms in `IOReader.rs`. It follows `cat.rs` for the
+streaming (`chunks_queued`, `chunks_done`, `awaits_write`, `reader.resume()`) and `wc.rs` for the
+operands. The option walker of `sort` and `uniq` is a file of its own now
+(`builtin/arg_parser.rs`, in the commit of 2026-09-06), so this commit takes no code from
+another builtin. It still needs the commit of 2026-08-15 (`wc`) under it, for the read of a file
+that cannot be polled.
+
+Tests. `test/js/bun/shell/commands/cut.test.ts` has 124 cases. They run with an empty `PATH`, so
+that only a builtin can answer. The flag is read once from the environment of the process, so on
+Linux and macOS the file runs itself again in a child that starts with the flag, and the one case
+of the outer run is that the child passes. On a build of the stack without this commit 119 of the
+124 fail. Besides the table: text that is not UTF-8 (seven rows), inputs larger than a pipe, a
+reader that ends first (`yes abc | cut -b2 | head -n 2`), 100,000 `-` operands in one command
+(the first version took one native frame for each and ended the process with a SEGV near 2,200),
+`> /dev/full` and `2> /dev/full`, a stdin that is a directory, the stdin of the process shared
+by several `cut`, `bun exec` and a `package.json` script under `--shell=bun` with an empty
+`PATH`, the count of open descriptors after 100 more runs, and the pause of the reader: with a
+next stage that never reads, `cut` takes less than a quarter of 16 MB from its stdin. All pass on
+the debug build and on a release build with the change, and the other shell test files pass as
+before. `bun run rust:clippy` passes for the workspace. The release binary is 24 KB larger
+(156,563,760 to 156,588,336 bytes, Linux x64).
+
+Not done, and known.
+
+- Windows and macOS did not run: this run has Linux x64 only, and the fork's workflows run no
+  test of the runtime. Windows is the one platform where the builtin is the default. The code is
+  type-checked for it: `bun run rust:check-all` passes for the 12 targets of CI.
+- `.kill()` and `.timeout()` do not end a `cut` that waits for a file operand (a FIFO, or
+  `/dev/stdin`). It is so for every builtin that opens its operands: see the list below.
+- `cut` of a regular file with stdout captured reads the file to its end in one task of the
+  event loop, so timers wait that long. Also below.
+- Options behind operands, long options by a prefix, `-w`.
+
+`tee` was written with `cut` and is not in this commit. The review measured it: `tee` wrote its
+files with a blocking write on the thread of the shell, and into a FIFO whose reader started two
+seconds later the timers of the program stood still for 2,021 ms, against 26 ms for a `>`
+redirect of a builtin. A `>` redirect opens its file with `bun_io::open_for_writing_impl` and
+writes through an `IOWriter`, which polls a FIFO and a socket (oven-sh/bun#34696). `tee` has to
+do the same for every operand, and on Windows every write of a builtin goes through the async
+writer, so there it is not a choice. Also from the review: a stdout that fails with anything but
+a closed pipe must not stop the copy to the files, a file that fails must be reported when it
+fails and not at the end of stdin, `-i` needs the Ctrl+C guard that an external command gets,
+and `bun test 2>&1 | tee test.log` is a bad first example, because a pipeline has the exit code
+of its last command and `tee` hides the failed test run. `tee.rs` with 28 tests is kept for a
+later day.
+
+`sleep` was the first plan for a second builtin and does not exist either. A builtin that sleeps
+needs a timer on the event loop. The JS event loop has `EventLoopTimer`, which needs a tag of
+its own. `bun run` and `bun exec` run on the mini event loop, which has no timers on POSIX (the
+uSockets timer is built for libuv only), and its owner would have to tick with a timeout. A task
+of the work pool that sleeps holds one of its threads for the whole time, and `node:fs` shares
+that pool. Where the timer lives is a decision of its own.
+
+Defects that the review found in the layer under the builtins. They are older than this commit,
+they are not fixed in it, and the fork has no issue tracker, so here they are:
+
+- `Interpreter::kill` ends the stdin of a builtin and nothing else that it reads. The reader of a
+  file operand is private in `cat.rs`, `wc.rs`, `head_tail.rs`, `sort_uniq.rs` and now `cut.rs`.
+  With a FIFO that a writer holds open for 8 seconds without a byte,
+  ``await $`head -n 1 fifo`.timeout(300)`` settles after 8,030 ms. The fix is one slot on
+  `Builtin` that `Cmd::builtin_stdin` returns too, in the commit of 2026-09-15. And a FIFO that
+  no writer has opened stops the thread of the shell in `open()`, for good.
+- The read of a file that cannot be polled (`IOReader::run_unpolled_read`, from the `wc` commit)
+  reads to the end of the file in one task. With stdout captured nothing pauses it: the program
+  gets no timer turn for a file of 200 MB, and `/dev/zero` never ends. It should give the loop
+  back after about 1 MB, as `yes.rs` does.
+- `head` and `tail` never pause their reader (`awaits_write` is `false` for them), so what they
+  queue for a stdout that is slow has no bound.
+- A stdout that fails gives another exit code in every builtin, and no message. `> /dev/full`
+  ends `cat` with 28 (the errno), `echo` with 65508, `sort` with 2, and `seq`, `wc`, `uniq` and
+  `head` with 1. `cut` takes 1 and says why. oven-sh/bun#32278 and oven-sh/bun#40033 are open
+  for `cat`.
+- `sort -o` opens its output without `refuse_shell_redirect` and `note_shell_redirect`, the two
+  calls that keep the embedded files of a compiled executable right.
+- `which cut` answers for `PATH`, also where the builtin is what runs. It is so for all builtins.
+- The same question as for `cut` is open for `wc`, `head`, `tail`, `sort` and `uniq` of this
+  fork, which are on everywhere: `uniq f.txt -c` writes a file named `-c` and exits 0, where
+  uniq(1) counts. They belong in `posix_disabled` by the rule above, or they need options behind
+  operands first.
+
+Designed and not built: middleware for `Bun.serve`. The first plan of this day was
+oven-sh/bun#17608 (93 thumbs-up, the most wanted open `Bun.serve` request, no maintainer comment,
+no pull request). A design review of it took 4.7 hours. Its result is a plan for several days, so
+nothing of it is in this commit. What it found, for whoever builds it:
+
+- The wrappers that the issue's comments post, and a wrapper made inside `ServerConfig::from_js`,
+  reach 8 of the 23 places where a route answers a request. A static `Response`, a `Bun.file`, a
+  `{ dir }` route, an HTML import with its chunks and the built-in 404 answer without JavaScript.
+  An authentication middleware that skips `"/admin": adminHtml` fails open.
+- Every route of HTTP/1, 2 and 3 is registered through three functions of uWS
+  (`HttpContext::onHttp` in `packages/bun-uws/src/HttpContext.h`, and its twins in
+  `Http2Context.h` and `Http3Context.h`). A gate there runs the chain in front of every route,
+  the dev server's and any later one. The gated handler is chosen when a route is registered, so
+  a server without middleware runs the code that it runs today.
+- The contract: `middleware: fn | fn[]`, each `(request, server, next) => Response`, the first of
+  the array outermost. `next()` resolves to the Response of the rest of the chain, or to
+  `undefined` when Bun wrote the answer itself (a static route, a file, an upgrade). To return
+  nothing without a call of `next()` is a TypeError for the `error` handler: it fails closed. A
+  second `next()` rejects.
+- What makes it large: `next()` after an `await` has no uWS request any more, so the request is
+  saved (an owning copy of the head) and routed again, with the state of the router saved around
+  the nested `route()`. The review counts 2,200 to 3,200 lines in about 40 files, and asks for
+  seven measurements, the first of them that the code of a server without middleware is the same
+  to the byte.
+
+Rebase notes. 76 patches onto oven-sh/bun ed436333444, which is 70 commits after the base of
+2026-11-14 (7f964e69651). The build of upstream works again: oven-sh/bun#49013 has the include
+that `BunPlugin.cpp` lacked. Nearly all of the 70 commits change who owns what in the Rust code:
+the VM, the event loop and the test runner are shared and their fields are cells, scopes and
+tests of the runner are ids, the environment of a shell command is an owned value, S3 callbacks
+are owned closures, a descriptor is owned by a `File`, pool tasks of the shell are `PoolTask<T>`.
+39 of the 76 patches had conflicts and were ported by hand. The other 37 applied without one,
+and four of those needed a line for the compiler (below). Nothing is dropped. One part of one
+patch is: `--watch-path` (2026-09-24) carried a fix for the key of `fs.watch()` handles on
+Windows, upstream has the same since oven-sh/bun#48960, and the commit message and the entry say
+so now.
+
+- After the rebase `cargo check` found six errors in five patches, each fixed in its patch:
+  `hot_reload` is a cell and the VM is shared (`.env` restart), a local named `jest`
+  (`--reporter=json`), `uws_loop_ref()` is `uws_loop()` (`eventLoopUtilization`), `pack_bump()` is
+  `cli_arena()` (`publishConfig`), a `mut` that is not needed (trusted publishing).
+- Two tests of the stack follow upstream now. The `append` tests of `filesink.test.ts` use the
+  descriptor check of the file, which replaced the one of the harness. One case of
+  `archive.test.ts`: with a glob, tar and zip now make symlinks last, as without one, so a file
+  "through" a symlink of the same archive lands in a directory (plain upstream gives the same
+  for the tar).
+- Where a port is more than a port (for a reader who takes one of these patches):
+  `--last-failed` keeps its state in a `Cell<Option<Box<..>>>` beside upstream's `timings`.
+  `kill()` of a shell command asks `this_value` where it had a flag. `globalName` is parsed in
+  `LinkerOptions::new`. `globalSetup` turns two `OnceCell` fields of the test isolation state
+  into `JsCell<Option<..>>`, because it sets them a second time. The zip patch has an enum where
+  upstream has two flags. `build.resolve()` has a new accessor `BundleV2::has_ssr_transpiler()`.
+  `--filter '[rev]'` reads a resolver entry as `&'static Entry`. The S3 copy is an owned closure.
+  A background job of the shell owns its environment as `AliasableBox<ShellExecEnv>`.
+- The three findings of `bun run rust:clippy` that the entry of 2026-11-13 lists are fixed, each
+  in its patch (`globalSetup`, `"$VAR"`, `build.resolve()`). Clippy passes for the workspace.
+- A trap for the next rebase: the assert on `task_tag::COUNT` in `src/runtime/dispatch.rs`. When
+  upstream and a patch both raise it by one, git merges the line without a conflict and the
+  number is wrong. It is 89 now.
+- What ran afterwards. The debug build and a release build link. The 118 test files that the
+  stack adds or changes ran on the debug build, and 109 of them on the release build (12,267
+  cases pass there, two fail: the host's `node` version, and one case that clones from GitHub
+  while the name did not resolve). On the debug build the failures are twelve database cases of
+  this machine (as on 2026-11-14) and cases that fail on a debug build of plain upstream as well:
+  the `--aot` ones below, `--parallel: each worker has a unique JEST_WORKER_ID` (one run of five
+  on both builds), three `glob.scan` cases at their 30 seconds in this large tree, and the one
+  case of `shell-load.test.ts`. The source lints (204) and `cargo fmt --all --check` pass, and
+  the fork's three workflows were green for the push of the rebased stack.
+- Only the tip of the stack was built. Whether each of the 76 commits builds alone was not
+  checked: that is a build per commit. The tip type-checks for all 12 targets of CI
+  (`bun run rust:check-all`: Linux with glibc and musl, macOS, Windows, Android and FreeBSD), so
+  the Windows and macOS lines of the ported patches compile. They did not run.
+
+A crash of upstream, seen on the way and not fixed here. `bun test --aot` of this file ends with a
+SEGV on a debug build of plain upstream main (ed436333444, WebKit b00aff56c903), four runs of
+four, and a file with `expect(1 + 1).toBe(2)` alone does not:
+
+```ts
+import { test, expect } from "bun:test";
+const log = (line: string) =>
+  require("node:fs").appendFileSync(process.env.GS_LOG!, line + "\n");
+test("a", async () => {
+  log("test a");
+});
+```
+
+The top frame is `WTF::removeIterator`, the check of hash table iterators that only a debug build
+has, under `JSC::AOT::Typed::LinkFlow::siteOf` or `findWhatSomeLaneWasGiven`, on a "Bun Compile"
+thread inside `runOnLanes`. So two lanes of the linker use one `HashMap`, one of them changing
+it. It is what makes `test-aot.test.ts`, `bundler_compile_aot.test.ts` and the `--aot` case of
+`global-setup.test.ts` fail on a debug build. CI has no debug lane. The hand-off for it was not
+taken up.
+
+Files: `src/runtime/shell/builtin/cut.rs` (new), `src/runtime/shell/Builtin.rs`,
+`src/runtime/shell/IOReader.rs`, `src/runtime/shell/mod.rs`, `docs/runtime/shell.mdx`,
+`test/js/bun/shell/commands/cut.test.ts` (new).
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

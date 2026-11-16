@@ -91,6 +91,8 @@ pub(crate) mod builtins {
     pub(crate) mod cd;
     #[path = "cp.rs"]
     pub(crate) mod cp;
+    #[path = "cut.rs"]
+    pub(crate) mod cut;
     #[path = "dirname.rs"]
     pub(crate) mod dirname;
     #[path = "echo.rs"]
