@@ -13,8 +13,8 @@ use crate::shell::ExitCode;
 use crate::shell::ast;
 use crate::shell::builtins::batch::Batch;
 use crate::shell::builtins::{
-    basename, break_continue, cat, cd, cp, dirname, echo, exit, export, head_tail, ls, mkdir, mv,
-    pwd, rm, seq, sort_uniq, touch, wait, wc, which, yes,
+    basename, break_continue, cat, cd, cp, cut, dirname, echo, exit, export, head_tail, ls, mkdir,
+    mv, pwd, rm, seq, sort_uniq, touch, wait, wc, which, yes,
 };
 use crate::shell::interpreter::{Interpreter, NodeId, is_pollable_from_mode, shell_openat};
 use crate::shell::io::{InKind, OutFd, OutKind};
@@ -48,6 +48,7 @@ pub(crate) enum State {
     Exiting(ExitCode),
     Batch(Batch),
     Cat(cat::Cat),
+    Cut(Box<cut::Cut>),
     HeadTail(Box<head_tail::Common>),
     Mv(mv::Mv),
     SortUniq(Box<sort_uniq::Common>),
@@ -117,11 +118,16 @@ shell_builtins! {
     Tail     "tail"     head_tail::Tail::start,
     Sort     "sort"     sort_uniq::Sort::start,
     Uniq     "uniq"     sort_uniq::Uniq::start,
+    Cut      "cut"      cut::start,
 }
 
 impl Kind {
     /// Left to the system binary unless the experimental feature flag is set.
-    pub(crate) const DISABLED_ON_POSIX: &'static [Kind] = &[Kind::Cat, Kind::Cp];
+    ///
+    /// A builtin that does not take every invocation its system command takes stays off where
+    /// that command exists (oven-sh/bun#10174, for `cp`). `cut` wants its options in front of
+    /// the operands and spelled in full: cut(1) of GNU also runs `cut file -f1` and `cut --delim=:`.
+    pub(crate) const DISABLED_ON_POSIX: &'static [Kind] = &[Kind::Cat, Kind::Cp, Kind::Cut];
 
     fn force_enable_on_posix() -> bool {
         bun_core::env_var::feature_flag::BUN_ENABLE_EXPERIMENTAL_SHELL_BUILTINS
@@ -745,6 +751,10 @@ impl Builtin {
         err: Option<bun_sys::SystemError>,
     ) -> Yield {
         let me = Self::of(interp, cmd);
+        // `cut` tells a closed pipe from the other failures, which it reports.
+        if let State::Cut(_) = me.state {
+            return cut::Cut::on_write(interp, cmd, err);
+        }
         let failed = err.map(|err| me.kind.exit_code_of_failed_write(&err));
         match (&me.state, failed) {
             (State::Batch(_), _) => Batch::on_write(interp, cmd),
@@ -756,7 +766,9 @@ impl Builtin {
             | (&State::Exiting(code), None) => Self::done(interp, cmd, code),
             (&State::Which { next, missing }, None) => which::print(interp, cmd, next, missing),
             (State::Yes(_), None) => yes::Yes::write(interp, cmd),
-            (State::Idle | State::Mv(_) | State::Wait { .. }, _) => Yield::suspended(),
+            (State::Idle | State::Cut(_) | State::Mv(_) | State::Wait { .. }, _) => {
+                Yield::suspended()
+            }
         }
     }
 }

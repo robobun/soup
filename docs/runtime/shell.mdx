@@ -827,7 +827,7 @@ console.log(result); // Blob(13) { size: 13, type: "text/plain" }
 
 ## Builtin Commands
 
-For cross-platform compatibility, Bun Shell implements a set of builtin commands, in addition to reading commands from the `PATH` environment variable.
+For cross-platform compatibility, Bun Shell implements a set of builtin commands, in addition to reading commands from the `PATH` environment variable. A builtin runs inside the Bun process, on the thread of the shell. A pipeline through a builtin moves only while the event loop of that thread runs.
 
 - `cd`: change the working directory
 - `ls`: list files in a directory (supports `-l` for long listing format)
@@ -876,6 +876,31 @@ await $`sort -c versions.txt`; // exit 1 and "sort: versions.txt:3: disorder: ..
 ```
 
 `sort -h`, `-V`, `-R`, `-M`, `-g` and `-m` are not supported.
+
+- `cut`: print selected bytes, characters or fields of every line of stdin or files
+
+| Option                      | Meaning                                                                        |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| `-b LIST`                   | Select bytes. With `-n`, a character is printed when its last byte is selected |
+| `-c LIST`                   | Select characters                                                              |
+| `-f LIST`                   | Select fields. A line without the delimiter is printed whole                   |
+| `-d CHAR`                   | With `-f`: the delimiter between fields, one character. The default is a tab   |
+| `-s`                        | With `-f`: do not print a line without the delimiter                           |
+| `--complement`              | Select everything but `LIST`                                                   |
+| `--output-delimiter=STRING` | Print `STRING` between fields, and between ranges of bytes or characters       |
+| `-z`                        | Lines end with a NUL byte instead of a newline                                 |
+
+A `LIST` is made of `N`, `N-M`, `N-` and `-M`, separated by commas. It counts from 1. What it selects is printed once, in the order of the line.
+
+```ts
+const names = await $`cut -d: -f1 /etc/passwd`.text();
+await $`git branch | cut -c3-`; // branch names without the two marker columns
+await $`cut -d, -f1,3 --output-delimiter=${"\t"} data.csv | sort -u`;
+```
+
+`cut` reads text as UTF-8 and does not read the locale. A byte that is not part of a UTF-8 sequence is one character.
+
+On Windows the builtin `cut` is the default. On Linux and macOS `cut` runs the program of the system, like `cat` and `cp`. To run the builtin there, start the process with `BUN_ENABLE_EXPERIMENTAL_SHELL_BUILTINS=1` in its environment. The builtin wants its options in front of the file operands, and long options in full. `cut file -f1` and `cut --delim=:` are errors, and so is `-w`.
 
 **Not** implemented yet, but planned:
 

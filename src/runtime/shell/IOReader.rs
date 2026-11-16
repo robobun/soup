@@ -36,6 +36,7 @@ pub(crate) enum ReaderTag {
     Tail,
     Sort,
     Uniq,
+    Cut,
 }
 
 // PERF: an inline small-vec may be worth it — profile if hot.
@@ -518,6 +519,9 @@ fn dispatch_read_chunk(
         ReaderTag::Uniq => crate::shell::builtins::sort_uniq::Uniq::on_io_reader_chunk(
             interp, child.node, chunk, remove,
         ),
+        ReaderTag::Cut => {
+            crate::shell::builtins::cut::Cut::on_io_reader_chunk(interp, child.node, chunk, remove)
+        }
     }
 }
 
@@ -527,6 +531,7 @@ fn awaits_write(child: ChildPtr, interp: Option<bun_ptr::ParentRef<Interpreter>>
     };
     match child.tag {
         ReaderTag::Cat => crate::shell::builtins::cat::Cat::awaits_write(interp.get(), child.node),
+        ReaderTag::Cut => crate::shell::builtins::cut::Cut::awaits_write(interp.get(), child.node),
         ReaderTag::Wc | ReaderTag::Head | ReaderTag::Tail | ReaderTag::Sort | ReaderTag::Uniq => {
             false
         }
@@ -558,6 +563,9 @@ fn dispatch_reader_done(
         }
         ReaderTag::Uniq => {
             crate::shell::builtins::sort_uniq::Uniq::on_io_reader_done(interp, child.node, err)
+        }
+        ReaderTag::Cut => {
+            crate::shell::builtins::cut::Cut::on_io_reader_done(interp, child.node, err)
         }
     }
 }
