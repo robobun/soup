@@ -327,6 +327,10 @@ Response.redirect("bun.sh", {
 
 Bun.inspect.custom;
 Bun.inspect;
+expectType(Bun.inspect([1, 2, 3], { maxArrayLength: 2, maxStringLength: null })).is<string>();
+Bun.inspect("text", { maxArrayLength: Infinity, maxStringLength: 10, compact: true });
+// @ts-expect-error
+Bun.inspect([], { maxArrayLength: "all" });
 
 fetch.preconnect("bun.sh");
 Bun.fetch.preconnect("bun.sh");

@@ -1647,7 +1647,7 @@ describe("compact prints one line", () => {
       `[ ${Array(100).fill(0).join(", ")}, ... 50 more items ]`,
     );
     expect(Bun.inspect({ a: Array(101).fill(0) }, { compact: true })).toBe(
-      `{ a: [ ${Array(100).fill(0).join(", ")}, ... 1 more items ] }`,
+      `{ a: [ ${Array(100).fill(0).join(", ")}, ... 1 more item ] }`,
     );
   });
 
@@ -1655,6 +1655,187 @@ describe("compact prints one line", () => {
     expect(Bun.inspect({ a: { b: 1 }, z: 1 }, { compact: true, depth: 0 })).toBe("{ a: [Object ...], z: 1 }");
     expect(Bun.inspect([{ b: 1 }, { c: 2 }], { compact: true, depth: 0 })).toBe("[ [Object ...], [Object ...] ]");
   });
+});
+
+describe("maxArrayLength", () => {
+  it("limits the elements of an array", () => {
+    expect(Bun.inspect([1, 2, 3, 4], { maxArrayLength: 2 })).toBe("[ 1, 2, ... 2 more items ]");
+    expect(Bun.inspect([1, 2, 3], { maxArrayLength: 2 })).toBe("[ 1, 2, ... 1 more item ]");
+    expect(Bun.inspect([1, 2, 3], { maxArrayLength: 3 })).toBe("[ 1, 2, 3 ]");
+    expect(Bun.inspect([1, 2, 3], { maxArrayLength: 100 })).toBe("[ 1, 2, 3 ]");
+    expect(Bun.inspect({ a: [1, 2, 3], b: [[4, 5, 6]] }, { maxArrayLength: 1, compact: true })).toBe(
+      "{ a: [ 1, ... 2 more items ], b: [ [ 4, ... 2 more items ] ] }",
+    );
+    expect(Bun.inspect(["a", "b", "c"], { maxArrayLength: 1 })).toBe('[ "a", ... 2 more items ]');
+    // A hole is not an element.
+    expect(Bun.inspect([1, , 3, 4], { maxArrayLength: 2 })).toBe("[ 1, empty item, 3, ... 1 more item ]");
+  });
+
+  it("0 and a negative number print no element", () => {
+    expect(Bun.inspect([1, 2, 3], { maxArrayLength: 0 })).toBe("[ ... 3 more items ]");
+    expect(Bun.inspect([1], { maxArrayLength: -5 })).toBe("[ ... 1 more item ]");
+    expect(Bun.inspect([], { maxArrayLength: 0 })).toBe("[]");
+    expect(Bun.inspect(Array(150).fill({ a: 1 }), { maxArrayLength: 0 })).toBe("[ ... 150 more items ]");
+    expect(Bun.inspect({ list: Array(150).fill(0) }, { maxArrayLength: 0, sorted: true })).toBe(
+      "{\n  list: [ ... 150 more items ],\n}",
+    );
+    expect(Bun.inspect(Object.assign([1, 2], { extra: true }), { maxArrayLength: 0 })).toBe(
+      "[ ... 2 more items, extra: true ]",
+    );
+  });
+
+  it("null and Infinity print every element", () => {
+    const array = Array.from({ length: 250 }, (_, i) => i);
+    expect(Bun.inspect(array)).toEndWith("98, 99,\n  ... 150 more items\n]");
+    for (const maxArrayLength of [null, Infinity, 250, 2 ** 40]) {
+      const all = Bun.inspect(array, { maxArrayLength });
+      expect(all).not.toContain("more item");
+      expect(all.match(/\d+/g)).toEqual(array.map(String));
+    }
+    expect(Bun.inspect(array, { maxArrayLength: 249 })).toEndWith("248,\n  ... 1 more item\n]");
+  });
+
+  it("limits the elements of a typed array", () => {
+    expect(Bun.inspect(new Uint8Array([1, 2, 3, 4]), { maxArrayLength: 2 })).toBe(
+      "Uint8Array(4) [ 1, 2, ... 2 more items ]",
+    );
+    expect(Bun.inspect(new BigInt64Array([1n, 2n, 3n]), { maxArrayLength: 1 })).toBe(
+      "BigInt64Array(3) [ 1n, ... 2 more items ]",
+    );
+    expect(Bun.inspect(new Float64Array([1.5, 2.5]), { maxArrayLength: 2 })).toBe("Float64Array(2) [ 1.5, 2.5 ]");
+    expect(Bun.inspect(new Uint16Array(3), { maxArrayLength: 0 })).toBe("Uint16Array(3) [ ... 3 more items ]");
+    expect(Bun.inspect(new Uint8ClampedArray(3).buffer, { maxArrayLength: 1 })).toBe(
+      "ArrayBuffer(3) [ 0, ... 2 more items ]",
+    );
+
+    // Without the option a typed array stops after 513 elements.
+    const bytes = new Uint8Array(1000).fill(7);
+    expect(Bun.inspect(bytes)).toEndWith(", 7, ... 487 more ]");
+    expect(Bun.inspect(bytes, { maxArrayLength: null }).match(/\b7\b/g)).toHaveLength(1000);
+    expect(Bun.inspect(bytes, { maxArrayLength: 600 })).toEndWith(", 7, ... 400 more items ]");
+  });
+
+  it("limits the entries of a Set and of a Map", () => {
+    const set = new Set([1, 2, 3]);
+    const map = new Map([
+      ["a", 1],
+      ["b", 2],
+    ]);
+    expect(Bun.inspect(set, { maxArrayLength: 1, compact: true })).toBe("Set(3) { 1, ... 2 more items }");
+    expect(Bun.inspect(map, { maxArrayLength: 1, compact: true })).toBe('Map(2) { "a": 1, ... 1 more item }');
+    expect(Bun.inspect(set, { maxArrayLength: 0, compact: true })).toBe("Set(3) { ... 3 more items }");
+    expect(Bun.inspect(map, { maxArrayLength: 0, compact: true })).toBe("Map(2) { ... 2 more items }");
+    expect(Bun.inspect(set, { maxArrayLength: 3, compact: true })).toBe("Set(3) { 1, 2, 3 }");
+    expect(Bun.inspect(map, { maxArrayLength: null, compact: true })).toBe('Map(2) { "a": 1, "b": 2 }');
+
+    expect(Bun.inspect(set, { maxArrayLength: 2 })).toBe("Set(3) {\n  1,\n  2,\n  ... 1 more item\n}");
+    expect(Bun.inspect(map, { maxArrayLength: 1 })).toBe('Map(2) {\n  "a": 1,\n  ... 1 more item\n}');
+    expect(Bun.inspect({ nested: set }, { maxArrayLength: 1 })).toBe(
+      "{\n  nested: Set(3) {\n    1,\n    ... 2 more items\n  },\n}",
+    );
+
+    // Without the option every entry is printed.
+    const big = new Set(Array.from({ length: 150 }, (_, i) => i));
+    expect(Bun.inspect(big)).not.toContain("more item");
+    expect(Bun.inspect(big, { maxArrayLength: 100 })).toEndWith("  99,\n  ... 50 more items\n}");
+  });
+
+  it("dims what it leaves out", () => {
+    expect(Bun.inspect([1, 2, 3], { maxArrayLength: 1, colors: true })).toContain("\x1b[2m... 2 more items\x1b[0m");
+    expect(Bun.inspect(new Set([1, 2]), { maxArrayLength: 1, colors: true })).toContain(
+      "\x1b[2m... 1 more item\x1b[0m",
+    );
+  });
+
+  it("rounds a number down, and takes nothing that is not a number or null", () => {
+    expect(Bun.inspect([1, 2, 3], { maxArrayLength: 1.9 })).toBe("[ 1, ... 2 more items ]");
+    expect(Bun.inspect([1, 2, 3], { maxArrayLength: NaN })).toBe("[ ... 3 more items ]");
+    expect(Bun.inspect("abc", { maxStringLength: 2.5 })).toBe('"ab"... 1 more character');
+    // Like `depth`, a value of another type is not an option.
+    for (const limit of [undefined, "1", true, {}, 1n]) {
+      expect(Bun.inspect([1, 2, 3], { maxArrayLength: limit })).toBe("[ 1, 2, 3 ]");
+      expect(Bun.inspect("abc", { maxStringLength: limit })).toBe('"abc"');
+    }
+  });
+});
+
+describe("maxStringLength", () => {
+  it("limits the characters of a string", () => {
+    expect(Bun.inspect("hello world", { maxStringLength: 5 })).toBe('"hello"... 6 more characters');
+    expect(Bun.inspect("hello!", { maxStringLength: 5 })).toBe('"hello"... 1 more character');
+    expect(Bun.inspect("hello", { maxStringLength: 5 })).toBe('"hello"');
+    expect(Bun.inspect("abc", { maxStringLength: 0 })).toBe('""... 3 more characters');
+    expect(Bun.inspect("abc", { maxStringLength: -1 })).toBe('""... 3 more characters');
+    expect(Bun.inspect("", { maxStringLength: 0 })).toBe('""');
+    expect(Bun.inspect({ a: "hello world", b: ["x", "yz"] }, { maxStringLength: 1, compact: true })).toBe(
+      '{ a: "h"... 10 more characters, b: [ "x", "y"... 1 more character ] }',
+    );
+    expect(Bun.inspect(new Map([["key", "value"]]), { maxStringLength: 2, compact: true })).toBe(
+      'Map(1) { "ke"... 1 more character: "va"... 3 more characters }',
+    );
+  });
+
+  it("null and Infinity print the whole string, as no option does", () => {
+    const long = "x".repeat(20_000);
+    for (const options of [undefined, { maxStringLength: null }, { maxStringLength: Infinity }]) {
+      expect(Bun.inspect(long, options)).toBe(`"${long}"`);
+    }
+    expect(Bun.inspect(long, { maxStringLength: 10_000 })).toBe(`"${"x".repeat(10_000)}"... 10000 more characters`);
+  });
+
+  it("counts UTF-16 code units and keeps a surrogate pair whole", () => {
+    expect(Bun.inspect("héllo wörld ✓", { maxStringLength: 7 })).toBe('"héllo w"... 6 more characters');
+    expect(Bun.inspect("a😀b", { maxStringLength: 3 })).toBe('"a😀"... 1 more character');
+    expect(Bun.inspect("a😀b", { maxStringLength: 2 })).toBe('"a"... 3 more characters');
+    expect(Bun.inspect('say "✓" twice', { maxStringLength: 7 })).toBe('"say \\"✓\\""... 6 more characters');
+  });
+
+  it("leaves property names and what is not a string as they are", () => {
+    expect(Bun.inspect({ a_long_property_name: 123456789 }, { maxStringLength: 2, compact: true })).toBe(
+      "{ a_long_property_name: 123456789 }",
+    );
+    expect(Bun.inspect(/a-long-pattern/, { maxStringLength: 2 })).toBe("/a-long-pattern/");
+  });
+
+  it("dims what it leaves out", () => {
+    expect(Bun.inspect("hello", { maxStringLength: 2, colors: true })).toBe(
+      '\x1b[0m\x1b[32m"he"\x1b[0m\x1b[2m... 3 more characters\x1b[0m',
+    );
+  });
+});
+
+it("console.dir takes maxArrayLength and maxStringLength", async () => {
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `
+        const value = { list: [1, 2, 3, 4], text: "hello world" };
+        console.dir(value, { maxArrayLength: 2 });
+        console.dir(value, { maxStringLength: 5 });
+        console.dir(value, { maxArrayLength: 0, maxStringLength: 0 });
+        console.dir(Array(150).fill(1), { maxArrayLength: null });
+        console.dir(Array(150).fill(1));
+        console.dir([1, 2, 3], { maxArrayLength: 1.5, maxStringLength: "2" });
+      `,
+    ],
+    env: bunEnv,
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const lines = stdout.replaceAll(/\s+/g, " ").trim();
+  expect({ lines, stderr }).toEqual({
+    lines: [
+      '{ list: [ 1, 2, ... 2 more items ], text: "hello world", }',
+      '{ list: [ 1, 2, 3, 4 ], text: "hello"... 6 more characters, }',
+      '{ list: [ ... 4 more items ], text: ""... 11 more characters, }',
+      `[ ${Array(150).fill(1).join(", ")} ]`,
+      `[ ${Array(100).fill(1).join(", ")}, ... 50 more items ]`,
+      "[ 1, ... 2 more items ]",
+    ].join(" "),
+    stderr: "",
+  });
+  expect(exitCode).toBe(0);
 });
 
 // Each case runs in a fresh child so the formatter hasn't loaded util.inspect before the failing call.

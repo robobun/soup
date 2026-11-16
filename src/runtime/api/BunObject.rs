@@ -82,8 +82,8 @@ use bun_jsc::EncodedSliceJsc as _;
 use bun_jsc::{StringJsc as _, bun_string_jsc};
 
 use crate::generated_bindgen::bun_object::{
-    BracesOptions, Bun__BunObject__inspect, Bun__BunObject__table, EditorOptions, InspectOptions,
-    InspectOptionsOrDepth, MMapOptions, WhichOptions, ZlibCompressionOptions,
+    BracesOptions, Bun__BunObject__inspect, Bun__BunObject__table, EditorOptions, InspectLimit,
+    InspectOptions, InspectOptionsOrDepth, MMapOptions, WhichOptions, ZlibCompressionOptions,
     ZlibDecompressionOptions, ZstdCompressionOptions,
 };
 use bun_jsc::bindgen::{self, BufferSource, JsHeap, JsLocal, JsScope, PinnedBytes};
@@ -323,7 +323,22 @@ fn apply_inspect_options(
     if let Some(compact) = options.compact {
         format_options.single_line = compact;
     }
+    if let Some(limit) = inspect_limit(&options.max_array_length) {
+        format_options.max_array_length = Some(limit);
+    }
+    if let Some(limit) = inspect_limit(&options.max_string_length) {
+        format_options.max_string_length = Some(limit);
+    }
     Ok(())
+}
+
+/// `None` when the option is not given, or is neither a number nor `null`.
+fn inspect_limit(limit: &InspectLimit<'_>) -> Option<u32> {
+    match limit {
+        InspectLimit::Unset | InspectLimit::Ignored(_) => None,
+        InspectLimit::Unlimited => Some(ConsoleObject::FormatOptions::NO_LIMIT),
+        InspectLimit::Count(count) => Some(ConsoleObject::FormatOptions::limit_from_number(*count)),
+    }
 }
 
 /// `Bun.inspect.table(tabularData, options)`
