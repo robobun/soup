@@ -811,6 +811,37 @@ Bun.inspect(arr);
 // => "Uint8Array(3) [ 1, 2, 3 ]"
 ```
 
+The second argument is an object of options.
+
+| Option            | Description                                                                                           |
+| ----------------- | ----------------------------------------------------------------------------------------------------- |
+| `depth`           | How many levels of nested objects to print. `Infinity` prints every level.                            |
+| `colors`          | Print with ANSI colors.                                                                               |
+| `sorted`          | Sort the properties of objects.                                                                       |
+| `compact`         | Print on one line.                                                                                    |
+| `maxArrayLength`  | How many elements of an array, a typed array, a `Set` or a `Map` to print. `null` prints all of them. |
+| `maxStringLength` | How many characters of a string to print. `null` prints all of them, which is also the default.       |
+
+`maxArrayLength` and `maxStringLength` work like the options of the same name of [`util.inspect()`](https://nodejs.org/api/util.html#utilinspectobject-options) in Node.js. Without `maxArrayLength`, `Bun.inspect()` prints the first 100 elements of an array, as `console.log` does. What is left out is counted.
+
+```ts
+const list = Array.from({ length: 500 }, (_, i) => i);
+
+Bun.inspect(list, { maxArrayLength: 3, compact: true });
+// => "[ 0, 1, 2, ... 497 more items ]"
+
+Bun.inspect(list, { maxArrayLength: null }); // all 500 elements
+
+Bun.inspect({ body: "hello world" }, { maxStringLength: 5, compact: true });
+// => '{ body: "hello"... 6 more characters }'
+```
+
+`console.dir()` takes both options as well, next to `depth` and `colors`.
+
+```ts
+console.dir(list, { maxArrayLength: null }); // prints all 500 elements
+```
+
 ### `Bun.inspect.custom`
 
 The symbol Bun uses to implement `Bun.inspect`. Override it to customize how Bun prints your objects. It is identical to `util.inspect.custom` in Node.js.

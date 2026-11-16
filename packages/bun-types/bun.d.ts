@@ -6678,6 +6678,36 @@ declare module "bun" {
      * Whether to compact the output
      */
     compact?: boolean;
+    /**
+     * How many elements of an array, a typed array, a `Set` or a `Map` to print. The rest is
+     * summed up as `... 12 more items`.
+     *
+     * `null` and `Infinity` print every element, and `0` prints none. Without this option an
+     * array prints its first 100 elements.
+     *
+     * @example
+     * ```ts
+     * Bun.inspect([1, 2, 3, 4], { maxArrayLength: 2 });
+     * // [ 1, 2, ... 2 more items ]
+     *
+     * Bun.inspect(new Array(500).fill(0), { maxArrayLength: null }); // all 500 elements
+     * ```
+     */
+    maxArrayLength?: number | null;
+    /**
+     * How many characters of a string to print. The rest is summed up as
+     * `... 12 more characters`.
+     *
+     * `null` and `Infinity` print the whole string, which is also what happens without this
+     * option.
+     *
+     * @example
+     * ```ts
+     * Bun.inspect({ body: "hello world" }, { maxStringLength: 5, compact: true });
+     * // { body: "hello"... 6 more characters }
+     * ```
+     */
+    maxStringLength?: number | null;
   }
 
   type WebSocketOptionsProtocolsOrProtocol =

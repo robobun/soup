@@ -86,12 +86,17 @@ export const indexOfLine = b.fn({
 
 export const inflateSync = zlib("inflate_sync", ZlibDecompressionOptions);
 
+/** `maxArrayLength` and `maxStringLength`: a count, or `null` for no limit, which `Infinity` also is. */
+export const InspectLimit = b.union({ unset: b.undefined, unlimited: b.null, count: b.f64, ignored: b.any });
+
 export const InspectOptions = b.dictionary(
   {
     depth: b.f64.otherAsNull,
     colors: b.bool.loose.optional,
     sorted: b.bool.loose.optional,
     compact: b.bool.loose.optional,
+    maxArrayLength: InspectLimit,
+    maxStringLength: InspectLimit,
   },
   { allowArray: true },
 );

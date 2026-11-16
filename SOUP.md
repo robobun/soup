@@ -9520,8 +9520,8 @@ Files: `src/zip/` (new), `src/archive/any.rs` (new), `src/archive/lib.rs`,
 
 ### 2026-11-07: `onResolve` is told the `kind` of a CSS `url()`, a `composes` and a conditional `@import`
 
-A fix, not a feature. It is a commit of its own in front of `build.resolve()` of the same day,
-which passes the `kind` of an import on and so needs it to be right.
+A fix, not a feature. It is a commit of its own in front of `build.resolve()` of the same day
+(dropped on 2026-11-16), which passes the `kind` of an import on and so needs it to be right.
 
 A `Bun.build` plugin reads `args.kind` from a table of names that is indexed by the discriminant
 of `ImportKind` (`enums.ImportKind` in `src/codegen/replacements.ts`). The table had 9 names for
@@ -11296,6 +11296,148 @@ Files: `src/runtime/shell/builtin/cut.rs` (new), `src/runtime/shell/Builtin.rs`,
 `src/runtime/shell/IOReader.rs`, `src/runtime/shell/mod.rs`, `docs/runtime/shell.mdx`,
 `test/js/bun/shell/commands/cut.test.ts` (new).
 
+### 2026-11-16: `maxArrayLength` and `maxStringLength` for `Bun.inspect()` and `console.dir()`
+
+`console.log` prints the first 100 elements of an array and then `... 900 more items`, and nothing
+could change the 100. `Bun.inspect(list, { depth: Infinity })` stops there too, which is
+oven-sh/bun#15193 (open since November 2024; the answer in it is that `util.inspect` has
+`maxArrayLength` and `Bun.inspect` does not, and that the issue stays open to track it). The two
+options that `util.inspect()` has for this now work in Bun's native formatter, under Node's names
+and with Node's rules.
+
+```ts
+const list = Array.from({ length: 500 }, (_, i) => i);
+
+Bun.inspect(list, { maxArrayLength: 3, compact: true }); // "[ 0, 1, 2, ... 497 more items ]"
+Bun.inspect(list, { maxArrayLength: null }); // all 500 elements
+console.dir(list, { maxArrayLength: Infinity }); // prints all 500 elements
+
+Bun.inspect({ body: "hello world" }, { maxStringLength: 5, compact: true });
+// '{ body: "hello"... 6 more characters }'
+```
+
+- `maxArrayLength` counts the elements of an array, a typed array, an `ArrayBuffer`, a `Set` and a
+  `Map`, at every depth. `null` and `Infinity` are no limit. `0` and a negative number print no
+  element (`[ ... 3 more items ]`). A number is rounded down, `NaN` is 0, and a value of another
+  type is not an option, as for `depth`. Nothing throws.
+- `maxStringLength` counts the UTF-16 code units of a string that is printed in quotes: the value
+  itself, an element, a property, a key of a `Map`. A surrogate pair is printed whole or left out
+  whole. Property names, regular expressions and the strings that `console.log` prints without
+  quotes are not cut.
+- What is left out is counted and printed dim: `... 12 more items`, `... 1 more character`.
+- Without the options one letter changes: an array of 101 elements ended with `... 1 more items`
+  and now ends with `... 1 more item`, as in Node. Everything else is as before. An array stops at
+  100 elements, a typed array at 513 with its `... 487 more`, and a `Set`, a `Map` and a string
+  are printed whole. Node's own defaults (100 for all four kinds, 10,000 characters) are not
+  taken over, because that would change what `console.log` prints today.
+
+oven-sh/bun#31809 is an open pull request of June 2026 for the array half of this (for
+oven-sh/bun#31808, "console.dir regression"): arrays only, no typed arrays, sets, maps or strings.
+It was found after this commit was written. The rules for the number were then made the same as
+there and in Node (rounded down, never an error), so if it lands, the array part of this commit
+goes and the rest stays.
+
+How it is built. `FormatOptions` and `Formatter` in `src/jsc/ConsoleObject.rs` have
+`max_array_length` and `max_string_length`, both `Option<u32>`, where `None` is what each kind did
+before. `Bun.inspect` reads them through its bindgen dictionary (a union of `undefined`, `null`, a
+number and anything else), and `console.dir` reads them beside `depth` and `colors`. The array
+printer had the 100 as a literal. A `Set` and a `Map` are walked by a C callback that cannot stop,
+so its context counts what it skips. The typed array printer has a loop for an explicit limit and
+keeps its own for the default. The head of a UTF-16 string goes through the printer that a whole
+one goes through, so what is escaped does not depend on the limit.
+
+Tests. 13 new cases in `test/js/bun/util/inspect.test.js`: arrays, nested arrays, an array with
+holes, typed arrays under and over their default of 513, sets and maps on one line and on several,
+the colors of what is left out, the numbers that are rounded, strings in Latin-1 and UTF-16 with
+a surrogate pair at the cut, and `console.dir` in a child process. 12 of them fail on bun 1.4.3.
+The thirteenth is a guard that passes on both: property names and regular expressions stay
+whole. The case that expected `... 1 more items` expects `... 1 more item`. All 152 cases of the
+file pass on the debug build, and so do `console-log.test.ts`, `inspect-error.test.js` and
+`test/js/node/util/util.test.js`. `test/integration/bun-types` passes with the new lines in its
+fixture.
+
+Not done, and known.
+
+- `console.log` takes no options, so `console.log(list)` still stops at 100. The way around is
+  `console.dir(list, { maxArrayLength: null })`. A default for the process is what
+  oven-sh/bun#12762 asks for. `--console-depth` and `console.depth` in bunfig.toml are the
+  precedent, and it is a decision of its own.
+- A function behind `[Bun.inspect.custom]` gets `depth` and `colors` in its options, as before.
+  The two limits are not passed on to it, so an `inspect(this.items, options)` in it uses
+  `util.inspect`'s defaults.
+- The entries of a `Map` iterator and of a `Set` iterator are not limited. A `Buffer` has its own
+  printer (`<Buffer 61 62 ...>`). `Bun.inspect.table` reads neither option. `showHidden` is not
+  here.
+- A limit of 0 prints an array on one line whatever `sorted` says.
+- The size of the release binary was not measured, and only Linux x64 ran. The code has no line
+  that depends on the platform.
+
+Found on the way, in upstream and not changed here: `Bun.inspect(new BigInt64Array(600))` ends
+with `0nn, ... 87 more ]`. The typed array printer writes the `n` of a BigInt a second time in
+front of its `... N more` (`write_typed_array_elements`). It was handed off to upstream's queue.
+The loop for an explicit limit does not do it.
+
+Rebase notes. 77 patches onto oven-sh/bun 5f3f8fe483e, 35 commits after the base of 2026-11-15
+(ed436333444). The 35 are the next round of "who owns what": a `BufferedReader` returns its
+result instead of calling its parent, the hot reloader is a value that the watcher owns, a
+`Bun.build` is a task that the bundle thread owns and a plugin request is a `Box`, a dependency
+version is an enum, picohttp is gone, a cast to a class returns a guard, the test runner's steps
+are sequence entries, and the VM is built with a struct literal where it was zeroed memory. 29 of
+the 77 patches stopped the rebase. 28 were ported by hand and one is dropped (below). The build
+then found errors in 20 patches, each fixed in its patch.
+
+- Dropped: `build.resolve()` (2026-11-07). See [Dropped](#dropped).
+- Where a port is more than a port, for a reader who takes one of these patches:
+  - `wc` (2026-08-15): the read of a file that cannot be polled is `read_chunks` of the new
+    reader with no event, and `on_io` and that read share one function. The reader is started
+    once, by `get_fd() != fd`.
+  - `.env` restart and `--watch-path`: the reloader has its flags as fields. `--watch-exclude` is
+    an `ExcludePatterns` value (new, in `src/watcher/exclude.rs`), which
+    `Watcher::set_exclude_patterns` takes once before the thread starts. The entry point is
+    tested against it before the reloader is boxed, and `Watcher::is_watching_file` replaces the
+    method of `ImportWatcher`, which no longer exists.
+  - `#semver:` (2026-09-17): upstream took `url` out of the commit request, so the request has
+    `source: GitCommitSource::{Clone(id), Remote(url)}` where it had an optional clone id.
+  - S3 metadata (2026-09-27): the metadata headers are part of what `SignResult::headers()`
+    returns, where two callers appended them. `SignResult::MAX_HEADERS` is a constant again (11),
+    and the array of signed headers is typed with it. `stat()` reads the response's `Headers`.
+  - `Bun.build({ watch })` (2026-10-09): the array for the inputs is a field of
+    `BuildOwner::Promise`, which stays on the JS thread, and the task has the paths.
+  - `alias` (2026-10-21): upstream now sends every import that a plugin declined back through
+    `resolve_import_records`, which is what this patch did for the imports with an alias. Its own
+    `resolve_records` and `after_plugins` are gone, the step reads `PluginAnswer`, and a module
+    that a plugin named has no alias. The commit message and the entry say so.
+  - `globalSetup` (2026-10-31): `before_process_exit` runs on both ways out of `global_exit`, and
+    `Teardown::MainThreadStop` returns `false` ("do not drop the VM").
+  - `import.meta.hot` (2026-11-05): the transpiler cache is version 53. Upstream took 52.
+  - zip (2026-11-06): a `Blob` from a JS value is a guard, so the bytes of a zip entry are read
+    in the loop that holds it, as upstream does for tar.
+  - Web Locks (2026-09-21): one `EventLoopKeepAlive` that is active while a request of the
+    client waits, where it called `refEventLoop()` once for each.
+  - `bundler_npm.test.ts`: upstream and the `bytes` loader patch both moved the same three
+    numbers. They are the sum of both moves now, and the test passes with them.
+- `cargo fmt --all --check` passes. The source lints pass (203) on the release binary. On the
+  debug build two of them scan the source tree for longer than their five seconds.
+- Windows and macOS. `cargo check --workspace` passes for each of the 12 targets of CI, which is
+  what `bun run rust:check-all` runs (Linux with glibc and musl, macOS, Windows, Android and
+  FreeBSD). So the Windows and macOS lines of the ported patches compile, among them the append
+  copy of `copy_file.rs`, `win_watcher.rs` and the two readers of the shell. They did not run.
+- What ran afterwards. The debug build links. The 115 test files that the stack adds or changes
+  ran on it, and about 13,500 cases pass. What fails is of this machine or of a debug build: ten
+  PostgreSQL and three MySQL cases (its databases), `should be the node version on the host`,
+  one `--aot` case (see 2026-11-15), and two to six `glob.scan` cases at their 30 seconds in a
+  tree of 315,000 files. Five more failed while five test files ran at once and pass when their
+  file runs alone: `--parallel: each worker has a unique JEST_WORKER_ID`, two cases of
+  `module-graph-isolation.test.ts` at their 5 seconds, `Bun.file(0) survives GC`, and
+  `memleak_pipeline` of `shell/leak.test.ts` at its 100. `semver.test.ts` and
+  `caseChange.test.ts` needed a `bun install` in `test/` first. The fork's three workflows were
+  green for the push of 2026-11-15.
+- Only the tip of the stack was built, as before.
+
+Files: `src/jsc/ConsoleObject.rs`, `src/runtime/api/BunObject.rs`,
+`src/runtime/api/BunObject.bind.ts`, `packages/bun-types/bun.d.ts`, `docs/runtime/utils.mdx`,
+`test/js/bun/util/inspect.test.js`, `test/integration/bun-types/fixture/index.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
@@ -11313,3 +11455,9 @@ Files: `src/runtime/shell/builtin/cut.rs` (new), `src/runtime/shell/Builtin.rs`,
 - 2026-10-23, async fake timers (`advanceTimersByTimeAsync()` and the other three): dropped on
   2026-11-01. oven-sh/bun#44833, the pull request the patch took its shape from, landed with the
   four functions and with the limit of `runAllTimers()`.
+- 2026-11-07, `build.resolve()` in `Bun.build` plugins: dropped on 2026-11-16. oven-sh/bun#48884
+  and oven-sh/bun#49011 rewrite what its native half stood on. A plugin request is a `Box` that
+  the plugins hold by an id, `run_resolver` and the plugin's pointer to its build are gone, and a
+  `Bun.build` is a task that the bundle thread owns. The call needs a new way from the plugins to
+  the bundle that waits for them, so it is a feature to write again and not a patch to port. The
+  commit before it, which tells `onResolve` the right `kind`, stays.

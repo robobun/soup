@@ -602,6 +602,19 @@ fn print_message(
                     print_options.enable_colors = colors_prop.to_boolean();
                 }
             }
+            for (name, limit) in [
+                ("maxArrayLength", &mut print_options.max_array_length),
+                ("maxStringLength", &mut print_options.max_string_length),
+            ] {
+                let Some(prop) = opts.get(global, name.as_bytes())? else {
+                    continue;
+                };
+                if prop.is_number() {
+                    *limit = Some(FormatOptions::limit_from_number(prop.as_number()));
+                } else if prop.is_null() {
+                    *limit = Some(FormatOptions::NO_LIMIT);
+                }
+            }
         }
     }
 
@@ -1175,6 +1188,12 @@ pub struct FormatOptions {
     pub single_line: bool,
     pub default_indent: u16,
     pub error_display_level: ErrorDisplayLevel,
+    /// `maxArrayLength`: how many elements of an array, a typed array, a `Set` or a `Map` are
+    /// printed. `None`: 100 of an array, and each of the others as it was printed before the
+    /// option existed.
+    pub max_array_length: Option<u32>,
+    /// `maxStringLength`: how many UTF-16 code units of a quoted string are printed.
+    pub max_string_length: Option<u32>,
 }
 
 impl Default for FormatOptions {
@@ -1189,6 +1208,8 @@ impl Default for FormatOptions {
             single_line: false,
             default_indent: 0,
             error_display_level: ErrorDisplayLevel::Full,
+            max_array_length: None,
+            max_string_length: None,
         }
     }
 }
@@ -1264,6 +1285,17 @@ impl ErrorDisplayLevel {
 }
 
 impl FormatOptions {
+    /// What `maxArrayLength` and `maxStringLength` are for `null` and for `Infinity`. No array
+    /// and no string is longer.
+    pub const NO_LIMIT: u32 = u32::MAX;
+
+    /// `maxArrayLength` or `maxStringLength` as a number: rounded down, `Infinity` for no
+    /// limit. A negative one and `NaN` are 0.
+    pub fn limit_from_number(limit: f64) -> u32 {
+        // `as` saturates, and `NaN` is 0.
+        limit as u32
+    }
+
     /// `depth`: a non-negative integer (clamped to `u16::MAX`) or `Infinity`.
     pub fn set_depth(&mut self, global_this: &JSGlobalObject, depth: f64) -> JsResult<()> {
         if depth.is_infinite() {
@@ -1308,6 +1340,8 @@ pub fn format2(
         fmt.quote_strings = options.quote_strings;
         fmt.max_depth = options.max_depth;
         fmt.single_line = options.single_line;
+        fmt.max_array_length = options.max_array_length;
+        fmt.max_string_length = options.max_string_length;
         fmt.indent = u32::from(options.default_indent);
         fmt.can_throw_stack_overflow = true;
         fmt.error_display_level = options.error_display_level;
@@ -1370,6 +1404,8 @@ pub fn format2(
     fmt.quote_strings = options.quote_strings;
     fmt.max_depth = options.max_depth;
     fmt.single_line = options.single_line;
+    fmt.max_array_length = options.max_array_length;
+    fmt.max_string_length = options.max_string_length;
     fmt.indent = u32::from(options.default_indent);
     fmt.can_throw_stack_overflow = true;
     fmt.error_display_level = options.error_display_level;
@@ -1568,6 +1604,10 @@ pub mod formatter {
         pub(crate) always_newline_scope: bool,
         pub single_line: bool,
         pub ordered_properties: bool,
+        /// See `FormatOptions::max_array_length`.
+        pub(crate) max_array_length: Option<u32>,
+        /// See `FormatOptions::max_string_length`.
+        pub(crate) max_string_length: Option<u32>,
         pub(crate) custom_formatted_object: CustomFormattedObject,
         pub(crate) disable_inspect_custom: bool,
         pub(crate) stack_check: StackCheck,
@@ -1603,6 +1643,8 @@ pub mod formatter {
                 always_newline_scope: false,
                 single_line: false,
                 ordered_properties: false,
+                max_array_length: None,
+                max_string_length: None,
                 custom_formatted_object: CustomFormattedObject::default(),
                 disable_inspect_custom: false,
                 stack_check: StackCheck::init(),
@@ -1641,6 +1683,8 @@ pub mod formatter {
                 always_newline_scope: self.always_newline_scope,
                 single_line: self.single_line,
                 ordered_properties: self.ordered_properties,
+                max_array_length: self.max_array_length,
+                max_string_length: self.max_string_length,
                 custom_formatted_object: self.custom_formatted_object,
                 disable_inspect_custom: self.disable_inspect_custom,
                 stack_check: self.stack_check,
@@ -2751,6 +2795,22 @@ pub mod formatter {
         }
     }
 
+    /// `... 3 more items`: the elements that `maxArrayLength` leaves out.
+    pub(crate) struct MoreItems<const C: bool>(pub(crate) u64);
+
+    impl<const C: bool> core::fmt::Display for MoreItems<C> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                f,
+                "{}... {} more item{}{}",
+                pfmt!("<r><d>", C),
+                self.0,
+                if self.0 == 1 { "" } else { "s" },
+                pfmt!("<r>", C),
+            )
+        }
+    }
+
     // ───────────────────────────────────────────────────────────────────────
     // MapIterator / SetIterator / PropertyIterator (forEach callback contexts)
     // ───────────────────────────────────────────────────────────────────────
@@ -2765,6 +2825,9 @@ pub mod formatter {
         pub(crate) formatter: &'a mut Formatter<'b>,
         pub(crate) writer: &'a mut dyn bun_io::Write,
         pub(crate) count: usize,
+        /// `maxArrayLength`: the entries after this many are counted in `skipped`.
+        pub(crate) limit: usize,
+        pub(crate) skipped: usize,
     }
 
     impl<'a, 'b, const C: bool, const IS_ITERATOR: bool, const SINGLE_LINE: bool>
@@ -2782,6 +2845,10 @@ pub mod formatter {
             };
             let this = ctx;
             if this.formatter.failed {
+                return;
+            }
+            if this.count >= this.limit {
+                this.skipped += 1;
                 return;
             }
             if SINGLE_LINE && this.count > 0 {
@@ -2864,6 +2931,9 @@ pub mod formatter {
         pub(crate) formatter: &'a mut Formatter<'b>,
         pub(crate) writer: &'a mut dyn bun_io::Write,
         pub(crate) is_first: bool,
+        /// `maxArrayLength`: the values after this many are counted in `skipped`.
+        pub(crate) remaining: usize,
+        pub(crate) skipped: usize,
     }
 
     impl<'a, 'b, const C: bool, const SINGLE_LINE: bool> SetIteratorCtx<'a, 'b, C, SINGLE_LINE> {
@@ -2880,6 +2950,11 @@ pub mod formatter {
             if this.formatter.failed {
                 return;
             }
+            if this.remaining == 0 {
+                this.skipped += 1;
+                return;
+            }
+            this.remaining -= 1;
             if SINGLE_LINE {
                 if !this.is_first {
                     this.formatter
@@ -3570,6 +3645,53 @@ pub mod formatter {
 
                 if C {
                     writer.write_all(pfmt!("<r><green>", true).as_bytes());
+                }
+
+                // `maxStringLength`: the start of the string, and how much of it is left out.
+                if let Some(max_length) = self.max_string_length
+                    && (max_length as usize) < str.length()
+                {
+                    let mut kept = max_length as usize;
+                    if str.is_utf16() {
+                        let units = str.utf16();
+                        // Both halves of a surrogate pair, or neither.
+                        if kept > 0
+                            && matches!(units[kept - 1], 0xD800..=0xDBFF)
+                            && matches!(units[kept], 0xDC00..=0xDFFF)
+                        {
+                            kept -= 1;
+                        }
+                        if writer.failed {
+                            self.failed = true;
+                        }
+                        // Printed the way the whole string is.
+                        let head =
+                            BunString::clone_utf16(&units[..kept]).to_js(self.global_this)?;
+                        self.print_as::<C>(Tag::JSON, writer_, head, jsc::JSType::StringObject)?;
+                        writer = WrappedWriter {
+                            ctx: writer_,
+                            failed: false,
+                            estimated_line_length: &mut self.estimated_line_length,
+                        };
+                    } else {
+                        let _ = JSPrinter::write_json_string(
+                            &str.latin1()[..kept],
+                            writer.ctx,
+                            JSPrinter::Encoding::Latin1,
+                        );
+                    }
+                    let left_out = str.length() - kept;
+                    writer.print(format_args!(
+                        "{}... {} more character{}{}",
+                        pfmt!("<r><d>", C),
+                        left_out,
+                        if left_out == 1 { "" } else { "s" },
+                        pfmt!("<r>", C),
+                    ));
+                    if writer.failed {
+                        self.failed = true;
+                    }
+                    return Ok(());
                 }
 
                 if str.is_utf16() {
@@ -4270,6 +4392,7 @@ pub mod formatter {
             let mut was_good_time = self.always_newline_scope ||
                 // heuristic: more than 10, probably should have a newline before it
                 len > 10;
+            let max_items = self.max_array_length.unwrap_or(100);
             {
                 self.indent += 1;
                 self.depth += 1;
@@ -4283,6 +4406,17 @@ pub mod formatter {
                 let _qs = defer_restore!(self.quote_strings, prev_quote_strings);
                 let mut empty_start: Option<u32> = None;
                 'first: {
+                    if max_items == 0 {
+                        // As in Node.js: `[ ... 3 more items ]`.
+                        was_good_time = false;
+                        writer.write_all(b"[ ");
+                        writer.add_for_new_line(2);
+                        writer.pretty::<C>(
+                            "... N more items".len(),
+                            format_args!("{}", MoreItems::<C>(len)),
+                        );
+                        break 'first;
+                    }
                     let element = value.get_direct_index(self.global_this, 0)?;
 
                     let tag = Tag::get_advanced(element, self.global_this, tag_opts)?;
@@ -4322,7 +4456,7 @@ pub mod formatter {
                 let mut i: u32 = 1;
                 let mut nonempty_count: u32 = 1;
 
-                while (i as u64) < len {
+                while max_items != 0 && (i as u64) < len {
                     let element = value.get_direct_index(self.global_this, i)?;
                     if element.is_empty() {
                         if empty_start.is_none() {
@@ -4344,9 +4478,9 @@ pub mod formatter {
                         }
                         continue;
                     }
-                    if nonempty_count >= 100 {
+                    if nonempty_count >= max_items {
                         writer.print_comma::<C>();
-                        if self.single_line {
+                        if self.single_line || !was_good_time {
                             writer.space();
                         } else {
                             writer.write_all(b"\n");
@@ -4355,12 +4489,7 @@ pub mod formatter {
                         }
                         writer.pretty::<C>(
                             "... N more items".len(),
-                            format_args!(
-                                "{}... {} more items{}",
-                                pf!("<r><d>"),
-                                len - u64::from(i),
-                                pf!("<r>")
-                            ),
+                            format_args!("{}", MoreItems::<C>(len - u64::from(i))),
                         );
                         break;
                     }
@@ -4495,6 +4624,7 @@ pub mod formatter {
             }
 
             if !self.single_line
+                && max_items != 0
                 && (self.ordered_properties
                     || was_good_time
                     || writer.good_time_for_a_new_line(self.indent))
@@ -4607,22 +4737,34 @@ pub mod formatter {
                 let _i = defer_decrement!(self.indent);
                 let _d = defer_decrement!(self.depth);
                 let global_this = self.global_this;
+                let limit = self
+                    .max_array_length
+                    .map_or(usize::MAX, |limit| limit as usize);
                 if self.single_line {
                     let mut iter = MapIteratorCtx::<C, false, true> {
                         formatter: self,
                         writer: writer_,
                         count: 0,
+                        limit,
+                        skipped: 0,
                     };
                     value.for_each(
                         global_this,
                         (&raw mut iter).cast::<c_void>(),
                         MapIteratorCtx::<C, false, true>::for_each,
                     )?;
-                    let count = iter.count;
+                    let (count, skipped) = (iter.count, iter.skipped);
                     if iter.formatter.failed {
                         return Ok(());
                     }
-                    if count > 0 {
+                    if skipped > 0 {
+                        if count > 0 {
+                            let _ = self.print_comma::<C>(writer_);
+                            let _ = writer_.write_all(b" ");
+                        }
+                        let _ = write!(writer_, "{}", MoreItems::<C>(skipped as u64));
+                    }
+                    if count > 0 || skipped > 0 {
                         let _ = writer_.write_all(b" ");
                     }
                 } else {
@@ -4630,14 +4772,21 @@ pub mod formatter {
                         formatter: self,
                         writer: writer_,
                         count: 0,
+                        limit,
+                        skipped: 0,
                     };
                     value.for_each(
                         global_this,
                         (&raw mut iter).cast::<c_void>(),
                         MapIteratorCtx::<C, false, false>::for_each,
                     )?;
+                    let skipped = iter.skipped;
                     if iter.formatter.failed {
                         return Ok(());
+                    }
+                    if skipped > 0 {
+                        let _ = self.write_indent(writer_);
+                        let _ = writeln!(writer_, "{}", MoreItems::<C>(skipped as u64));
                     }
                 }
             }
@@ -4674,6 +4823,8 @@ pub mod formatter {
                         formatter: self,
                         writer: writer_,
                         count: 0,
+                        limit: usize::MAX,
+                        skipped: 0,
                     };
                     value.for_each(
                         global_this,
@@ -4693,6 +4844,8 @@ pub mod formatter {
                         formatter: self,
                         writer: writer_,
                         count: 0,
+                        limit: usize::MAX,
+                        skipped: 0,
                     };
                     value.for_each(
                         global_this,
@@ -4756,22 +4909,34 @@ pub mod formatter {
                 let _i = defer_decrement!(self.indent);
                 let _d = defer_decrement!(self.depth);
                 let global_this = self.global_this;
+                let remaining = self
+                    .max_array_length
+                    .map_or(usize::MAX, |limit| limit as usize);
                 if self.single_line {
                     let mut iter = SetIteratorCtx::<C, true> {
                         formatter: self,
                         writer: writer_,
                         is_first: true,
+                        remaining,
+                        skipped: 0,
                     };
                     value.for_each(
                         global_this,
                         (&raw mut iter).cast::<c_void>(),
                         SetIteratorCtx::<C, true>::for_each,
                     )?;
-                    let is_first = iter.is_first;
+                    let (is_first, skipped) = (iter.is_first, iter.skipped);
                     if iter.formatter.failed {
                         return Ok(());
                     }
-                    if !is_first {
+                    if skipped > 0 {
+                        if !is_first {
+                            let _ = self.print_comma::<C>(writer_);
+                            let _ = writer_.write_all(b" ");
+                        }
+                        let _ = write!(writer_, "{}", MoreItems::<C>(skipped as u64));
+                    }
+                    if !is_first || skipped > 0 {
                         let _ = writer_.write_all(b" ");
                     }
                 } else {
@@ -4779,14 +4944,21 @@ pub mod formatter {
                         formatter: self,
                         writer: writer_,
                         is_first: true,
+                        remaining,
+                        skipped: 0,
                     };
                     value.for_each(
                         global_this,
                         (&raw mut iter).cast::<c_void>(),
                         SetIteratorCtx::<C, false>::for_each,
                     )?;
+                    let skipped = iter.skipped;
                     if iter.formatter.failed {
                         return Ok(());
+                    }
+                    if skipped > 0 {
+                        let _ = self.write_indent(writer_);
+                        let _ = writeln!(writer_, "{}", MoreItems::<C>(skipped as u64));
                     }
                 }
             }
@@ -5558,20 +5730,27 @@ pub mod formatter {
 
             writer.print(format_args!("({}) [ ", array_buffer.len));
 
+            let max_items = self.max_array_length;
             use jsc::JSType as T;
             match js_type {
-                T::Int8Array => Self::write_typed_array::<i8, C>(&mut writer, slice),
-                T::Int16Array => Self::write_typed_array::<i16, C>(&mut writer, slice),
-                T::Uint16Array => Self::write_typed_array::<u16, C>(&mut writer, slice),
-                T::Int32Array => Self::write_typed_array::<i32, C>(&mut writer, slice),
-                T::Uint32Array => Self::write_typed_array::<u32, C>(&mut writer, slice),
-                T::Float16Array => Self::write_typed_array::<bun_core::f16, C>(&mut writer, slice),
-                T::Float32Array => Self::write_typed_array::<f32, C>(&mut writer, slice),
-                T::Float64Array => Self::write_typed_array::<f64, C>(&mut writer, slice),
-                T::BigInt64Array => Self::write_typed_array::<i64, C>(&mut writer, slice),
-                T::BigUint64Array => Self::write_typed_array::<u64, C>(&mut writer, slice),
+                T::Int8Array => Self::write_typed_array::<i8, C>(&mut writer, slice, max_items),
+                T::Int16Array => Self::write_typed_array::<i16, C>(&mut writer, slice, max_items),
+                T::Uint16Array => Self::write_typed_array::<u16, C>(&mut writer, slice, max_items),
+                T::Int32Array => Self::write_typed_array::<i32, C>(&mut writer, slice, max_items),
+                T::Uint32Array => Self::write_typed_array::<u32, C>(&mut writer, slice, max_items),
+                T::Float16Array => {
+                    Self::write_typed_array::<bun_core::f16, C>(&mut writer, slice, max_items)
+                }
+                T::Float32Array => Self::write_typed_array::<f32, C>(&mut writer, slice, max_items),
+                T::Float64Array => Self::write_typed_array::<f64, C>(&mut writer, slice, max_items),
+                T::BigInt64Array => {
+                    Self::write_typed_array::<i64, C>(&mut writer, slice, max_items)
+                }
+                T::BigUint64Array => {
+                    Self::write_typed_array::<u64, C>(&mut writer, slice, max_items)
+                }
                 // Uint8Array, Uint8ClampedArray, DataView, ArrayBuffer
-                _ => Self::write_typed_array::<u8, C>(&mut writer, slice),
+                _ => Self::write_typed_array::<u8, C>(&mut writer, slice, max_items),
             }
 
             writer.write_all(b" ]");
@@ -5588,6 +5767,7 @@ pub mod formatter {
         fn write_typed_array<N: TypedArrayElement, const C: bool>(
             writer: &mut WrappedWriter<'_>,
             bytes: &[u8],
+            max_items: Option<u32>,
         ) {
             // `Unaligned`: an ArrayBuffer over foreign memory (bun:ffi, N-API) starts anywhere.
             let slice = bun_core::Unaligned::<N>::slice_of(bytes);
@@ -5596,6 +5776,7 @@ pub mod formatter {
                 writer,
                 slice.len(),
                 N::IS_BIGINT,
+                max_items,
                 &mut |w, i| w.print(format_args!("{}", N::display(slice[i].get()))),
             );
         }
@@ -5604,9 +5785,34 @@ pub mod formatter {
             writer: &mut WrappedWriter<'_>,
             len: usize,
             is_bigint: bool,
+            max_items: Option<u32>,
             print_element: &mut dyn FnMut(&mut WrappedWriter<'_>, usize),
         ) {
             let suffix = if is_bigint { "n" } else { "" };
+            // `maxArrayLength`: as for an array.
+            if let Some(max_items) = max_items {
+                let shown = len.min(max_items as usize);
+                for i in 0..shown {
+                    if i > 0 {
+                        writer.print_comma::<C>();
+                        if writer.failed {
+                            return;
+                        }
+                        writer.space();
+                    }
+                    writer.write_all(pfmt!("<r><yellow>", C).as_bytes());
+                    print_element(writer, i);
+                    writer.print(format_args!("{}{}", suffix, pfmt!("<r>", C)));
+                }
+                if shown < len {
+                    if shown > 0 {
+                        writer.print_comma::<C>();
+                        writer.space();
+                    }
+                    writer.print(format_args!("{}", MoreItems::<C>((len - shown) as u64)));
+                }
+                return;
+            }
             writer.write_all(pfmt!("<r><yellow>", C).as_bytes());
             print_element(writer, 0);
             writer.print(format_args!("{}{}", suffix, pfmt!("<r>", C)));
