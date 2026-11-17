@@ -771,6 +771,10 @@ pub struct RuntimeOptions {
     pub cron_period: Box<[u8]>,
     pub cpu_prof: CpuProf,
     pub heap_prof: HeapProf,
+    /// The command line has no `-e` or `-p` and no flag that is not known, so nothing on it went
+    /// unused. A `bun` or a `node` without a script then takes its script from a stdin that is
+    /// not a terminal.
+    pub may_read_script_from_stdin: bool,
 }
 
 #[derive(Default)]
@@ -841,6 +845,7 @@ impl Default for RuntimeOptions {
             cron_period: Box::default(),
             cpu_prof: CpuProf::default(),
             heap_prof: HeapProf::default(),
+            may_read_script_from_stdin: false,
         }
     }
 }

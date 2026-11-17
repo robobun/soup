@@ -1386,6 +1386,10 @@ pub(crate) mod command {
         }
 
         if tag == Tag::AutoCommand {
+            // `echo 'console.log(1)' | bun`, `bun < script.ts`
+            if run_command::RunCommand::exec_piped_stdin(ctx)? {
+                return Ok(());
+            }
             Output::flush();
             return HelpCommand::exec();
         }

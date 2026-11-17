@@ -219,7 +219,8 @@ describe("--print for cjs/esm", () => {
   });
 });
 
-function group(run: (code: string) => SyncSubprocess<"pipe", "inherit">) {
+// `scriptArgv` is what `process.argv` holds after the executable: `-` when it asked for stdin.
+function group(run: (code: string) => SyncSubprocess<"pipe", "inherit">, scriptArgv: string[] = ["-"]) {
   test("it works", async () => {
     const { stdout } = run('console.log("hello world")');
     expect(stdout.toString("utf8")).toEqual("hello world\n");
@@ -249,7 +250,7 @@ function group(run: (code: string) => SyncSubprocess<"pipe", "inherit">) {
   test("process.argv", async () => {
     const { stdout } = run("console.log(process.argv)");
     const exe = isWindows ? bunExe().replaceAll("/", "\\") : bunExe();
-    expect(JSON.parse(stdout.toString("utf8"))).toEqual([exe, "-"]);
+    expect(JSON.parse(stdout.toString("utf8"))).toEqual([exe, ...scriptArgv]);
   });
 
   test("process._eval", async () => {
@@ -323,6 +324,198 @@ describe("echo | bun run -", () => {
   }
 
   group(run);
+});
+
+describe("echo | bun", () => {
+  function run(code: string) {
+    const result = Bun.spawnSync([bunExe()], {
+      env: bunEnv,
+      stdin: Buffer.from(code),
+      stderr: "inherit",
+    });
+    if (!result.success) {
+      queueMicrotask(() => {
+        throw new Error("echo | bun failed");
+      });
+    }
+
+    return result;
+  }
+
+  // Nothing on the command line names the script, so `process.argv` has no `-`, as in Node.
+  group(run, []);
+});
+
+describe.concurrent("a script on a stdin that is not a terminal, without `-`", () => {
+  // `pipe` is written to a pipe, which is then closed.
+  async function run(
+    stdin: Bun.SpawnOptions.Writable | { pipe: string },
+    { args = [], cwd, argv0 }: { args?: string[]; cwd?: string; argv0?: string } = {},
+  ) {
+    const piped = typeof stdin === "object" && "pipe" in stdin ? stdin.pipe : undefined;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), ...args],
+      argv0,
+      cwd,
+      env: bunEnv,
+      stdin: piped === undefined ? (stdin as Bun.SpawnOptions.Writable) : "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (piped !== undefined) {
+      const sink = proc.stdin as Bun.FileSink;
+      if (piped) sink.write(piped);
+      await sink.end();
+    }
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test("is TypeScript, with top-level await", async () => {
+    const script = `const answer: number = await Promise.resolve(42);\nconsole.log(answer satisfies number);\n`;
+    expect(await run(Buffer.from(script))).toEqual({ stdout: "42\n", stderr: "", exitCode: 0 });
+  });
+
+  test("echo | bun, through a pipe", async () => {
+    expect(await run({ pipe: `console.log("through a pipe");` })).toEqual({
+      stdout: "through a pipe\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test("bun < script.ts", async () => {
+    using dir = tempDir("bun-stdin-file", {
+      "script.ts": `console.log(import.meta.path.endsWith("[stdin]"), "from a file" as string);`,
+    });
+    expect(await run(Bun.file(join(String(dir), "script.ts")), { cwd: String(dir) })).toEqual({
+      stdout: "true from a file\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test("the flags in front of it apply", async () => {
+    using dir = tempDir("bun-stdin-flags", {
+      "preload.ts": `globalThis.preloaded = "preloaded";`,
+    });
+    const script = `console.log(globalThis.preloaded, JSON.stringify(process.argv.slice(1)));`;
+    expect(await run(Buffer.from(script), { args: ["--preload", "./preload.ts"], cwd: String(dir) })).toEqual({
+      stdout: "preloaded []\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test("the exit code is the script's", async () => {
+    expect(await run(Buffer.from(`console.log("before"); process.exit(3);`))).toEqual({
+      stdout: "before\n",
+      stderr: "",
+      exitCode: 3,
+    });
+  });
+
+  test("an uncaught error is reported with [stdin] as its file", async () => {
+    const { stdout, stderr, exitCode } = await run(Buffer.from(`throw new Error("thrown on stdin");`));
+    expect(stdout).toBe("");
+    expect(stderr).toContain("error: thrown on stdin");
+    expect(stderr).toContain("[stdin]:1:");
+    expect(exitCode).toBe(1);
+  });
+
+  test("a stdin that holds nothing gets the help, as before", async () => {
+    using dir = tempDir("bun-stdin-empty", { "empty.ts": "" });
+    for (const stdin of ["ignore", Bun.file(join(String(dir), "empty.ts")), { pipe: "" }] as const) {
+      const { stdout, exitCode } = await run(stdin);
+      expect(stdout).toContain("Usage: bun <command>");
+      expect(exitCode).toBe(0);
+    }
+  });
+
+  test("bun run without a script still prints the help of run", async () => {
+    const { stdout, exitCode } = await run(Buffer.from(`console.log("the script ran");`), { args: ["run"] });
+    expect(stdout).toContain("Usage: bun run");
+    expect(stdout).not.toContain("the script ran");
+    expect(exitCode).toBe(0);
+  });
+
+  test("-e keeps stdin for its code", async () => {
+    expect(await run({ pipe: "not a script" }, { args: ["-e", "console.log(await Bun.stdin.text())"] })).toEqual({
+      stdout: "not a script\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test.each([
+    ["an -e without code", ["--smol", "-e", ""]],
+    ["a flag that is not known", ["--not-a-flag-of-bun"]],
+  ])("%s does not run stdin", async (_, args) => {
+    const { stdout, exitCode } = await run({ pipe: `console.log("the script ran");` }, { args });
+    expect(stdout).toContain("Usage: bun <command>");
+    expect(stdout).not.toContain("the script ran");
+    expect(exitCode).toBe(0);
+  });
+
+  test.skipIf(isWindows)("a stdin that cannot be read is an error", async () => {
+    using dir = tempDir("bun-stdin-directory", {});
+    await using proc = Bun.spawn({
+      cmd: ["sh", "-c", 'exec "$0" < "$1"', bunExe(), String(dir)],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("Failed to read the script from stdin");
+    expect(exitCode).toBe(1);
+  });
+
+  describe("as node", () => {
+    test("the script runs, and process.argv has no script in it", async () => {
+      const script = `console.log("as node", JSON.stringify(process.argv.slice(1)), require("node:path").basename(__filename));`;
+      expect(await run({ pipe: script }, { argv0: "node" })).toEqual({
+        stdout: "as node [] [stdin]\n",
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
+    test("node - a b passes a b to the script", async () => {
+      const script = `console.log(JSON.stringify(process.argv.slice(1)));`;
+      expect(await run({ pipe: script }, { argv0: "node", args: ["-", "a", "b"] })).toEqual({
+        stdout: `["-","a","b"]\n`,
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
+    test("an empty stdin runs nothing and exits with 0", async () => {
+      expect(await run("ignore", { argv0: "node" })).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+    });
+
+    test("a flag that is not known does not run stdin", async () => {
+      const { stdout, stderr, exitCode } = await run(
+        { pipe: `console.log("the script ran");` },
+        { argv0: "node", args: ["--not-a-flag-of-node"] },
+      );
+      expect(stdout).toBe("");
+      expect(stderr).toContain("Missing script to execute");
+      expect(exitCode).toBe(1);
+    });
+  });
+});
+
+test.concurrent.each(["-", "run -"])("bun %s with an empty stdin runs nothing", async args => {
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), ...args.split(" ")],
+    env: bunEnv,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({ stdout, stderr, exitCode }).toEqual({ stdout: "", stderr: "", exitCode: 0 });
 });
 
 test("process._eval (undefined for normal run)", async () => {
