@@ -210,6 +210,28 @@ This is TypeScript!
 
 `bun run -` treats all input as TypeScript with JSX support.
 
+A plain `bun`, without `run`, does not need the `-`. When no script is named and stdin is not a terminal, `bun` reads stdin to its end and runs it as the script, like `node`, `python` and `sh` do. Runtime flags in front of it, such as `--smol` or `--preload`, apply.
+
+```bash terminal icon="terminal"
+echo "console.log('Hello')" | bun
+```
+
+```txt
+Hello
+```
+
+That includes a file that is redirected into Bun and a here-document in a shell script:
+
+```bash terminal icon="terminal"
+bun < script.ts
+bun --smol <<'EOF'
+const answer: number = await Promise.resolve(42);
+console.log(answer);
+EOF
+```
+
+As in Node.js, `process.argv` then has no entry for the script, where `bun run -` puts a `-`. If stdin holds no bytes at all, for example in `bun < /dev/null`, `bun` prints its help as it does in a terminal. `bun run` without a script still prints the scripts of `package.json`.
+
 ## `bun run --console-depth`
 
 Control the depth of object inspection in console output with the `--console-depth` flag.

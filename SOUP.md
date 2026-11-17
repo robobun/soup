@@ -11438,6 +11438,169 @@ Files: `src/jsc/ConsoleObject.rs`, `src/runtime/api/BunObject.rs`,
 `src/runtime/api/BunObject.bind.ts`, `packages/bun-types/bun.d.ts`, `docs/runtime/utils.mdx`,
 `test/js/bun/util/inspect.test.js`, `test/integration/bun-types/fixture/index.ts`.
 
+### 2026-11-17: `bun` runs a script that is piped to it
+
+`echo 'console.log(1)' | bun` printed the help. A script on stdin ran only behind `bun -` or
+`bun run -`. `node`, `python`, `ruby` and `sh` read their script from stdin when no file is named,
+so shell scripts are written that way: a here-document, `curl ... | node`, `node < file`. Under
+the `node` that `bun --bun` and `bunx` put in `PATH` those failed with
+`error: Missing script to execute`. Now, when no script is named and stdin is not a terminal,
+`bun` runs what stdin holds.
+
+```sh
+echo 'console.log("hello")' | bun
+bun < script.ts
+bun --smol <<'EOF'
+const answer: number = await Promise.resolve(42);
+console.log(answer);
+EOF
+```
+
+- The script is the entry point `[stdin]` of the working directory, the one `bun run -` makes:
+  TypeScript with JSX, top-level await, `require` and `import`, and `import.meta.path` ends in
+  `[stdin]`.
+- `process.argv` is the executable alone, as in Node. `bun run -` still has its `-` in
+  `process.argv[1]`.
+- The flags in front of it apply: `--preload`, `--smol`, `--define` and the rest.
+- Only a `bun` without a command does this. `bun run` without a script prints the scripts of the
+  package.json and its help, as before.
+- Only a command line on which nothing went unused does this. `bun -e ""`, `bun -p ""` and a
+  flag that is not known (`bun --tpyo`) do not read stdin. They get the help as before, and
+  under the name `node` the error as before.
+- An empty stdin keeps the help. `bun < /dev/null`, a stdin that is closed and a child whose stdin
+  is ignored (the default of `Bun.spawn`) print what they printed before. Node runs the empty
+  script there and exits with 0. The help is more use than nothing, and it is what a `bun` in a
+  CI step or a Dockerfile gets today. Empty is no byte at all: `echo | bun` runs a newline.
+- A stdin that cannot be read, `bun < some-directory`, is an error with exit code 1.
+- Under the name `node` Bun does what Node does, for an empty stdin too: nothing runs and the
+  exit code is 0. A terminal still gets the REPL. `node - a b` reads the script from stdin and
+  passes `a b` to it. Before, it looked for a file with the name `-`.
+- `bun -` and `bun run -` with an empty stdin run nothing and exit with 0, like `node -`. They
+  failed with `error: Module not found` for `[stdin]`.
+
+One thing changes for a program that is not a script: a `bun` without arguments whose stdin is a
+pipe that nobody writes to and nobody closes now waits for that pipe, where it printed the help.
+That is what `node` and `python` do with such a pipe. On Windows the terminal of Git Bash, Cygwin
+and MSYS2 is such a pipe, and it is told apart (`std::io::IsTerminal` knows its name), so `bun`
+typed there prints the help.
+
+How it is built. The argument parser sets `runtime_options.may_read_script_from_stdin` when the
+command line has no `-e` or `-p` and no flag that it did not know. `RunCommand::exec_stdin` is
+split into `read_stdin` and `boot_stdin`, with three callers: `exec_stdin` for `-`, which puts
+the `-` into the arguments, the new `exec_piped_stdin`, which returns `false` for a command line
+that does not ask for it, a terminal and an empty stdin, and `exec_as_if_node`, where it printed
+`Missing script to execute` and where a positional `-` now is stdin. `exec_auto_or_run` in
+`src/runtime/cli/mod.rs` calls `exec_piped_stdin` where a `bun` without a command went to the
+help. An empty script gets a newline in `boot_stdin`, because an empty `eval.script` means that
+there is none.
+
+Tests, in `test/cli/run/run-eval.test.ts`, 25 new cases. The seven that `bun run -` has also run
+for `echo | bun`, with `process.argv` as the executable alone. Sixteen for the rules above:
+TypeScript with top-level await, a pipe, a file as stdin, a `--preload` in front, the exit code,
+an uncaught error that names `[stdin]`, a stdin that holds nothing (ignored, an empty file, a
+pipe that is closed at once), `bun run`, `-e` that keeps stdin for its code, `-e ""` and an
+unknown flag that do not run stdin, a directory as stdin, and four with `argv0: "node"`. Two for
+`bun -` and `bun run -` with an empty stdin. 19 of the 25 fail on bun 1.4.3. The six that pass
+on both pin what does not change. All 82 cases of the file pass on the debug build.
+`test/js/bun/shell/exec.test.ts` has a case that runs a `bun` without arguments for its help. It
+gets an empty stdin now, where it had the stdin of the test run.
+
+Not done, and known.
+
+- Windows did not run. The reading is the code of `bun run -`, which has its Windows test, and
+  `cargo check` passes for `x86_64-pc-windows-msvc`. The check for the terminal of Git Bash is
+  the standard library's and was not tried there.
+- `--watch` and `--hot` keep the process alive after the script, as they do for `bun run -`, and
+  a restart has no stdin left to read. `--aot` answers
+  `no file matches the entry point "[stdin]"`, as it does for `bun --aot -`.
+- A read that fails with `EAGAIN`, on a stdin that another process made non-blocking, is the
+  error above and is not tried again.
+- Found on the way, in upstream and in bun 1.4.3, and not changed here:
+  - `echo ... | bun - a b` does not pass `a b` to the script. The `-` is skipped like a flag,
+    `a` is read as the command (`bun add`), and the packages `a` and `b` are installed.
+    `bun - left-pad` and `bun run - a b` are right.
+  - Under the name `node`, `node --version` fails with `Missing script to execute` and
+    `node -v` with `Invalid Argument '-v'`. `--version` is a flag of `bun` alone, so the table
+    of `node` does not know it. A script of package.json that asks `node --version` fails under
+    `bun --bun run`.
+
+Rebase notes. 77 patches onto oven-sh/bun 67d1f55fb37, 41 commits after the base of 2026-11-16
+(5f3f8fe483e). The 41 are the round of "no JS types in the core": the shell builtins share one
+write path and one state enum (oven-sh/bun#49161), the redis client is a core with events
+(oven-sh/bun#49153 and three after it), the postgres and mysql requests are a pipeline of enums
+(oven-sh/bun#49172, oven-sh/bun#49155), an S3 upload is a state machine behind one `NetworkSink`
+(oven-sh/bun#49165), libdeflate, llhttp, ls-hpack and libwebp are Rust crates now, a request of
+the HTTP client has one owner, `bun test --parallel` has a schedule crate, and a bit set is
+borrowed. 32 of the 77 patches stopped the rebase. All were ported and nothing is dropped. The
+build, and a search for what upstream removed, then found errors in four more (`--dry-run`,
+`--filter '[rev]'`, the coverage ignore hints and the compression of `Bun.serve`), each fixed in
+its patch.
+
+- Where a port is more than a port, for a reader who takes one of these patches:
+  - The shell builtins (`wc`, `head` and `tail`, `sort` and `uniq`, `cut`, `wait`, `break` and
+    `continue`, and the changes to `export`, `yes`, `rm`, `mkdir`, `touch`, `cp`): written again
+    for `Builtin::sink`, `finish` and `fail`. The ones that read input keep what they have
+    between events in new variants of upstream's `State` (`Wc`, `HeadTail`, `SortUniq`, `Cut`,
+    `Wait { parked_on }`), and `Builtin::on_io_writer_chunk` calls their `on_write`. `cut` is
+    asked first and gets the error itself, because it tells a closed pipe from the failures it
+    reports. `sort` keeps its own last write, because a failed one exits with 2. The usage
+    strings that the old registry held and nothing printed are gone.
+  - `redis.multi()` (2026-10-20): the queue of a transaction and the reading of its replies are
+    in the core (`src/valkey/client.rs`: `send_transaction`, `Plan`, `on_transaction_reply`, the
+    events `Executed` and `Invalid`), with nine tests in `src/valkey/tests/client.rs`. The JS
+    layer builds the array or the error. A transaction reaches its client through the internal
+    field only.
+  - Cursors (2026-10-26): the states of a cursor are in `src/sql/postgres/pipeline.rs`
+    (`Protocol::{Cursor, Fetch, Close}`, `Stage::Suspended`, `refuses` for the transaction
+    rule), its messages in `frontend.rs`, with four tests in `src/sql/tests/postgres.rs`.
+    `protocol/Close.rs` is gone.
+  - S3 metadata (2026-09-27) and copy (2026-10-25): the metadata is a field of upstream's
+    `Target` and is set in `NetworkSink::send` for the requests that create the object. The copy
+    is a `Callback::Copy` of the new `simple_request.rs`.
+  - SOCKS5 (2026-09-13): `write_socks_handshake` and `on_socks_data` return
+    `ControlFlow<NextStep>`, as `on_writable` and `on_data` do now.
+  - zip (2026-11-06) and the compression of `Bun.serve` (2026-09-04): `bun_deflate`
+    (`Compressor`, `Level`, `compress_to_vec`) where libdeflate was. A compressor that cannot be
+    allocated is an out-of-memory error, where it was `DeflateInitFailed`.
+  - `import.meta.hot` (2026-11-05): `ImportMetaHotUse` is beside upstream's `ParsedForCache` in
+    `src/js_parser/parse/parse_entry.rs`. The cache is still version 53, upstream 52.
+  - `globalSetup` (2026-10-31): `Argv::joined()`. The host of the setup gets `--name=value`, and
+    a worker keeps upstream's `--name value`, which upstream's new test of the worker's
+    arguments pins.
+  - `--last-failed` and `collectCoverageFrom`: upstream has one `count_unfinished` for a file
+    that was interrupted, aborted or lost to a crash. The record of a failed file and
+    `worker_crashed` are set in the arm of the crash, where they were.
+  - `--filter '[rev]'`: `DynamicBitSet::copy_from`, and on Windows one
+    `EventLoopHandle::leak_mini()` for the thread where it made an `AnyEventLoop`.
+  - `collectCoverageFrom`: `SavedSourceMap` is no `OnSourceMapChunk` any more, so
+    `CoverageInclude.rs` has a handler of three lines that files the map.
+  - The file lists of the entries of `redis.multi()`, cursors and `import.meta.hot` name the
+    files as they are now.
+- `cargo fmt --all --check` passes. The source lints pass (203) on the release binary. On the
+  debug build three of them run into their five seconds. The bun-types test passes (30).
+  `cargo test` passes for `bun_valkey`, `bun_sql`, `bun_sql_jsc` and `bun_shell_parser`.
+- Windows and macOS. `cargo check --workspace` passes for `x86_64-pc-windows-msvc` and
+  `aarch64-apple-darwin`. The other ten targets of `bun run rust:check-all` were not checked
+  today. The Windows check found the `AnyEventLoop` line above. Nothing ran on either.
+- What ran afterwards. The debug build links. The 116 test files that the stack adds or changes
+  ran on it, and about 13,800 cases pass. What fails is of this machine or of a debug build: ten
+  PostgreSQL and three MySQL cases (its databases), `should be the node version on the host`,
+  one `--aot` case (see 2026-11-15), two `glob.scan` cases at their 30 seconds, and the seven
+  snapshots of `visible-surface` and `members-of-prototype-objects`, which a debug build cannot
+  match (`AsyncLocalStorage` has an `__id__` there, and `emit` reads `this` for its log). One
+  case of `process.test.js` failed while 33 test files ran in one process and passes when its
+  file runs alone. The server cases of `valkey.test.ts` need the `redis_unified` container, so
+  its eight transaction cases ran against the local Redis from a copy of the block, and pass.
+  `caseChange.test.ts` needed a `bun install` in `test/` first. The fork's three workflows were
+  green for the push of 2026-11-16.
+- Only the tip of the stack was built, as before.
+
+Files: `src/runtime/cli/run_command.rs` (`exec_piped_stdin`, `stdin_is_terminal`, `read_stdin`,
+`read_piped_stdin`, `boot_stdin`, `exec_as_if_node`), `src/runtime/cli/mod.rs`,
+`src/runtime/cli/Arguments.rs`, `src/options_types/context.rs`
+(`may_read_script_from_stdin`), `docs/runtime/index.mdx`, `test/cli/run/run-eval.test.ts`,
+`test/js/bun/shell/exec.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

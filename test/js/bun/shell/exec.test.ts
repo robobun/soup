@@ -136,7 +136,8 @@ describe("bun exec", () => {
     .runAsTest("cd with no arguments works");
 
   test("bun works even when not in PATH", async () => {
-    const val = await $`bun exec 'bun'`.env({ ...bunEnv, PATH: "" }).nothrow();
+    // A `bun` without arguments reads its script from a stdin that is not a terminal, so it gets an empty one.
+    const val = await $`bun exec 'bun' < ${new Response("")}`.env({ ...bunEnv, PATH: "" }).nothrow();
     expect(val.stderr.toString()).not.toContain("bun: command not found: bun");
     expect(val.stdout.toString()).toContain("Bun is a fast JavaScript runtime");
   });

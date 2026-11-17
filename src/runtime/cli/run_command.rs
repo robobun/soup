@@ -3002,19 +3002,9 @@ impl RunCommand {
     fn exec_stdin(ctx: &mut ContextData) -> crate::Result<bool> {
         bun_core::scoped_log!(RUN_LOG, "Executing from stdin");
 
-        // read from stdin
-        // PERF: could swap to
-        // `SmallVec<[u8; 2048]>` if profiled hot; cold CLI path here.
-        // `read_to_end_into` is the cursor-relative streaming reader
-        // (stdin is a pipe/tty, not seekable; `read_to_end` would `pread(0)`).
-        let mut list: Vec<u8> = Vec::new();
-        if bun_sys::File::borrow(&Fd::stdin())
-            .read_to_end_into(&mut list)
-            .is_err()
-        {
+        let Ok(script) = Self::read_stdin() else {
             return Ok(false);
-        }
-        ctx.runtime_options.eval.script = list.leak();
+        };
 
         // Prepend "-" to `ctx.passthrough` so `process.argv[1]` matches
         // Node's `node -` semantics.
@@ -3023,15 +3013,88 @@ impl RunCommand {
         passthrough_list.append(&mut ctx.passthrough);
         ctx.passthrough = passthrough_list;
 
-        // NOT routed through `boot_and_handle_error` — the
-        // stdin path skips the
-        // `configure_allocator(long_running=true)` / `.md` checks and prints
-        // `basename(target_name)` (= "-"), not `basename(entry_path)`
-        // (= "[stdin]"), in the error message.
-        if let Err(err) = Self::boot(ctx, synthetic_entry_point(b"[stdin]"), None) {
+        if let Err(err) = Self::boot_stdin(ctx, script) {
             Self::boot_failed_exit(ctx, b"-", &err);
         }
         Ok(true)
+    }
+
+    /// `echo 'console.log(1)' | bun` and `bun < script.ts`: no script is named
+    /// and stdin is not a terminal, so stdin is the script, as it is for
+    /// `node`, `python` and `sh`. `process.argv` has no `-` in it, as in Node.
+    ///
+    /// `false` if this command line does not read its script from stdin, or
+    /// stdin holds nothing: `bun < /dev/null` gets what a `bun` without a
+    /// script got before, its help.
+    pub(crate) fn exec_piped_stdin(ctx: &mut ContextData) -> crate::Result<bool> {
+        if !ctx.runtime_options.may_read_script_from_stdin || Self::stdin_is_terminal() {
+            return Ok(false);
+        }
+        bun_core::scoped_log!(RUN_LOG, "Executing a script that is piped to stdin");
+
+        let script = Self::read_piped_stdin();
+        if script.is_empty() {
+            return Ok(false);
+        }
+        if let Err(err) = Self::boot_stdin(ctx, script) {
+            Self::boot_failed_exit(ctx, b"[stdin]", &err);
+        }
+        Ok(true)
+    }
+
+    /// Whether a person types what stdin reads.
+    fn stdin_is_terminal() -> bool {
+        if Output::is_stdin_tty() {
+            return true;
+        }
+        // The terminal of Git Bash, and of Cygwin and MSYS2, is a pipe that
+        // is not a console. `bun` there still prints its help.
+        #[cfg(windows)]
+        {
+            use std::io::IsTerminal as _;
+            std::io::stdin().is_terminal()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn read_stdin() -> bun_sys::Result<Vec<u8>> {
+        // PERF: could swap to
+        // `SmallVec<[u8; 2048]>` if profiled hot; cold CLI path here.
+        // `read_to_end_into` is the cursor-relative streaming reader
+        // (stdin is a pipe/tty, not seekable; `read_to_end` would `pread(0)`).
+        let mut script: Vec<u8> = Vec::new();
+        bun_sys::File::borrow(&Fd::stdin()).read_to_end_into(&mut script)?;
+        Ok(script)
+    }
+
+    /// The script that nothing but stdin names. What was read before an
+    /// error is not run.
+    fn read_piped_stdin() -> Vec<u8> {
+        match Self::read_stdin() {
+            Ok(script) => script,
+            Err(err) => {
+                Output::err(err, "Failed to read the script from stdin", ());
+                Global::exit(1);
+            }
+        }
+    }
+
+    /// Runs `script` as the entry point `[stdin]` of the working directory.
+    fn boot_stdin(ctx: &mut ContextData, mut script: Vec<u8>) -> crate::Result<()> {
+        if script.is_empty() {
+            // An empty `eval.script` means that there is none to run.
+            script.push(b'\n');
+        }
+        ctx.runtime_options.eval.script = script.leak();
+
+        // NOT routed through `boot_and_handle_error` — the
+        // stdin path skips the
+        // `configure_allocator(long_running=true)` / `.md` checks, and the
+        // callers say in their error message how the script was named.
+        Self::boot(ctx, synthetic_entry_point(b"[stdin]"), None)
     }
 
     /// `bun serve [dir]`: boot the builtin static file server
@@ -3119,6 +3182,23 @@ impl RunCommand {
             // probe), which is the same check `bun update --interactive` uses.
             if Output::is_stdin_tty() {
                 return Self::exec_node_repl(ctx);
+            }
+            // Node: the script is what a stdin that is not a terminal holds,
+            // also when that is nothing (`node < /dev/null` exits with 0).
+            if !ctx.runtime_options.may_read_script_from_stdin || Self::stdin_is_terminal() {
+                Self::exec_as_if_node_missing_script();
+            }
+            let script = Self::read_piped_stdin();
+            if let Err(err) = Self::boot_stdin(ctx, script) {
+                Self::exec_as_if_node_boot_failed(ctx, b"[stdin]", err);
+            }
+            return Ok(());
+        }
+
+        // `node - a b`: the script is on stdin, and `a b` are its arguments.
+        if ctx.positionals[0].as_ref() == b"-" {
+            if Self::exec_stdin(ctx)? {
+                return Ok(());
             }
             Self::exec_as_if_node_missing_script();
         }

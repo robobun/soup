@@ -1688,6 +1688,9 @@ pub(crate) fn parse(cmd: CommandTag, ctx: Context<'_>) -> crate::Result<api::Tra
         } else if let Some(script) = args.option(b"--eval") {
             ctx.runtime_options.eval.script = script;
         }
+        ctx.runtime_options.may_read_script_from_stdin = unknown_long_flags.is_empty()
+            && args.option(b"--print").is_none()
+            && args.option(b"--eval").is_none();
         ctx.runtime_options.if_present = args.flag(b"--if-present");
         ctx.runtime_options.smol = args.flag(b"--smol");
         // To `node`, `--check` means something else.
