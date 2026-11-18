@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
 import { createHash, createHmac, hash as nodeHash } from "node:crypto";
 import { join } from "node:path";
+import blake3Vectors from "./blake3-test-vectors.json";
 
-// Every digest literal in this file was checked against python hashlib (openssl for md4).
+// Every digest literal in this file was checked against python hashlib (openssl for md4). hashlib has no blake3: its
+// literals are from blake3-test-vectors.json, or are what a build that passes that file gives.
 
 const fileBlob = expect.objectContaining({
   name: "TypeError",
@@ -76,7 +78,9 @@ describe("digest() into a TypedArray needs room for the digest", () => {
   }
   const thenUntouched = (digest: Buffer) => (size: number) =>
     Buffer.concat([digest, Buffer.alloc(size - digest.length, 0xee)]);
-  const isXOF = (algorithm: string) => algorithm.startsWith("shake");
+  // Node has the two SHAKEs, so it says what they fill an array with.
+  const isShake = (algorithm: string) => algorithm.startsWith("shake");
+  const isXOF = (algorithm: string) => isShake(algorithm) || algorithm === "blake3";
   const takesKey = (algorithm: Bun.SupportedCryptoAlgorithms) => {
     try {
       return !!new Bun.CryptoHasher(algorithm, "key");
@@ -95,10 +99,24 @@ describe("digest() into a TypedArray needs room for the digest", () => {
     check(make, thenUntouched(make().digest()));
   });
 
-  test.each(Bun.CryptoHasher.algorithms.filter(isXOF))("%s fills it", algorithm => {
+  test.each(Bun.CryptoHasher.algorithms.filter(isShake))("%s fills it", algorithm => {
     check(
       () => new Bun.CryptoHasher(algorithm).update("abc"),
       outputLength => createHash(algorithm, { outputLength }).update("abc").digest(),
+    );
+  });
+
+  test("blake3 fills it", () => {
+    // 131 bytes of output for the three bytes 0, 1, 2.
+    const output = Buffer.from(blake3Vectors.cases.find(({ input_len }) => input_len === 3)!.hash, "hex");
+    const make = () => new Bun.CryptoHasher("blake3").update(new Uint8Array([0, 1, 2]));
+    for (const size of [32, 33, 63, 64, 65, 131]) {
+      const into = new Uint8Array(size).fill(0xee);
+      expect(make().digest(into)).toBe(into);
+      expect(Buffer.from(into).toString("hex")).toBe(output.subarray(0, size).toString("hex"));
+    }
+    expect(() => make().digest(new Uint8Array(31))).toThrow(
+      expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE", message: "TypedArray must be at least 32 bytes" }),
     );
   });
 });
@@ -455,10 +473,16 @@ describe("HMAC", () => {
     });
   }
 
-  const unsupported = [["shake128"], ["shake256"]] as const;
+  const unsupported = [["shake128"], ["shake256"], ["blake3"]] as const;
   test.each(unsupported)("%s is not supported", algorithm => {
     expect(() => new Bun.CryptoHasher(algorithm, "key")).toThrow("HMAC is not supported for this algorithm yet");
     expect(new Bun.CryptoHasher(algorithm).algorithm).toBe(algorithm);
+  });
+
+  test("a name that is not known is answered with every name", () => {
+    const message = throws(() => new Bun.CryptoHasher("sha257" as Bun.SupportedCryptoAlgorithms, "key"));
+    expect(message).toStartWith("algorithm must be one of ");
+    expect(Bun.CryptoHasher.algorithms.filter(algorithm => !message.includes(`'${algorithm}'`))).toEqual([]);
   });
 });
 
@@ -581,6 +605,7 @@ describe("CryptoHasher", () => {
     "blake2b512":
       "e4cfa39a3d37be31c59609e807970799caa68a19bfaa15135f165085e01d41a65ba1e1b146aeb6bd0092b49eac214c103ccfa3a365954bbbe52f74a2b3620c94",
     "blake2s256": "19213bacc58dee6dbde3ceb9a47cbb330b3d86f8cca8997eb00be456f140ca25",
+    "blake3": "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f",
     "ripemd160": "108f07b8382412612c048d07d13f814118445acd",
     "rmd160": "108f07b8382412612c048d07d13f814118445acd",
     "md4": "866437cb7a794bce2b727acc0362ee27",
@@ -657,5 +682,128 @@ describe("CryptoHasher", () => {
       instance: collect(encoding => new Bun.CryptoHasher(algorithm).update("hello").digest(encoding as any)),
       static: collect(encoding => Bun.CryptoHasher.hash(algorithm, "hello", encoding as any)),
     }).toEqual({ instance: expected, static: expected });
+  });
+});
+
+describe("blake3", () => {
+  // test_vectors.json of the BLAKE3 repository. The input of each case is the bytes 0 to 250, again and again.
+  const cases = blake3Vectors.cases.map(({ input_len, hash }) => ({ length: input_len, output: hash }));
+  const hashOf = (length: number) => cases.find(c => c.length === length)!.output.slice(0, 64);
+  const input = (length: number) => {
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i++) bytes[i] = i % 251;
+    return bytes;
+  };
+
+  test("the official test vectors", () => {
+    expect(cases.map(({ length }) => length)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 63, 64, 65, 127, 128, 129, 1023, 1024, 1025, 2048, 2049, 3072, 3073, 4096, 4097, 5120,
+      5121, 6144, 6145, 7168, 7169, 8192, 8193, 16384, 31744, 102400,
+    ]);
+    const actual = cases.map(({ length }) => {
+      const bytes = input(length);
+      return {
+        length,
+        static: Bun.CryptoHasher.hash("blake3", bytes, "hex"),
+        instance: new Bun.CryptoHasher("blake3").update(bytes).digest("hex"),
+        // A TypedArray gets as much of the output as it holds. Each case has 131 bytes of it.
+        output: Buffer.from(new Bun.CryptoHasher("blake3").update(bytes).digest(new Uint8Array(131))).toString("hex"),
+      };
+    });
+    // The hash is the first 32 bytes of the output.
+    expect(actual).toEqual(
+      cases.map(({ length, output }) => ({
+        length,
+        static: output.slice(0, 64),
+        instance: output.slice(0, 64),
+        output,
+      })),
+    );
+  });
+
+  test("update() in two parts gives the hash of the whole", () => {
+    // Whole kilobytes are hashed in runs of 2, 4, 8 and so on, several at a time. A run begins only where the count of
+    // kilobytes before it is a multiple of its length, so each place to split the input leads to other runs.
+    const wrong: [length: number, split: number][] = [];
+    for (const { length, output } of cases) {
+      const bytes = input(length);
+      const splits = new Set([0, 1, 63, 64, 65, length - 1, length].filter(split => split >= 0 && split <= length));
+      for (let kilobyte = 1024; kilobyte <= length; kilobyte += 1024) {
+        for (const split of [kilobyte - 64, kilobyte - 1, kilobyte, kilobyte + 1]) {
+          if (split <= length) splits.add(split);
+        }
+      }
+      for (const split of splits) {
+        const hasher = new Bun.CryptoHasher("blake3");
+        hasher.update(bytes.subarray(0, split));
+        hasher.update(bytes.subarray(split));
+        if (hasher.digest("hex") !== output.slice(0, 64)) wrong.push([length, split]);
+      }
+    }
+    expect(wrong).toEqual([]);
+  });
+
+  test("an input in one update, in kilobytes and in uneven parts has one hash", () => {
+    // An update of one kilobyte or less is hashed a block at a time. One update with a long input is hashed several
+    // kilobytes at a time, by other code.
+    const kilobytes = [17, 32, 33, 64, 65, 127, 128, 129, 255, 256, 257, 300, 511, 512, 513, 777];
+    const lengths = kilobytes.flatMap(count => [1024 * count, 1024 * count + 1, 1024 * count + 1023]);
+    const bytes = input(1024 * 778);
+    const wrong = lengths.filter(length => {
+      const whole = Bun.CryptoHasher.hash("blake3", bytes.subarray(0, length), "hex");
+      const byKilobyte = new Bun.CryptoHasher("blake3");
+      for (let at = 0; at < length; at += 1024) byKilobyte.update(bytes.subarray(at, Math.min(at + 1024, length)));
+      const uneven = new Bun.CryptoHasher("blake3");
+      for (let at = 0, part = 0; at < length; part++) {
+        const size = 1024 * [3, 5, 1, 8, 2, 40][part % 6] + (part % 3);
+        uneven.update(bytes.subarray(at, Math.min(at + size, length)));
+        at += size;
+      }
+      return byKilobyte.digest("hex") !== whole || uneven.digest("hex") !== whole;
+    });
+    expect(wrong).toEqual([]);
+  });
+
+  test("a hasher is empty after digest(), and a copy goes its own way", () => {
+    const hasher = new Bun.CryptoHasher("blake3");
+    expect({ algorithm: hasher.algorithm, byteLength: hasher.byteLength }).toEqual({
+      algorithm: "blake3",
+      byteLength: 32,
+    });
+    hasher.update(input(3072));
+    const copy = hasher.copy();
+    expect(hasher.digest("hex")).toBe(hashOf(3072));
+    expect(hasher.digest("hex")).toBe(hashOf(0));
+    expect(hasher.update(input(1)).digest("hex")).toBe(hashOf(1));
+    // The copy has the three kilobytes, and gets two more.
+    copy.update(input(5120).subarray(3072));
+    expect(copy.copy().digest("hex")).toBe(hashOf(5120));
+    expect(copy.digest("hex")).toBe(hashOf(5120));
+  });
+
+  test("the name is blake3, in any case", () => {
+    expect(Bun.CryptoHasher.algorithms).toContain("blake3");
+    for (const name of ["BLAKE3", "Blake3"] as string[] as "blake3"[]) {
+      expect(new Bun.CryptoHasher(name).algorithm).toBe("blake3");
+      expect(Bun.CryptoHasher.hash(name, "", "hex")).toBe(hashOf(0));
+    }
+    for (const name of ["blake3-256", "blake-3", "blake3b", "b3"] as string[] as "blake3"[]) {
+      expect(() => new Bun.CryptoHasher(name)).toThrow(`Unsupported algorithm ${name}`);
+      expect(() => Bun.CryptoHasher.hash(name, "")).toThrow(`Unsupported algorithm "${name}"`);
+    }
+  });
+
+  test("static hash() gives the 32 bytes of the hash in each form", () => {
+    const bytes = input(8192);
+    const hash = Buffer.from(hashOf(8192), "hex");
+    expect(Bun.CryptoHasher.hash("blake3", bytes)).toEqual(hash);
+    expect(Bun.CryptoHasher.hash("blake3", bytes, "base64")).toBe(hash.toString("base64"));
+    // Other than digest(), it writes the hash and no more of the output.
+    const into = new Uint8Array(40).fill(0xee);
+    expect(Bun.CryptoHasher.hash("blake3", bytes, into)).toBe(into);
+    expect(Buffer.from(into).toString("hex")).toBe(hash.toString("hex") + "ee".repeat(8));
+    expect(() => Bun.CryptoHasher.hash("blake3", bytes, new Uint8Array(31))).toThrow(
+      "TypedArray must be at least 32 bytes",
+    );
   });
 });

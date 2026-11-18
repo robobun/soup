@@ -14,8 +14,10 @@ use bun_sha_hmac::sha as hashers;
 
 // sha3/blake2 algorithms with no BoringSSL streaming context:
 // RustCrypto's `sha3`/`blake2` crates are wired into the
-// `ZigHashAlgo` trait below.
-use zig_crypto_algos::{Blake2s256, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
+// `ZigHashAlgo` trait below. BLAKE3 is `bun_blake3`.
+use zig_crypto_algos::{
+    Blake2s256, Blake3, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256,
+};
 
 const EVP_MAX_MD_SIZE_USIZE: usize = boring_ssl::EVP_MAX_MD_SIZE as usize;
 
@@ -127,13 +129,21 @@ impl CryptoHasher {
         // SAFETY: caller passes a valid (ptr,len) byte slice
         let name = unsafe { bun_core::ffi::slice(name_bytes.cast::<u8>(), name_len) };
 
-        if let Some(inner) = CryptoHasherZig::init(name) {
-            return Some(Box::new(CryptoHasher::Zig(inner)));
-        }
-
         let algorithm = evp::lookup_ignore_case(name)?;
 
         match algorithm {
+            // node:crypto gets the digests that Node has. Bun.CryptoHasher has one more: blake3.
+            evp::Algorithm::Sha3_224
+            | evp::Algorithm::Sha3_256
+            | evp::Algorithm::Sha3_384
+            | evp::Algorithm::Sha3_512
+            | evp::Algorithm::Shake128
+            | evp::Algorithm::Shake256
+            | evp::Algorithm::Blake2s256 => {
+                if let Some(inner) = CryptoHasherZig::init(algorithm) {
+                    return Some(Box::new(CryptoHasher::Zig(inner)));
+                }
+            }
             evp::Algorithm::Ripemd160
             | evp::Algorithm::Blake2b256
             | evp::Algorithm::Blake2b512
@@ -288,7 +298,8 @@ impl CryptoHasher {
         if let Some(evp) = EVP::by_name(algorithm) {
             return Ok(CryptoHasher::Evp(Box::new(evp)));
         }
-        CryptoHasherZig::init(algorithm)
+        evp::lookup_ignore_case(algorithm)
+            .and_then(CryptoHasherZig::init)
             .map(CryptoHasher::Zig)
             .ok_or_else(|| {
                 heap.invalid_arguments(format_args!(
@@ -466,6 +477,7 @@ mod zig_crypto_algos {
     pub(super) type Shake128 = sha3::Shake128;
     pub(super) type Shake256 = sha3::Shake256;
     pub(super) type Blake2s256 = blake2::Blake2s256;
+    pub(super) type Blake3 = bun_blake3::Hasher;
 
     /// Fixed-digest Keccak/BLAKE2 — `final_` writes exactly `DIGEST_LENGTH`
     /// bytes via `FixedOutputReset`.
@@ -514,6 +526,18 @@ mod zig_crypto_algos {
     impl_xof!(Shake128, Shake128, 16);
     impl_xof!(Shake256, Shake256, 32);
     impl_fixed!(Blake2s256, Blake2s256, 32);
+
+    /// `final_` fills `out` with as much of the output as it has room for, as the SHAKEs do. The hash is the first 32 bytes.
+    impl ZigHashAlgo for Blake3 {
+        const ALGORITHM: evp::Algorithm = evp::Algorithm::Blake3;
+        const DIGEST_LENGTH: u8 = bun_blake3::OUT_LEN as u8;
+        fn update(&mut self, bytes: &[u8]) {
+            Blake3::update(self, bytes);
+        }
+        fn final_(&mut self, out: &mut [u8]) {
+            self.finalize_xof(out);
+        }
+    }
 }
 
 /// Expands the macro once per supported `ZigHashAlgo` type.
@@ -526,6 +550,7 @@ macro_rules! for_each_zig_algo {
         $mac!(Shake128   $(, $($args)*)?);
         $mac!(Shake256   $(, $($args)*)?);
         $mac!(Blake2s256 $(, $($args)*)?);
+        $mac!(Blake3     $(, $($args)*)?);
     };
 }
 
@@ -548,8 +573,7 @@ impl CryptoHasherZig {
         None
     }
 
-    pub(crate) fn init(name: &[u8]) -> Option<CryptoHasherZig> {
-        let algorithm = evp::lookup_ignore_case(name)?;
+    pub(crate) fn init(algorithm: evp::Algorithm) -> Option<CryptoHasherZig> {
         macro_rules! arm {
             ($ty:ty, $alg:expr) => {
                 if $alg == <$ty as ZigHashAlgo>::ALGORITHM {

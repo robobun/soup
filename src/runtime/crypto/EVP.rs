@@ -32,6 +32,7 @@ impl AlgorithmExt for Algorithm {
             Algorithm::Blake2b256 => c"blake2b256",
             Algorithm::Blake2b512 => c"blake2b512",
             Algorithm::Blake2s256 => c"blake2s256",
+            Algorithm::Blake3 => c"blake3",
             Algorithm::Md4 => c"md4",
             Algorithm::Md5 => c"md5",
             Algorithm::Ripemd160 => c"ripemd160",
@@ -48,19 +49,17 @@ impl AlgorithmExt for Algorithm {
             Algorithm::Sha3_512 => c"sha3-512",
             Algorithm::Shake128 => c"shake128",
             Algorithm::Shake256 => c"shake256",
-            // upstream enum is `#[non_exhaustive]`; the variant set is closed in
-            // practice.
-            _ => unreachable!("unhandled EVP algorithm variant"),
         }
     }
 }
 
 /// Stable iteration order over every `Algorithm` variant — the lowered enum is
-/// foreign + `#[non_exhaustive]`, so we can't derive an iterator for it.
-pub(crate) const ALL: [Algorithm; 19] = [
+/// foreign, so we can't derive an iterator for it.
+pub(crate) const ALL: [Algorithm; 20] = [
     Algorithm::Blake2b256,
     Algorithm::Blake2b512,
     Algorithm::Blake2s256,
+    Algorithm::Blake3,
     Algorithm::Md4,
     Algorithm::Md5,
     Algorithm::Ripemd160,
@@ -81,7 +80,7 @@ pub(crate) const ALL: [Algorithm; 19] = [
 
 /// Algorithm names joined as `"'a', 'b', … 'y' or 'z'"` (declaration order),
 /// for "must be one of" error messages.
-pub(crate) const ALGORITHM_ONE_OF: &str = "'blake2b256', 'blake2b512', 'blake2s256', 'md4', 'md5', \
+pub(crate) const ALGORITHM_ONE_OF: &str = "'blake2b256', 'blake2b512', 'blake2s256', 'blake3', 'md4', 'md5', \
 'ripemd160', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512', 'sha512-224', 'sha512-256', \
 'sha3-224', 'sha3-256', 'sha3-384', 'sha3-512', 'shake128' or 'shake256'";
 
@@ -98,6 +97,7 @@ bun_core::comptime_string_map! {
         b"sha256" => Algorithm::Sha256,
         b"sha384" => Algorithm::Sha384,
         b"sha512" => Algorithm::Sha512,
+        b"blake3" => Algorithm::Blake3,
         b"rmd160" => Algorithm::Ripemd160,
         b"sha-224" => Algorithm::Sha224,
         b"sha-256" => Algorithm::Sha256,

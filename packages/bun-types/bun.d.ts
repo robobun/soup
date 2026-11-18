@@ -7754,6 +7754,7 @@ declare module "bun" {
     | "blake2b256"
     | "blake2b512"
     | "blake2s256"
+    | "blake3"
     | "md4"
     | "md5"
     | "ripemd160"
@@ -7822,7 +7823,7 @@ declare module "bun" {
     /**
      * Finalize the hash
      *
-     * @param hashInto `TypedArray` to write the hash into. Faster than creating a new one each time. It must hold at least {@link byteLength} bytes. `shake128` and `shake256` fill all of it.
+     * @param hashInto `TypedArray` to write the hash into. Faster than creating a new one each time. It must hold at least {@link byteLength} bytes. `shake128`, `shake256` and `blake3` fill all of it.
      */
     digest(hashInto: NodeJS.TypedArray): NodeJS.TypedArray;
 

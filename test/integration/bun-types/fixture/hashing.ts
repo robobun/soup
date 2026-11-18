@@ -7,6 +7,17 @@ crc = Bun.hash.crc32(new Uint8Array([1, 2, 3]), crc);
 crc = Bun.hash.crc32(new Uint8Array([4, 5, 6]), crc);
 
 {
+  const blake3 = new Bun.CryptoHasher("blake3");
+  blake3.update("hello world").digest("hex") satisfies string;
+  blake3.digest(new Uint8Array(64)) satisfies NodeJS.TypedArray;
+  Bun.CryptoHasher.hash("blake3", "hello world") satisfies Buffer;
+  const algorithm: Bun.SupportedCryptoAlgorithms = "blake3";
+  algorithm;
+  // @ts-expect-error the name has no length in it
+  new Bun.CryptoHasher("blake3-256");
+}
+
+{
   const argon2 = { algorithm: "argon2id", memoryCost: 65536, timeCost: 3 } as const;
   const hash: string = Bun.password.hashSync("hunter2", argon2);
 

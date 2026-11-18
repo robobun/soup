@@ -21,6 +21,7 @@ Bun statically links these libraries:
 | Library | License |
 |---------|---------|
 | [`boringssl`](https://boringssl.googlesource.com/boringssl/) | [several licenses](https://boringssl.googlesource.com/boringssl/+/refs/heads/master/LICENSE) |
+| [`BLAKE3`](https://github.com/BLAKE3-team/BLAKE3) (not linked: `src/blake3` and its kernel are derived from it) | CC0 1.0, or Apache 2.0 |
 | [`brotli`](https://github.com/google/brotli) (not linked: the Brotli codec is derived from parts of it) | MIT |
 | [`libarchive`](https://github.com/libarchive/libarchive) (not linked: `src/tar` is derived from parts of it) | [several licenses](https://github.com/libarchive/libarchive/blob/master/COPYING) |
 | [`llhttp`](https://github.com/nodejs/llhttp) (not linked: `src/http1` is derived from parts of it) | MIT |

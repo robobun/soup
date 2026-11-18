@@ -287,6 +287,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bun_blake3"
+version = "0.0.0"
+dependencies = [
+ "bun_highway",
+]
+
+[[package]]
 name = "bun_boringssl"
 version = "0.0.0"
 dependencies = [
@@ -1633,6 +1640,7 @@ dependencies = [
  "bun_ast",
  "bun_ast_jsc",
  "bun_base64",
+ "bun_blake3",
  "bun_boringssl",
  "bun_boringssl_sys",
  "bun_brotli",

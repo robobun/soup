@@ -200,7 +200,7 @@ describe("Bun.CSRF", () => {
     }
     // @ts-expect-error - testing invalid input
     expect(() => CSRF.verify()).toThrow(invalid("token must be a string"));
-    for (const algorithm of ["md5", "sha1", "bogus", ""] as any[]) {
+    for (const algorithm of ["md5", "sha1", "blake3", "bogus", ""] as any[]) {
       expect(() => CSRF.generate(secret, { algorithm })).toThrow(invalid("Algorithm not supported"));
       expect(() => CSRF.verify(token, { secret, algorithm })).toThrow(invalid("Algorithm not supported"));
     }

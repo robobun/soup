@@ -186,11 +186,11 @@ pub mod evp {
     /// We do this to avoid asking BoringSSL what the digest name is, because
     /// that API is confusing.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-    #[non_exhaustive]
     pub enum Algorithm {
         Blake2b256,
         Blake2b512,
         Blake2s256,
+        Blake3,
         Md4,
         Md5,
         Ripemd160,
@@ -231,7 +231,10 @@ pub mod evp {
                 Algorithm::Sha3_256 => Some(ffi::EVP_sha3_256()),
                 Algorithm::Sha3_384 => Some(ffi::EVP_sha3_384()),
                 Algorithm::Sha3_512 => Some(ffi::EVP_sha3_512()),
-                _ => None,
+                Algorithm::Blake2s256
+                | Algorithm::Blake3
+                | Algorithm::Shake128
+                | Algorithm::Shake256 => None,
             }
         }
     }

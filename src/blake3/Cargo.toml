@@ -1,0 +1,18 @@
+[package]
+name = "bun_blake3"
+version.workspace = true
+edition.workspace = true
+autotests = false
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bun_highway.workspace = true
+
+[[test]]
+name = "blake3"
+path = "tests/main.rs"

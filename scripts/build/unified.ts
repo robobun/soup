@@ -172,6 +172,8 @@ const noUnify: readonly string[] = [
   "src/jsc/bindings/highway_zlib.cpp",
   // The highway TU of the zstd encoder — same reason.
   "src/jsc/bindings/highway_zstd.cpp",
+  // The highway TU of BLAKE3: same reason.
+  "src/jsc/bindings/highway_blake3.cpp",
   // Declares its own minimal CGRect/kCFStringEncodingUTF8/kCFNumberDoubleType
   // so it doesn't pull a CoreGraphics load command; bundled with files that
   // include the real CF headers those names become ambiguous.

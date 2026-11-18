@@ -264,6 +264,7 @@ Bun.hash.rapidhash("data", 1234);
 - `"blake2b256"`
 - `"blake2b512"`
 - `"blake2s256"`
+- `"blake3"`
 - `"md4"`
 - `"md5"`
 - `"ripemd160"`
@@ -343,6 +344,35 @@ hasher.digest(arr);
 console.log(arr);
 // => Uint8Array(32) [ 185, 77, 39, 185, 147, ... ]
 ```
+
+### BLAKE3
+
+`"blake3"` gives a 32-byte hash. BLAKE3 is made to hash long inputs fast. Within one `update()` or `hash()` call, runs of two or more kilobytes are hashed several kilobytes at a time with the widest vector instructions that the CPU has: AVX-512, AVX2, SSSE3 or NEON. An update of less than two kilobytes is hashed one 64-byte block at a time, so give a long input to `update()` in large parts.
+
+```ts
+const hasher = new Bun.CryptoHasher("blake3");
+hasher.update("hello world");
+hasher.digest("hex");
+// => "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24"
+
+Bun.CryptoHasher.hash("blake3", "hello world", "base64");
+// => "10mB76cKDIgLjYwZhdB128v2ebmaX5kU5ar5a4ManiQ="
+```
+
+BLAKE3 can give more than 32 bytes of output. `.digest()` with a `TypedArray` fills the whole array, and the first 32 bytes are the hash. `"shake128"` and `"shake256"` do the same.
+
+```ts
+const hasher = new Bun.CryptoHasher("blake3");
+hasher.update("hello world");
+
+const out = new Uint8Array(64);
+hasher.digest(out);
+// The first 32 bytes of `out` are the hash above. The other 32 continue the output.
+```
+
+`"blake3"` is an algorithm of `Bun.CryptoHasher` only. `node:crypto` does not have it, as in Node.js: `crypto.createHash("blake3")` throws. There is one exception. `crypto.hash()` with a `TypedArray` for the result is a form that Node.js does not have. It is `Bun.CryptoHasher.hash()`, and takes `"blake3"`.
+
+The keyed mode and the key derivation mode of BLAKE3 are not available, and `"blake3"` does not take an HMAC key.
 
 ### HMAC in `Bun.CryptoHasher`
 
