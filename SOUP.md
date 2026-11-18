@@ -11601,6 +11601,251 @@ Files: `src/runtime/cli/run_command.rs` (`exec_piped_stdin`, `stdin_is_terminal`
 (`may_read_script_from_stdin`), `docs/runtime/index.mdx`, `test/cli/run/run-eval.test.ts`,
 `test/js/bun/shell/exec.test.ts`.
 
+### 2026-11-18: BLAKE3 in `Bun.CryptoHasher`
+
+`new Bun.CryptoHasher("blake3")` threw `Unsupported algorithm blake3`. oven-sh/bun#24111 asks for
+it (open since October 2025, 20 thumbs up). BLAKE3 is what content-addressed stores, build caches
+and file synchronisers hash with, because a long input is hashed several kilobytes at a time, and
+in Bun that meant a package in JavaScript or WebAssembly, or a native addon. It is now an
+algorithm of `Bun.CryptoHasher`, from a new crate in safe Rust and one Highway kernel.
+
+```ts
+const hasher = new Bun.CryptoHasher("blake3");
+hasher.update("hello ");
+hasher.update("world");
+hasher.digest("hex"); // "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24"
+
+Bun.CryptoHasher.hash("blake3", await Bun.file("disk.img").bytes()); // a Buffer of 32 bytes
+
+// BLAKE3 has as much output as is asked for. A TypedArray gets as much as it holds.
+const sixtyFour = new Bun.CryptoHasher("blake3")
+  .update("hello world")
+  .digest(new Uint8Array(64));
+```
+
+- The name is `blake3`, in any case of its letters. `.algorithm` is `"blake3"`, `.byteLength` is
+  32, and `Bun.CryptoHasher.algorithms` and the type `Bun.SupportedCryptoAlgorithms` have it.
+  `blake3-256` is not a name: a name that is accepted cannot be taken back later.
+- `digest()`, `digest(encoding)` and the static `hash()` give the 32 bytes of the hash.
+  `digest(typedArray)` fills the whole array, as it does for `shake128` and `shake256`, and the
+  first 32 bytes are the hash. An array of less than 32 bytes throws. The static
+  `hash(name, input, typedArray)` writes 32 bytes and no more, as it writes 16 for `shake128`.
+- `update()`, `copy()` and the empty hasher after `digest()` are those of every algorithm.
+- It takes no key. `new Bun.CryptoHasher("blake3", key)` throws
+  `HMAC is not supported for this algorithm yet`, as for `blake2s256` and the SHAKEs. That
+  argument means HMAC. BLAKE3 has a keyed mode of its own, which is not HMAC, and an argument
+  that means one thing for 16 algorithms and another for the 17th is a trap. The keyed mode and
+  the key derivation mode are not exposed.
+- `node:crypto` does not have it, because Node does not. `createHash("blake3")` throws
+  `Digest method not supported`, `crypto.hash("blake3", data)` throws
+  `Digest method blake3 is not supported`, `createHmac` throws `ERR_CRYPTO_INVALID_DIGEST` and
+  `getHashes()` does not list it. node:crypto gets the digests that BoringSSL has no streaming
+  context for from the hashers of `Bun.CryptoHasher`, and it got every one of them. That bridge
+  is a list now (the four SHA-3, the two SHAKEs, `blake2s256`, and the four it had by name), so
+  an algorithm that is added to `Bun.CryptoHasher` is not added to node:crypto by accident. The
+  one form of `crypto.hash()` that Node does not have, with a TypedArray for the result, is
+  `Bun.CryptoHasher.hash()` and takes `blake3`.
+- `Bun.CSRF` does not take it. Its list of algorithms is its own.
+
+Numbers. The release build for linux x64 at `-march=nehalem`, on an AMD EPYC with AVX-512.
+`Bun.CryptoHasher.hash(name, input, typedArray)`, the median of 10 interleaved rounds, in MiB/s.
+Two rows of the same algorithm differ by 0.2% at most up to 1 MiB, and by 1.7% at 16 MiB.
+
+| MiB/s                  | 32 B | 1 KiB | 2 KiB | 4 KiB | 16 KiB | 64 KiB | 1 MiB | 16 MiB |
+| ---------------------- | ---- | ----- | ----- | ----- | ------ | ------ | ----- | ------ |
+| `blake3`               | 174  | 954   | 1243  | 2331  | 7965   | 9453   | 9912  | 9658   |
+| the AVX2 kernel alone  |      |       | 919   | 1726  | 3482   | 3700   | 3751  | 3671   |
+| the SSSE3 kernel alone |      |       | 992   | 1874  | 2024   | 2072   | 2077  | 1955   |
+| in updates of 1 KiB    |      |       | 891   | 925   | 953    | 967    | 966   | 964    |
+| `sha256`               | 277  | 1707  | 1878  | 1986  | 2076   | 2098   | 2102  | 2096   |
+| `sha1`                 | 296  | 1803  | 1988  | 2101  | 2192   | 2212   | 2220  | 2221   |
+| `blake2b512`           | 164  | 1027  | 1066  | 1089  | 1108   | 1113   | 1114  | 1116   |
+| `sha512`               | 137  | 741   | 814   | 849   | 884    | 891    | 895   | 895    |
+
+The second and third rows are builds with the wider targets compiled out, 6 rounds each. An
+update of less than two kilobytes never reaches the kernel, so the fourth row is the code for
+one block at a time, with a call from JavaScript for each kilobyte. An input that comes in such
+updates is hashed at that speed, however long it is, and the docs say so. Up to one kilobyte
+BLAKE3 is that code alone, and this CPU hashes SHA-256 and SHA-1 with instructions of their own:
+175 ns against 110 ns for 32 bytes, and 0.56 of the speed of `sha256` at 1 KiB. From 4 KiB with
+AVX-512, and from 16 KiB with AVX2, it is the fastest row of the table.
+
+What it costs a program that never names it, measured on the same two release builds:
+
+- 28,672 bytes of executable (156,096,704 to 156,125,376, stripped). 12,774 of them are the
+  kernel (6,962 for AVX-512, 3,037 for AVX2, 2,775 for SSSE3), 8,688 the crate, 434 the dispatch.
+- No static initializer, and no instruction of it at startup or in a call for `sha256`,
+  `shake256`, `blake2s256` or a digest of node:crypto (`qemu-x86_64 -d in_asm` over its symbols
+  shows no block. One `blake3` call shows 76).
+- The lookup of a name, in instructions of `lookup_ignore_case` for one call, counted with
+  `qemu-x86_64 -one-insn-per-tb`: `sha256` 89 to 89, `sha512` 89 to 89, `sha1` 60 to 60, `md5`
+  55 to 55, `blake2b512` 124 to 124, `shake256` 206 to 206. Two names change, `sha384` from 86
+  to 92 and `sha224` from 92 to 89, because `blake3` is the seventh name of six letters and
+  the comparisons of that length have a new order.
+- Cells of the garbage collector for one call, from `heapStats()`: the constructor 1 to 1,
+  `update()`, `digest(typedArray)` and the static `hash()` 0 to 0. One read of
+  `Bun.CryptoHasher.algorithms` makes 20 strings where it made 19.
+- A `blake3` hasher is 136 bytes beside its cell. 200,000 of them alive, each after one update
+  and one digest, peak at 91 to 94 MB of resident memory. The same loop is 82 to 84 MB for
+  `blake2s256` and 122 to 125 MB for `sha256`, before this commit and after it.
+
+How it is built.
+
+- `src/blake3` is the crate `bun_blake3`, `#![forbid(unsafe_code)]`, derived from the reference
+  implementation of the BLAKE3 team (CC0, listed in `LICENSE.md`), the hash mode alone. It has
+  the compression function for one block, the state of one chunk, and the tree.
+- The tree is driven the way the `blake3` crate drives it and not the way the reference does.
+  The reference hashes a chunk, then merges. Here, while more than one kilobyte is left, the
+  longest run of whole chunks that is a power of two, that begins where a subtree of its length
+  begins, and that is 256 at most goes to the kernel in one call. The kernel gives the chaining
+  value of each chunk, then each level of parents is one more call, down to two values. Those
+  two go on the stack unmerged, because their parent is the root if no more input comes, and
+  the root is compressed another way. The last kilobyte of an input is never hashed ahead, for
+  the same reason.
+- A run is two chunks or more. On this CPU two chunks in the kernel are 1.3 times the scalar
+  code with AVX-512 and 1.0 to 1.05 times with SSSE3. With AVX2 they are 0.93 to 0.98 times,
+  so up to 7% slower than without the kernel, and four chunks are 1.8 times. The lower numbers
+  are from the review of the commit, with the constructor, `update()` and `digest()`.
+- The stack of chaining values is a `Vec` that is empty until the second kilobyte. Inline it
+  is 1,728 bytes for an input of 2^64 bytes, and most hashers see one kilobyte or less. A
+  `const` assertion holds the hasher at 136 bytes.
+- `src/jsc/bindings/highway_blake3.cpp` is the kernel: `Blake3HashMany` compresses several
+  inputs at a time, one in each 32-bit lane, for chunks (16 blocks each) and for parents (one
+  block each). The words of the inputs are transposed into the lanes with interleaves, and the
+  chaining values are written as the bytes that the next level reads. It is compiled for the
+  baseline (SSSE3 on x64, NEON on arm64), for AVX2 and for AVX-512, and `BUN_HWY_DISPATCH` picks
+  one at the first call. The AVX-512 target has groups of 16 and of 8, the others one width. A
+  group that is not full hashes its last input again in the lanes that are left, so the kernel
+  hashes every input it is given and returns nothing. A kernel that did less would give a wrong
+  hash, and no caller has a scalar loop that could hide that.
+- The seven rounds are a loop. Unrolled, with the schedule as constants, the three targets were
+  32,690 bytes where they are 12,774, and 1% to 4% faster with AVX-512. With a group of four
+  lanes beside each wider one they were 46,275 bytes and no faster.
+- `bun_highway::blake3::hash_many` is the safe wrapper, and the one `unsafe` block of what
+  ships. The stand-in for the kernel in the tests of the crate has another. The wrapper panics
+  unless the input is exactly as many inputs as the output has room for.
+- The algorithm is one more variant of `bun_sha_hmac::evp::Algorithm` and one more row of
+  `for_each_zig_algo!` in `src/runtime/crypto/CryptoHasher.rs`, which is how `blake2s256` and
+  the SHAKEs are there. The enum is not `#[non_exhaustive]` any more, and `tag_cstr` has no
+  `_ => unreachable!` arm, so a variant without a name is an error of the compiler and not a
+  panic in `.algorithm`.
+
+Why not the `blake3` crate of crates.io, which is one dependency and one row. The registry crates
+of `Cargo.lock` went from 186 at the port to Rust to 182, and the six that came are for tests and
+for one build script, so it would be the first one added to what ships. Built without a C
+compiler it has kernels written with `core::arch` and a CPU detection of its own, which is what
+`clippy.toml` and the source lint `byte-search.test.ts` keep out of the tree, and it has none for
+NEON or AVX-512.
+Built with one, its build script needs a C compiler for each of the twelve targets. And why not
+the crate of this commit without a kernel: it is the row of updates of 1 KiB above, 0.46 of the
+speed of `sha256` on this CPU, for an issue whose reason is speed.
+
+Tests.
+
+- `cargo test -p bun_blake3` (8 tests, and the crate is in `scripts/rust-test.ts`). The 35
+  official test vectors at 131 bytes of output, and their prefixes. The file is
+  `test/js/bun/util/blake3-test-vectors.json`, as it is in the BLAKE3 repository. A second
+  BLAKE3 in `tests/support.rs`, written the plain way of the paper, passes the same vectors and
+  then says what to expect at 125 more lengths, for two updates split at each place near a
+  block and a chunk, for updates of 17 sizes, and for 300 inputs in updates of changing sizes.
+  That BLAKE3 also stands in for the kernel, as `src/deflate/tests/support.rs` does for its
+  kernels, and records each call. One test has the list of calls for 1, 2, 3, 4, 8, 16, 17, 100
+  and 600 kilobytes, and one for a run that cannot begin where the input does.
+- `test/js/bun/util/bun-cryptohasher.test.ts`, 10 new cases, through the real kernel. The
+  official vectors by the constructor, by the static `hash()` and into an array of 131 bytes.
+  Each vector in two updates, split near every kilobyte. 48 lengths up to 777 kilobytes in one
+  update, in updates of one kilobyte, which the kernel never sees, and in uneven updates: the
+  three agree. The empty hasher after `digest()`, `copy()`, the name in capitals, four names
+  that are refused, the key that is refused, and the three forms of the static `hash()`. The
+  tables of the file that list every algorithm have `blake3`, and one case holds the message
+  for a name that is not known to the list of algorithms. Without the commit 9 of the 10 fail
+  and the other 145 cases of the file pass.
+- `test/js/node/crypto/crypto.test.ts` has the list of algorithms, the digest of `hello world`,
+  and one case for what node:crypto answers. `crypto-hmac-algorithm.test.ts` and
+  `csrf.test.ts` have the name where they list what is refused.
+- `test/js/bun/jsc-stress/fixtures/simd-baseline.test.ts`, which CI runs under an emulated
+  baseline CPU, hashes the official vectors of two kilobytes and more.
+- The three x64 targets ran here. AVX-512 on the host. AVX2 under `qemu-x86_64 -cpu Haswell` and
+  SSSE3 under `-cpu Nehalem`: the 9 cases and the `simd-baseline` case pass on the debug build,
+  and a line printed from the kernel named the target each time (the line is not in the
+  commit). `scripts/verify-baseline-static` passes on the release build with two new lines in
+  `allowlist-x64.txt`, for the AVX2 and AVX-512 kernels.
+
+Not done, and known.
+
+- The NEON target did not run, and no arm64 or Windows build was made: there is no such machine
+  here, and the fork's CI builds nothing. The kernel is one template for every width, so NEON
+  takes the path that SSSE3 takes, with other instructions under it. The two lines in
+  `allowlist-x64-windows.txt` are the Linux lines in the spelling of that file, and were not
+  made by a Windows build.
+- oven-sh/bun#49021, open, replaces Highway with `bun_simd`, SIMD in safe Rust. If it lands,
+  `highway_blake3.cpp` and the body of `bun_highway::blake3::hash_many` are written again on
+  it, about 250 lines. The crate, the name, the tests and the docs stay.
+- Up to one kilobyte the code is scalar, and slower than `sha256` where the CPU has SHA
+  instructions. The `blake3` crate compresses a single block with vectors too. That is a second
+  kernel, and it is not here.
+- No keyed mode, no key derivation mode and no option for the length of the output. Each needs
+  an argument that `Bun.CryptoHasher` does not have yet, and must not be the HMAC key.
+- The static `hash(name, input, typedArray)` writes `byteLength` bytes for the SHAKEs and for
+  `blake3`, and `digest(typedArray)` fills the array. That difference is older than this
+  commit.
+- `bun_sha_hmac::hmac::generate` still panics for a variant that BoringSSL has no `EVP_MD` for.
+  `Bun.CSRF`, its one caller with a name from JavaScript, keeps such names away with its list.
+- `new Bun.CryptoHasher(name, key)` with a name that is not known answers with the list of all
+  algorithms, and four of the twenty take no key: `blake2s256`, the two SHAKEs, and now
+  `blake3`. A review of the diff before the push asked for `blake3` to be left out of that
+  message. It is kept, so that the message and `Bun.CryptoHasher.algorithms` stay one list,
+  and a test holds them together. The other seven points of that review are changed in the
+  commit: the docs and the test for the one form of `crypto.hash()` that takes `blake3`, the
+  docs for updates of less than two kilobytes, the comment and the numbers for a short run
+  with AVX2, and four of wording and types.
+- oven-sh/bun#27028 (zacoons, February 2026) was the first patch for the issue: one line that
+  put Zig's `std.crypto.hash.Blake3` into the same table under the name `blake3-256`. It was
+  closed after the rewrite in Rust took the file and the implementation away. This commit has
+  its place in the table, and its edits to the lists of the tests.
+
+Rebase notes. 78 patches onto oven-sh/bun 4ce14ba8b15, 5 commits after the base of 2026-11-17
+(67d1f55fb37).
+
+- `redis.multi()` (2026-10-20) stopped the rebase in three files. oven-sh/bun#49200 gives
+  `connect()` and `onclose` the reason of a failure and added `Reason` and a helper `refused`
+  where the patch added `Transaction` and a helper `invalid`. Both are kept. The tests of the
+  crate pass (`cargo test -p bun_valkey`, 43), and so do `connection-failures.test.ts` (112),
+  `valkey-gc.test.ts` (29), the 19 cases of `valkey.test.ts` that need no server, and its 8
+  transaction cases against the local Redis from a copy of the block.
+- The compression of `Bun.serve` (2026-09-04) did not stop the rebase and did not build.
+  oven-sh/bun#49035 replaces the brotli library with an encoder in safe Rust, and
+  `bun_brotli::encode_append` is gone. `Compression.rs` uses `Encoder::with_quality` and
+  `max_compressed_size` now, in its patch. `bun-serve-compress.test.ts` passes (22).
+- oven-sh/bun#49154 gives the DOM wrappers one base class. The wrappers that the stack adds
+  built as they were, and their tests pass: EventSource (18), FileReader (44), Web Storage (36),
+  Web Locks (36).
+- `cargo clippy --workspace`, which upstream's CI runs and the fork's does not, refused one
+  statement in each of two patches: `jsr:` (2026-10-18, `field_reassign_with_default` in
+  `src/resolver/package_json.rs`) and cursors (2026-10-26, `needless_pass_by_value` for `park`
+  in `src/sql_jsc/postgres/Cursor.rs`). Each is changed in its patch, and clippy passes for the
+  workspace.
+- `cargo fmt --all --check` passes. The source lints pass (206) on the release build. The
+  bun-types test passes (30) with `AOT_ENGINE_DIRECTORY` set to the `aot` folder of the
+  prebuilt WebKit, which one of its cases needs on a machine without `vendor/WebKit`. Also run
+  on the debug build after the rebase: `module-graph-isolation.test.ts` (417) and
+  `proxy.test.ts` (148). The fork's three workflows were green for the push of 2026-11-17.
+- Only the tip of the stack was built, as before.
+
+Files: `src/blake3/` (`lib.rs`, `Cargo.toml`, `tests/main.rs`, `tests/support.rs`),
+`src/jsc/bindings/highway_blake3.cpp`, `src/highway/blake3.rs`, `src/highway/lib.rs`,
+`src/sha_hmac/sha.rs`, `src/runtime/crypto/EVP.rs`, `src/runtime/crypto/CryptoHasher.rs`,
+`src/runtime/Cargo.toml`, `Cargo.toml`, `Cargo.lock`, `scripts/build/unified.ts`,
+`scripts/build/flags.ts`, `scripts/build/bun.ts`, `scripts/build/deps/highway.ts`,
+`scripts/rust-test.ts`, `scripts/verify-baseline-static/allowlist-x64.txt`,
+`scripts/verify-baseline-static/allowlist-x64-windows.txt`, `LICENSE.md`,
+`docs/project/license.mdx`, `docs/runtime/hashing.mdx`, `packages/bun-types/bun.d.ts`,
+`bench/snippets/crypto-hasher.mjs`, `test/js/bun/util/blake3-test-vectors.json`,
+`test/js/bun/util/bun-cryptohasher.test.ts`, `test/js/bun/util/csrf.test.ts`,
+`test/js/node/crypto/crypto.test.ts`, `test/js/node/crypto/crypto-hmac-algorithm.test.ts`,
+`test/js/bun/jsc-stress/fixtures/simd-baseline.test.ts`,
+`test/integration/bun-types/fixture/hashing.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

@@ -860,6 +860,14 @@ _ZN3bun9N_AVX3_DLL14ZstdWriteCodesEPKhmPKtPhmPm  [AVX, AVX2, AVX512BW, AVX512DQ,
 
 
 # ----------------------------------------------------------------------------
+# Bun BLAKE3 (src/jsc/bindings/highway_blake3.cpp).
+# Gate: BUN_HWY_DISPATCH (highway_dispatch.h) via hwy::SupportedTargets. (2 symbols)
+# ----------------------------------------------------------------------------
+_ZN3bun6N_AVX2L14Blake3HashManyEPKhmmPKjmbjjjPh  [AVX, AVX2]
+_ZN3bun6N_AVX3L14Blake3HashManyEPKhmmPKjmbjjjPh  [AVX, AVX2, AVX512BW, AVX512F, AVX512VL]
+
+
+# ----------------------------------------------------------------------------
 # Bun Brotli (src/brotli).
 # Gate: with_bmi2! (src/highway/lib.rs) via is_x86_feature_detected!("bmi2"). (8 symbols)
 # ----------------------------------------------------------------------------

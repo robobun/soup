@@ -18,6 +18,7 @@ import {
 } from "node:zlib";
 import * as zlibGolden from "../../../node/zlib/zlib-golden/observe";
 import { decodeDifferences, encodeDifferences, inParts, loadCases } from "../../image/webp-golden/observe";
+import blake3Vectors from "../../util/blake3-test-vectors.json";
 import * as zstdGolden from "../../util/zstd-golden/observe";
 
 // Use Buffer.alloc instead of "x".repeat() — repeat is slow in debug JSC builds.
@@ -771,5 +772,17 @@ describe("zstd codec: BMI2 runtime dispatch", () => {
   });
   test.each(inParts(zstd.decode, ["stored"], 40))("decompress, part %#", async some => {
     expect(await zstdGolden.decodeDifferences(some)).toBe("");
+  });
+});
+
+describe("BLAKE3: Highway runtime dispatch", () => {
+  // src/jsc/bindings/highway_blake3.cpp hashes 16, 8 or 4 kilobytes of a run at a time, and the two of a short run in
+  // half a vector. The official test vectors have runs of 2, 4, 8, 16, 32 and 64 kilobytes.
+  test("runs of whole kilobytes", () => {
+    const cases = blake3Vectors.cases.filter(({ input_len }) => input_len >= 2048);
+    const bytes = Buffer.alloc(102_400);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = i % 251;
+    const hashes = cases.map(({ input_len }) => Bun.CryptoHasher.hash("blake3", bytes.subarray(0, input_len), "hex"));
+    expect(hashes).toEqual(cases.map(({ hash }) => hash.slice(0, 64)));
   });
 });

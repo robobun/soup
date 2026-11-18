@@ -2,6 +2,7 @@
 // Per crate map: `bun.highway.*` → `bun_highway::*` (same C++ backing).
 #![feature(core_io_borrowed_buf, fn_align, hint_prefetch)]
 
+pub mod blake3;
 pub mod brotli;
 pub mod checksums;
 pub mod webp;

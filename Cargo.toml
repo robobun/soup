@@ -102,6 +102,7 @@ members = [
   "src/sys_jsc",
   "src/dispatch",
   "src/brotli",
+  "src/blake3",
   "src/bundler_jsc",
   "src/perf",
   "src/resolve_builtins",
@@ -482,6 +483,7 @@ bun_sha_hmac = { path = "src/sha_hmac" }
 bun_sys_jsc = { path = "src/sys_jsc" }
 bun_dispatch = { path = "src/dispatch" }
 bun_brotli = { path = "src/brotli" }
+bun_blake3 = { path = "src/blake3" }
 bun_bundler_jsc = { path = "src/bundler_jsc" }
 bun_perf = { path = "src/perf" }
 bun_resolve_builtins = { path = "src/resolve_builtins" }
@@ -550,6 +552,10 @@ opt-level = 3
 
 # Unoptimized, the default quality takes seconds for a few kilobytes.
 [profile.dev.package.bun_brotli]
+opt-level = 3
+
+# Loops over every byte that is hashed.
+[profile.dev.package.bun_blake3]
 opt-level = 3
 
 # Runs for every byte that a WebSocket server receives.

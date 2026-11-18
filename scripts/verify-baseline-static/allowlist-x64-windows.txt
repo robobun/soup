@@ -834,6 +834,14 @@ bun::N_AVX3_DL::ZstdWriteCodes  [AVX, AVX2, AVX512BW, AVX512DQ, AVX512F, AVX512V
 
 
 # ----------------------------------------------------------------------------
+# Bun BLAKE3 (src/jsc/bindings/highway_blake3.cpp).
+# Gate: BUN_HWY_DISPATCH (highway_dispatch.h) via hwy::SupportedTargets. (2 symbols)
+# ----------------------------------------------------------------------------
+bun::N_AVX2::Blake3HashMany  [AVX, AVX2]
+bun::N_AVX3::Blake3HashMany  [AVX, AVX2, AVX512BW, AVX512F, AVX512VL]
+
+
+# ----------------------------------------------------------------------------
 # Bun Brotli (src/brotli).
 # Gate: with_bmi2! (src/highway/lib.rs) via is_x86_feature_detected!("bmi2"). (8 symbols)
 # ----------------------------------------------------------------------------
