@@ -171,6 +171,8 @@ Once installed, the binary can upgrade itself:
 bun upgrade
 ```
 
+To install one version in place of the running one, newer or older, pass the version: `bun upgrade 1.3.3`. See [Installing Older Versions](#installing-older-versions).
+
 <Tip>
 **Homebrew users** <br />
 To avoid conflicts with Homebrew, use `brew upgrade bun` instead.
@@ -202,7 +204,28 @@ Use a canary build to test new features and bug fixes before they reach a stable
 
 ## Installing Older Versions
 
-Since Bun is a single binary, you can install older versions by re-running the installer script with a specific version.
+`bun upgrade` takes a version and installs that release in place of the running one. The version can be older or newer.
+
+```bash terminal icon="terminal"
+bun upgrade 1.3.3
+```
+
+`v1.3.3`, `bun-v1.3.3` and `--version 1.3.3` name the same release. A partial version such as `1.3` is not accepted. The download is checked against the SHA-256 that GitHub lists for the release. Releases up to v1.2.15 were published without one: `bun upgrade` installs them without that check and prints a warning. On an x64 CPU without AVX2, `bun upgrade <version>` installs the `-baseline` build of that release.
+
+<Warning>
+  An older release does not have the security fixes of the releases after it. Read the [security
+  advisories](https://github.com/oven-sh/bun/security/advisories) before you stay on one.
+</Warning>
+
+<Note>
+  A release that is older than this feature does not take a version. The installer script below installs any version,
+  whatever release is installed, so use it to go back. An older release may also not read a lockfile or a cache that a
+  newer release wrote.
+</Note>
+
+To run another version once, without replacing the installed one, use `bunx bun@1.3.3`.
+
+Since Bun is a single binary, you can also install a specific version by re-running the installer script with that version.
 
 <Tabs>
   <Tab title="Linux & macOS">

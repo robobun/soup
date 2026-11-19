@@ -2162,7 +2162,7 @@ Learn more: <magenta>https://bun.com/docs/cli/bun-create<r>
 
                 pretty!(
                     "\
-<b>Usage<r>: <b><green>bun upgrade<r> <cyan>[flags]<r>
+<b>Usage<r>: <b><green>bun upgrade<r> <cyan>[flags]<r> <blue>[\\<version\\>]<r>
   Upgrade Bun
 
 <b>Examples:<r>
@@ -2172,11 +2172,15 @@ Learn more: <magenta>https://bun.com/docs/cli/bun-create<r>
   <d>{}<r>
   <b><green>bun upgrade<r> <cyan>--{}<r>
 
+  <d>Install one version of Bun, newer or older than this one<r>
+  <b><green>bun upgrade<r> <blue>{}<r>
+
 Full documentation is available at <magenta>https://bun.com/docs/installation#upgrading<r>
 ",
                     latest,
                     switch_desc,
                     switch_flag,
+                    bun_core::Environment::VERSION_STRING,
                 );
                 Output::flush();
             }
