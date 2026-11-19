@@ -55,7 +55,28 @@ bun upgrade --stable
 
 ## Install a specific version
 
-To install a specific version of Bun, use the install script with a version tag:
+To install a specific version of Bun, newer or older than the current one, pass the version to `bun upgrade`:
+
+```bash terminal icon="terminal"
+bun upgrade 1.3.3
+```
+
+`v1.3.3`, `bun-v1.3.3` and `--version 1.3.3` name the same release. `bun upgrade` checks the download against the SHA-256 that GitHub lists for the release, runs the new binary to check its version, and then replaces the current binary. Releases up to v1.2.15 were published without a SHA-256: they are installed without that check, with a warning.
+
+<Warning>
+  An older release does not have the security fixes of the releases after it. Read the [security
+  advisories](https://github.com/oven-sh/bun/security/advisories) before you stay on one.
+</Warning>
+
+<Note>
+  A release that is older than this feature does not take a version. The install script below installs any version,
+  whatever release is installed, so use it to go back. An older release may also not read a lockfile or a cache that a
+  newer release wrote.
+</Note>
+
+To run another version once, without replacing the installed one, use `bunx bun@1.3.3`.
+
+The install script also takes a version tag:
 
 <Tabs>
   <Tab title="macOS & Linux">

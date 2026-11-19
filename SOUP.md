@@ -12095,6 +12095,262 @@ Files: `src/blake3/` (`lib.rs`, `Cargo.toml`, `tests/main.rs`, `tests/support.rs
 `test/js/bun/jsc-stress/fixtures/simd-baseline.test.ts`,
 `test/integration/bun-types/fixture/hashing.ts`.
 
+### 2026-11-19: `bun upgrade <version>` installs one release of Bun, newer or older
+
+`bun upgrade` installed the latest stable release or the latest canary build, and nothing else.
+`bun upgrade 1.3.5` answered `error: This command updates Bun itself, and does not take package
+names`, with the note to run `bun update 1.3.5`. The way to another version was the install
+script with the tag, `curl -fsSL https://bun.com/install | bash -s "bun-v1.3.5"`, which is the line
+the docs have for it. Someone who goes back one release after an upgrade, or who looks for the
+release that broke something, copies that line each time. A comment on oven-sh/bun#17390 asks for
+`bun upgrade --version 1.2.0`, and a search of public code on GitHub finds that command line in
+156 files, where it fails today. Now the command takes a version.
+
+```sh
+bun upgrade 1.3.5            # that release, in place of the running one
+bun upgrade v1.3.5           # the same
+bun upgrade bun-v1.3.5       # the same, by the name of its tag
+bun upgrade --version 1.3.5  # the same, as Deno spells it. --version=1.3.5 too
+bun upgrade 1.3.5 --profile  # its build with debug symbols
+```
+
+- A version is three numbers, with `v` or `bun-v` in front or with nothing. These are the
+  spellings that `install.ps1` takes. `--version` with a version after it is the same as the
+  version alone.
+- The release is looked up by its tag, with `GET /repos/oven-sh/bun/releases/tags/bun-v1.3.5` on
+  `api.github.com`. So a chosen version is one request to the API and one download,
+  `GITHUB_API_DOMAIN` and `GITHUB_TOKEN` apply to it, and what follows is the code of
+  `bun upgrade`: the SHA-256 of the download against the digest that GitHub lists for the asset,
+  `unzip`, a run of the new executable to see that it reports the version, and the swap.
+- GitHub lists a digest from bun-v1.2.16 on. An older release is installed with one more line,
+  `warn: GitHub has no checksum for Bun v1.2.0, so the download is not verified`. The install
+  script checks the digest of no release.
+- On an x64 CPU without AVX2 a chosen version is the `-baseline` build of the release. Before
+  v1.4.0 the build without a suffix needs AVX2, and the install scripts choose in the same way.
+  `bun upgrade` without a version asks for the names it asked for before.
+- The flags that go with a version are a closed list: `--stable`, `--profile` and the three that
+  choose the certificate store. Any other flag beside a version is refused before a request, and
+  the error names it. `bun upgrade 1.3.5 --dry-run` would otherwise install 1.3.5, because the
+  command reads no such flag. `--canary` beside a version has an error of its own, and so has a
+  second version.
+- A flag other than `--version` that has a version for its value is refused on every line,
+  because `bun upgrade --to=1.3.5` installed the latest release. `bun upgrade --version=1.3.5`
+  did that too, and installs 1.3.5 now. A `--version` without a version after it is refused. It
+  was ignored, and the latest release was installed.
+- A release build that is asked for its own version says `You're already on Bun v1.4.6` and
+  exits with 0, without a request. A canary build with that number installs the release.
+- It prints `Installing Bun v1.3.5. You're on v1.4.6` first. At the end an older release gets
+  `Downgraded.`, `Release notes for Bun v1.3.5`, the commit log from the older tag to the newer
+  one, and on a release build the install script line that goes back to the version it
+  replaced. A newer release gets the text of `bun upgrade`.
+- Errors with exit code 1: a version that no release has (the error names the host that
+  answered and the tag), a release without a build for this platform (it names the zip), an
+  answer that is the release of another tag, and a lookup or a download that is refused (it
+  names the URL and the status). Where the old message names the install script, the new one
+  names it with the version, also when the download was fine and the executable could not be
+  replaced.
+- Words of two kinds that are nearly a version get a note of their own in place of
+  `Use bun update`: `canary`, `stable` and `latest` are told the flag, and digits with dots such
+  as `1.3` are told that a version has three numbers. Every other word is still the name of a
+  package, so `v8` and `1.3.5-beta.1` get the error they got.
+- `bun upgrade`, `--stable`, `--canary` and `--profile` without a version do what they did.
+
+oven-sh/bun#14706 added `bun upgrade <version>` in 2024 and was closed in 2025. It replaced the
+flags `--canary` and `--stable` with the words `canary` and `stable`. The comment at the close
+says that this breaks users, and that the install script already installs a version. This commit
+removes no flag and takes no word but a version. What the command does and the script does not:
+it replaces the executable that runs it, wherever that is installed, it checks the digest, and it
+runs the new executable and compares its version before the swap. The script puts its argument
+into the URL as it is, so `bash -s 1.3.5` is a 404, and its only run of the new executable is
+`completions`, with the result thrown away. oven-sh/bun#8073 (a way back after `bun upgrade`,
+15 thumbs up) and oven-sh/bun#2943 (a choice among installed versions, 14 thumbs up) are not
+answered by this and stay open: nothing here records what was installed before, and nothing
+keeps two versions.
+
+What it costs, measured on two release builds from one toolchain (linux x64, ThinLTO, not
+canary): the commit before this one, and this one.
+
+- The executable is 156,883,136 and 156,895,424 bytes stripped, 12,288 more. `.text` grows by
+  8,704 bytes and `.rodata` by 4,096. The symbols of `upgrade_command` in `bun-profile` are
+  21,724 and 31,042 bytes (`llvm-nm -S`): `exec` 630 to 3,736, `_exec` 19,072 to 24,147, and
+  1,274 in eight new symbols.
+- Other commands run the same code. The disassembly of `cli::start`, `command::start`,
+  `command::which`, `command::create_context_data` and `arguments::parse` is 6,478 lines in
+  both builds, and no line differs once the addresses are taken out. `bun-profile --version`
+  under `qemu-x86_64 -one-insn-per-tb` runs 63,823 instructions of the executable in both
+  builds, the same number in every function, and 196,405 and 196,487 in the loader and libc,
+  which depend on where the linker put things. System calls and allocator calls are the same for
+  `bun --version` (91 and 6), `bun exec --help` (91 and 19) and `bun run --help` (93 and 121).
+- `bun upgrade` without a version sends the same requests and prints the same text. Against a
+  local release server that logs each request, `bun upgrade` (the whole install, with
+  `BUN_DRY_RUN=1`), `--stable`, `--profile`, `--stable --profile` and `bun-types --dev` give the
+  same request lines, with their headers, and the same stderr on both builds. `--help` differs
+  by the usage line and the new example.
+- A word that is refused costs what it cost. `bun upgrade bun-types` is 95 system calls
+  (`qemu-x86_64 -strace`), and 29 calls into the allocator with 7 frees (`gdb`), on both builds,
+  and 295 more instructions of 290,286.
+- A chosen version is two requests, and the lookup is answered with 200 at once.
+
+How it is built.
+
+- `ExactVersion` in `src/runtime/cli/upgrade_command.rs` is three numbers that print as `1.3.5`
+  and have an order. `ExactVersion::parse` gives the word to `bun_semver::Version::parse_exact`,
+  the parser of `bun pm version`. That parser also reads `=1.3.5`, `01.3.5`, a prerelease and
+  build metadata. So a word is a version only if it is the tag `bun-v1.3.5` written again from
+  the three numbers, or that tag without `bun-`, or without `bun-v`.
+- `UpgradeCommand::exec` has the loop that refuses every argument without `--` in it as the name
+  of a package. The version is read in that branch, in front of the error, and the loop now
+  looks at the flags too: `--version` and its value, a flag whose value is a version, and the
+  first flag that is not on the list for a line with a version. All of it is in `exec`, before
+  the HTTP thread starts. The parser of the command line is not used for it. It knows the flags
+  of `bun run` for this command, more than a hundred, and does not say which ones the command
+  reads.
+- `enum Release { Latest, Exact(ExactVersion) }` goes to `_exec` and to the one lookup of a
+  release. That function was `get_latest_version` and is `get_release`. For `Latest` it writes
+  the URL it wrote. For `Exact` it writes the path of the tag and has exits of its own.
+- The chosen release is read from `oven-sh/bun`. The latest release is still read from
+  `oven-sh/bun-releases-for-updater`, whose README says that it exists to tell `bun upgrade`
+  what the latest version is, and calls that leftover technical debt. The two hold the same zip
+  for linux x64 where it was compared (bun-v1.2.18 and bun-v1.4.5), and not always for macOS:
+  for bun-v1.2.18 the `bun-darwin-aarch64.zip` of the mirror is 21,442,379 bytes and the one of
+  `oven-sh/bun` is 21,447,857, with another SHA-256. The install scripts download from
+  `oven-sh/bun`.
+- `Build` is the name of a zip and of the executable in it. Its four constants are the default
+  build, `-profile`, `-baseline` and `-baseline-profile`, and they replace the four constants
+  that held the first two. `Build::of` asks `std::is_x86_feature_detected!("avx2")` for a chosen
+  version only.
+- Each message that says `latest` or `is out` has a second arm for `Exact`. `ManualInstall`
+  prints the install script for a `Release`, and the two messages for an executable that cannot
+  be replaced use it in place of the constant.
+
+Tests, in `test/cli/install/bun-upgrade.test.ts`. The release server of that file answered
+every path with one release. It now answers the path of the latest release and the path of one
+tag, answers a 404 for every other tag as `api.github.com` does, and keeps the path of each
+request. Every process of the file now has proxy variables that name a closed port, with the
+local server exempt, so a `bun upgrade` that goes on where a case expects a refusal cannot reach
+GitHub and swap in a real build. One case that was there also holds the two request paths of
+`--stable`. 41 new cases:
+
+- Five spellings, `BUN_CANARY=1`, and `--stable` with `--profile` and a certificate flag: the
+  requests are the lookup of the tag and the zip, and the zip is the `-profile` one when asked.
+- On linux x64, the zip is the default one if `/proc/cpuinfo` has `avx2` and `-baseline` if not.
+  Every other case takes either name, so the file does not depend on the CPU of the machine.
+- Two installs that complete on a stand-in of the executable, one of an older and one of a
+  newer version, with the whole text of the end.
+- The version of the build itself: a canary build looks it up, a release build says that it is
+  on it and sends nothing.
+- A version that no release has, a release without assets, a release that answers with another
+  tag, a lookup that answers 403, a download that answers 404, an install directory that cannot
+  be written to (not as root), and the three cases of the digest.
+- 24 command lines that are refused before any request, each with its whole message: two
+  versions, `--canary`, `--version` without a version, flags that nothing reads, words that are
+  nearly versions, and six words that are still package names.
+
+With the source of this commit taken out, 35 of the 50 cases of the file fail on the debug
+build: 34 of the new ones and the case for the help text. The six package names pass on both
+sides and pin what does not change. With the commit 49 pass and one is skipped for root, on the
+debug build, which is a canary build, and on a release build that is not. That second build is
+the only one with the answer for the running version and with the line that goes back. The
+skipped case passes when the file runs as another user.
+
+Not done, and known.
+
+- Windows and macOS did not run. `cargo check` passes for `x86_64-pc-windows-msvc` and
+  `aarch64-unknown-linux-gnu`. The two cases that complete an install are skipped on Windows:
+  the fake release there has to be the running executable, which reports its own version and
+  no other, and the `--stable` case of the file already installs that one.
+- On Windows the install script line for a version is the one of the docs,
+  `iex "& {$(irm https://bun.com/install.ps1)} -Version 1.3.5"`, and the message says to run it
+  in PowerShell. It does not paste into cmd.exe or Git Bash. The review of this commit proposed
+  `powershell -c "& ([scriptblock]::Create((irm https://bun.com/install.ps1))) -Version 1.3.5"`
+  for all three shells. Nobody ran that line, so it is not printed.
+- No CI machine lacks AVX2, so the `-baseline` arm runs in no lane. It ran here on the release
+  build: under `qemu-x86_64 -cpu Nehalem`, `bun upgrade 1.2.3` asks for
+  `bun-linux-x64-baseline.zip` and installs from its folder, `--profile` asks for
+  `bun-linux-x64-baseline-profile.zip`, and `bun upgrade` without a version asks for
+  `bun-linux-x64.zip` as before. Under `-cpu Haswell` the version asks for `bun-linux-x64.zip`.
+  A flag `--baseline` is not added. It is refused beside a version, like every flag that is not
+  on the list.
+- An x64 Bun under Rosetta 2 is not told apart. The install scripts check for it first and
+  install the arm64 build. Here the CPU is asked for AVX2, and Rosetta says no before macOS 15.
+  The review of this commit found that the `-baseline` zip for darwin x64 of the releases
+  1.1.22 to 1.3.14 needs AVX2 all the same. If so, the new executable fails the run before the
+  swap, and nothing is replaced. Not checked here.
+- A release that is older than this commit does not take a version. After a downgrade the way
+  to another version is the install script. A release build prints that line for the version
+  it replaced, and the docs say so. The review of this commit found that `bun upgrade` itself
+  crashes before any request in the 34 releases from 0.1.12 to 0.7.1 on glibc 2.41, so that
+  from those the script is the only way. Not checked here. Whether those versions are refused
+  is a question for a maintainer.
+- Every release before 1.4.5 is in the range of one of the four security advisories that are
+  published today. The docs have a warning with the link. The command prints none. Whether a
+  downgrade should print one is a question for the owner of security.
+- A release without a digest is installed with a warning and not refused. `REVIEW.md` says that
+  a check whose prerequisite is missing fails the operation. On `oven-sh/bun` 195 releases
+  have a linux x64 zip: 29 with a digest (bun-v1.2.16 to bun-v1.4.5) and 166 without. Refusing
+  those would leave 29 versions to choose from. Two ways to a check for them: the
+  `SHASUMS256.txt` that `oven-sh/bun` has beside the zips of a release, which is one more
+  request and is not signed by anything the command can check, or one upload of the old zips
+  again, after which GitHub lists digests and the command checks them as it is. This is a
+  ruling for a maintainer.
+- On a line without a version a flag that is not known is still ignored, as before:
+  `bun upgrade --dry-run` and `bun upgrade --stabel` install the latest release. Refusing them
+  turns command lines that exit with 0 today into errors. The install commands refuse a flag
+  that they do not know (`bun install has no --x flag`). Whether this command should is a
+  ruling for a maintainer too.
+- The arguments are still read from the third word of the command line. So
+  `bun --smol upgrade 1.3.5` and a `BUN_OPTIONS` with a flag are refused as before.
+  oven-sh/bun#46007, open, rewrites that loop.
+- Only whole versions are taken. `1.3` is told that a version has three numbers, and is not
+  resolved to the newest 1.3 release.
+- `bun --help` still lists the command as `Upgrade to latest version of Bun.`, and the zsh and
+  fish completions are as they were. The bash completions offered `--version --cwd -v` for the
+  command, and offer `--canary --stable` now.
+- On a canary build the commit log link names the running side `bun-v1.4.6`, a tag that exists
+  only after that release. The text of `--stable` has the same link.
+- The patch touches a file that three open pull requests change, and each needs a merge by
+  hand. Applied on oven-sh/bun#46007 it conflicts in 6 of its 33 hunks of `upgrade_command.rs`,
+  all in the loop of `exec`. On oven-sh/bun#48792, which unpacks the Windows release in the
+  process and looks canary up through the API with a parameter for the path, in 5 hunks and in
+  4 of the test file. On oven-sh/bun#43643, which changes how the zip is unpacked, in 5 and 5.
+
+A review of the diff before the push asked for three changes to what the command accepts, and
+all three are in the commit: the closed list of flags where one flag was refused by name,
+`--version` as a spelling where it was refused, and `oven-sh/bun` for the lookup where it was the
+mirror. Its other points that are in: the messages with the URL and the status, the script line
+after a downgrade and for an executable that cannot be replaced, the notes for words that are
+nearly versions, the example in the help with the version of the build, the docs (the warning,
+`bunx bun@1.3.3` to run a version without installing it, the sentence under Upgrading), the
+proxy variables of the tests, and the cases that do not depend on the CPU. Not taken: a test
+helper that exposes the table of builds, a run in `scripts/verify-baseline.ts`, the line for
+three shells on Windows, a check for Rosetta, and `--stable` in the zsh completions.
+
+Rebase notes. 79 patches onto oven-sh/bun ca7729d01a3, 14 commits after the base of 2026-11-18
+(4ce14ba8b15). Upstream has 5 more commits since the rebase, and the stack is not on them.
+
+- Zip in `Bun.Archive` (2026-11-06) stopped the rebase and did not build. oven-sh/bun#49187
+  replaces zlib-ng with a DEFLATE codec in safe Rust, and `bun_zlib::InflateDecoder`,
+  `ReturnCode` and `crc32_bytes` are gone. `src/zip` now inflates with `bun_zlib::Inflater`
+  (`inflate_to_vec`, with the same room of one byte more than the entry declares) and takes
+  CRC-32 from `bun_highway::crc32`, in its patch. `archive.test.ts` passes (282).
+- Four more patches stopped the rebase where upstream added a line beside the line of the
+  patch, and both lines are kept: `legalComments` (2026-09-29) and `import.meta.hot`
+  (2026-11-05) beside the deferred `require` of oven-sh/bun#49117, trusted publishing
+  (2026-10-02) beside a new module of the CLI, and BLAKE3 (2026-11-18) in four build scripts
+  beside `highway_zlib.cpp` of oven-sh/bun#49187.
+- Run on the debug build after the rebase: `archive.test.ts` (282), `bun-cryptohasher.test.ts`
+  (154), `bun-serve-compress.test.ts` (22), `transpiler-cache.test.ts` (36),
+  `bundler_comments.test.ts` (76) and `hot.test.ts` (52).
+- `cargo clippy --workspace` and `cargo fmt --all --check` pass. The source lints pass (210) on
+  the release build. On the debug build two of them run into their 5 second limit, as before.
+  The bun-types test passes (30). The fork's three workflows were green for the push of
+  2026-11-18.
+- Only the tip of the stack was built, as before.
+
+Files: `src/runtime/cli/upgrade_command.rs`, `src/runtime/cli/mod.rs`, `docs/installation.mdx`,
+`docs/guides/util/upgrade.mdx`, `completions/bun.bash`, `completions/bun-cli.json`,
+`test/cli/install/bun-upgrade.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

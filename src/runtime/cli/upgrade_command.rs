@@ -1,5 +1,6 @@
 use bun_collections::VecExt;
 use core::ffi::c_char;
+use core::fmt;
 use std::io::Write as _;
 
 use bun_alloc::Arena as Bump;
@@ -13,6 +14,7 @@ use bun_install::integrity::{Integrity, Tag as IntegrityTag};
 use bun_parsers::json as JSON;
 use bun_paths::{self, SEP_STR};
 use bun_resolver::fs;
+use bun_semver as Semver;
 use bun_sys as sys;
 use bun_url::URL;
 use bun_which::which;
@@ -116,11 +118,6 @@ impl Version {
     pub(crate) const ZIP_FILENAME: &'static str =
         const_format::concatcp!(Version::FOLDER_NAME, ".zip");
 
-    pub(crate) const PROFILE_FOLDER_NAME: &'static str =
-        const_format::concatcp!("bun-", Version::TRIPLET, Version::SUFFIX, "-profile");
-    pub(crate) const PROFILE_ZIP_FILENAME: &'static str =
-        const_format::concatcp!(Version::PROFILE_FOLDER_NAME, ".zip");
-
     const CURRENT_VERSION: &'static str =
         const_format::concatcp!("bun-v", Global::package_json_version);
 
@@ -150,6 +147,140 @@ impl Version {
     }
 }
 
+/// The version that `bun upgrade <version>` names. It prints as `1.2.3`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ExactVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl ExactVersion {
+    const CURRENT: Self = Self {
+        major: Environment::VERSION.major as u64,
+        minor: Environment::VERSION.minor as u64,
+        patch: Environment::VERSION.patch as u64,
+    };
+
+    /// Takes `1.2.3`, `v1.2.3` and `bun-v1.2.3`, the spellings of `install.ps1`, and nothing else.
+    fn parse(word: &[u8]) -> Option<Self> {
+        let text = word.strip_prefix(b"bun-").unwrap_or(word);
+        let parsed = Semver::Version::parse_exact(Semver::SlicedString::init(text, text))?;
+        let version = Self {
+            major: parsed.major,
+            minor: parsed.minor,
+            patch: parsed.patch,
+        };
+        // The parser also reads `=1.2.3`, `01.2.3`, a prerelease and build metadata.
+        let mut tag = Vec::new();
+        write!(&mut tag, "bun-v{version}").expect("oom");
+        [&tag[..], &tag[b"bun-".len()..], &tag[b"bun-v".len()..]]
+            .contains(&word)
+            .then_some(version)
+    }
+}
+
+impl fmt::Display for ExactVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Which release `bun upgrade` installs.
+#[derive(Clone, Copy)]
+enum Release {
+    Latest,
+    Exact(ExactVersion),
+}
+
+/// A build of a release for this platform: the zip it is published as, and the executable in that zip.
+struct Build {
+    zip: &'static str,
+    exe: &'static str,
+}
+
+macro_rules! build {
+    ($suffix:literal, $exe:literal) => {
+        Build {
+            zip: const_format::concatcp!(Version::FOLDER_NAME, $suffix, ".zip"),
+            exe: const_format::concatcp!(
+                Version::FOLDER_NAME,
+                $suffix,
+                SEP_STR,
+                $exe,
+                UpgradeCommand::EXE_SUFFIX
+            ),
+        }
+    };
+}
+
+impl Build {
+    const DEFAULT: Self = build!("", "bun");
+    const PROFILE: Self = build!("-profile", "bun-profile");
+    const BASELINE: Self = build!("-baseline", "bun");
+    const BASELINE_PROFILE: Self = build!("-baseline-profile", "bun-profile");
+
+    /// A release before Bun v1.4.0 has two builds for x64, and the one without a suffix needs AVX2. Later releases
+    /// keep both names. So for a chosen version the CPU decides, as it does in the install scripts.
+    fn of(release: Release, use_profile: bool) -> &'static Self {
+        let use_baseline = matches!(release, Release::Exact(_)) && Self::cpu_needs_baseline();
+        match (use_baseline, use_profile) {
+            (false, false) => &Self::DEFAULT,
+            (false, true) => &Self::PROFILE,
+            (true, false) => &Self::BASELINE,
+            (true, true) => &Self::BASELINE_PROFILE,
+        }
+    }
+
+    fn cpu_needs_baseline() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            !std::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+}
+
+/// The command that installs a release without `bun upgrade`, for when that fails.
+struct ManualInstall(Release);
+
+impl ManualInstall {
+    /// The command for a version is the one of the docs, which PowerShell alone reads.
+    const SHELL: &'static str = if cfg!(target_os = "windows") {
+        " in PowerShell"
+    } else {
+        ""
+    };
+}
+
+impl fmt::Display for ManualInstall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Release::Exact(version) = self.0 else {
+            return f.write_str(UpgradeCommand::MANUAL_UPGRADE_COMMAND);
+        };
+        if cfg!(target_os = "windows") {
+            write!(
+                f,
+                "iex \"& {{$(irm https://bun.com/install.ps1)}} -Version {version}\""
+            )
+        } else if cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos"
+        )) {
+            write!(
+                f,
+                "curl -fsSL https://bun.com/install | bash -s \"bun-v{version}\""
+            )
+        } else {
+            f.write_str(UpgradeCommand::MANUAL_UPGRADE_COMMAND)
+        }
+    }
+}
+
 // Exported C symbol — null-terminated
 // Moved out of `impl Version` — Rust impl blocks cannot hold `static` items.
 // `*const c_char` is `!Sync`, so wrap in the `#[repr(transparent)]` `SyncCStr` newtype
@@ -175,10 +306,11 @@ pub(crate) struct UpgradeCommand;
 impl UpgradeCommand {
     const DEFAULT_GITHUB_HEADERS: &'static [u8] = b"Acceptapplication/vnd.github.v3+json";
 
-    pub(crate) fn get_latest_version<const SILENT: bool>(
+    fn get_release<const SILENT: bool>(
         env_loader: &mut DotEnv::Loader,
         mut refresher: Option<&mut Progress::Progress>,
-        use_profile: bool,
+        release: Release,
+        zip_filename: &'static str,
     ) -> crate::Result<Option<Version>> {
         let mut headers_buf: Vec<u8> = Self::DEFAULT_GITHUB_HEADERS.to_vec();
 
@@ -206,11 +338,19 @@ impl UpgradeCommand {
         // `AsyncHTTP::init_sync` wants `URL<'static>` / `&'static [u8]`, so back
         // the buffers in the process-lifetime CLI arena.
         let url_buf: &'static mut Vec<u8> = crate::cli::cli_arena().alloc(Vec::new());
-        write!(
-            url_buf,
-            "https://{}/repos/Jarred-Sumner/bun-releases-for-updater/releases/latest",
-            bstr::BStr::new(github_api_domain),
-        )
+        match release {
+            Release::Latest => write!(
+                url_buf,
+                "https://{}/repos/Jarred-Sumner/bun-releases-for-updater/releases/latest",
+                bstr::BStr::new(github_api_domain),
+            ),
+            Release::Exact(wanted) => write!(
+                url_buf,
+                "https://{}/repos/oven-sh/bun/releases/tags/bun-v{}",
+                bstr::BStr::new(github_api_domain),
+                wanted,
+            ),
+        }
         .expect("oom");
         let api_url = URL::parse(&url_buf[..]);
 
@@ -270,6 +410,26 @@ impl UpgradeCommand {
             async_http.client.progress = refresher.as_deref_mut();
         }
         let response = async_http.send_sync(metadata_body)?;
+
+        if let Release::Exact(wanted) = release
+            && response.status_code() != 200
+            && !SILENT
+        {
+            let refresher = refresher.expect("infallible: progress active");
+            refresher.end();
+            refresher.refresh();
+
+            if response.status_code() == 404 {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> Bun v{} was not found: {} has no release of oven-sh/bun with the tag bun-v{}.\n<blue>note<r><d>:<r> The releases are listed at https://github.com/oven-sh/bun/releases",
+                    wanted,
+                    bstr::BStr::new(github_api_domain),
+                    wanted
+                );
+                Global::exit(1);
+            }
+            Self::exit_on_failed_request(wanted, &url_buf[..], response.status_code());
+        }
 
         match response.status_code() {
             404 => return Err(crate::Error::HTTP404),
@@ -371,6 +531,25 @@ impl UpgradeCommand {
             return Ok(None);
         }
 
+        if let Release::Exact(wanted) = release
+            && ExactVersion::parse(&version.tag) != Some(wanted)
+        {
+            if !SILENT {
+                let refresher = refresher.expect("infallible: progress active");
+                refresher.end();
+                refresher.refresh();
+
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> Asked for Bun v{}, and the answer was the release {}.",
+                    wanted,
+                    bstr::BStr::new(&*version.tag)
+                );
+                Global::exit(1);
+            }
+
+            return Ok(None);
+        }
+
         'get_asset: {
             let Some(assets_) = expr.as_property(b"assets") else {
                 break 'get_asset;
@@ -399,23 +578,15 @@ impl UpgradeCommand {
                 if let Some(name_) = asset.as_property(b"name") {
                     if let Some(name) = name_.expr.as_utf8_string_literal() {
                         if bun_core::env::IS_DEBUG {
-                            let filename = if !use_profile {
-                                Version::ZIP_FILENAME
-                            } else {
-                                Version::PROFILE_ZIP_FILENAME
-                            };
                             bun_core::prettyln!(
                                 "Comparing {} vs {}",
                                 bstr::BStr::new(name),
-                                filename
+                                zip_filename
                             );
                             Output::flush();
                         }
 
-                        if !use_profile && name != Version::ZIP_FILENAME.as_bytes() {
-                            continue;
-                        }
-                        if use_profile && name != Version::PROFILE_ZIP_FILENAME.as_bytes() {
+                        if name != zip_filename.as_bytes() {
                             continue;
                         }
 
@@ -453,6 +624,14 @@ impl UpgradeCommand {
             let refresher = refresher.expect("infallible: progress active");
             refresher.end();
             refresher.refresh();
+            if let Release::Exact(wanted) = release {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> Bun v{} has no build for this platform <d>({})<r>",
+                    wanted,
+                    zip_filename
+                );
+                Global::exit(1);
+            }
             if let Some(name) = version.name() {
                 bun_core::pretty_errorln!(
                     "Bun v{} is out, but not for this platform ({}) yet.",
@@ -469,18 +648,28 @@ impl UpgradeCommand {
 
     const EXE_SUFFIX: &'static str = if cfg!(windows) { ".exe" } else { "" };
 
-    const EXE_SUBPATH: &'static str = const_format::concatcp!(
-        Version::FOLDER_NAME,
-        SEP_STR,
-        "bun",
-        UpgradeCommand::EXE_SUFFIX
-    );
-    const PROFILE_EXE_SUBPATH: &'static str = const_format::concatcp!(
-        Version::PROFILE_FOLDER_NAME,
-        SEP_STR,
-        "bun-profile",
-        UpgradeCommand::EXE_SUFFIX
-    );
+    /// For a chosen version, an answer that is not the release or its zip ends the command.
+    fn exit_on_failed_request(wanted: ExactVersion, url: &[u8], status: u32) -> ! {
+        bun_core::pretty_errorln!(
+            "<r><red>error<r><d>:<r> Bun v{} was not installed: {} answered {}.\n<blue>note<r><d>:<r> Run the install script{} for that version:\n  <b>{}<r>",
+            wanted,
+            bstr::BStr::new(url),
+            status,
+            ManualInstall::SHELL,
+            ManualInstall(Release::Exact(wanted))
+        );
+        Global::exit(1);
+    }
+
+    /// What a line with a version may have beside it: the flags that this command reads, and the ones that say where
+    /// its certificates come from. `--canary` is not here because it has an error of its own.
+    const FLAGS_BESIDE_A_VERSION: [&'static [u8]; 5] = [
+        b"--stable",
+        b"--profile",
+        b"--use-system-ca",
+        b"--use-openssl-ca",
+        b"--use-bundled-ca",
+    ];
 
     const MANUAL_UPGRADE_COMMAND: &'static str = {
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -506,9 +695,36 @@ impl UpgradeCommand {
     #[cold]
     pub(crate) fn exec(ctx: Command::Context) -> crate::Result<()> {
         let args = bun_core::argv();
-        if args.len() > 2 {
-            for arg in args.iter().skip(2) {
-                if !strings::contains(arg, b"--") {
+        let mut release = Release::Latest;
+        let mut unread_flag: Option<&[u8]> = None;
+        let mut words = args.iter().skip(2);
+        while let Some(arg) = words.next() {
+            let version = if !strings::contains(arg, b"--") {
+                let Some(version) = ExactVersion::parse(arg) else {
+                    if arg == b"canary" {
+                        bun_core::pretty_errorln!(
+                            "<r><red>error<r><d>:<r> canary is not a version.\n<blue>note<r><d>:<r> Use `bun upgrade --canary` for the latest canary build."
+                        );
+                        Global::exit(1);
+                    }
+                    if arg == b"stable" || arg == b"latest" {
+                        bun_core::pretty_errorln!(
+                            "<r><red>error<r><d>:<r> {} is not a version.\n<blue>note<r><d>:<r> Use `bun upgrade --stable` for the latest stable release.",
+                            bstr::BStr::new(arg)
+                        );
+                        Global::exit(1);
+                    }
+                    // `v8` and `7zip` are packages. Digits and dots alone are a version with a part too few or too many.
+                    if arg.first().is_some_and(u8::is_ascii_digit)
+                        && arg.iter().all(|c| matches!(c, b'0'..=b'9' | b'.'))
+                    {
+                        bun_core::pretty_errorln!(
+                            "<r><red>error<r><d>:<r> {} is not a full version.\n<blue>note<r><d>:<r> A version has three numbers, as in `bun upgrade {}`.",
+                            bstr::BStr::new(arg),
+                            Environment::VERSION_STRING
+                        );
+                        Global::exit(1);
+                    }
                     bun_core::pretty_error!(
                         "<r><red>error<r><d>:<r> This command updates Bun itself, and does not take package names.\n<blue>note<r><d>:<r> Use `bun update"
                     );
@@ -517,22 +733,95 @@ impl UpgradeCommand {
                     }
                     bun_core::pretty_errorln!("` instead.");
                     Global::exit(1);
+                };
+                version
+            } else if arg == b"--version" || arg.starts_with(b"--version=") {
+                let value = match arg.strip_prefix(b"--version=") {
+                    Some(value) => value,
+                    None => words.next().unwrap_or_default(),
+                };
+                let Some(version) = ExactVersion::parse(value) else {
+                    bun_core::pretty_errorln!(
+                        "<r><red>error<r><d>:<r> --version needs a version after it, as in `bun upgrade --version {}`.\n<blue>note<r><d>:<r> To print the version of this Bun, use `bun --version`.",
+                        Environment::VERSION_STRING
+                    );
+                    Global::exit(1);
+                };
+                version
+            } else {
+                // A flag that nothing reads would leave `--to=1.2.3` to install the latest release.
+                if let Some((_, value)) = strings::split_once_char(arg, b'=')
+                    && let Some(version) = ExactVersion::parse(value)
+                {
+                    bun_core::pretty_errorln!(
+                        "<r><red>error<r><d>:<r> This command does not take {}.\n<blue>note<r><d>:<r> Use `bun upgrade {}` to install that version.",
+                        bstr::BStr::new(arg),
+                        version
+                    );
+                    Global::exit(1);
                 }
+                if unread_flag.is_none()
+                    && arg != b"--canary"
+                    && !Self::FLAGS_BESIDE_A_VERSION.contains(&arg)
+                {
+                    unread_flag = Some(arg);
+                }
+                continue;
+            };
+            if let Release::Exact(first) = release {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> This command installs one version of Bun, and more than one was given.\n<blue>note<r><d>:<r> Use `bun upgrade {}`.",
+                    first
+                );
+                Global::exit(1);
+            }
+            release = Release::Exact(version);
+        }
+
+        if let Release::Exact(version) = release {
+            if argv_contains(b"--canary") {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> A version and --canary were both given.\n<blue>note<r><d>:<r> Use `bun upgrade {}` for that release, or `bun upgrade --canary` for the latest canary build.",
+                    version
+                );
+                Global::exit(1);
+            }
+            // `bun upgrade 1.2.3 --dry-run` would install 1.2.3.
+            if let Some(flag) = unread_flag {
+                bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> This command does not take {} with a version.\n<blue>note<r><d>:<r> Use `bun upgrade {}`.",
+                    bstr::BStr::new(flag),
+                    version
+                );
+                Global::exit(1);
+            }
+            if !Environment::IS_CANARY && version == ExactVersion::CURRENT {
+                bun_core::pretty_errorln!("<r>You're already on Bun <b>v{}<r>", version);
+                Global::exit(0);
             }
         }
 
-        if let Err(err) = Self::_exec(ctx) {
-            bun_core::pretty_errorln!(
-                "<r>Bun upgrade failed with error: <red><b>{}<r>\n\n<cyan>Please upgrade manually<r>:\n  <b>{}<r>\n\n",
-                err.name(),
-                Self::MANUAL_UPGRADE_COMMAND
-            );
+        if let Err(err) = Self::_exec(ctx, release) {
+            match release {
+                Release::Latest => bun_core::pretty_errorln!(
+                    "<r>Bun upgrade failed with error: <red><b>{}<r>\n\n<cyan>Please upgrade manually<r>:\n  <b>{}<r>\n\n",
+                    err.name(),
+                    Self::MANUAL_UPGRADE_COMMAND
+                ),
+                Release::Exact(version) => bun_core::pretty_errorln!(
+                    "<r><red>error<r><d>:<r> Bun v{} was not installed: {}\n<blue>note<r><d>:<r> Run the install script{} for that version:\n  <b>{}<r>",
+                    version,
+                    err.name(),
+                    ManualInstall::SHELL,
+                    ManualInstall(release)
+                ),
+            }
             Global::exit(1);
         }
         Ok(())
     }
 
-    fn _exec(ctx: Command::Context) -> crate::Result<()> {
+    fn _exec(ctx: Command::Context, release: Release) -> crate::Result<()> {
         HTTP::http_thread::init(&Default::default());
 
         fs::FileSystem::init(None)?;
@@ -541,6 +830,10 @@ impl UpgradeCommand {
         env_loader.load_process()?;
 
         let use_canary: bool = 'brk: {
+            if matches!(release, Release::Exact(_)) {
+                break 'brk false;
+            }
+
             let default_use_canary = Environment::IS_CANARY;
 
             if default_use_canary && argv_contains(b"--stable") {
@@ -553,15 +846,17 @@ impl UpgradeCommand {
         };
 
         let use_profile = argv_contains(b"--profile");
+        let build = Build::of(release, use_profile);
 
         let mut version: Version = if !use_canary {
             let refresher = &mut Progress::Progress::default();
             refresher.start(b"Fetching version tags", 0);
 
-            let Some(version) = Self::get_latest_version::<false>(
+            let Some(version) = Self::get_release::<false>(
                 &mut env_loader,
                 Some(&mut *refresher),
-                use_profile,
+                release,
+                build.zip,
             )?
             else {
                 return Ok(());
@@ -587,7 +882,18 @@ impl UpgradeCommand {
                 Global::exit(1);
             }
 
-            if !Environment::IS_CANARY {
+            if let Release::Exact(wanted) = release {
+                bun_core::pretty_errorln!(
+                    "<r><b>Installing Bun <cyan>v{}<r><b>.<r> You're on <blue>v{}{}<r>\n",
+                    wanted,
+                    Global::package_json_version,
+                    if Environment::IS_CANARY {
+                        "-canary"
+                    } else {
+                        ""
+                    }
+                );
+            } else if !Environment::IS_CANARY {
                 bun_core::pretty_errorln!(
                     "<r><b>Bun <cyan>v{}<r> is out<r>! You're on <blue>v{}<r>\n",
                     bstr::BStr::new(&version.name().unwrap()),
@@ -645,6 +951,14 @@ impl UpgradeCommand {
 
             let response = async_http.send_sync(zip_file_buffer)?;
 
+            if let Release::Exact(wanted) = release
+                && response.status_code() != 200
+            {
+                refresher.end();
+                refresher.refresh();
+                Self::exit_on_failed_request(wanted, &zip_url_bytes, response.status_code());
+            }
+
             match response.status_code() {
                 404 => {
                     if use_canary {
@@ -670,18 +984,41 @@ impl UpgradeCommand {
             refresher.refresh();
 
             if bytes.is_empty() {
-                bun_core::pretty_errorln!(
-                    "<r><red>error:<r> Failed to download the latest version of Bun. Received empty content"
-                );
+                match release {
+                    Release::Latest => bun_core::pretty_errorln!(
+                        "<r><red>error:<r> Failed to download the latest version of Bun. Received empty content"
+                    ),
+                    Release::Exact(wanted) => bun_core::pretty_errorln!(
+                        "<r><red>error:<r> Failed to download Bun v{}. Received empty content",
+                        wanted
+                    ),
+                }
                 Global::exit(1);
             }
 
             if version.digest.tag.is_supported() && !version.digest.verify(bytes) {
-                bun_core::pretty_errorln!(
-                    "<r><red>error:<r> The file downloaded from {} did not match the checksum reported by the GitHub API for this release.\n<r>note: run <b>bun upgrade<r> again to retry the download",
-                    bstr::BStr::new(&zip_url_bytes)
-                );
+                match release {
+                    Release::Latest => bun_core::pretty_errorln!(
+                        "<r><red>error:<r> The file downloaded from {} did not match the checksum reported by the GitHub API for this release.\n<r>note: run <b>bun upgrade<r> again to retry the download",
+                        bstr::BStr::new(&zip_url_bytes)
+                    ),
+                    Release::Exact(wanted) => bun_core::pretty_errorln!(
+                        "<r><red>error:<r> The file downloaded from {} did not match the checksum reported by the GitHub API for this release.\n<r>note: run <b>bun upgrade {}<r> again to retry the download",
+                        bstr::BStr::new(&zip_url_bytes),
+                        wanted
+                    ),
+                }
                 Global::exit(1);
+            }
+
+            // Releases up to Bun v1.2.15 were published before GitHub kept a digest for each asset.
+            if let Release::Exact(wanted) = release
+                && !version.digest.tag.is_supported()
+            {
+                bun_core::warn!(
+                    "GitHub has no checksum for Bun v{}, so the download is not verified",
+                    wanted
+                );
             }
 
             let version_name = version.name().unwrap();
@@ -745,11 +1082,7 @@ impl UpgradeCommand {
             let _ = sys::chdir(tmpdir_z);
 
             let tmpname: &ZStr = bun_core::zstr!("bun.zip");
-            let exe: &[u8] = if use_profile {
-                Self::PROFILE_EXE_SUBPATH.as_bytes()
-            } else {
-                Self::EXE_SUBPATH.as_bytes()
-            };
+            let exe: &[u8] = build.exe.as_bytes();
 
             let zip_file = match save_dir.open_file(
                 tmpname.as_bytes(),
@@ -1211,7 +1544,7 @@ impl UpgradeCommand {
                             );
                             Output::err_generic(
                                 "Failed to restore the working copy of Bun. The installation is now corrupt.\n\nPlease reinstall Bun manually with the following command:\n   {}\n",
-                                (Self::MANUAL_UPGRADE_COMMAND,),
+                                (ManualInstall(release),),
                             );
                             Global::exit(1);
                         }
@@ -1222,7 +1555,7 @@ impl UpgradeCommand {
                         (
                             bstr::BStr::new(destination_executable),
                             bstr::BStr::new(err.name()),
-                            Self::MANUAL_UPGRADE_COMMAND,
+                            ManualInstall(release),
                         ),
                     );
                     Global::exit(1);
@@ -1257,6 +1590,26 @@ impl UpgradeCommand {
                     Environment::GIT_SHA_SHORT,
                     bstr::BStr::new(&*version.tag)
                 );
+            } else if let Release::Exact(wanted) = release
+                && wanted < ExactVersion::CURRENT
+            {
+                bun_core::pretty_errorln!(
+                    "<r> Downgraded.\n\n<b><green>Welcome to Bun v{}!<r>\n\nRelease notes for Bun v{}:\n\n    <cyan>https://bun.com/blog/release-notes/{}<r>\n\nReport any bugs:\n\n    https://github.com/oven-sh/bun/issues\n\nCommit log:\n\n    https://github.com/oven-sh/bun/compare/{}...{}\n",
+                    bstr::BStr::new(&version_name),
+                    bstr::BStr::new(&version_name),
+                    bstr::BStr::new(&*version.tag),
+                    bstr::BStr::new(&*version.tag),
+                    Version::CURRENT_VERSION
+                );
+                // The release that was just installed may not take a version. A canary build has no tag to name.
+                if !Environment::IS_CANARY {
+                    bun_core::pretty_errorln!(
+                        "\nTo go back to Bun v{}, run the install script{}:\n\n    {}\n",
+                        ExactVersion::CURRENT,
+                        ManualInstall::SHELL,
+                        ManualInstall(Release::Exact(ExactVersion::CURRENT))
+                    );
+                }
             } else {
                 let bun_v = const_format::concatcp!("bun-v", Global::package_json_version);
 
