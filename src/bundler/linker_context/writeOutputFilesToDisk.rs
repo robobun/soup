@@ -66,6 +66,22 @@ pub(crate) fn write_output_files_to_disk(
         }
     };
 
+    // With `clean`, what the build does not write is found before the first write and removed after the last one.
+    let bundle = c.bundle;
+    let stale = match bundle.clean.as_deref() {
+        Some(clean) => Some(find_stale_outputs(
+            c,
+            clean,
+            log,
+            &root_dir,
+            root_path,
+            chunks,
+            standalone_chunk_contents.is_some(),
+            standalone_sourcemaps,
+        )?),
+        None => None,
+    };
+
     // `code()`/`code_standalone()` take both `chunk` (an element of `chunks`)
     // and `chunks` as
     // `&Chunk` / `&[Chunk]` (read-only), so iterate by index and reborrow
@@ -607,7 +623,7 @@ pub(crate) fn write_output_files_to_disk(
 
     // In standalone mode, additional output files (assets) are inlined into the HTML.
     if standalone_chunk_contents.is_some() {
-        return Ok(());
+        return remove_stale_outputs(log, &root_dir, root_path, stale);
     }
 
     {
@@ -672,5 +688,432 @@ pub(crate) fn write_output_files_to_disk(
         }
     }
 
-    Ok(())
+    remove_stale_outputs(log, &root_dir, root_path, stale)
+}
+
+#[derive(Clone, Copy)]
+enum Kept {
+    /// The build writes over it.
+    File,
+    /// A kept file is below it.
+    Directory,
+    /// The bytecode of a chunk. Whether the build writes it is known only once it is made, and a stale one must not
+    /// stay beside new code.
+    RemovedFirst,
+}
+
+/// What `clean` leaves in the output directory: the files that `write_output_files_to_disk` is about to write, those
+/// that the caller writes afterwards, and the directories they are in.
+#[derive(Default)]
+struct KeptOutputs {
+    /// By path in the output directory, with `/` between its parts.
+    paths: bun_collections::StringHashMap<Kept>,
+    /// The kept names of each directory, by its path. The output directory is `b""`.
+    children: bun_collections::StringHashMap<Vec<Box<[u8]>>>,
+}
+
+impl KeptOutputs {
+    const SEPARATORS: &[u8] = if cfg!(windows) { b"/\\" } else { b"/" };
+
+    fn keep(
+        &mut self,
+        rel_path: &[u8],
+        suffix: &[u8],
+        kind: Kept,
+    ) -> Result<(), bun_alloc::AllocError> {
+        let mut path: Vec<u8> = Vec::with_capacity(rel_path.len() + suffix.len());
+        for part in strings::tokenize_any(rel_path, Self::SEPARATORS) {
+            match part {
+                b"." => {}
+                b".." => {
+                    // A path that leaves the output directory names none of its files.
+                    if path.is_empty() {
+                        return Ok(());
+                    }
+                    path.truncate(strings::last_index_of_char(&path, b'/').unwrap_or(0));
+                }
+                _ => {
+                    if !path.is_empty() {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(part);
+                }
+            }
+        }
+        if path.is_empty() {
+            return Ok(());
+        }
+        path.extend_from_slice(suffix);
+        let mut from = 0;
+        loop {
+            let end = strings::index_of_char_pos(&path, b'/', from).unwrap_or(path.len());
+            if !self.paths.contains_key(&path[..end]) {
+                let kind = if end == path.len() {
+                    kind
+                } else {
+                    Kept::Directory
+                };
+                self.paths.put(&path[..end], kind)?;
+                let siblings = self.children.get_or_put(&path[..from.saturating_sub(1)])?;
+                siblings.value_ptr.push(Box::from(&path[from..end]));
+            }
+            if end == path.len() {
+                return Ok(());
+            }
+            from = end + 1;
+        }
+    }
+}
+
+/// What `clean` removes once the build has written its files.
+struct StaleOutput {
+    /// In the output directory, with `/` between its parts.
+    path: Box<[u8]>,
+    is_directory: bool,
+}
+
+type RemovalFailure = Option<(bun_sys::Error, Vec<u8>)>;
+
+/// `clean`: finds what is in the output directory and is not written by this build, for `remove_stale_outputs`.
+/// Nothing is written yet, so a refusal leaves the directory as it was.
+///
+/// A file that the build writes stays and is written over, so it is never absent. What is in the way of a write is
+/// removed here: a link at the name of an output, which the write would follow, and a directory at the name of a file.
+#[cold]
+#[inline(never)]
+fn find_stale_outputs(
+    c: &LinkerContext,
+    clean: &options::CleanOutputs,
+    log: &mut bun_ast::Log,
+    root_dir: &bun_sys::Dir,
+    root_path: &[u8],
+    chunks: &[Chunk],
+    is_standalone: bool,
+    standalone_sourcemaps: &[Option<Box<[u8]>>],
+) -> Result<Vec<StaleOutput>, Error> {
+    use paths::{ParentEqual, is_parent_or_equal};
+
+    let mut real_buf = bun_paths::path_buffer_pool::get();
+    let real: &[u8] = match root_dir.get_fd_path(&mut real_buf) {
+        Ok(real) => real,
+        Err(e) => {
+            log.add_sys_error(
+                &e,
+                format_args!(
+                    "finding the real path of outdir {} to clean it",
+                    quote(root_path)
+                ),
+            );
+            return Err(Error::WriteFailed);
+        }
+    };
+    let mut cwd_buf = bun_paths::path_buffer_pool::get();
+    let cwd: Option<&[u8]> = bun_sys::getcwd_z(&mut cwd_buf)
+        .ok()
+        .map(|cwd| cwd.as_bytes());
+    let top_level_dir = bun_resolver::fs::FileSystem::get().top_level_dir();
+    let refuse = |log: &mut bun_ast::Log, reason: core::fmt::Arguments<'_>| {
+        let written = paths::Path::resolve(&[cwd.unwrap_or(top_level_dir), root_path]);
+        let note = "clean removes everything in outdir that the build does not write. Use a directory that holds only the output of the build";
+        let notes = Box::new([bun_ast::range_data(None, bun_ast::Range::NONE, note)]);
+        let outdir = quote(root_path);
+        if strings::without_trailing_slash(&written) == real {
+            log.add_range_error_fmt_with_notes(
+                None,
+                bun_ast::Range::NONE,
+                notes,
+                format_args!("refusing to clean outdir {outdir}: {reason}"),
+            );
+        } else {
+            log.add_range_error_fmt_with_notes(
+                None,
+                bun_ast::Range::NONE,
+                notes,
+                format_args!(
+                    "refusing to clean outdir {outdir}: resolves to {}, which {reason}",
+                    quote(real)
+                ),
+            );
+        }
+        Error::WriteFailed
+    };
+
+    let mut caller_buf = bun_paths::path_buffer_pool::get();
+    let caller: Option<&[u8]> = (!clean.caller.is_empty()).then(|| {
+        let path = bun_core::ZBox::from_bytes(&clean.caller);
+        bun_sys::realpath(&path, &mut caller_buf).unwrap_or(&clean.caller)
+    });
+    let protected: [(&'static str, Option<&[u8]>); 5] = [
+        (
+            "the home directory",
+            bun_core::env_var::HOME.get_not_empty(),
+        ),
+        (
+            "the bun executable",
+            bun_core::self_exe_path().ok().map(|exe| exe.as_bytes()),
+        ),
+        ("the current directory", cwd),
+        ("the project directory", Some(top_level_dir)),
+        ("the script that called Bun.build", caller),
+    ];
+    if let Some(what) = bun_sys::first_protected_in(real, protected) {
+        return Err(refuse(log, format_args!("is or contains {what}")));
+    }
+
+    // The resolver follows links, so the path it gives a file is the real one. A plugin and the `files` option name a
+    // file as they like.
+    let has_unresolved_paths = c.bundle.plugins.is_some() || c.bundle.file_map.is_some();
+    let mut input_buf = bun_paths::path_buffer_pool::get();
+    for source in c.parse_graph().input_files.items_source() {
+        let path = &source.path;
+        if !path.is_file() || !bun_paths::is_absolute(path.text) {
+            continue;
+        }
+        let input: &[u8] = if has_unresolved_paths {
+            match bun_sys::realpath(&bun_core::ZBox::from_bytes(path.text), &mut input_buf) {
+                Ok(input) => input,
+                // Nothing on disk has this path, so nothing is removed with it.
+                Err(e) if e.get_errno() == bun_sys::E::ENOENT => continue,
+                Err(e) => {
+                    log.add_sys_error(
+                        &e,
+                        format_args!(
+                            "finding the real path of {} to clean outdir {}",
+                            quote(path.text),
+                            quote(root_path)
+                        ),
+                    );
+                    return Err(Error::WriteFailed);
+                }
+            }
+        } else {
+            path.text
+        };
+        if is_parent_or_equal(real, input) != ParentEqual::Unrelated {
+            return Err(refuse(
+                log,
+                format_args!("contains {}, which the build reads", quote(input)),
+            ));
+        }
+    }
+
+    let mut kept = KeptOutputs::default();
+    for (index, chunk) in chunks.iter().enumerate() {
+        if is_standalone && !matches!(chunk.content, Content::Html) {
+            if standalone_sourcemaps
+                .get(index)
+                .is_some_and(Option::is_some)
+            {
+                kept.keep(&chunk.final_rel_path, b".map", Kept::File)?;
+            }
+            continue;
+        }
+        kept.keep(&chunk.final_rel_path, b"", Kept::File)?;
+        if !chunk.external_legal_comments.is_empty() {
+            kept.keep(
+                &chunk.final_rel_path,
+                legal_comments::FILE_EXTENSION,
+                Kept::File,
+            )?;
+        }
+        if matches!(
+            chunk.content.sourcemap(c.options.source_maps),
+            SourceMapOption::External | SourceMapOption::Linked
+        ) {
+            kept.keep(&chunk.final_rel_path, b".map", Kept::File)?;
+        }
+        if c.options.generate_bytecode_cache && c.chunk_gets_bytecode(chunk) {
+            kept.keep(
+                &chunk.final_rel_path,
+                BYTECODE_EXTENSION.as_bytes(),
+                Kept::RemovedFirst,
+            )?;
+        }
+    }
+    if !is_standalone {
+        for file in c.graph.additional_output_files.iter() {
+            kept.keep(&file.dest_path, b"", Kept::File)?;
+        }
+    }
+    // `Bun.build` writes its metafiles once the linker has returned.
+    let bundle_options = &c.bundle.transpiler.options;
+    let metafiles = [
+        &bundle_options.metafile_json_path,
+        &bundle_options.metafile_markdown_path,
+    ];
+    for path in metafiles.into_iter().chain(&clean.written_later) {
+        kept.keep(path, b"", Kept::File)?;
+    }
+
+    let mut stale = Vec::new();
+    let mut failure: RemovalFailure = None;
+    find_unkept(root_dir, &mut Vec::new(), &kept, &mut stale, &mut failure);
+    match failure {
+        None => Ok(stale),
+        Some((e, path)) => Err(fail_to_remove(log, &e, &path, root_path)),
+    }
+}
+
+fn fail_to_remove(
+    log: &mut bun_ast::Log,
+    e: &bun_sys::Error,
+    path: &[u8],
+    root_path: &[u8],
+) -> Error {
+    log.add_sys_error(
+        e,
+        format_args!(
+            "removing {} to clean outdir {}",
+            quote(path),
+            quote(root_path)
+        ),
+    );
+    Error::WriteFailed
+}
+
+/// Adds to `stale` what is in `dir` and not in `kept`, and removes what is in the way of a write. `prefix` is the path
+/// of `dir` in the output directory, empty or with a `/` at its end.
+fn find_unkept(
+    dir: &bun_sys::Dir,
+    prefix: &mut Vec<u8>,
+    kept: &KeptOutputs,
+    stale: &mut Vec<StaleOutput>,
+    failure: &mut RemovalFailure,
+) {
+    use bun_sys::{E, EntryKind};
+
+    let mut entries: Vec<(Vec<u8>, EntryKind)> = Vec::new();
+    let mut listing = bun_sys::dir_iterator::iterate(dir.fd());
+    loop {
+        match listing.next() {
+            Ok(Some(entry)) => entries.push((entry.name.slice_u8().to_vec(), entry.kind)),
+            Ok(None) => break,
+            Err(e) => {
+                failure.get_or_insert_with(|| (e, prefix.clone()));
+                return;
+            }
+        }
+    }
+
+    let remove_now = |name: &[u8], path: &[u8], failure: &mut RemovalFailure| {
+        if let Err(e) = dir.delete_tree(name) {
+            failure.get_or_insert_with(|| (e, path.to_vec()));
+        }
+    };
+    let prefix_len = prefix.len();
+    let mut unkept: Vec<StaleOutput> = Vec::new();
+    let mut found = bun_collections::StringSet::new();
+    for (name, listed) in &entries {
+        prefix.truncate(prefix_len);
+        prefix.extend_from_slice(name);
+        // A checkout that is deployed from the output directory keeps its repository.
+        if prefix_len == 0 && name == b".git" {
+            continue;
+        }
+        let Some(&wanted) = kept.paths.get(&prefix[..]) else {
+            unkept.push(StaleOutput {
+                path: Box::from(&prefix[..]),
+                is_directory: *listed == EntryKind::Directory,
+            });
+            continue;
+        };
+        bun_core::handle_oom(found.insert(name));
+        let kind = match *listed {
+            EntryKind::Unknown => kind_of(dir, name),
+            known => known,
+        };
+        match (wanted, kind) {
+            (Kept::File, EntryKind::File) => continue,
+            (Kept::Directory, EntryKind::Directory) => {
+                let options = bun_sys::OpenDirOptions {
+                    iterate: true,
+                    no_follow: true,
+                };
+                match dir.open_dir(name, options) {
+                    Ok(subdirectory) => {
+                        prefix.push(b'/');
+                        find_unkept(&subdirectory, prefix, kept, stale, failure);
+                        continue;
+                    }
+                    Err(e) if e.get_errno() == E::ENOENT => continue,
+                    // A link took its place since the listing.
+                    Err(e) if matches!(e.get_errno(), E::ENOTDIR | E::ELOOP) => {}
+                    Err(e) => {
+                        failure.get_or_insert_with(|| (e, prefix.clone()));
+                        continue;
+                    }
+                }
+            }
+            // In the way of a write, or the bytecode of a chunk.
+            _ => {}
+        }
+        remove_now(name, prefix, failure);
+    }
+    prefix.truncate(prefix_len);
+
+    // Where names differ only by case, or by how a character is composed, an entry can be the file of a kept name
+    // that the listing does not have. Removed after the writes, it would take the new file with it.
+    let is_absent = |name: &[u8]| bun_sys::lstatat(dir.fd(), &paths::Path::from(name)).is_err();
+    let kept_names = kept.children.get(&prefix[..prefix_len.saturating_sub(1)]);
+    let has_alias = kept_names.is_some_and(|names| {
+        found.count() < names.len()
+            && (names.iter()).any(|name| !found.contains(name) && !is_absent(name))
+    });
+    if has_alias {
+        for entry in &unkept {
+            remove_now(&entry.path[prefix_len..], &entry.path, failure);
+        }
+    } else {
+        stale.append(&mut unkept);
+    }
+}
+
+/// For a listing that does not tell what an entry is.
+fn kind_of(dir: &bun_sys::Dir, name: &[u8]) -> bun_sys::EntryKind {
+    match bun_sys::lstatat(dir.fd(), &paths::Path::from(name)) {
+        Ok(stat) => bun_sys::kind_from_mode(stat.st_mode as bun_sys::Mode),
+        Err(_) => bun_sys::EntryKind::Unknown,
+    }
+}
+
+/// `clean`: the build has written its files, and what `find_stale_outputs` found goes. An entry that cannot be removed
+/// fails the build, which is whole by then.
+#[inline]
+fn remove_stale_outputs(
+    log: &mut bun_ast::Log,
+    root_dir: &bun_sys::Dir,
+    root_path: &[u8],
+    stale: Option<Vec<StaleOutput>>,
+) -> Result<(), Error> {
+    match stale {
+        None => Ok(()),
+        Some(stale) => remove_each(log, root_dir, root_path, stale),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn remove_each(
+    log: &mut bun_ast::Log,
+    root_dir: &bun_sys::Dir,
+    root_path: &[u8],
+    stale: Vec<StaleOutput>,
+) -> Result<(), Error> {
+    let mut failure: RemovalFailure = None;
+    for entry in stale {
+        let is_removed = entry.is_directory
+            && match bun_sys::rmdirat(root_dir.fd(), &paths::Path::from(&entry.path)) {
+                Ok(()) => true,
+                // A mount point stays, with what is in it: `rmdir` refuses one before it looks inside. On Windows
+                // the error is for a directory in use, which is removed like any other.
+                Err(e) => cfg!(not(windows)) && e.get_errno() == bun_sys::E::EBUSY,
+            };
+        if !is_removed && let Err(e) = root_dir.delete_tree(&entry.path) {
+            failure.get_or_insert_with(|| (e, entry.path.into_vec()));
+        }
+    }
+    match failure {
+        None => Ok(()),
+        Some((e, path)) => Err(fail_to_remove(log, &e, &path, root_path)),
+    }
 }

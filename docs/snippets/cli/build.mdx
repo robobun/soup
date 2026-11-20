@@ -46,6 +46,14 @@ bun build <entry points>
   Output directory (used when building multiple entry points)
 </ParamField>
 
+<ParamField path="--clean" type="boolean">
+  Remove from <code>--outdir</code> what this build does not write. Needs <code>--outdir</code>
+</ParamField>
+
+<ParamField path="--no-clean" type="boolean">
+  Turn <code>--clean</code> off
+</ParamField>
+
 <ParamField path="--outfile" type="string">
   Write output to a specific file
 </ParamField>

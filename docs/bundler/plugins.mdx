@@ -359,6 +359,8 @@ const result = await Bun.build({
 });
 ```
 
+A plugin that writes files of its own into `outdir` writes them in `onEnd()`. With [`clean: true`](/bundler#clean), Bun removes from `outdir` what the bundle does not have, after it has written the bundle and before it calls `onEnd()`. A file that a plugin wrote there in `setup()`, `onStart()`, `onResolve()` or `onLoad()` is gone by then.
+
 ## Native plugins
 
 Bun's bundler is written in native code and uses multiple threads to load and parse modules in parallel. JavaScript plugins run on a single thread, because JavaScript itself is single-threaded.

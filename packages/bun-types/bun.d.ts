@@ -5003,6 +5003,51 @@ declare module "bun" {
     outdir?: string;
 
     /**
+     * Remove from {@link outdir} what this build does not write.
+     *
+     * After a build with `clean: true`, `outdir` holds the files of that build
+     * and nothing else. That ends the pile of chunks and assets whose `[hash]`
+     * changed. With `watch: true`, every rebuild does it.
+     *
+     * Bun removes the old files after it has written the bundle, so a build
+     * that fails before that removes nothing. A file that the build writes
+     * again is written over, as without `clean`. The bytecode of a chunk and
+     * the files of `dts` are removed and made again.
+     *
+     * What stays: a `.git` at the top of `outdir`, and a mount point with what
+     * is in it. Everything else goes, including the files that another build
+     * or a script put there, and the files that a plugin wrote there before
+     * its `onEnd`. A symbolic link is removed, and what it leads to is not.
+     *
+     * The build fails, and removes and writes nothing, if `outdir` is or
+     * contains the working directory, the home directory, the Bun executable
+     * or the script that called `Bun.build()`, or a source file of the bundle:
+     * an entry point, or a module, a stylesheet or an asset that it imports.
+     * Bun does not see every file that a build reads. A macro, a
+     * `tsconfig.json`, a `package.json`, a file that is imported only for its
+     * types and a file that a plugin reads by itself are not protected.
+     *
+     * `Bun.build()` throws if `clean` is `true` without `outdir`, or with a
+     * `compile` that makes an executable.
+     *
+     * Equivalent CLI flag: `--clean`
+     *
+     * @default false
+     *
+     * @example
+     * ```ts
+     * await Bun.build({
+     *   entrypoints: ['./src/index.ts'],
+     *   outdir: './dist',
+     *   splitting: true,
+     *   clean: true,
+     * });
+     * // dist has index.js and the chunks of this build, and no chunk of an earlier one
+     * ```
+     */
+    clean?: boolean;
+
+    /**
      * Create a standalone executable or self-contained HTML.
      *
      * When `true`, creates an executable for the current platform.

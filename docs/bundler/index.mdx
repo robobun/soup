@@ -182,6 +182,7 @@ With `watch: true`, `Bun.build()` returns a `BuildWatcher` in place of a promise
 - **A build that fails** is a result with `success: false` and the errors in `logs`. The [`throw`](#logs-and-errors) option has no say here, and the watcher goes on. What a plugin throws from `setup()` or `onEnd` is in `logs` as it was thrown. After a failed build the watcher also builds again when the file that a relative import did not find, or a missing entry point, is created.
 - **Changes that come together are one rebuild.** The watcher waits until no watched file has changed for 50 milliseconds. A change that arrives while a build is running starts another one right after it.
 - **The loop gets the newest build.** If several rebuilds finish while the body of the loop is busy, the next iteration gets the last of them and the ones in between are skipped. Each build is returned once.
+- **A rebuild leaves the files of the builds before it**, such as a chunk whose hash has changed. With [`clean: true`](#clean), every rebuild removes them, and everything else that it did not write.
 
 <Note>
   For TypeScript, `watch` has to be the literal `true` for the result to be a `BuildWatcher`. A `watch` of type
@@ -413,6 +414,67 @@ for (const res of result.outputs) {
 ```
 
 When `outdir` is set, the `path` property on a `BuildArtifact` is the absolute path it was written to.
+
+### clean
+
+Removes from [`outdir`](#outdir) what the build does not write. A build only adds files and writes over them. With [`splitting`](#splitting) or a `[hash]` in [`naming`](#naming), the names change from build to build, and the old files pile up.
+
+<Tabs>
+  <Tab title="JavaScript">
+    ```ts title="build.ts" icon="/icons/typescript.svg"
+    await Bun.build({
+      entrypoints: ['./index.tsx'],
+      outdir: './out',
+      splitting: true,
+      clean: true,
+    })
+    ```
+  </Tab>
+  <Tab title="CLI">
+    ```bash terminal icon="terminal"
+    bun build ./index.tsx --outdir ./out --splitting --clean
+    ```
+  </Tab>
+</Tabs>
+
+After the build, `outdir` holds the files of that build and nothing else.
+
+- **Bun removes the old files after it has written the bundle.** A build that fails before that removes nothing. Until the end of the build, the old chunks are there beside the new ones.
+- **A file that the build writes again is written over**, as without `clean`. That holds for the chunks, their source maps and legal comment files, the assets, and a [metafile](#metafile) in `outdir`. The bytecode of a chunk, the files of [`dts`](#dts) and the files that `bun compile --library` adds are removed and made again.
+- **A `.git` at the top of `outdir` stays**, for an `outdir` that is a checkout of the branch you deploy. A mount point below `outdir` stays too, with what is in it.
+- **A symbolic link is removed, and what it leads to is not.** That includes a link at the name of a file or a directory that the build writes: the build makes a file or a directory of its own there.
+- **Everything else goes**: the files of another build that shares the `outdir`, files that a script copied there, and files that a [plugin](/bundler/plugins) wrote there before its `onEnd`. A `BuildArtifact` of an earlier build whose file is gone can no longer be read.
+- **If a file cannot be removed, the build fails**, with its own files written.
+
+`--no-clean` turns `--clean` off, also when it comes first. Use it to run a package script that has `--clean` without it.
+
+#### Files that are not part of the bundle
+
+Copy them into `outdir` after the build, in the script that calls `Bun.build()`. A plugin writes its files in [`onEnd`](/bundler/plugins#onend).
+
+With `bun build --watch --clean`, nothing runs between two rebuilds, so a copied file is gone after the first one. Three ways around that:
+
+- Give the bundle an `outdir` of its own, beside the other files.
+- Import the file from the bundle, so that it is an [asset](/bundler/loaders#file) of the build.
+- Watch with [`Bun.build({ watch: true })`](#watch-mode), and copy the files in its loop.
+
+#### What Bun refuses to clean
+
+The build fails, and Bun removes and writes nothing, when `outdir` is or contains one of these:
+
+- the working directory, the home directory or the Bun executable
+- the script that called `Bun.build()`
+- a source file of the bundle: an entry point, or a module, a stylesheet or an asset that it imports
+
+```txt
+error: refusing to clean outdir ".": is or contains the current directory
+
+note: clean removes everything in outdir that the build does not write. Use a directory that holds only the output of the build
+```
+
+Bun does not know every file that a build reads. It does not refuse an `outdir` for a [macro](/bundler/macros) or a file that a macro reads, a `tsconfig.json` or a `package.json`, a file that is imported only for its types, or a file that a plugin reads by itself. Keep such files out of `outdir`.
+
+`clean` needs `outdir`. It can't be used with `--no-bundle`, `--app`, or a [`compile`](/compiler/executables) that makes an executable.
 
 ### target
 
@@ -2134,6 +2196,7 @@ interface Bun {
 interface BuildConfig {
   entrypoints: string[]; // list of file path
   outdir?: string; // output directory
+  clean?: boolean; // default: false, remove from outdir what the build does not write
   target?: Target; // default: "browser"
   /**
    * Output module format. Top-level await is only supported for `"esm"`.

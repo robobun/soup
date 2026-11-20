@@ -690,6 +690,7 @@ impl BuildCommand {
                 &mut minify_duration,
                 &mut input_code_length,
                 fetcher,
+                clean_outputs(&ctx.bundler_options),
             ) {
                 Ok(r) => r,
                 Err(err) => {
@@ -1316,6 +1317,34 @@ fn summary_ignores_dot_slash(outputs: &[options::OutputFile]) -> bool {
         }
         index > 0 && bun_paths::is_sep(first[index])
     })
+}
+
+/// `--clean`, with the metafiles that this command writes into `--outdir` once the bundle is there.
+fn clean_outputs(
+    options: &bun_options_types::context::BundlerOptions,
+) -> Option<Box<options::CleanOutputs>> {
+    use bun_paths::{ParentEqual, Path, is_parent_or_equal};
+
+    if !options.clean {
+        return None;
+    }
+    let cwd = bun_resolver::fs::FileSystem::get().top_level_dir();
+    let outdir = Path::resolve(&[cwd, &options.outdir]);
+    let outdir = strings::without_trailing_slash(&outdir);
+    let mut written_later = Vec::new();
+    for file in [&options.metafile, &options.metafile_md] {
+        if file.is_empty() {
+            continue;
+        }
+        let file = Path::resolve(&[cwd, file]);
+        if is_parent_or_equal(outdir, &file) == ParentEqual::Parent {
+            written_later.push(Box::from(&file.as_bytes()[outdir.len()..]));
+        }
+    }
+    Some(Box::new(options::CleanOutputs {
+        written_later,
+        caller: Box::default(),
+    }))
 }
 
 pub(crate) fn compile_outfile(outfile: &[u8]) -> &[u8] {

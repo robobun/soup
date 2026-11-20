@@ -290,6 +290,33 @@ impl Dir {
     }
 }
 
+/// What stands against emptying `dir`, a real path: the first of `protected` that it is or contains.
+/// A protected path that is a symlink counts as the directory it leads to.
+pub fn first_protected_in<'a, T>(
+    dir: &[u8],
+    protected: impl IntoIterator<Item = (T, Option<&'a [u8]>)>,
+) -> Option<T> {
+    use bun_paths::{ParentEqual, is_parent_or_equal};
+    let mut buf = bun_paths::path_buffer_pool::get();
+    for (what, path) in protected {
+        let Some(path) = path else { continue };
+        let real: &[u8] = match Dir::open(path) {
+            Ok(opened) => match opened.get_fd_path(&mut buf) {
+                Ok(real) => &real[..],
+                Err(_) => path,
+            },
+            Err(_) => path,
+        };
+        // Older versions read `\` as `/`, and installed there.
+        let [dir, real] =
+            [dir, real].map(|path| bun_core::strings::replace_char(path, b'\\', b'/'));
+        if is_parent_or_equal(&dir, &real) != ParentEqual::Unrelated {
+            return Some(what);
+        }
+    }
+    None
+}
+
 #[cfg(unix)]
 pub const AT_REMOVEDIR: i32 = libc::AT_REMOVEDIR;
 #[cfg(windows)]

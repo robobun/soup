@@ -121,6 +121,9 @@ pub struct BundleV2<'a> {
     /// If false we can skip TLA validation and propagation.
     pub(crate) has_any_top_level_await_modules: bool,
 
+    /// `clean`: see `write_output_files_to_disk`.
+    pub clean: Option<Box<crate::options::CleanOutputs>>,
+
     /// Barrel optimization: tracks which exports have been requested from each
     /// module encountered during barrel BFS. Keys are source indices. Values
     /// track requested export names for deduplication and cycle detection.
@@ -2722,6 +2725,7 @@ pub mod bv2_impl {
                 drain_defer_task: DeferredBatchTask::default(),
                 asynchronous: false,
                 has_any_top_level_await_modules: false,
+                clean: None,
                 requested_exports: Vec::new(),
             });
             if let Some(bo) = bake_options {
@@ -3792,9 +3796,11 @@ pub mod bv2_impl {
             minify_duration: &mut u64,
             source_code_size: &mut u64,
             fetcher: Option<&mut DependenciesScanner<'_>>,
+            clean: Option<Box<crate::options::CleanOutputs>>,
         ) -> Result<BuildResult, Error> {
             let mut this = BundleV2::init(transpiler, None, alloc, event_loop, None, alloc);
             this.unique_key = generate_unique_key();
+            this.clean = clean;
             this.bun_watcher
                 .clone_from(&this.transpiler.resolver.watcher);
 

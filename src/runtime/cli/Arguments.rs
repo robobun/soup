@@ -788,6 +788,10 @@ pub(crate) const BUILD_ONLY_PARAMS: &[ParamType] = concat_params!(
             "--target <STR>                   The intended execution environment for the bundle. \"browser\", \"bun\" or \"node\""
         ),
         parse_param!("--outdir <STR>                   Default to \"dist\" if multiple files"),
+        parse_param!(
+            "--clean                          Remove from --outdir what this build does not write"
+        ),
+        parse_param!("--no-clean                       Turn --clean off"),
         parse_param!("--outfile <STR>                  Write to a file"),
         parse_param!(
             "--metafile <STR>?                Write a JSON file with metadata about the build"
@@ -3216,6 +3220,29 @@ fn parse_build_command_options(
         if !outfile.is_empty() {
             ctx.bundler_options.outfile = outfile.into();
         }
+    }
+
+    // An unknown flag is ignored, so without `--no-clean` a script's `--clean` could not be taken back.
+    if args.flag(b"--clean") && !args.flag(b"--no-clean") {
+        let options = &ctx.bundler_options;
+        // `--compile --target=browser` writes pages into `--outdir`. An executable is one file.
+        let makes_executable = compiles && args.option(b"--target") != Some(b"browser");
+        let refusal = if makes_executable {
+            Some("--clean cannot be used with --compile")
+        } else if options.outdir.is_empty() {
+            Some("--clean requires --outdir")
+        } else if options.transform_only {
+            Some("--clean cannot be used with --no-bundle")
+        } else if options.bake {
+            Some("--clean cannot be used with --app")
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            Output::err_generic(message, ());
+            Global::exit(1);
+        }
+        ctx.bundler_options.clean = true;
     }
 
     if let Some(metafile) = args.option(b"--metafile") {

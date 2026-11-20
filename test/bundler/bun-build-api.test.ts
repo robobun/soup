@@ -1,6 +1,6 @@
 import assert from "assert";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
+import { linkSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "fs";
 import {
   bunEnv,
   bunExe,
@@ -3142,4 +3142,267 @@ test("css @import resolve errors report importKind 'import-rule' with and withou
     kinds[entry] = build.logs.map(log => (log as ResolveMessage).importKind);
   }
   expect(kinds).toEqual({ "plain.css": ["import-rule"], "conditional.css": ["import-rule"] });
+});
+
+describe("clean", () => {
+  const files = {
+    "src/index.ts": `import("./lazy").then(lazy => console.log(lazy.value));\n`,
+    "src/lazy.ts": `export const value = 1;\n`,
+  };
+  // Everything below `dir`, directories too, with "/" between the parts of a path.
+  const tree = (dir: string) =>
+    (readdirSync(dir, { recursive: true }) as string[]).map(name => name.replaceAll("\\", "/")).sort();
+  const names = (build: Bun.BuildOutput) => build.outputs.map(output => path.basename(output.path)).sort();
+
+  test("leaves in outdir what the build writes and a top-level .git, and only when it is true", async () => {
+    using dir = tempDir("bun-build-api-clean", files);
+    const outdir = join(String(dir), "dist");
+    const config = { entrypoints: [join(String(dir), "src/index.ts")], outdir, splitting: true };
+    const first = names(await Bun.build(config));
+    expect(tree(outdir)).toEqual(first);
+
+    writeFileSync(join(String(dir), "src/lazy.ts"), `export const value = 2;\n`);
+    mkdirSync(join(outdir, "old/deep"), { recursive: true });
+    writeFileSync(join(outdir, "old/deep/page.js"), "stale");
+    mkdirSync(join(outdir, ".git"));
+    writeFileSync(join(outdir, ".git/HEAD"), "ref: refs/heads/pages\n");
+    const stale = [...first, ".git", ".git/HEAD", "old", "old/deep", "old/deep/page.js"];
+
+    let second: string[] = [];
+    for (const clean of [undefined, false]) {
+      second = names(await Bun.build({ ...config, clean }));
+      expect(tree(outdir)).toEqual([...new Set([...stale, ...second])].sort());
+    }
+    expect(second).not.toEqual(first);
+
+    const cleaned = await Bun.build({ ...config, clean: true });
+    expect(names(cleaned)).toEqual(second);
+    expect(tree(outdir)).toEqual([".git", ".git/HEAD", ...second]);
+    expect(await Promise.all(cleaned.outputs.map(output => output.text()))).toEqual(
+      cleaned.outputs.map(output => readFileSync(output.path, "utf8")),
+    );
+  });
+
+  test("a build that fails removes nothing", async () => {
+    using dir = tempDir("bun-build-api-clean-failed", {
+      "src/index.ts": `import "./missing";\n`,
+      "dist/index.js": "previous",
+      "dist/old/chunk.js": "previous",
+    });
+    const outdir = join(String(dir), "dist");
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "src/index.ts")],
+      outdir,
+      clean: true,
+      throw: false,
+    });
+    expect(build.success).toBe(false);
+    expect(tree(outdir)).toEqual(["index.js", "old", "old/chunk.js"]);
+    expect(readFileSync(join(outdir, "index.js"), "utf8")).toBe("previous");
+  });
+
+  test("keeps the metafiles that the build writes into outdir", async () => {
+    using dir = tempDir("bun-build-api-clean-metafile", {
+      ...files,
+      "dist/meta.json": "stale",
+      "dist/gone.md": "stale",
+    });
+    const outdir = join(String(dir), "dist");
+    const config = {
+      entrypoints: [join(String(dir), "src/index.ts")],
+      outdir,
+      splitting: true,
+      metafile: { json: "meta.json", markdown: "reports/meta.md" },
+      clean: true,
+    };
+    const build = await Bun.build(config);
+    const chunks = names(build).filter(name => name.endsWith(".js"));
+    expect(chunks).toHaveLength(2);
+    expect(tree(outdir)).toEqual([...chunks, "meta.json", "reports", "reports/meta.md"].sort());
+    expect(Object.keys(JSON.parse(readFileSync(join(outdir, "meta.json"), "utf8")))).toEqual(["inputs", "outputs"]);
+
+    // A second name for each: a file that is removed and made again has one link afterwards.
+    linkSync(join(outdir, "meta.json"), join(String(dir), "meta.json"));
+    linkSync(join(outdir, "reports/meta.md"), join(String(dir), "meta.md"));
+    await Bun.build(config);
+    expect(["meta.json", "reports/meta.md"].map(name => statSync(join(outdir, name)).nlink)).toEqual([2, 2]);
+  });
+
+  test("refuses an outdir that holds a file that the build reads, and removes nothing", async () => {
+    using dir = tempDir("bun-build-api-clean-input", {
+      "src/index.ts": `import { value } from "../lib/value";\nconsole.log(value);\n`,
+      "lib/value.ts": `export const value = 1;\n`,
+      "lib/notes.txt": "kept",
+    });
+    const before = tree(String(dir));
+    const outdir = join(String(dir), "lib");
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "src/index.ts")],
+      outdir,
+      clean: true,
+      throw: false,
+    });
+    expect(build.logs.map(log => log.message)).toEqual([
+      `refusing to clean outdir ${JSON.stringify(outdir)}: contains ${JSON.stringify(join(String(dir), "lib", "value.ts"))}, which the build reads`,
+    ]);
+    expect(build.success).toBe(false);
+    expect(tree(String(dir))).toEqual(before);
+  });
+
+  test.each(["//", "/./"])("finds a file that a plugin names with %j in its path", async separator => {
+    using dir = tempDir("bun-build-api-clean-plugin-path", {
+      "src/index.ts": `import value from "virtual:value";\nconsole.log(value);\n`,
+      "gen/value.ts": `export default 1;\n`,
+    });
+    const before = tree(String(dir));
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "src/index.ts")],
+      outdir: join(String(dir), "gen"),
+      clean: true,
+      throw: false,
+      plugins: [
+        {
+          name: "value",
+          setup(builder) {
+            builder.onResolve({ filter: /^virtual:value$/ }, () => ({
+              path: String(dir) + separator + join("gen", "value.ts"),
+            }));
+          },
+        },
+      ],
+    });
+    expect(build.logs.map(log => log.message)).toEqual([
+      `refusing to clean outdir ${JSON.stringify(join(String(dir), "gen"))}: contains ${JSON.stringify(join(String(dir), "gen", "value.ts"))}, which the build reads`,
+    ]);
+    expect(build.success).toBe(false);
+    expect(tree(String(dir))).toEqual(before);
+  });
+
+  test("refuses an outdir that holds the script that called Bun.build", async () => {
+    using dir = tempDir("bun-build-api-clean-caller", {
+      "src/index.ts": `console.log(1);\n`,
+      "tools/notes.txt": "kept",
+      "tools/build.ts": `
+        const build = await Bun.build({
+          entrypoints: [import.meta.dir + "/../src/index.ts"],
+          outdir: import.meta.dir,
+          clean: true,
+          throw: false,
+        });
+        console.log(JSON.stringify([build.success, ...build.logs.map(log => log.message)]));
+      `,
+    });
+    const tools = join(String(dir), "tools");
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join("tools", "build.ts")],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual([
+      false,
+      `refusing to clean outdir ${JSON.stringify(tools)}: is or contains the script that called Bun.build`,
+    ]);
+    expect(tree(tools)).toEqual(["build.ts", "notes.txt"]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("removes what a plugin writes into outdir before its onEnd", async () => {
+    using dir = tempDir("bun-build-api-clean-plugin-writes", files);
+    const outdir = join(String(dir), "dist");
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "src/index.ts")],
+      outdir,
+      clean: true,
+      plugins: [
+        {
+          name: "writes",
+          setup(builder) {
+            mkdirSync(outdir, { recursive: true });
+            writeFileSync(join(outdir, "from-setup.txt"), "");
+            builder.onStart(() => writeFileSync(join(outdir, "from-onStart.txt"), ""));
+            builder.onEnd(() => writeFileSync(join(outdir, "from-onEnd.txt"), ""));
+          },
+        },
+      ],
+    });
+    expect(tree(outdir)).toEqual([...names(build), "from-onEnd.txt"].sort());
+  });
+
+  test("a build that fails while it writes its files removes nothing", async () => {
+    using dir = tempDir("bun-build-api-clean-failed-write", { ...files, "dist/gone.js": "stale" });
+    const outdir = join(String(dir), "dist");
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "src/index.ts")],
+      outdir,
+      splitting: true,
+      sourcemap: "linked",
+      // The name of the chunk fits in a directory entry, and the name of its source map does not.
+      naming: { chunk: `[name]-${Buffer.alloc(245, "x")}.[ext]` },
+      clean: true,
+      throw: false,
+    });
+    expect(build.success).toBe(false);
+    expect(readdirSync(outdir)).toContain("gone.js");
+  });
+
+  test("a plugin can turn it on", async () => {
+    using dir = tempDir("bun-build-api-clean-plugin", { ...files, "dist/gone.js": "stale" });
+    const outdir = join(String(dir), "dist");
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "src/index.ts")],
+      outdir,
+      plugins: [
+        {
+          name: "clean",
+          setup(builder) {
+            builder.config.clean = true;
+          },
+        },
+      ],
+    });
+    expect(tree(outdir)).toEqual(names(build));
+  });
+
+  test("compile with target: 'browser' writes its page into a cleaned outdir", async () => {
+    using dir = tempDir("bun-build-api-clean-standalone-html", {
+      "page.html": `<!doctype html><html><head><script type="module" src="./app.ts"></script></head><body></body></html>`,
+      "app.ts": `console.log("app");\n`,
+      "dist/gone.html": "stale",
+    });
+    const outdir = join(String(dir), "dist");
+    const build = await Bun.build({
+      entrypoints: [join(String(dir), "page.html")],
+      outdir,
+      compile: true,
+      target: "browser",
+      clean: true,
+    });
+    expect(build.success).toBe(true);
+    expect(tree(outdir)).toEqual(["page.html"]);
+  });
+
+  test("invalid values and combinations throw, and nothing is removed", async () => {
+    using dir = tempDir("bun-build-api-clean-invalid", { ...files, "dist/previous.js": "previous" });
+    const before = tree(String(dir));
+    const entrypoints = [join(String(dir), "src/index.ts")];
+    const outdir = join(String(dir), "dist");
+    expect(() => Bun.build({ entrypoints, outdir, clean: "false" as any })).toThrow(
+      'The "clean" property must be of type boolean, got string',
+    );
+    expect(() => Bun.build({ entrypoints, outdir, clean: 1 as any })).toThrow(
+      'The "clean" property must be of type boolean, got number',
+    );
+    expect(() => Bun.build({ entrypoints, clean: true })).toThrow("clean requires outdir");
+    expect(() => Bun.build({ entrypoints, outdir, clean: true, compile: true })).toThrow(
+      "clean cannot be used with compile",
+    );
+    expect(() => Bun.build({ entrypoints, outdir, clean: true, compile: { aot: true } as any })).toThrow(
+      "clean cannot be used with compile",
+    );
+    expect(tree(String(dir))).toEqual(before);
+  });
 });
