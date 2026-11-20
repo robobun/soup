@@ -604,6 +604,8 @@ _bun_build_completion() {
         '*: :->file' \
         '--outfile[Write the output to a specific file (default: stdout)]:outfile' \
         '--outdir[Write the output to a directory (required for splitting)]:outdir' \
+        '--clean[Remove from --outdir what this build does not write]' \
+        '--no-clean[Turn --clean off]' \
         '--minify[Enable all minification flags]' \
         '--minify-whitespace[Remove unneeded whitespace]' \
         '--minify-syntax[Transform code to use less syntax]' \

@@ -1328,3 +1328,402 @@ describe("--alias", () => {
     expect(exitCode).toBe(1);
   });
 });
+
+describe.concurrent("--clean", () => {
+  const files = {
+    "src/index.ts": `import("./lazy").then(lazy => console.log(lazy.value));\n`,
+    "src/lazy.ts": `export const value = 1;\n`,
+  };
+  const note =
+    "note: clean removes everything in outdir that the build does not write. Use a directory that holds only the output of the build\n";
+
+  async function build(cwd: string, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build", ...args],
+      env: bunEnv,
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  // Everything below `dir`, directories too, with "/" between the parts of a path.
+  const tree = (dir: string) =>
+    (fs.readdirSync(dir, { recursive: true }) as string[]).map(name => name.replaceAll("\\", "/")).sort();
+
+  // Gives every file of `dist` a second name outside it. A file that is then removed and made again has one link,
+  // and a file that is written over has two.
+  function link(dir: string, dist: string) {
+    mkdirSync(join(dir, "links"));
+    const names = tree(dist).filter(name => fs.statSync(join(dist, name)).isFile());
+    names.forEach((name, index) => fs.linkSync(join(dist, name), join(dir, "links", String(index))));
+    return () =>
+      Object.fromEntries(
+        names.map(name => [name.replace(/-\w{8}\./, "-[hash]."), fs.statSync(join(dist, name)).nlink]),
+      );
+  }
+
+  test("leaves in --outdir what the build writes and a top-level .git, and only with the flag", async () => {
+    using dir = tempDir("build-clean", files);
+    const dist = join(String(dir), "dist");
+    const args = ["src/index.ts", "--outdir=dist", "--splitting"];
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    const first = tree(dist).filter(name => name !== "index.js");
+    expect(first).toEqual([expect.stringMatching(/^lazy-\w+\.js$/)]);
+
+    writeFileSync(join(String(dir), "src/lazy.ts"), `export const value = 2;\n`);
+    mkdirSync(join(dist, "old/deep"), { recursive: true });
+    writeFileSync(join(dist, "old/deep/page.js"), "stale");
+    writeFileSync(join(dist, "notes.txt"), "stale");
+    mkdirSync(join(dist, ".git"));
+    writeFileSync(join(dist, ".git/HEAD"), "ref: refs/heads/pages\n");
+    mkdirSync(join(dist, "old/.git"));
+    const stale = [...first, ".git", ".git/HEAD", "notes.txt", "old", "old/.git", "old/deep", "old/deep/page.js"];
+
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    const second = tree(dist).filter(name => name !== "index.js" && !stale.includes(name));
+    expect(second).toEqual([expect.stringMatching(/^lazy-\w+\.js$/)]);
+    const everything = [...stale, ...second, "index.js"].sort();
+    expect(tree(dist)).toEqual(everything);
+
+    // --no-clean takes --clean back, wherever it is.
+    for (const flags of [
+      ["--clean", "--no-clean"],
+      ["--no-clean", "--clean"],
+    ]) {
+      expect(await build(String(dir), ...args, ...flags)).toMatchObject({ stderr: "", exitCode: 0 });
+      expect(tree(dist)).toEqual(everything);
+    }
+
+    expect(await build(String(dir), ...args, "--clean")).toMatchObject({ stderr: "", exitCode: 0 });
+    expect(tree(dist)).toEqual([".git", ".git/HEAD", "index.js", ...second]);
+    expect(fs.readFileSync(join(dist, ".git/HEAD"), "utf8")).toBe("ref: refs/heads/pages\n");
+  });
+
+  test("a file that the build writes again is written over, and so is a metafile in --outdir", async () => {
+    using dir = tempDir("build-clean-written-over", {
+      "src/index.ts": `/*! (c) entry */\nimport logo from "./logo.txt" with { type: "file" };\nimport("./lazy").then(lazy => console.log(lazy.value, logo));\n`,
+      "src/lazy.ts": `export const value = 1;\n`,
+      "src/logo.txt": "logo",
+    });
+    const dist = join(String(dir), "dist");
+    const args = [
+      "src/index.ts",
+      "--outdir=dist",
+      "--splitting",
+      "--sourcemap=linked",
+      "--legal-comments=linked",
+      "--metafile=dist/meta.json",
+      "--metafile-md=./dist/reports/meta.md",
+      "--clean",
+    ];
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    const links = link(String(dir), dist);
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    expect(links()).toEqual({
+      "index.js": 2,
+      "index.js.LEGAL.txt": 2,
+      "index.js.map": 2,
+      "lazy-[hash].js": 2,
+      "lazy-[hash].js.map": 2,
+      "logo-[hash].txt": 2,
+      "meta.json": 2,
+      "reports/meta.md": 2,
+    });
+  });
+
+  test("the bytecode of a chunk and the declaration files are removed and made again", async () => {
+    using dir = tempDir("build-clean-made-again", {
+      "src/index.ts": `export const value: number = 1;\n`,
+      "dist/gone.js.jsc": "stale",
+      "dist/gone.d.ts": "stale",
+    });
+    const dist = join(String(dir), "dist");
+    for (const [flag, again] of [
+      ["--bytecode", "index.js.jsc"],
+      ["--dts", "index.d.ts"],
+    ]) {
+      const args = ["src/index.ts", "--outdir=dist", flag, "--clean"];
+      expect(await build(String(dir), ...args)).toMatchObject({ exitCode: 0 });
+      expect(tree(dist).filter(name => !name.endsWith(".aot.ts"))).toEqual([again, "index.js"].sort());
+      const links = link(String(dir), dist);
+      expect(await build(String(dir), ...args)).toMatchObject({ exitCode: 0 });
+      expect(links()).toMatchObject({ "index.js": 2, [again]: 1 });
+      rmSync(join(String(dir), "links"), { recursive: true });
+    }
+  });
+
+  test("a link to a directory goes without what it leads to", async () => {
+    using dir = tempDir("build-clean-directory-link", { ...files, "outside/kept.txt": "kept" });
+    const dist = join(String(dir), "dist");
+    const args = ["src/index.ts", "--outdir=dist", "--clean"];
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    // A junction on Windows, where a link to a directory needs no privilege that way.
+    fs.symlinkSync(join(String(dir), "outside"), join(dist, "linked-directory"), "junction");
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    expect(tree(dist)).toEqual(["index.js"]);
+    expect(tree(join(String(dir), "outside"))).toEqual(["kept.txt"]);
+  });
+
+  // A link to a file needs a privilege on Windows that a CI machine does not give.
+  test.skipIf(isWindows)("a link to a file goes without its target, also at the name of an output", async () => {
+    using dir = tempDir("build-clean-file-link", { ...files, "outside/kept.txt": "kept" });
+    const dist = join(String(dir), "dist");
+    const args = ["src/index.ts", "--outdir=dist", "--clean"];
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    fs.symlinkSync(join(String(dir), "outside/kept.txt"), join(dist, "linked-file.txt"));
+    // Without --clean the build writes through a link that is at the name of an output.
+    rmSync(join(dist, "index.js"));
+    fs.symlinkSync(join(String(dir), "outside/kept.txt"), join(dist, "index.js"));
+    expect(await build(String(dir), ...args)).toMatchObject({ stderr: "", exitCode: 0 });
+    expect(tree(dist)).toEqual(["index.js"]);
+    expect(fs.lstatSync(join(dist, "index.js")).isFile()).toBe(true);
+    expect(fs.readFileSync(join(String(dir), "outside/kept.txt"), "utf8")).toBe("kept");
+  });
+
+  test("a build that fails removes nothing", async () => {
+    using dir = tempDir("build-clean-failed", {
+      "src/index.ts": `import "./missing";\n`,
+      "dist/index.js": "previous",
+      "dist/old/chunk.js": "previous",
+    });
+    const { stderr, exitCode } = await build(String(dir), "src/index.ts", "--outdir=dist", "--clean");
+    expect(stderr).toContain(`error: Could not resolve: "./missing"`);
+    expect(tree(join(String(dir), "dist"))).toEqual(["index.js", "old", "old/chunk.js"]);
+    expect(fs.readFileSync(join(String(dir), "dist/index.js"), "utf8")).toBe("previous");
+    expect(exitCode).toBe(1);
+  });
+
+  test("a build that fails while it writes its files removes nothing", async () => {
+    using dir = tempDir("build-clean-failed-write", {
+      ...files,
+      "dist/gone.js": "stale",
+      "dist/old/chunk.js": "stale",
+    });
+    // The name of the chunk fits in a directory entry, and the name of its source map does not.
+    const chunkNaming = `--chunk-naming=[name]-${Buffer.alloc(245, "x")}.[ext]`;
+    const { exitCode } = await build(
+      String(dir),
+      "src/index.ts",
+      "--outdir=dist",
+      "--splitting",
+      "--sourcemap=linked",
+      chunkNaming,
+      "--clean",
+    );
+    expect(tree(join(String(dir), "dist")).filter(name => !name.startsWith("index.js"))).toEqual([
+      "gone.js",
+      "old",
+      "old/chunk.js",
+    ]);
+    expect(exitCode).toBe(1);
+  });
+
+  test("keeps the maps, the legal comments, the assets, the nested entry points and a metafile of the build", async () => {
+    using dir = tempDir("build-clean-kinds", {
+      "src/index.ts": `/*! (c) entry */\nimport logo from "./logo.txt" with { type: "file" };\nimport("./lazy").then(lazy => console.log(lazy.value, logo));\n`,
+      "src/lazy.ts": `export const value = 1;\n`,
+      "src/logo.txt": "logo",
+      "src/pages/about.ts": `console.log("about");\n`,
+      "dist/index.js.map": "stale",
+      "dist/gone.js": "stale",
+      "dist/gone.js.map": "stale",
+      "dist/gone.js.LEGAL.txt": "stale",
+      "dist/pages/gone.js": "stale",
+      "dist/assets/gone.txt": "stale",
+    });
+    const dist = join(String(dir), "dist");
+    const { stderr, exitCode } = await build(
+      String(dir),
+      "src/index.ts",
+      "src/pages/about.ts",
+      "--outdir=dist",
+      "--splitting",
+      "--sourcemap=linked",
+      "--legal-comments=linked",
+      "--metafile=dist/meta.json",
+      "--clean",
+    );
+    expect(stderr).toBe("");
+    expect(tree(dist).map(name => name.replace(/-\w{8}\./, "-[hash]."))).toEqual([
+      "index.js",
+      "index.js.LEGAL.txt",
+      "index.js.map",
+      "lazy-[hash].js",
+      "lazy-[hash].js.map",
+      "logo-[hash].txt",
+      "meta.json",
+      "pages",
+      "pages/about.js",
+      "pages/about.js.map",
+    ]);
+    expect(JSON.parse(fs.readFileSync(join(dist, "index.js.map"), "utf8")).version).toBe(3);
+    expect(exitCode).toBe(0);
+  });
+
+  test.each([
+    [["src/index.ts", "src/pages/about.ts", "--splitting", "--sourcemap=external"]],
+    [["src/index.ts", "src/pages/about.ts", "--splitting", "--minify", "--legal-comments=external"]],
+    [
+      [
+        "src/index.ts",
+        "src/pages/about.ts",
+        "--splitting",
+        "--entry-naming=[dir]/[name]-[hash].[ext]",
+        "--chunk-naming=chunks/[name]-[hash].[ext]",
+        "--asset-naming=assets/[name]-[hash].[ext]",
+      ],
+    ],
+    [["index.html", "--splitting", "--sourcemap=linked", "--public-path=/static/"]],
+    [["index.html", "--compile", "--target=browser", "--sourcemap=linked"]],
+  ])("with %j, a cleaned --outdir is what a build into an empty one gives", async args => {
+    using dir = tempDir("build-clean-same", {
+      "index.html": `<!doctype html><html><head><link rel="stylesheet" href="./src/main.css"><script type="module" src="./src/index.ts"></script></head><body></body></html>`,
+      "src/index.ts": `/*! (c) entry */\nimport logo from "./logo.txt" with { type: "file" };\nimport { shared } from "./shared";\nimport("./lazy").then(lazy => console.log(lazy.value, logo, shared));\n`,
+      "src/pages/about.ts": `import { shared } from "../shared";\nimport("../lazy").then(lazy => console.log(lazy.value, shared));\n`,
+      "src/shared.ts": `export const shared = "shared";\n`,
+      "src/lazy.ts": `export const value = 1;\n`,
+      "src/logo.txt": "logo",
+      "src/main.css": `body { color: red }\n`,
+      "dirty/index.js": "stale",
+      "dirty/gone.js": "stale",
+      "dirty/gone.js.map": "stale",
+      "dirty/chunks/gone.js": "stale",
+      "dirty/assets/gone.txt": "stale",
+      "dirty/pages/deep/gone.js": "stale",
+    });
+    const read = (outdir: string) =>
+      tree(join(String(dir), outdir)).map(name => {
+        const file = join(String(dir), outdir, name);
+        return [name, fs.statSync(file).isDirectory() ? null : fs.readFileSync(file, "latin1")];
+      });
+    expect(await build(String(dir), ...args, "--outdir=fresh")).toMatchObject({ stderr: "", exitCode: 0 });
+    const fresh = read("fresh");
+    expect(fresh.length).toBeGreaterThan(0);
+    // The second time, every file of the build is there before the build: one that the build writes and does not
+    // keep would be removed behind it.
+    for (let time = 0; time < 2; time++) {
+      expect(await build(String(dir), ...args, "--outdir=dirty", "--clean")).toMatchObject({ stderr: "", exitCode: 0 });
+      expect(read("dirty")).toEqual(fresh);
+    }
+  });
+
+  test("--compile --target=browser writes its page into a cleaned --outdir", async () => {
+    using dir = tempDir("build-clean-standalone-html", {
+      "page.html": `<!doctype html><html><head><script type="module" src="./app.ts"></script></head><body></body></html>`,
+      "app.ts": `console.log("app");\n`,
+      "dist/gone.html": "stale",
+      "dist/chunk-gone.js": "stale",
+    });
+    const built = await build(String(dir), "--compile", "--target=browser", "page.html", "--outdir=dist", "--clean");
+    expect(built).toMatchObject({ stderr: "", exitCode: 0 });
+    expect(tree(join(String(dir), "dist"))).toEqual(["page.html"]);
+  });
+
+  type Refusal = string | ((dir: string) => string);
+  const refused = (message: string) => `${message}\n\n${note}`;
+  test.each([
+    [["--clean"], "--clean requires --outdir\n"],
+    [["--outfile=dist/index.js", "--clean"], "--clean requires --outdir\n"],
+    [["--no-bundle", "--outdir=dist", "--clean"], "--clean cannot be used with --no-bundle\n"],
+    [["--app", "--outdir=dist", "--clean"], "--clean cannot be used with --app\n"],
+    [["--compile", "--clean"], "--clean cannot be used with --compile\n"],
+    [["--compile", "--outdir=dist", "--clean"], "--clean cannot be used with --compile\n"],
+    [["--outdir=.", "--clean"], refused(`refusing to clean outdir ".": is or contains the current directory`)],
+    [
+      ["--outdir=dist/..", "--clean"],
+      refused(`refusing to clean outdir "dist/..": is or contains the current directory`),
+    ],
+    [
+      ["--outdir=src", "--clean"],
+      (dir: string) =>
+        refused(
+          `refusing to clean outdir "src": contains ${JSON.stringify(join(dir, "src", "index.ts"))}, which the build reads`,
+        ),
+    ],
+    [
+      ["--outdir=lib", "--clean"],
+      (dir: string) =>
+        refused(
+          `refusing to clean outdir "lib": contains ${JSON.stringify(join(dir, "lib", "value.ts"))}, which the build reads`,
+        ),
+    ],
+    [
+      // A link to `lib`.
+      ["--outdir=out", "--clean"],
+      (dir: string) =>
+        refused(
+          `refusing to clean outdir "out": resolves to ${JSON.stringify(join(dir, "lib"))}, which contains ${JSON.stringify(join(dir, "lib", "value.ts"))}, which the build reads`,
+        ),
+    ],
+  ] as [string[], Refusal][])("%j is an error, and nothing is removed", async (args, message) => {
+    using dir = tempDir("build-clean-refused", {
+      "src/index.ts": `import { value } from "../lib/value";\nconsole.log(value);\n`,
+      "lib/value.ts": `export const value = 1;\n`,
+      "lib/notes.txt": "kept",
+      "dist/previous.js": "previous",
+    });
+    const real = realpathSync(String(dir));
+    fs.symlinkSync(join(real, "lib"), join(real, "out"), "junction");
+    const before = tree(real);
+    const { stdout, stderr, exitCode } = await build(real, "src/index.ts", ...args);
+    const expected = typeof message === "string" ? message : message(real);
+    expect({ stdout, stderr }).toEqual({ stdout: "", stderr: `error: ${expected}` });
+    expect(tree(real)).toEqual(before);
+    expect(exitCode).toBe(1);
+  });
+
+  test("refuses an --outdir that the working directory is in", async () => {
+    using dir = tempDir("build-clean-above", { "project/index.ts": `console.log(1);\n`, "notes.txt": "kept" });
+    const before = tree(String(dir));
+    const { stdout, stderr, exitCode } = await build(
+      join(String(dir), "project"),
+      "index.ts",
+      "--outdir=..",
+      "--clean",
+    );
+    expect({ stdout, stderr }).toEqual({
+      stdout: "",
+      stderr: `error: ${refused(`refusing to clean outdir "..": is or contains the current directory`)}`,
+    });
+    expect(tree(String(dir))).toEqual(before);
+    expect(exitCode).toBe(1);
+  });
+
+  test("a rebuild of --watch removes the chunk of the build before it", async () => {
+    using dir = tempDir("build-clean-watch", files);
+    const dist = join(String(dir), "dist");
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "build",
+        "--watch",
+        "--no-clear-screen",
+        "src/index.ts",
+        "--outdir=dist",
+        "--splitting",
+        "--clean",
+      ],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    // A build prints the name of its chunk when it has written its files and removed the stale ones.
+    const chunks: string[] = [];
+    const decoder = new TextDecoder();
+    let printed = "";
+    for await (const bytes of proc.stdout) {
+      printed += decoder.decode(bytes, { stream: true });
+      const name = printed.match(/lazy-\w+\.js(?![\s\S]*lazy-)/)?.[0];
+      if (name === undefined || name === chunks.at(-1)) continue;
+      chunks.push(name);
+      expect(tree(dist)).toEqual(["index.js", name]);
+      if (chunks.length === 2) break;
+      writeFileSync(join(String(dir), "src/lazy.ts"), `export const value = 2;\n`);
+    }
+    expect(new Set(chunks).size).toBe(2);
+  });
+});

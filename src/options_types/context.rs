@@ -188,6 +188,8 @@ impl ContextData {
 
 pub struct BundlerOptions {
     pub outdir: Box<[u8]>,
+    /// `--clean`: `outdir` ends with nothing but what the build writes.
+    pub clean: bool,
     pub outfile: Box<[u8]>,
     pub metafile: Box<[u8]>,
     pub metafile_md: Box<[u8]>,
@@ -266,6 +268,7 @@ impl Default for BundlerOptions {
     fn default() -> Self {
         Self {
             outdir: Box::default(),
+            clean: false,
             outfile: Box::default(),
             metafile: Box::default(),
             metafile_md: Box::default(),

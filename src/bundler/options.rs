@@ -1327,6 +1327,17 @@ bun_core::comptime_string_map! {
     };
 }
 
+/// `clean`: the linker's writer leaves in the output directory only what the build writes. What
+/// is here is what the caller of the build knows and the writer does not.
+#[derive(Clone, Default)]
+pub struct CleanOutputs {
+    /// Files that the caller writes once the bundle is written, as paths in the output directory.
+    /// They stay where they are.
+    pub written_later: Vec<Box<[u8]>>,
+    /// The script that called `Bun.build`, which a build must not remove. Empty for `bun build`.
+    pub caller: Box<[u8]>,
+}
+
 /// What `BundleOptions::type_check` checks.
 pub struct TypeChecked<'a, 'i> {
     pub cwd: &'a [u8],

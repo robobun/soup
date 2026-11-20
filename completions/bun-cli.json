@@ -4459,6 +4459,20 @@
           "multiple": true
         },
         {
+          "name": "clean",
+          "description": "Remove from --outdir what this build does not write",
+          "hasValue": false,
+          "required": false,
+          "multiple": false
+        },
+        {
+          "name": "no-clean",
+          "description": "Turn --clean off",
+          "hasValue": false,
+          "required": false,
+          "multiple": false
+        },
+        {
           "name": "outfile",
           "description": "Write to a file",
           "hasValue": true,

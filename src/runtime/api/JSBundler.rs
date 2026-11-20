@@ -122,6 +122,8 @@ pub(crate) mod js_bundler {
         pub(crate) loaders: Option<api::LoaderMap>,
         pub(crate) dir: OwnedString,
         pub(crate) outdir: OwnedString,
+        /// `clean`: see `BundleV2::clean`.
+        pub(crate) clean: Option<Box<options::CleanOutputs>>,
         pub(crate) rootdir: OwnedString,
         pub(crate) tsconfig_override: OwnedString,
         pub(crate) jsx: api::Jsx,
@@ -193,6 +195,7 @@ pub(crate) mod js_bundler {
                 loaders: None,
                 dir: OwnedString::default(),
                 outdir: OwnedString::default(),
+                clean: None,
                 rootdir: OwnedString::default(),
                 tsconfig_override: OwnedString::default(),
                 jsx: api::Jsx {
@@ -1102,6 +1105,15 @@ pub(crate) mod js_bundler {
                 drop(slice);
             }
 
+            // Not loose: `clean: "false"` must not delete files.
+            if config.get_boolean_strict(global_this, "clean")? == Some(true) {
+                let caller = global_this.bun_vm().main().unwrap_or_default();
+                this.clean = Some(Box::new(options::CleanOutputs {
+                    written_later: Vec::new(),
+                    caller: Box::from(caller),
+                }));
+            }
+
             if let Some(slice) = config.get_optional_slice(global_this, b"tsconfig")? {
                 this.tsconfig_override.append_slice_exact(slice.slice())?;
                 drop(slice);
@@ -1871,6 +1883,20 @@ pub(crate) mod js_bundler {
                     .throw_invalid_arguments(format_args!("dts cannot be used with compile")));
             }
 
+            if this.clean.is_some() {
+                // The linker's writer removes the stale files, and it writes no executable.
+                let refusal = if this.outdir.is_empty() {
+                    Some("clean requires outdir")
+                } else if this.compile.is_some() && !this.compiles_standalone_html() {
+                    Some("clean cannot be used with compile")
+                } else {
+                    None
+                };
+                if let Some(message) = refusal {
+                    return Err(global_this.throw_invalid_arguments(format_args!("{message}")));
+                }
+            }
+
             // ESM bytecode requires compile because module_info (import/export metadata)
             // is only available in compiled binaries. Without it, JSC must parse the file
             // twice (once for module analysis, once for bytecode), which is a deopt.
@@ -1916,6 +1942,17 @@ pub(crate) mod js_bundler {
             }
 
             Ok(this)
+        }
+    }
+
+    impl Config {
+        /// `compile` with `target: "browser"` and only HTML entry points: each page becomes one HTML file, and no executable is made.
+        pub(crate) fn compiles_standalone_html(&self) -> bool {
+            self.compile.is_some()
+                && self.target == Target::Browser
+                && self.entry_points.count() > 0
+                && (self.entry_points.keys().iter())
+                    .all(|entry_point| entry_point.ends_with(b".html"))
         }
     }
 

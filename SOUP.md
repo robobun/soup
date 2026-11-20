@@ -12351,6 +12351,305 @@ Files: `src/runtime/cli/upgrade_command.rs`, `src/runtime/cli/mod.rs`, `docs/ins
 `docs/guides/util/upgrade.mdx`, `completions/bun.bash`, `completions/bun-cli.json`,
 `test/cli/install/bun-upgrade.test.ts`.
 
+### 2026-11-20: `clean` for `Bun.build` and `bun build --clean`, an `outdir` with nothing but what the build wrote
+
+A build adds files to `outdir` and writes over them. It removes none. With `--splitting`, or with
+a `[hash]` in a name, each build that changes a chunk leaves the chunk of the build before it, and
+each rebuild of watch mode does too. oven-sh/bun#4655 (open since September 2023, 18 thumbs up,
+no objection in it) asks for `clean: true`. Until now `bun build --clean` and
+`Bun.build({ clean: true })` were accepted and ignored. What a project writes today is
+`rm -rf dist &&` in front of the build, which empties the directory before a build that can
+fail. A script that calls `Bun.build` can remove what is not in `result.outputs` in a few lines.
+`bun build` has no place for those lines, and nothing runs between two rebuilds of
+`bun build --watch`. So what the bundler adds is the flag, the same thing in watch mode, and a
+refusal where the directory is not one to empty.
+
+```ts
+await Bun.build({
+  entrypoints: ["./src/index.tsx"],
+  outdir: "./dist",
+  splitting: true,
+  clean: true,
+});
+```
+
+```sh
+bun build ./src/index.tsx --outdir dist --splitting --clean
+bun build ./src/index.tsx --outdir dist --splitting --clean --watch
+```
+
+- After the build, `outdir` holds the files of that build, and a `.git` at its top if there was
+  one. Everything else is gone: files, directories, links.
+- The stale files are found before the first write and removed after the last one. A build that
+  fails before that removes nothing: not for a syntax error, a type error of `--check`, an import
+  that does not resolve, or a file of the bundle that cannot be written. Until the end, the old
+  chunks are there beside the new ones, so an old entry point finds its old chunks.
+- A file that the build writes again is written over, as without the option. That is every
+  chunk, its source map, its file of legal comments, every asset, and a metafile that is in
+  `outdir`. On a rebuild of unchanged sources with 200 outputs in four directories, 200 of 200
+  files keep their inode and no `unlinkat` is made.
+- Some files are removed and made again, and are absent in between. The bytecode of a chunk
+  (`.jsc`) is removed before the writes, because whether it is written is known only once it is
+  made, and a stale one must not stay beside new code. What the caller of the linker writes
+  afterwards is removed with the stale files and then written: the `.d.ts` and `.aot.ts` files
+  of `--dts`, and the `package.json` of `bun compile --library`.
+- A symbolic link in `outdir` is removed, and what it leads to is not touched. A link at the name
+  of an output, or of a directory that the build writes into, is removed before the writes, and
+  the build makes a file or a directory of its own there. Without `clean` the build writes
+  through such a link. Vite's `emptyOutDir` removes links the same way.
+- The `.git` at the top stays because Vite keeps it: an `outdir` can be the checkout of the
+  branch that is deployed. A `.git` further down is not kept. A mount point below `outdir` stays
+  too, with what is in it: a volume that is mounted at `dist/uploads` is not emptied.
+- What goes with the rest: the files of another build that writes to the same `outdir`, files
+  that a script copied there before the build, and files that a plugin wrote there in `setup()`,
+  `onStart()`, `onResolve()` or `onLoad()`. A plugin writes its files in `onEnd()`, which runs
+  after the removal. A `BuildArtifact` of an earlier build whose file is gone fails with `ENOENT`
+  when it is read.
+- With `--watch`, and with `watch: true`, every rebuild does the same. With
+  `bun build --watch --clean` nothing can copy a file back between two rebuilds. The docs name
+  three ways around that: an `outdir` of its own for the bundle, an import that makes the file
+  an asset, and `Bun.build({ watch: true })` with the copy in its loop.
+- The build fails, and removes and writes nothing, if `outdir` is or contains the working
+  directory, the project directory, the home directory, the bun executable or the script that
+  called `Bun.build`:
+  `error: refusing to clean outdir ".": is or contains the current directory`, with a note that
+  says what the option removes. If `outdir` is a link, the message has where it leads:
+  `refusing to clean outdir "out": resolves to "/app/lib", which contains ...`. The first four
+  are the directories that `bun pm cache rm` refuses, and both commands now ask one function.
+- It also fails if `outdir` contains a source file of the bundle, an entry point or a module, a
+  stylesheet or an asset that it imports:
+  `error: refusing to clean outdir "lib": contains "/app/lib/value.ts", which the build reads`.
+  A path that a plugin or the `files` option names is made real first, so `/app//lib/value.ts`
+  is found too.
+- The bundler does not know every file that a build reads. A macro and what it reads, a
+  `tsconfig.json` (also one that another `extends`), a `package.json`, a file that is imported
+  only for its types, and a file that a plugin reads by itself are not seen, and an `outdir` that
+  holds one of them is cleaned. The docs and the types say so.
+- If a stale file cannot be removed, the build fails with that error, and its own files are
+  written by then.
+- `--no-clean` turns `--clean` off, wherever it is on the command line. `bun build` ignores a
+  flag that it does not know, so without it `bun run build --no-clean` would still remove files.
+- Refused before any work, with exit code 1: `--clean` without `--outdir`, which includes
+  `--outfile` (`--clean requires --outdir`), with `--no-bundle`, with `--app`, and with a
+  `--compile` that makes an executable. `Bun.build()` throws for `clean: true` without `outdir`
+  (`clean requires outdir`) and with a `compile` that makes an executable
+  (`clean cannot be used with compile`). The value has to be a boolean: `clean: "false"` throws,
+  where most options of `Bun.build` take it as `true`.
+- `compile` with `target: "browser"`, which writes one HTML file for each page, takes the
+  option. So does `bun compile --library`, for its folder.
+- A plugin that sets `build.config.clean` in `setup()` turns it on.
+
+How it is built.
+
+- The linker's writer does it, `write_output_files_to_disk` in
+  `src/bundler/linker_context/writeOutputFilesToDisk.rs`. It is the one place that
+  `bun build --outdir`, `Bun.build({ outdir })` and the rebuilds of both watch modes pass
+  through, on the bundle thread and not on the JS thread, and it runs only after scan, parse,
+  type check and link succeeded. After it has opened the directory it calls
+  `find_stale_outputs`, and at its two ways out with success it calls `remove_stale_outputs`.
+  Everything goes through the handle that the files are written through.
+- `find_stale_outputs` reads the real path of the directory from that handle and stops the build
+  if it cannot. It asks `bun_sys::first_protected_in` (new, in `src/sys/dir.rs`) about the five
+  paths. That function is the loop that `protected_in` of `bun pm cache rm` had, moved below the
+  runtime, and the command passes it its five entries as before. Then it compares the path of
+  every input of the graph with the real path of `outdir`. The resolver follows links, so its
+  paths are real. When the build has a plugin or the `files` option, each path goes through
+  `realpath` first.
+- What stays is a set of names that are fixed before the first write: the path of every chunk,
+  its `.map` when source maps are linked or external, its `.LEGAL.txt` when it has legal comments
+  for a file, the `.map` files of a standalone HTML build, the assets, and the metafiles. A path
+  is normalized part by part, and each directory above a kept file is in the set as a directory.
+- `find_unkept` lists each directory once. A regular file at a kept name stays. A directory above
+  a kept name is opened without following a link, and listed in turn. What is at a kept name and
+  is of another kind is removed at once with `Dir::delete_tree`, and so is the bytecode of a
+  chunk. Every other entry goes on a list. No entry is `stat`ed, unless the file system does not
+  say what an entry is.
+- Where names differ only by case, an entry of the list can be the file of a kept name that the
+  listing does not have under that spelling. Removed after the writes, it would take the new file
+  with it. So a kept name that the listing lacks is looked up once, and if it is there, the
+  entries of that directory are removed before the writes and not after.
+- `remove_each` goes through the list when the files are written. For a directory it asks
+  `rmdir` first: a mount point answers `EBUSY` before the kernel looks inside, and is left. The
+  rest goes to `Dir::delete_tree`. It goes on past what it cannot remove and fails the build with
+  the first error.
+- `BundleV2::clean` is an `Option<Box<CleanOutputs>>`, and `CleanOutputs` is what the caller
+  knows and the writer does not: the script that called `Bun.build`, and for `bun build` the
+  metafiles that the command writes into `outdir` afterwards. It is not a field of
+  `BundleOptions`. That struct has no padding left, and every `Transpiler` of every `bun run`
+  has one. `BundleV2::generate_from_cli` takes it as a parameter, and the task of `Bun.build`
+  sets it beside the plugins.
+- The test for a `compile` that makes a page and not an executable was written out in
+  `js_bundle_completion_task.rs`. It is `Config::compiles_standalone_html` now, for that place
+  and for the new error.
+
+What it costs, measured on two release builds from one directory and one toolchain (linux x64,
+ThinLTO): the commit before this one and this one.
+
+- A build without the option makes the same system calls. `bun build --outdir dist --splitting`
+  of two modules into a directory with one stale chunk: 20 `openat`, 22 `close`, 12 `getdents64`,
+  0 `unlinkat`, 2 `readlink`, 5 `fstat`, 2 `mkdirat` and 7 `write` on both builds, in three runs
+  each under `qemu-x86_64 -strace`. `Bun.build` with the same options: 28, 28, 14, 0, 3, 8, 2
+  and 7 on both.
+- In the writer, the path from the return of `make_open_path` to the next call is 7 instructions
+  before and 14 after (`objdump`): two loads, a test of the pointer, a branch that is not taken,
+  and the stores of an empty list. Each of the two ways out has one more compare and one more
+  branch that is not taken. The calls of the new functions are in cold blocks.
+- `BundleV2` grows from 1544 to 1552 bytes and the `Config` of `Bun.build` from 1960 to 1968,
+  one of each for a build. `BundleOptions` (1712), `Transpiler` (3152), `LinkerOptions` (128) and
+  the CLI's `BundlerOptions` (696) are as they were (an array type of that size in each crate,
+  and the error of `cargo check`).
+- `Bun.build()` reads one more option: 49 property reads of the config before, 50 after, and the
+  new one is `clean` (a `Proxy` that counts).
+- The stripped executable is 157,312,952 and 157,333,432 bytes, 20,480 more. `.text` grows by
+  15,616 bytes and `.rodata` by 4,096 (`size -A`). In `bun-profile`, `write_output_files_to_disk`
+  is 17,189 and 17,648 bytes, and the new functions are 4,545 (`find_unkept`), 4,295
+  (`find_stale_outputs`), 2,177 (`KeptOutputs::keep`), 1,008 (`remove_each`) and 1,522 for the
+  hash table of the names (`nm -S`). `parse_build_command_options` grows by 333.
+- With the option, a build of 200 entry points into four directories, with nothing stale: 10
+  more `getdents64` (two for each of five directories), 5 more `readlink` (the real paths of
+  `outdir` and of the four directories it is compared with), 8 more `openat`, and no `unlinkat`.
+  With 1,000 stale files in two directories it makes 1,003 `unlinkat`, with 2,000 it makes 2,003.
+
+Tests. 40 new cases, in the files that were there.
+
+- `test/bundler/cli.test.ts`, 27 cases in `describe("--clean")`. Three builds of one project:
+  without the flag a stale chunk, a nested directory, a file and two `.git` directories stay,
+  with `--clean --no-clean` in both orders they stay too, and with `--clean` only the top `.git`
+  and the two files of the build are left. A second name (a hard link) for every file of a build
+  with linked source maps, linked legal comments, an asset and two metafiles: after a rebuild
+  each file has two links, so none was removed and made again. The same for bytecode and
+  declaration files, which have one. A link to a directory (a junction on Windows) and a link to
+  a file, also at the name of an output, that go without their targets. A build that fails
+  before it writes, and one that fails while it writes (a source map whose name is too long),
+  which both leave the stale files. The exact tree of a build with every kind of file. Five sets
+  of options for which a cleaned directory has the names and the bytes of a build into an empty
+  one, also when it is cleaned a second time, two of them with an HTML entry point and one of
+  those a standalone page. Twelve command lines that are refused, each with its whole message
+  and the tree unchanged, one of them an `outdir` that is a link. One rebuild of
+  `bun build --watch`.
+- `test/bundler/bun-build-api.test.ts`, 12 cases in `describe("clean")`: the same three builds
+  with `undefined`, `false` and `true`, a failed build, a build that fails while it writes, two
+  metafiles that keep their links, an `outdir` that holds an import, one that holds a file that
+  a plugin names with `//` or `/./` in its path, one that holds the script that calls
+  `Bun.build` (in a child process), a plugin whose files from `setup()` and `onStart()` go and
+  whose file from `onEnd()` stays, a plugin that sets the option, a standalone HTML build, and
+  five calls that throw.
+- `test/bundler/bun-build-watch.test.ts`, one case: a rebuild of a watcher with `clean: true`.
+- On bun 1.4.3, 25 of the 27 CLI cases and 10 of the 12 API cases fail, and the watch case
+  cannot run there. The four that pass on both pin what does not change: a build that fails, in
+  either way, removes nothing.
+- On the debug build the three files pass whole (94, 116 and 38 cases), and so do the
+  `bun pm cache` cases of `bun-pm.test.ts` (57), `bun-build-dts.test.ts` (11) and
+  `metafile.test.ts` (66).
+- Run by hand on the debug build, because a test cannot set them up: a bind mount below
+  `outdir`, which stays with its file while the stale files beside it go, and a build by a user
+  who may not remove a stale directory, which writes its files and then fails with
+  `Permission denied: removing "locked" to clean outdir "dist"`.
+
+Not done, and known.
+
+- Windows and macOS did not run. `cargo check` passes for `x86_64-pc-windows-msvc` and
+  `aarch64-apple-darwin` with the three crates that changed and everything below them. The test
+  of a link to a file is skipped on Windows, where such a link needs a privilege. The test of a
+  junction is not skipped and has not run there.
+- The step for names that differ only by case did not run: this machine has no file system
+  without case. On Linux it does nothing, because a name that the listing lacks is not there.
+- `.d.ts`, `.aot.ts` and the `package.json` of `--library` are removed and made again, and with
+  `--dts` the type check is between the two. The review of this commit shows how to keep them:
+  the type check hook (`options::TypeCheck`) would hand its files to the linker as additional
+  output files. That changes upstream's declaration path in five files and was left.
+- A build that fails after the bundle is written has removed the stale files by then: a
+  declaration outside `--root`, or a metafile that cannot be written.
+- The guard finds a source file of the bundle by its path, and nothing else that a build reads.
+  The list of what it does not see is in the entry above and in the docs. A record of every file
+  that a build reads does not exist in the bundler.
+- A mount point is kept only where the walk meets it: at the top of `outdir` or in a directory
+  that the build writes into. One that is deeper in a stale directory is emptied, by
+  `Dir::delete_tree`, as `bun pm cache rm` would.
+- `bun build --no-bundle --outdir dist --clean` is refused and not served. That mode is written
+  by the CLI alone, its names have no hash by default, and it has no rebuild. A `compile` to an
+  executable with `outdir` in `Bun.build` is refused too: the executable is written later, on
+  the JS thread.
+- The command prints nothing about what it removed, and there is no dry run, no list of names to
+  keep and no folder to copy from. webpack has `keep` and `dry`, Vite copies `publicDir` after
+  it empties. For `bun build --watch --clean` that is the missing half, and it is a feature of
+  its own.
+- Two builds that write to one `outdir`, such as a client and a server bundle, cannot both have
+  the option: the second removes what the first wrote. The docs say so.
+- The option is not the default. Electroid asks in the issue whether it should be. It deletes
+  files, so it is off until somebody turns it on.
+- `bun build` still ignores a flag that it does not know, so `--clean --dry-run` removes files.
+  Refusing unknown flags is a change for every `bun build` command line and was left.
+- The build scripts of the three `bun init` templates still call `rm(outdir)`. They empty the
+  directory before the build, which is not what this option does, so they were left.
+- `bunfig.toml` has no section for `bun build`, so the option has no place there
+  (oven-sh/bun#18290).
+- The patch does not apply to oven-sh/bun alone. It stands on two patches of this stack: the
+  files of legal comments (2026-09-29), which it keeps, and `Bun.build({ watch: true })`
+  (2026-10-09), which one of its tests uses. It calls `Dir::get_fd_path` and `getcwd_z`, which
+  the open pull requests oven-sh/bun#49146, oven-sh/bun#38365 and oven-sh/bun#40372 remove.
+
+A review of the diff before the push did not pass the first version. In that one the stale files
+were removed before the first write, a metafile was removed and made again, the guard compared
+paths as they were written, and the docs promised more than the code did. On its debug build the
+review deleted a file that a plugin named with `//` in its path, the script that called
+`Bun.build` with `outdir: import.meta.dir`, and the files of a volume that was mounted below
+`outdir`, and `--clean --no-clean` removed files. All of that is changed in this commit: the
+removal after the writes, the value in place of the flag, the metafiles that stay, `realpath`
+for the paths of plugins, the script among the refused paths, the mount point, `--no-clean`, the
+messages with the real path and a note, the error of `--compile --clean`, the hard links in the
+tests where inodes were compared, and the docs, which now list what the guard does not see and
+where a plugin writes. Not taken: declarations through the linker, a rename of the stale files
+that a failed build could undo, a debug check of the kept names against every file that the
+writer writes, a guard for macros and for `tsconfig.json`, and a port to oven-sh/bun without the
+two patches below it. The review asked for a second review of the changed commit. That one has
+not run.
+
+Rebase notes. 80 patches onto oven-sh/bun 7bb427f3be9, 8 commits after the base of 2026-11-19
+(ca7729d01a3). Nothing was dropped.
+
+- Cursors for `Bun.SQL` (2026-10-26) stopped the rebase and was ported. oven-sh/bun#49292 names a
+  request of the PostgreSQL pipeline by a `Turn` that only `Pipeline::push` makes, and a queued
+  query holds a `Seat` (the connection and the turn) where it held the connection. The cursor
+  patch now keeps `Place::Suspended` beside `Place::Queued(Seat)`, `enqueue_fetch` returns the
+  seat of the request it queues again, and the two callers of `queued()` pass it. A rejected
+  cursor statement is unqueued by its turn. The four pipeline tests of the patch name requests
+  by turn and push a `char`, as upstream's do. `postgres-cursor.test.ts` passes (106), and
+  `bun run rust:test -p bun_sql` passes (27).
+- Response compression for `Bun.serve` (2026-09-04) rebased without a conflict and did not
+  build. oven-sh/bun#49205 replaces the zstd C library with a codec in Rust, and
+  `bun_zstd::is_error`, `bun_zstd::Result` and the optional level are gone. `encode` now calls
+  `bun_zstd::compress_append(&mut out, input, ZSTD_LEVEL)`, which reserves the bound itself. The
+  fix is in its patch. `bun-serve-compress.test.ts` passes (22).
+- BLAKE3 (2026-11-18) stopped the rebase in five files where oven-sh/bun#49205 added
+  `highway_zstd.cpp` beside the line of `highway_blake3.cpp`: two build scripts, the two
+  allowlists of the baseline check and `simd-baseline.test.ts`. Both lines are kept.
+  `Bun.INI.parse()` (2026-08-19) stopped it in `Cargo.lock`, where the same pull request added
+  a crate beside `bun_ini`.
+- Run on the debug build after the rebase: the files above, `bun-cryptohasher.test.ts` (154),
+  `s3-copy.test.ts` (41), `s3-metadata.test.ts` (38), `wire-frames.test.ts` (10),
+  `valkey-gc.test.ts` (29), `valkey.test.ts` (80) and the BLAKE3 case of
+  `simd-baseline.test.ts`. `sql-debug.test.ts` passes its 20 PostgreSQL cases. Its 3 MySQL cases
+  fail on this machine, where the database refuses `root`.
+- `cargo clippy --workspace` and `cargo fmt --all --check` pass. The source lints pass (211) on
+  the release build. On the debug build two of them run into their 5 second limit, as before.
+  The bun-types test passes (30), with `AOT_ENGINE_DIRECTORY` set to the engine of the build
+  cache: one of its cases runs the bindgen, which looks for that folder. The fork's three
+  workflows were green for the push of 2026-11-19.
+- The rebased stack was pushed once before the feature, so that the port of the cursor patch
+  was not only on this machine.
+- Only the tip of the stack was built, as before.
+
+Files: `src/bundler/linker_context/writeOutputFilesToDisk.rs`, `src/bundler/options.rs`,
+`src/bundler/bundle_v2.rs`, `src/sys/dir.rs`, `src/options_types/context.rs`,
+`src/runtime/cli/Arguments.rs`, `src/runtime/cli/build_command.rs`,
+`src/runtime/cli/package_manager_command.rs`, `src/runtime/api/JSBundler.rs`,
+`src/runtime/api/js_bundle_completion_task.rs`, `packages/bun-types/bun.d.ts`,
+`docs/bundler/index.mdx`, `docs/bundler/plugins.mdx`, `docs/bundler/esbuild.mdx`,
+`docs/snippets/cli/build.mdx`, `completions/bun-cli.json`, `completions/bun.zsh`,
+`test/bundler/cli.test.ts`, `test/bundler/bun-build-api.test.ts`,
+`test/bundler/bun-build-watch.test.ts`, `test/integration/bun-types/fixture/build.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

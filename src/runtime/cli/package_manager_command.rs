@@ -237,26 +237,7 @@ impl PackageManagerCommand {
             ),
             ("the current directory", Some(cwd)),
         ];
-        let mut buf = bun_paths::path_buffer_pool::get();
-        for (what, path) in protected {
-            let Some(path) = path else { continue };
-            // Compare real paths on both sides, so that a symlink to `$HOME` compares equal to
-            // `$HOME`.
-            let real: &[u8] = match Dir::open(path) {
-                Ok(opened) => match opened.get_fd_path(&mut buf) {
-                    Ok(real) => &real[..],
-                    Err(_) => path,
-                },
-                Err(_) => path,
-            };
-            if !matches!(
-                Path::resolve_path::is_parent_or_equal(dir, real),
-                Path::resolve_path::ParentEqual::Unrelated
-            ) {
-                return Some(what);
-            }
-        }
-        None
+        bun_sys::first_protected_in(dir, protected)
     }
 
     fn get_subcommand(args_ptr: &mut &'static [&'static [u8]]) -> &'static [u8] {

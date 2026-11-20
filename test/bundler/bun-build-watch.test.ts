@@ -2,8 +2,8 @@ import type { BuildOutput, BuildWatcher, BunPlugin } from "bun";
 import { buildWatcherState } from "bun:internal-for-testing";
 import { describe, expect, spyOn, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
-import { mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
 // The results of the watcher, up to and including the first one that `accept` takes. A save can
 // be more than one rebuild, so a test waits for the result it means and not for "the next one".
@@ -510,6 +510,31 @@ describe("Bun.build({ watch: true })", () => {
     writeFileSync(join(String(dir), "last again"), "");
     expect(await seen).toMatchObject({ pending: false, builds });
     expect(counts.start).toBe(builds);
+  });
+
+  test("with clean: true, a rebuild removes from outdir the chunk of the build before it", async () => {
+    using dir = tempDir("build-watch-clean", {
+      "index.ts": `import("./lazy").then(lazy => console.log(lazy.value));`,
+      "lazy.ts": `export const value = "one";`,
+    });
+    const outdir = join(String(dir), "out");
+    const names = (output: BuildOutput) => output.outputs.map(artifact => basename(artifact.path)).sort();
+    await using watcher = Bun.build({
+      entrypoints: [join(String(dir), "index.ts")],
+      outdir,
+      splitting: true,
+      clean: true,
+      watch: true,
+    });
+    const first = (await until(watcher, succeeded)).at(-1)!;
+    expect(names(first)).toHaveLength(2);
+    expect(readdirSync(outdir).sort()).toEqual(names(first));
+
+    writeFileSync(join(String(dir), "lazy.ts"), `export const value = "two";`);
+    const renamed = (output: BuildOutput) => output.success && names(output).join() !== names(first).join();
+    const second = (await until(watcher, renamed)).at(-1)!;
+    expect(names(second)).toHaveLength(2);
+    expect(readdirSync(outdir).sort()).toEqual(names(second));
   });
 
   test("does not watch node_modules", async () => {

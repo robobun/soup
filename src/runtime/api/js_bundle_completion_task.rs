@@ -1058,20 +1058,8 @@ impl JSBundleCompletionTask {
                 drops_source_maps,
             });
         }
-        let compile_to_standalone_html = 'brk: {
-            if config.compile.is_none() || config.target != bun_ast::Target::Browser {
-                break 'brk false;
-            }
-            // Only activate standalone HTML when all entrypoints are HTML files
-            for ep in config.entry_points.keys() {
-                if !ep.ends_with(b".html") {
-                    break 'brk false;
-                }
-            }
-            config.entry_points.count() > 0
-        };
         // When compiling to standalone HTML, don't use the bun executable compile path
-        if compile_to_standalone_html {
+        if config.compiles_standalone_html() {
             transpiler.options.compile_mode = options::CompileMode::StandaloneHtml;
             config.compile = None;
         }
@@ -1274,6 +1262,7 @@ impl JSBundleCompletionTask {
 
         let mut bv2 = BundleV2::init(transpiler, None, heap, event_loop, worker_pool, heap);
         bv2.plugins = plugins;
+        bv2.clean.clone_from(&config.clean);
         bv2.recheck_unresolved_imports = self.watch_inputs.is_some();
         bv2.plugin_context = self.context;
         bv2.completion = Some(completion);

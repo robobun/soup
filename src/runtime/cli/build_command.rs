@@ -708,6 +708,7 @@ impl BuildCommand {
                 &mut minify_duration,
                 &mut input_code_length,
                 fetcher,
+                clean_outputs(&ctx.bundler_options),
             ) {
                 Ok(r) => r,
                 Err(err) => {
@@ -1333,6 +1334,37 @@ impl BuildCommand {
             ctx.debug.hot_reload == HotReload::Watch,
         );
     }
+}
+
+/// `--clean`, with the metafiles that this command writes into `--outdir` once the bundle is there.
+fn clean_outputs(
+    options: &bun_options_types::context::BundlerOptions,
+) -> Option<Box<options::CleanOutputs>> {
+    use resolve_path::{ParentEqual, is_parent_or_equal, join_abs_string_buf, platform};
+
+    if !options.clean {
+        return None;
+    }
+    let cwd = bun_resolver::fs::FileSystem::get().top_level_dir();
+    let mut outdir_buf = bun_paths::path_buffer_pool::get();
+    let outdir =
+        join_abs_string_buf::<platform::Auto>(cwd, &mut outdir_buf[..], &[&options.outdir]);
+    let outdir = strings::without_trailing_slash(outdir);
+    let mut file_buf = bun_paths::path_buffer_pool::get();
+    let mut written_later = Vec::new();
+    for file in [&options.metafile, &options.metafile_md] {
+        if file.is_empty() {
+            continue;
+        }
+        let file = join_abs_string_buf::<platform::Auto>(cwd, &mut file_buf[..], &[file]);
+        if is_parent_or_equal(outdir, file) == ParentEqual::Parent {
+            written_later.push(Box::from(&file[outdir.len()..]));
+        }
+    }
+    Some(Box::new(options::CleanOutputs {
+        written_later,
+        caller: Box::default(),
+    }))
 }
 
 pub(crate) fn compile_outfile(outfile: &[u8]) -> &[u8] {

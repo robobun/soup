@@ -178,6 +178,16 @@ for await (const buildResult of Bun.build({ entrypoints: ["hey"], watch: true, p
   expectType(disposedBuildWatcher).is<Bun.BuildWatcher>();
 }
 
+expectType(Bun.build({ entrypoints: ["hey"], outdir: "./dist", clean: true })).is<Promise<Bun.BuildOutput>>();
+expectType(Bun.build({ entrypoints: ["hey"], outdir: "./dist", clean: true, watch: true })).is<Bun.BuildWatcher>();
+
+Bun.build({
+  entrypoints: ["hey"],
+  outdir: "./dist",
+  // @ts-expect-error
+  clean: "yes",
+});
+
 Bun.build({
   entrypoints: ["hey"],
   // @ts-expect-error
