@@ -386,6 +386,11 @@ declare module "bun" {
     message?: string;
   }
 
+  interface PromiseRejectionEventInit extends EventInit {
+    promise: Promise<any>;
+    reason?: any;
+  }
+
   interface CloseEventInit extends EventInit {
     code?: number;
     reason?: string;
@@ -562,6 +567,8 @@ declare module "bun" {
     fetch: FetchEvent;
     message: MessageEvent;
     messageerror: MessageEvent;
+    rejectionhandled: PromiseRejectionEvent;
+    unhandledrejection: PromiseRejectionEvent;
     // exit: Event;
   }
 

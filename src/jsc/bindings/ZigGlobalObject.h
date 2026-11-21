@@ -323,6 +323,8 @@ public:
     void handleRejectedPromises();
     size_t holdRejectedPromises() { return m_aboutToBeNotifiedRejectedPromises.hold(this); }
     void releaseRejectedPromises(size_t mark) { m_aboutToBeNotifiedRejectedPromises.release(this, mark); }
+    void noteRejectionEventOutcome(JSC::JSPromise* promise, uint8_t outcome) { m_aboutToBeNotifiedRejectedPromises.noteEventOutcome(this, promise, outcome); }
+    uint8_t takeRejectionEventOutcome(JSC::JSPromise* promise) { return m_aboutToBeNotifiedRejectedPromises.takeEventOutcome(promise); }
     ALWAYS_INLINE void* bunVM() const { return m_bunVM; }
 #if OS(WINDOWS)
     uv_loop_t* uvLoop() const

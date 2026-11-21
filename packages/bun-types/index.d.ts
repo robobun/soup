@@ -30,3 +30,16 @@
 // Must disable this so it doesn't conflict with the DOM onmessage type, but still
 // allows us to declare our own globals that Node's types can "see" and not conflict with
 declare var onmessage: Bun.__internal.UseLibDomIfAvailable<"onmessage", never>;
+/**
+ * The handler of the `unhandledrejection` event of the global object. Returning
+ * `false` from it cancels the event, as `event.preventDefault()` does.
+ */
+declare var onunhandledrejection: Bun.__internal.UseLibDomIfAvailable<
+  "onunhandledrejection",
+  ((ev: PromiseRejectionEvent) => any) | null
+>;
+/** The handler of the `rejectionhandled` event of the global object. */
+declare var onrejectionhandled: Bun.__internal.UseLibDomIfAvailable<
+  "onrejectionhandled",
+  ((ev: PromiseRejectionEvent) => any) | null
+>;

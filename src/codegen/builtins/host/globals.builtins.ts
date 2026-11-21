@@ -171,9 +171,9 @@ const keptAsTargetOfEvents = (eventTarget: b.TableType) =>
     ? b.storedIn(b.nativeCell(targetsOfEventsCell))
     : b.createdIn(eventTarget, b.nativeCell(targetsOfEventsCell));
 
-const listenerRegistration = (eventTarget: b.TableType) =>
+const listenerRegistration = (eventTarget: b.TableType, type: b.TableType = b.string.loose) =>
   ({
-    args: { type: b.string.loose, listener: b.object.nullable, options: b.any.optional },
+    args: { type, listener: b.object.nullable, options: b.any.optional },
     capability: "js",
     throws: true,
     runsOnlyOperandCode: true,
@@ -182,8 +182,10 @@ const listenerRegistration = (eventTarget: b.TableType) =>
       type: b.inspected,
       listener: [
         b.retained,
+        ...(eventTarget === globalObject && type !== eventsOfGlobalObjectWithoutRejections ? [eventOfRejections] : []),
         // dispatchEvent hands the listener the event that it was handed. What native code dispatches on a signal, and `open` and `close` elsewhere, is an Event. The events of the classes below Event are made by
-        // MessagePort.cpp, BroadcastChannel.cpp, WebSocket.cpp, Worker.cpp, WorkerMessagingProxy.cpp and src/runtime/webview/ChromeBackend.cpp alone. Worker says so in its rows (eventsOfWorker). WHOEVER GIVES MessageChannel,
+        // MessagePort.cpp, BroadcastChannel.cpp, WebSocket.cpp, Worker.cpp, WorkerMessagingProxy.cpp, PromiseRejectionEvent.cpp and src/runtime/webview/ChromeBackend.cpp alone. Worker says so in its rows (eventsOfWorker),
+        // and the line above says it for the global object (eventOfRejections). WHOEVER GIVES MessageChannel,
         // BroadcastChannel, WebSocket, Bun.WebView OR THE BINDINGS createNodeWorkerConstructor, createNodeWorkerThreadsBinding, createWebSocketBindingForWs ROWS SAYS THERE WHICH EVENTS THEY MAKE.
         b.called({
           afterwards: "TouchesOnlyWhatRowNames",
@@ -255,6 +257,15 @@ const eventHandlerAttributeKeptIn = (cell: string, eventTarget: b.TableType) => 
 
 const receiver = b.operand("this");
 const globalObject = b.builtin("globalThis");
+
+// PromiseRejectionEvent.cpp: what native code makes for the `unhandledrejection` and `rejectionhandled` listeners of the global object, and for nothing else. The row of addEventListener says that an Event is made.
+const eventOfRejections = b.createdIn(b.instance("PromiseRejectionEvent"), b.nativeMemory);
+// The other events that native code dispatches on the global object. A listener that is added for one of them by name is handed no event of rejections.
+const eventsOfGlobalObjectWithoutRejections = b.enumeration(["error", "message", "messageerror"]);
+const rejectionHandlerAttribute = (() => {
+  const { setter } = eventHandlerAttribute(globalObject);
+  return { ...setter, uses: { ...setter.uses, value: [...setter.uses.value, eventOfRejections] } };
+})();
 
 // The listeners that were added earlier run, with the event and the target, and the event keeps the target.
 // What stands for the global object there has the members of the global object, and is not identical to `globalThis`. Native code makes no other object for it.
@@ -1944,6 +1955,8 @@ export default b.declarations(
   b.method("AbortSignal.prototype.onabort", eventHandlerAttributeKeptIn("AbortSignal.onabort", receiver)),
   b.static("onerror", b.property(b.any, { setter: eventHandlerAttribute(globalObject).setter })),
   b.static("onmessage", b.property(b.any, { setter: eventHandlerAttribute(globalObject).setter })),
+  b.static("onrejectionhandled", b.property(b.any, { setter: rejectionHandlerAttribute })),
+  b.static("onunhandledrejection", b.property(b.any, { setter: rejectionHandlerAttribute })),
   // --localstorage-file adds it (ZigGlobalObject.cpp): the static table, which has sessionStorage, does not have it.
   b.static("localStorage", b.property(b.any)),
   // A class of the library (src/js/internal/event_source.ts) that native code loads where the global is first read.
@@ -1951,7 +1964,10 @@ export default b.declarations(
   // Two classes of one module of the library (src/js/internal/file_reader.ts), loaded the same way.
   b.static("FileReader", b.property(b.any)),
   b.static("ProgressEvent", b.property(b.any)),
-  b.fn("addEventListener", listenerRegistration(globalObject)),
+  b.fn("addEventListener", [
+    listenerRegistration(globalObject, eventsOfGlobalObjectWithoutRejections),
+    listenerRegistration(globalObject),
+  ]),
   b.fn("removeEventListener", listenerRemoval),
   // Whatever it is called on, the target is the global object.
   b.fn("dispatchEvent", { ...eventDispatch(globalObject), this: b.any, implementation: b.generic }),

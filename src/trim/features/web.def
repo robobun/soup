@@ -52,7 +52,7 @@ feature Fetch "fetch and Bun.FetchSession"
 
 feature Url "URL and URLSearchParams"
 
-feature Events "Event, CustomEvent, ErrorEvent, MessageEvent and CloseEvent"
+feature Events "Event, CustomEvent, ErrorEvent, MessageEvent, CloseEvent and PromiseRejectionEvent"
 
 feature AbortSignal "AbortController and AbortSignal"
 

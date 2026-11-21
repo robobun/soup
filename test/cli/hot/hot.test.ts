@@ -1970,6 +1970,58 @@ it("holds the promise of the entry point itself, which it looks at on every tick
   expect(await line("load 2:")).toBe("load 2: 1 held");
 });
 
+// A reload that failed is reported like any rejection that nobody handled, so a listener that an earlier load left on
+// the global object is asked first. The rejection of the first load is an uncaught exception, and is not.
+it("tells the unhandledrejection listeners of the global object of a reload that failed", async () => {
+  const source = (then: string) => `
+    globalThis.loads = (globalThis.loads ?? 0) + 1;
+    if (globalThis.loads === 1)
+      addEventListener("unhandledrejection", event => {
+        console.log("load " + globalThis.loads + " listener: " + event.reason.message);
+        event.preventDefault();
+      });
+    console.log("load " + globalThis.loads + " ran");
+    ${then}
+  `;
+  using dir = tempDir("hot-unhandledrejection", { "main.js": source(`throw new Error("thrown by load 1");`) });
+  await using runner = spawn({
+    cmd: [bunExe(), "--hot", "--no-clear-screen", "main.js"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+  });
+  const read = (stream: ReadableStream<Uint8Array>) => {
+    const reader = stream.getReader();
+    let text = "";
+    return async (isEnough: (text: string) => boolean) => {
+      while (!isEnough(text)) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += Buffer.from(value).toString();
+      }
+      return text;
+    };
+  };
+  const stdout = read(runner.stdout);
+  const stderr = read(runner.stderr);
+  const lines = async (count: number) =>
+    (await stdout(text => text.split("\n").length > count)).split("\n").slice(0, count);
+
+  expect(await lines(1)).toEqual(["load 1 ran"]);
+  expect(await stderr(text => text.includes("thrown by load 1"))).toContain("error: thrown by load 1");
+  writeFileSync(join(String(dir), "main.js"), source(`throw new Error("thrown by load 2");`));
+  expect(await lines(3)).toEqual(["load 1 ran", "load 2 ran", "load 2 listener: thrown by load 2"]);
+  // A syntax error: the file does not run again, and the listener is asked all the same.
+  writeFileSync(join(String(dir), "main.js"), `console.log("never" +);`);
+  expect((await lines(4))[3]).toBe("load 2 listener: Unexpected )");
+  runner.kill();
+  const printed = await stderr(() => false);
+  expect(printed).not.toContain("thrown by load 2");
+  expect(printed).not.toContain("Unexpected )");
+});
+
 // The cell of a collected promise goes to the next promise that is made.
 it.each([
   ["pending", `new Promise(() => {})`],

@@ -188,9 +188,9 @@ Bun computes the next fire time only after the handler and any returned `Promise
 Errors match `setTimeout` semantics:
 
 - A synchronous `throw` emits `process.on("uncaughtException")`.
-- A rejected returned `Promise` emits `process.on("unhandledRejection")`.
+- A rejected returned `Promise` is an unhandled rejection: Bun dispatches [`unhandledrejection`](/runtime/web-apis#unhandled-rejections) on the global object and, unless a listener cancels that event, emits `process.on("unhandledRejection")`.
 
-Without a listener, the process exits with code `1`. With a listener, the job keeps running — it does not stop on the first failure.
+Without a listener, the process exits with code `1`. With a `process.on("unhandledRejection")` listener, or an `unhandledrejection` listener that calls `event.preventDefault()`, the job keeps running. It does not stop on the first failure.
 
 ```ts
 process.on("unhandledRejection", err => log.error("cron failed:", err));

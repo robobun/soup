@@ -1,7 +1,14 @@
 // Constructors and objects of the global object and of native modules of which the table says no more than what they are: whoever reads one gets that object.
 import * as b from "bun-builtins-table";
 import { cppClassBehindGlobal, prototypeBehindGlobalListsAllMembers } from "../collect-webcore-tables.ts";
-import { builtinModulesCell, detailsOfEventsCell, errorsOfEventsCell, targetsOfEventsCell } from "./native-cells.ts";
+import {
+  builtinModulesCell,
+  detailsOfEventsCell,
+  errorsOfEventsCell,
+  promisesOfEventsCell,
+  reasonsOfEventsCell,
+  targetsOfEventsCell,
+} from "./native-cells.ts";
 import { answering, constructing, promiseOf, retainedByNativeCode } from "./native-code.ts";
 
 const constructorsBelowFunctionPrototype = [
@@ -23,7 +30,7 @@ const constructorsBelowFunctionPrototype = [
 ];
 
 const constructorsBelow = {
-  Event: ["CloseEvent", "CustomEvent", "ErrorEvent", "MessageEvent"],
+  Event: ["CloseEvent", "CustomEvent", "ErrorEvent", "MessageEvent", "PromiseRejectionEvent"],
   EventTarget: ["BroadcastChannel", "MessagePort"],
   PerformanceEntry: ["PerformanceMark", "PerformanceMeasure", "PerformanceResourceTiming"],
 };
@@ -424,6 +431,44 @@ const constructionsOfClasses: Readonly<Record<string, b.ClassOptions>> = {
       lineno: readsStream(b.f64),
       colno: readsStream(b.f64),
       error: { ...readsStream(b.any), uses: { this: [b.returnedFrom(errorsOfEventsCell)] } },
+    },
+  },
+  // JSPromiseRejectionEvent.cpp: the options are required, and `promise` in them, which has to be an object. It and `reason` are kept as they are and answered as they are.
+  // PromiseRejectionEvent.cpp makes the events of the global object's `unhandledrejection` and `rejectionhandled` listeners, with a promise of the program and what it was rejected with.
+  PromiseRejectionEvent: {
+    types: [b.viewType("PromiseRejectionEvent")],
+    call: refused,
+    construct: [
+      { args: { type: b.notPassed }, returns: b.never, capability: "heap", throws: true, implementation: b.hostCall },
+      // Refused for want of the options, before the type is made a string of.
+      {
+        args: { type: b.any, eventInitDict: b.notPassed },
+        returns: b.never,
+        capability: "heap",
+        throws: true,
+        uses: { type: b.inspected },
+        implementation: b.hostCall,
+      },
+      {
+        args: { type: b.any, eventInitDict: b.any },
+        returns: b.instance("PromiseRejectionEvent").fresh,
+        capability: "js",
+        throws: true,
+        runsOnlyOperandCode: true,
+        uses: {
+          type: [b.runs("ToPrimitive")],
+          eventInitDict: [
+            ...membersOfOptionsOfEvent("promise", "reason"),
+            b.memberStoredIn(["promise"], b.nativeCell(promisesOfEventsCell)),
+            b.memberStoredIn(["reason"], b.nativeCell(reasonsOfEventsCell)),
+          ],
+        },
+        implementation: b.hostCall,
+      },
+    ],
+    proto: {
+      promise: { ...readsStream(b.any), uses: { this: [b.returnedFrom(promisesOfEventsCell)] } },
+      reason: { ...readsStream(b.any), uses: { this: [b.returnedFrom(reasonsOfEventsCell)] } },
     },
   },
   // JSDOMFormData.cpp: it looks at none of its operands.

@@ -2942,6 +2942,48 @@ describe.concurrent("behavior depends on the module a function is imported from"
     expect(bun.exitCode).toBe(1);
   });
 
+  // Vitest asks the listeners of `process` and no others. The thread that runs the tests does not dispatch the web's
+  // `unhandledrejection`, in either flavour: a listener that cancels it would take the rejection from the runner.
+  test("a rejection that nobody handles is not told to the unhandledrejection listeners of the global object", async () => {
+    const body = (module: string) => `
+      import { afterEach, test } from "${module}";
+      const never = new Promise(() => {});
+      addEventListener("unhandledrejection", event => {
+        console.log("global object:", event.reason.message);
+        event.preventDefault();
+      });
+      onunhandledrejection = () => false;
+      afterEach(() => process.removeAllListeners("unhandledRejection"));
+
+      test("left to process", async () => {
+        const listener = new Promise(resolve => process.on("unhandledRejection", reason => resolve(console.log("process:", reason.message))));
+        Promise.reject(new Error("left to process"));
+        await listener;
+      });
+      test("left to the runner", async () => {
+        Promise.reject(new Error("left to the runner"));
+        await never;
+      });
+      test("the next test", () => {});
+    `;
+
+    const vitest = await runTests({ "a.test.js": body("vitest") });
+    expect({ log: vitest.log, results: vitest.results, errors: vitest.errors }).toEqual({
+      log: ["process: left to process"],
+      results: ["(pass) left to process", "(fail) left to the runner", "(pass) the next test"],
+      errors: ["error: left to the runner"],
+    });
+    expect(vitest.exitCode).toBe(1);
+
+    const bun = await runTests({ "a.test.js": body("bun:test") });
+    expect({ log: bun.log, results: bun.results, errors: bun.errors }).toEqual({
+      log: [],
+      results: ["(fail) left to process", "(fail) left to the runner", "(pass) the next test"],
+      errors: ["error: left to process", "error: left to the runner"],
+    });
+    expect(bun.exitCode).toBe(1);
+  });
+
   test(`"bun:test" and "@jest/globals" keep the done callback`, async () => {
     const { log, results, exitCode } = await runTests({
       "a.test.js": `

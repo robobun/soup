@@ -1144,6 +1144,51 @@ describe("Bun.ModuleGraph — error attribution matrix", () => {
       exitCode: 0,
     });
   });
+  test("a rejection that a graph's onError takes is not the global object's: its unhandledrejection listeners are asked about the host's alone", async () => {
+    using d = tempDir("module-graph-onerror-unhandledrejection", {
+      "faults.mjs": `export function reject(message) { Promise.reject(new Error(message)); }`,
+      "host.mjs": `const seen = [];
+        const done = () => { if (seen.length === 3) { console.log(JSON.stringify(seen)); process.exit(0); } };
+        addEventListener("unhandledrejection", event => { seen.push("listener:" + event.reason.message); event.preventDefault(); done(); });
+        const withOnError = new Bun.ModuleGraph({ onError: (e, kind) => { seen.push("onError:" + kind + ":" + e.message); done(); } });
+        const withoutOnError = new Bun.ModuleGraph({});
+        const [its, hosts] = await Promise.all([withOnError.import("./faults.mjs"), withoutOnError.import("./faults.mjs?2")]);
+        withOnError.run(() => its.reject("the graph's"));
+        // a graph without an onError is part of the host's program
+        withoutOnError.run(() => hosts.reject("a graph's without onError"));
+        Promise.reject(new Error("the host's"));`,
+    });
+    const r = await runBun(["host.mjs"], { cwd: String(d) });
+    expect({ out: JSON.parse(r.stdout), err: r.stderr, exitCode: r.exitCode }).toEqual({
+      out: ["onError:unhandledRejection:the graph's", "listener:a graph's without onError", "listener:the host's"],
+      err: "",
+      exitCode: 0,
+    });
+  });
+  test("a rejection that a graph's onError took is owed no rejectionhandled when it gets a handler later", async () => {
+    using d = tempDir("module-graph-onerror-rejectionhandled", {
+      "faults.mjs": `export function reject(message) { return Promise.reject(new Error(message)); }`,
+      "host.mjs": `const seen = [];
+        addEventListener("unhandledrejection", event => { seen.push("unhandledrejection:" + event.reason.message); event.preventDefault(); });
+        addEventListener("rejectionhandled", event => seen.push("rejectionhandled:" + event.reason.message));
+        process.on("rejectionHandled", () => seen.push("process rejectionHandled"));
+        const graph = new Bun.ModuleGraph({ onError: (e, kind) => { seen.push("onError:" + kind + ":" + e.message); } });
+        const faults = await graph.import("./faults.mjs");
+        const graphs = graph.run(() => faults.reject("the graph's"));
+        const hosts = Promise.reject(new Error("the host's"));
+        setImmediate(() => {
+          graphs.catch(() => {});
+          hosts.catch(() => {});
+          setImmediate(() => setImmediate(() => console.log(JSON.stringify(seen))));
+        });`,
+    });
+    const r = await runBun(["host.mjs"], { cwd: String(d) });
+    expect({ out: JSON.parse(r.stdout), err: r.stderr, exitCode: r.exitCode }).toEqual({
+      out: ["onError:unhandledRejection:the graph's", "unhandledrejection:the host's", "rejectionhandled:the host's"],
+      err: "",
+      exitCode: 0,
+    });
+  });
   test("onError runs in the context the graph was made in: what it throws, rejects or starts there is the host's", async () => {
     using d = tempDir("module-graph-onerror-reentry", {
       "faults.mjs": `

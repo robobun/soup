@@ -541,6 +541,47 @@ declare var ErrorEvent: {
   new (type: string, eventInitDict?: Bun.ErrorEventInit): ErrorEvent;
 };
 
+/**
+ * The event of `unhandledrejection` and `rejectionhandled`, which Bun
+ * dispatches on `globalThis` (`self` in a `Worker`).
+ *
+ * `unhandledrejection` is dispatched for a promise that was rejected and still
+ * has no handler when the event loop has run the callbacks that were due and
+ * their microtasks. Its listeners are called before those of
+ * `process.on("unhandledRejection")`. If one of them calls
+ * `event.preventDefault()`, the rejection is handled: nothing is printed, the
+ * exit code stays as it is, `process` is not told, and the
+ * `--unhandled-rejections` mode does not apply.
+ *
+ * `rejectionhandled` is dispatched when such a promise gets a handler later.
+ *
+ * The thread of `bun test` that runs the tests does not dispatch the two
+ * events: a rejection there fails the test. A `Worker` that a test starts
+ * dispatches them.
+ *
+ * @example
+ * ```ts
+ * addEventListener("unhandledrejection", event => {
+ *   console.error("unhandled rejection:", event.reason);
+ *   event.preventDefault();
+ * });
+ * ```
+ */
+interface PromiseRejectionEvent extends Event {
+  /** The promise that was rejected. */
+  readonly promise: Promise<any>;
+  /** What the promise was rejected with. */
+  readonly reason: any;
+}
+
+declare var PromiseRejectionEvent: Bun.__internal.UseLibDomIfAvailable<
+  "PromiseRejectionEvent",
+  {
+    prototype: PromiseRejectionEvent;
+    new (type: string, eventInitDict: Bun.PromiseRejectionEventInit): PromiseRejectionEvent;
+  }
+>;
+
 /** A CloseEvent is sent to clients using WebSockets when the connection is closed. This is delivered to the listener indicated by the WebSocket object's onclose attribute. */
 interface CloseEvent extends Event {
   /** Returns the WebSocket connection close code provided by the server. */
@@ -595,6 +636,8 @@ interface EventMap {
   fetch: FetchEvent;
   message: MessageEvent;
   messageerror: MessageEvent;
+  rejectionhandled: PromiseRejectionEvent;
+  unhandledrejection: PromiseRejectionEvent;
   // exit: Event;
 }
 

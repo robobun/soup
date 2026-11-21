@@ -1,0 +1,7 @@
+{
+  "failures": {
+    "support/promise-rejection-events.js :: unhandledrejection: from createImageBitmap which is UA triggered": "FAIL: Bun has no createImageBitmap",
+    "support/promise-rejection-events.js :: no unhandledrejection/rejectionhandled: rejection handler attached synchronously to a promise created from createImageBitmap": "FAIL: Bun has no createImageBitmap",
+    "support/promise-rejection-events.js :: delayed handling: delaying handling rejected promise created from createImageBitmap will cause both events to fire": "FAIL: Bun has no createImageBitmap"
+  }
+}

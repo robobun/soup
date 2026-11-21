@@ -41,6 +41,17 @@ webWorker.onmessage = event => {
 // On the worker thread, `postMessage` is automatically "routed" to the parent thread.
 postMessage({ hello: "world" });
 
+// On the worker thread: a rejection that nothing handles is told to the worker's own global object.
+addEventListener("unhandledrejection", event => {
+  console.error("unhandled rejection:", event.reason);
+  event.preventDefault();
+});
+onunhandledrejection = event => {
+  postMessage({ failed: String(event.reason) });
+  return false;
+};
+addEventListener("message", event => postMessage(event.data));
+
 // On the main thread
 nodeWorker.postMessage({ hello: "world" });
 

@@ -115,7 +115,7 @@ export default b.declarations(
   extendAll([...fetchFeatures, ...s3Features], "Bun.FetchSession"),
 
   extendAll(["Url"], "Bun.pathToFileURL", "URL", "URLSearchParams"),
-  extendAll(["Events"], "CloseEvent", "CustomEvent", "ErrorEvent", "Event", "MessageEvent"),
+  extendAll(["Events"], "CloseEvent", "CustomEvent", "ErrorEvent", "Event", "MessageEvent", "PromiseRejectionEvent"),
   // src/js/internal/event_source.ts: a fetch() whose body it decodes, and the events it fires for it.
   extendAll(
     [...fetchFeatures, ...abortSignalFeatures, "TextDecoder", "Url"],

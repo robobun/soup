@@ -19,6 +19,7 @@ test("exists", () => {
   expect(typeof ErrorEvent !== "undefined").toBe(true);
   expect(typeof CloseEvent !== "undefined").toBe(true);
   expect(typeof MessageEvent !== "undefined").toBe(true);
+  expect(typeof PromiseRejectionEvent !== "undefined").toBe(true);
   expect(typeof TextEncoder !== "undefined").toBe(true);
   expect(typeof WebSocket !== "undefined").toBe(true);
   expect(typeof Blob !== "undefined").toBe(true);
@@ -40,7 +41,11 @@ test("exists", () => {
 const globalSetters = [
   [ErrorEvent, "onerror", "error", "error"],
   [MessageEvent, "onmessage", "message", "data"],
+  [PromiseRejectionEvent, "onunhandledrejection", "unhandledrejection", "reason"],
+  [PromiseRejectionEvent, "onrejectionhandled", "rejectionhandled", "reason"],
 ];
+// What each of the three constructors reads of it.
+const globalSetterEventInit = { data: "hello", error: "hello", reason: "hello", promise: Promise.resolve() };
 
 for (const [Constructor, name, eventName, prop] of globalSetters) {
   test(`self.${name}`, () => {
@@ -55,13 +60,13 @@ for (const [Constructor, name, eventName, prop] of globalSetters) {
     try {
       globalThis[name] = callback;
       expect(globalThis[name]).toBe(callback);
-      dispatchEvent(new Constructor(eventName, { data: "hello", error: "hello" }));
+      dispatchEvent(new Constructor(eventName, globalSetterEventInit));
       expect(called).toBe(true);
     } finally {
       globalThis[name] = null;
 
       called = false;
-      dispatchEvent(new Constructor(eventName, { data: "hello", error: "hello" }));
+      dispatchEvent(new Constructor(eventName, globalSetterEventInit));
       expect(called).toBe(false);
     }
   });
@@ -76,13 +81,13 @@ for (const [Constructor, name, eventName, prop] of globalSetters) {
 
     try {
       addEventListener(eventName, callback);
-      dispatchEvent(new Constructor(eventName, { data: "hello", error: "hello" }));
+      dispatchEvent(new Constructor(eventName, globalSetterEventInit));
       expect(called).toBe(true);
     } finally {
       globalThis[name] = null;
       removeEventListener(eventName, callback);
       called = false;
-      dispatchEvent(new Constructor(eventName, { data: "hello", error: "hello" }));
+      dispatchEvent(new Constructor(eventName, globalSetterEventInit));
       expect(called).toBe(false);
     }
   });
@@ -90,7 +95,7 @@ for (const [Constructor, name, eventName, prop] of globalSetters) {
 
 // Assigning onmessage/onerror through a receiver that is not the global object
 // (e.g. a Proxy of globalThis) used to crash with a type confusion.
-test.concurrent("onmessage/onerror assignment through a Proxy of globalThis", async () => {
+test.concurrent("on* handler assignment through a Proxy of globalThis", async () => {
   const script = `
     const messages = [];
     const onMessage = e => messages.push(e.data);
@@ -110,6 +115,20 @@ test.concurrent("onmessage/onerror assignment through a Proxy of globalThis", as
     with (new Proxy(globalThis, {})) { onmessage = function () {} }
     if (typeof globalThis.onmessage !== "function") throw new Error("onmessage not installed through with scope");
     globalThis.onmessage = null;
+
+    for (const name of ["onunhandledrejection", "onrejectionhandled"]) {
+      const seen = [];
+      const handler = e => seen.push(e.reason);
+      new Proxy(globalThis, {})[name] = handler;
+      if (globalThis[name] !== handler) throw new Error(name + " not installed through Proxy");
+      dispatchEvent(new PromiseRejectionEvent(name.slice(2), { promise: Promise.resolve(), reason: "hello" }));
+      if (seen.join() !== "hello") throw new Error(name + " not dispatched");
+      new Proxy(globalThis, {})[name] = null;
+      if (globalThis[name] !== null) throw new Error(name + " not cleared through Proxy");
+    }
+    with (new Proxy(globalThis, {})) { onunhandledrejection = function () {} }
+    if (typeof globalThis.onunhandledrejection !== "function") throw new Error("onunhandledrejection not installed through with scope");
+    globalThis.onunhandledrejection = null;
     console.log("ok");
   `;
   await using proc = Bun.spawn({
@@ -158,21 +177,21 @@ test.concurrent("worker: onmessage assignment through a Proxy of self", async ()
 // alive after that.
 const storesFixture = join(import.meta.dir, "..", "bun", "jsc", "stores-that-end-in-a-definition-fixture.js");
 
-test.concurrent(
-  "onmessage/onerror: every store that ends in a definition on globalThis installs the handler",
-  async () => {
-    const script = `
+test.concurrent("on* handlers: every store that ends in a definition on globalThis installs the handler", async () => {
+  const script = `
     const stores = require(${JSON.stringify(storesFixture)});
     const events = {
       onmessage: () => new MessageEvent("message", { data: "payload" }),
       onerror: () => new ErrorEvent("error", { error: "payload" }),
+      onunhandledrejection: () => new PromiseRejectionEvent("unhandledrejection", { promise: Promise.resolve(), reason: "payload" }),
+      onrejectionhandled: () => new PromiseRejectionEvent("rejectionhandled", { promise: Promise.resolve(), reason: "payload" }),
     };
     for (const [what, store] of Object.entries(stores)) {
       for (const [name, makeEvent] of Object.entries(events)) {
         const where = what + ", " + name;
         const seen = [];
-        const first = event => seen.push("first:" + (event.data ?? event.error));
-        const second = event => seen.push("second:" + (event.data ?? event.error));
+        const first = event => seen.push("first:" + (event.data ?? event.error ?? event.reason));
+        const second = event => seen.push("second:" + (event.data ?? event.error ?? event.reason));
         store(globalThis, name, first);
         if (globalThis[name] !== first) throw new Error(where + ": not read back");
         dispatchEvent(makeEvent());
@@ -189,22 +208,21 @@ test.concurrent(
     }
     console.log("ok");
   `;
-    await using proc = Bun.spawn({
-      cmd: [bunExe(), "-e", script],
-      env: bunEnv,
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-    expect(stderr).toBe("");
-    expect(stdout).toBe("ok\n");
-    expect(exitCode).toBe(0);
-  },
-);
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "-e", script],
+    env: bunEnv,
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stderr).toBe("");
+  expect(stdout).toBe("ok\n");
+  expect(exitCode).toBe(0);
+});
 
 // The global of a node:vm context made from globalThis answers for the properties of globalThis. As the receiver of a
 // Reflect.set it is what the native setter gets as its `this`, and it is no global object of Bun's own.
 test.concurrent(
-  "onmessage/onerror: Reflect.set with the global of a node:vm context of globalThis as the receiver",
+  "on* handlers: Reflect.set with the global of a node:vm context of globalThis as the receiver",
   async () => {
     const script = `
     const vm = require("node:vm");
@@ -212,10 +230,12 @@ test.concurrent(
     const events = {
       onmessage: () => new MessageEvent("message", { data: "payload" }),
       onerror: () => new ErrorEvent("error", { error: "payload" }),
+      onunhandledrejection: () => new PromiseRejectionEvent("unhandledrejection", { promise: Promise.resolve(), reason: "payload" }),
+      onrejectionhandled: () => new PromiseRejectionEvent("rejectionhandled", { promise: Promise.resolve(), reason: "payload" }),
     };
     const seen = [];
     for (const [name, makeEvent] of Object.entries(events)) {
-      const handler = event => seen.push(name + ":" + (event.data ?? event.error));
+      const handler = event => seen.push(name + ":" + (event.data ?? event.error ?? event.reason));
       if (!Reflect.set({}, name, handler, contextGlobal)) throw new Error(name + ": Reflect.set answered false");
       if (globalThis[name] !== handler) throw new Error(name + ": not read back");
       dispatchEvent(makeEvent());
@@ -232,7 +252,7 @@ test.concurrent(
     });
     const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
     expect(stderr).toBe("");
-    expect(stdout).toBe("onmessage:payload,onerror:payload\n");
+    expect(stdout).toBe("onmessage:payload,onerror:payload,onunhandledrejection:payload,onrejectionhandled:payload\n");
     expect(exitCode).toBe(0);
   },
 );
@@ -313,7 +333,53 @@ test("MessageEvent", () => {
   expect(called).toBe(true);
 });
 
-test.each([Event, CustomEvent, ErrorEvent, CloseEvent, MessageEvent].map(C => [C.name, C]))(
+test("PromiseRejectionEvent", () => {
+  const promise = Promise.resolve();
+  const reason = new Error("reason");
+  const event = new PromiseRejectionEvent("unhandledrejection", { promise, reason, cancelable: true });
+  expect({
+    length: PromiseRejectionEvent.length,
+    belowEvent: Object.getPrototypeOf(PromiseRejectionEvent.prototype) === Event.prototype,
+    tag: Object.prototype.toString.call(event),
+    type: event.type,
+    promise: event.promise === promise,
+    reason: event.reason === reason,
+    cancelable: event.cancelable,
+    bubbles: event.bubbles,
+    isTrusted: event.isTrusted,
+  }).toEqual({
+    length: 2,
+    belowEvent: true,
+    tag: "[object PromiseRejectionEvent]",
+    type: "unhandledrejection",
+    promise: true,
+    reason: true,
+    cancelable: true,
+    bubbles: false,
+    isTrusted: false,
+  });
+
+  // `promise` is an object that is kept as it is, a promise or not. `reason` is anything.
+  const thenable = { then() {} };
+  expect(new PromiseRejectionEvent("x", { promise: thenable }).promise).toBe(thenable);
+  expect(new PromiseRejectionEvent("x", { promise }).reason).toBeUndefined();
+  expect(new PromiseRejectionEvent("x", { promise, reason: null }).reason).toBeNull();
+  expect(new PromiseRejectionEvent("x", { promise }).cancelable).toBe(false);
+
+  for (const init of [undefined, null, {}, { reason }, { promise: undefined }, { promise: null }, { promise: 1 }]) {
+    expect(() => new PromiseRejectionEvent("x", init)).toThrow(TypeError);
+  }
+  expect(() => new PromiseRejectionEvent("x")).toThrow(TypeError);
+  expect(() => PromiseRejectionEvent("x", { promise })).toThrow(TypeError);
+
+  const target = new EventTarget();
+  const seen = [];
+  target.addEventListener("rejectionhandled", e => seen.push(e.promise === promise, e.reason));
+  target.dispatchEvent(new PromiseRejectionEvent("rejectionhandled", { promise, reason: "world" }));
+  expect(seen).toEqual([true, "world"]);
+});
+
+test.each([Event, CustomEvent, ErrorEvent, CloseEvent, MessageEvent, PromiseRejectionEvent].map(C => [C.name, C]))(
   "new %s() without a type throws ERR_MISSING_ARGS",
   (_, C) => {
     expect(() => new C()).toThrow(
@@ -667,6 +733,7 @@ describe("new.target.prototype", () => {
     ["MessageEvent", MessageEvent, ["message"]],
     ["PerformanceMark", PerformanceMark, ["mark"]],
     ["PerformanceObserver", PerformanceObserver, [() => {}]],
+    ["PromiseRejectionEvent", PromiseRejectionEvent, ["unhandledrejection", { promise: Promise.resolve() }]],
     ["TextEncoder", TextEncoder, []],
     ["URL", URL, ["http://example.com/"]],
     ["URLPattern (pattern, base)", URLPattern, ["/a", "http://example.com/"]],

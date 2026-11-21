@@ -12401,6 +12401,443 @@ Files: `src/bundler/linker_context/writeOutputFilesToDisk.rs`, `src/bundler/opti
 `test/bundler/cli.test.ts`, `test/bundler/bun-build-api.test.ts`,
 `test/bundler/bun-build-watch.test.ts`, `test/integration/bun-types/fixture/build.ts`.
 
+### 2026-11-21: `unhandledrejection` and `rejectionhandled` on the global object, and `PromiseRejectionEvent`
+
+A browser, Deno and Cloudflare Workers tell the global object of a rejection that nobody handled:
+`addEventListener("unhandledrejection", ...)` on `window`, on `self` in a worker. Bun told
+`process.on("unhandledRejection")` and nobody else. A listener on `globalThis` was accepted and
+never called, `PromiseRejectionEvent` did not exist, and `"onunhandledrejection" in globalThis`
+was `false`. oven-sh/bun#45240 (open, October 2026) reports what that costs in a `Worker`: code
+that was written for web workers installs its safety net with
+`self.addEventListener("unhandledrejection", e => e.preventDefault())`, and under Bun one
+forgotten `await` ends the worker all the same. Two pull requests of this bot for it,
+oven-sh/bun#35834 and oven-sh/bun#45596, were closed in sweeps of stale pull requests, and no
+maintainer had objected to either. Both events, the event class and the two handler attributes
+are here now.
+
+```ts
+addEventListener("unhandledrejection", event => {
+  console.error("unhandled rejection:", event.reason);
+  event.preventDefault(); // handled: Bun prints nothing itself, and the process goes on
+});
+
+addEventListener("rejectionhandled", event => {
+  // the promise of an earlier "unhandledrejection" got a handler after all
+});
+
+Promise.reject(new Error("boom"));
+```
+
+```ts worker.ts
+onunhandledrejection = event => {
+  postMessage({ failed: String(event.reason) });
+  return false; // the same as event.preventDefault()
+};
+```
+
+What it does, and the decisions in it.
+
+- The listeners of the global object are asked first, and `process` only if none of them cancels
+  the event. That is Deno's order, which has both kinds of listener too.
+- `event.preventDefault()`, or `return false` from an `onunhandledrejection` handler, makes the
+  rejection handled, with every value of `--unhandled-rejections`: the listeners of
+  `process.on("unhandledRejection")` are not called, no warning is printed, `strict` and `throw`
+  raise no `uncaughtException`, the default report does not print, and the exit code is not set.
+  This is a choice. The other rule that was on the table lets a canceled event count for as much
+  as a listener of `process` does, so that `strict` still raises its exception first and `warn`
+  still warns. One rule for six modes is easier to say and to test, and it is what Deno does: it
+  skips its whole Node layer for a rejection that the web event handled.
+- A listener that does not cancel changes nothing that comes after it. For each of the six modes,
+  with and without a listener of `process`, the output, the warnings and the exit code are those
+  of a run without the listener, with the listener's own line in front. A program that has both
+  kinds of listener is told twice of a rejection that it does not cancel.
+- The answer is read when the microtasks that the listeners queued have run, as HTML has it.
+  `await null` and then `event.preventDefault()` cancels. After an `await` that waits for a
+  timer or for I/O it is too late. A handler that a microtask of a listener attaches to the
+  promise is no late handler. Deno reads the answer when the listener returns, and the first
+  cut of this commit did too.
+- The microtasks run once for the event, after the last listener. HTML runs them after each
+  listener, so in a browser a second listener sees what a microtask of the first did, and here it
+  does not. Every event that Bun dispatches from native code is like that (`message` on the same
+  global object in `MessagePortPipe.cpp` and `WorkerMessagingProxy.cpp`), and one event that is
+  different would be worse than one stated difference.
+- A rejection that is reported while script is on the stack gets no such checkpoint, as in HTML,
+  and the answer is read at once. `expect(fn).toThrow()` in a program reports the rejections of
+  `fn` before it returns, and `Bun.cron` reports a job whose promise rejects after its first
+  `await` from a promise reaction. The first cut drained the microtasks after a canceled event
+  there, in the middle of the caller's synchronous code.
+- A handler that a listener attaches to the promise does not cancel the event.
+- `rejectionhandled` is dispatched when a promise that was reported gets its first handler later.
+  It comes from the task that `process.on("rejectionHandled")` comes from, before it, and it
+  cannot be canceled. For a handler that came inside the `unhandledrejection` listener or in one
+  of its microtasks it is not dispatched. If the `unhandledrejection` was canceled, `process`
+  hears of neither the rejection nor the handler, and `--unhandled-rejections=warn` prints no
+  `PromiseRejectionHandledWarning` for it. That holds when the listener is gone by then.
+- A `Worker`, of the web kind and of `node:worker_threads`, dispatches both on its own global
+  object. A listener that cancels keeps the worker running. Without that, the worker ends with
+  exit code 1 and its parent gets `"error"`, as before.
+- `bun test`: the thread that runs the tests keeps a rejection for the runner and does not ask
+  the listeners of the global object, whichever module a test was imported from. Vitest asks the
+  listeners of `process` and no others. The first cut asked them while a test from `"vitest"`
+  ran, and a listener that canceled could then take the runner's own report of a test that
+  never settles: the file was abandoned and the run ended with `Ran 0 tests` and exit code 0. A
+  `Worker` that a test starts asks its own listeners.
+- While a macro runs, the listeners are not asked: what a macro rejects is the transpiler's.
+- The `onError` of a `Bun.ModuleGraph` still goes first: a rejection that it takes is not
+  reported on the global object, and gets no `rejectionhandled` when it is handled later.
+- A rejection in a `node:vm` context or in a `ShadowRealm` is dispatched on the global object of
+  the thread.
+- A rejection is reported where it was before: from the event loop, when the callbacks that were
+  due and their microtasks have run. A handler that another callback of the same turn attaches
+  is in time. HTML queues a task for the report, and Node.js reports after each callback.
+- What a listener throws is reported as an uncaught exception, like what a listener of any event
+  throws. With a listener for `uncaughtException`, the other listeners and `process` are still
+  asked. Without one, the process ends with exit code 1 after the other listeners were called,
+  and a `Worker` ends at once.
+- With `--hot`, a reload that failed is reported through the event, a syntax error too, so a
+  listener that an earlier load left behind can cancel it. The first load is not: the rejection
+  of an entry module is an uncaught exception.
+- `new PromiseRejectionEvent(type, { promise, reason })` takes two arguments. `promise` is
+  required and has to be an object, and `event.promise` is that object. HTML has it as `object`
+  (`interfaces/html.idl` of the Web Platform Tests). WebKit's IDL has `Promise<any>`, and the two
+  earlier pull requests wrapped what was passed in a new promise.
+- In a DOM environment of `bun test`, `PromiseRejectionEvent` and the two handlers follow
+  `onerror` and `onmessage`: they are the window's where the window has them (jsdom), and Bun's
+  where it does not (happy-dom). Nothing is dispatched on that thread either way.
+
+How it is built.
+
+- The policy is one call in `VirtualMachine::unhandled_rejection_owned`
+  (`src/jsc/VirtualMachine.rs`), after the guard for a thread that is stopping and after the arm of
+  `Bun.ModuleGraph`, and before the branch of `bun test` and the switch over the mode. It is the
+  one function that every reporter passes: the queue of the promise tracker, `Bun.cron`, macros,
+  a `--hot` reload and the two places where `bun test` reports for itself. When the call answers
+  that a listener canceled the event, or when the thread was told to stop meanwhile, the function
+  returns. `VirtualMachine::handled_promise` has the twin for `rejectionhandled`, and returns
+  before `process` is told when the rejection had been canceled.
+- The two earlier pull requests had the dispatch inside `Bun__handleUnhandledRejection`, beside
+  the emit for `process`. The function that decides is above that one: `strict` raises its
+  `uncaughtException` before it calls down, `warn` and `none` do not look at the answer, and
+  `bun test` does not call it at all. So a cancel meant something else in each mode there. A
+  design pass weighed six placements before the code was written and took this one.
+  `BunProcess.cpp` and `promiseRejectionTracker` have no line of this commit.
+- Who is asked is one predicate, `asks_rejection_event_listeners`: the thread has had a listener,
+  no macro runs, and the thread is not the one that runs `bun test`. The four reporters that
+  must not ask (two in `Macro.rs`, two in `test_command.rs`) are told apart by that state. The
+  review asked for an argument that names the reporter. That changes the signature of
+  `unhandled_rejection` at eight call sites in five files that six open pull requests of
+  upstream rework, and gives the same eight answers, so it is not in this commit.
+- `Bun__dispatchUnhandledRejectionEvent` and `Bun__dispatchRejectionHandledEvent` are in
+  `PromiseRejectionEvent.cpp`, beside the class, and are the only makers of these events. They
+  build nothing unless the global object has a listener for the event, dispatch under
+  `Bun::ErrorHandlerContextScope`, like the emit for `process`, and give up when the thread is
+  being terminated. The first one calls `GlobalObject::drainMicrotasks()` after the dispatch,
+  if `vm.entryScope` is null, and then reads `defaultPrevented()` and whether the promise has a
+  handler. That drain runs the `process.nextTick` callbacks as well.
+- A thread that never added a listener for either event does not make the call. `GlobalEventScope`
+  already hears of every listener that is added to a global object, and sets
+  `VirtualMachine::has_rejection_event_listener`, which is never cleared. So a program without a
+  listener pays one compare and one branch here for each rejection that is reported, and nothing
+  for a promise.
+- What a listener did with a reported promise is kept for the late handler in a `JSWeakMap` of
+  `Bun::RejectedPromiseQueue`, which is made when the first listener cancels an event or attaches
+  a handler: "canceled" (then `process` is not told of the handler) and "handled in the event"
+  (then the global object is not told). `handled_promise` takes the entry whenever the thread
+  has had a listener, also where it does not dispatch. The queue's `append`, `didHandle` and
+  `markReported` are as they were.
+- `handleRejectedPromises` has the two lines of oven-sh/bun#43927, word for word: a promise
+  whose rejection is a graph's is not marked as reported. Without them a graph's rejection that
+  got a handler later was told to the host with `rejectionhandled`, and to `process`. The text
+  is upstream's so that the rebase onto that pull request is a no-op.
+- `JSPromiseRejectionEvent` is written on today's `JSDOMInterfaceWithAdditionalChildren`, after
+  `JSErrorEvent`. The promise and the reason are `JSValueInWrappedObject`s that the wrapper
+  marks. The four handler attributes of the global object (`onmessage`, `onerror` and the two new
+  ones) are one macro over `globalObjectForEventHandler`, so the new setters take a receiver that
+  is a proxy or the global of a `node:vm` context, which is what oven-sh/bun#37053 fixed for the
+  old two.
+- The table of built-ins of the ahead-of-time compiler has the class, its constructor, which
+  refuses a call without the options, the two cells for `promise` and `reason`, and the two
+  attributes. That native code makes a `PromiseRejectionEvent` is said once, in
+  `listenerRegistration`, for a listener on the global object, so the row of
+  `EventTarget.prototype.addEventListener` without a receiver has it as well. The global
+  `addEventListener` has a first overload for the names `error`, `message` and `messageerror`
+  that does not say it. The resolver's list of events that native code dispatches on the global
+  object has the two new names, so a compiled listener may take the global object off
+  `event.target`. The class is part of the `Events` feature of a trimmed executable.
+
+What it costs, measured on two release builds from one directory and one toolchain (linux x64,
+ThinLTO): the commit before this one and this one. A count of instructions is that of the
+process and its threads in user mode (`perf_event_open`), the lowest of the runs, which were
+taken in turns. The spread is how far the runs of one build are apart.
+
+- A promise costs nothing new. `Zig::GlobalObject::promiseRejectionTracker` is 825 bytes in both
+  builds, and the queue's `append`, `didHandle` and `markReported` have no new line. 2,000,000
+  rejections that are caught (`try { await Promise.reject(i) } catch {}`): 4,263,463,151 and
+  4,264,077,630 instructions, lowest of 9, with a spread of 9,000,000. An earlier pair of 7 runs
+  had the new build 630,000 below the old one.
+- A rejection that is reported in a program that never had a listener for the two events: 10 to
+  13 more instructions, of about 1,130. `unhandled_rejection_owned` runs two more, a compare of
+  the flag with a byte in memory and a branch that is taken, and is otherwise the same up to
+  there (`objdump`). `handleRejectedPromises` runs eight more for the guard of oven-sh/bun#43927,
+  which reads the owner of the promise out of its buffer a second time. 100,000 rejections with
+  `--unhandled-rejections=none`: 116,999,638 and 118,074,564 (lowest of 15, spread 3,000,000).
+  With a listener of `process` in the default mode: 153,100,140 and 154,437,438 (spread
+  2,400,000). The floor, the same program with no rejection, is 4,194,790 and 4,198,654.
+- A late handler. 20,000 promises that are reported and handled afterwards, with a listener for
+  `rejectionHandled`: 158,918,529 and 159,271,829 (lowest of 9, spread 3,700,000), about 17 more
+  for each promise of about 7,700.
+- A rejection that a listener cancels costs about 3,560 instructions: the event, its wrapper, the
+  call and the checkpoint (360,074,772 for 100,000). One that a listener of `process` takes costs
+  about 1,500.
+- A listener that is added to the global object and removed again: 7.7 more instructions for
+  the pair, the two compares of the name in `GlobalEventScope::onDidChangeListenerImpl`.
+  1,000,000 pairs for an event named `x`: 2,157,808,003 and 2,165,556,304, spread under 800,000.
+- Starting. A file that holds `void 0;`: 3,671,125 and 3,678,112 (lowest of 21), 7,000 more,
+  which is inside the spread of 47,000. 50 workers, one after the other: 293,094,279 and
+  292,602,109 (spread 1,200,000). 200 calls of `Bun.gc(true)`: 199,653,432 and 199,273,894.
+- `VirtualMachine` is 6,784 bytes in both builds, the size that `init` asks the allocator for:
+  the flag is in padding. In `Zig::GlobalObject` the rejection queue is 8 bytes further in
+  (0x29d0 and 0x29d8 in `handleRejectedPromises`), and by its definition it is 8 bytes larger,
+  the pointer to the map. The sizes of the C++ types were not read: the release builds carry no
+  type information, and gdb could not read that of the debug build. By the definitions there is
+  one more pointer in `DOMIsoSubspaces` and in `DOMClientIsoSubspaces` for each thread, one more
+  constructor slot and one more structure slot for each global object, and two more names in
+  `EventNames`.
+- The stripped executable is 157,358,008 and 157,374,392 bytes, 16,384 more. `.text` grows by
+  12,768 bytes and `.rodata` by 4,096, and `.data` and `.bss` are as they were (`size -A`). In
+  `bun-profile` the 32 symbols of the event class and its wrapper are 8,062 bytes,
+  `Bun__dispatchUnhandledRejectionEvent` is 1,054, `Bun__dispatchRejectionHandledEvent` 996,
+  `RejectedPromiseQueue::noteEventOutcome` 632 and `takeEventOutcome` 300 (`nm -S`).
+  `unhandled_rejection_owned` grows from 790 to 938, `HandledPromiseTask::run`, which has
+  `handled_promise` in it, from 251 to 402, `handleRejectedPromises` from 767 to 831 and
+  `onDidChangeListenerImpl` from 218 to 256.
+
+Tests. 70 new cases in the files that were there, one stored program, and one ported suite.
+Every case of a test file fails on a release build of the commit before this one, and on bun
+1.4.3.
+
+- `test/js/node/process/process.test.js`, 54 cases in one `describe`. For each of the six modes,
+  with and without a listener of `process`: a listener that does not cancel leaves the output,
+  the warnings and the exit code of the run without it, and a listener that cancels leaves
+  `web boom`, `alive`, an empty stderr and exit code 0. The same for both kinds of `Worker` in a
+  child process, one child for each mode and twelve workers in it, because a `Worker` inside
+  `bun test` does not ask the listeners of `process`. Then the shape of the event, the two
+  handler attributes with `return false`, a listener that is added after the rejection in the
+  same turn, `preventDefault()` after `await null` (in time) and after an `await` of
+  `setImmediate` (too late), two listeners and the microtasks of the first, a rejection that
+  `expect(fn).toThrow()` reports with script on the stack, a listener that throws, a rejection
+  that a listener makes, a `node:vm` context and a `ShadowRealm`, the six things a listener can
+  have done when the handler comes late (nothing, cancel, attach, attach in a microtask, and the
+  last two with cancel), a canceled rejection whose listener is removed in four ways before
+  the handler comes, and 30 rejections with `Bun.gc(true)` inside both listeners, of which ten
+  promises are held by their event alone.
+- `test/js/web/web-globals.test.js`, 7 new cases and 4 that were widened: the constructor, and
+  the two new attributes in every table that `onmessage` and `onerror` are in (a store through a
+  proxy, a `with` scope, 15 kinds of store that end in a definition, `Reflect.set` with the
+  global of a `node:vm` context as the receiver, `new.target.prototype`).
+- `test/js/web/workers/worker.test.ts`, 3 cases that run inside `bun test`, which is the proof
+  that a `Worker` of a test asks its own listeners: the three handlers of the issue and a worker
+  that still answers, a listener that does not cancel (`"error"` and exit code 1), and
+  `rejectionhandled` for a handler that a timer attaches.
+  `test/js/node/worker_threads/worker_threads.test.ts`, 2 cases: the same order for a
+  `node:worker_threads` Worker, and `terminate()` while the worker is inside a listener, after
+  which nothing is told of the rejection behind it.
+- `test/js/bun/test/vitest-flavor.test.ts`, 1 case with two runs: a listener and a handler
+  attribute that would cancel are never called, under `"vitest"` and under `bun:test`, and the
+  listeners of `process` and the runner get what they got.
+- `test/js/bun/module-graph/module-graph.test.ts`, 2 cases: the graph with an `onError` keeps
+  its rejection and the one of a graph without goes to the listener, and a rejection that a
+  graph took gets no `rejectionhandled` and no `rejectionHandled` when it is handled later.
+- `test/cli/hot/hot.test.ts`, 1 case: the first load throws and the listener that it left is
+  not called, a save that throws and a save with a syntax error are told to that listener, and
+  stderr has the error of the first load alone.
+- `test/js/third_party/wpt-unhandled-promise-rejections/`: the four files of the Web Platform
+  Tests that need no document, byte for byte at 9986bb32c9e, run in a child process on the main
+  thread and in a `Worker`. 41 of 44 subtests pass in each place. The other three call
+  `createImageBitmap`, which Bun does not have, and are listed in `expectations.json`. The
+  subtests about the order of tasks in a window are inside `if ('document' in self)` upstream
+  and do not run.
+- `a-rejection-that-native-code-reports.js` in
+  `test/aot/parallel/the-global-object-comes-back-as-the-target-of-an-event/`: a compiled program
+  whose two listeners read `process` off `event.target`. It prints what plain Bun prints in the
+  four ways that `run-parallel.ts` builds it. The four new lines in `HANDS_IT_OUT` of
+  `src/aot/builtins/resolve/tests/exposure.rs` say the same to the resolver, and that test fails
+  on the first of them without the two names in the list (`bun run rust:test -p bun_aot`).
+- On the debug build the whole files pass: `process.test.js` (270, and one case that wants
+  another `node` on this machine), `web-globals.test.js` (76), `worker.test.ts` (47),
+  `vitest-flavor.test.ts` (192), `module-graph.test.ts` (299), the two worker cases, the case
+  of `hot.test.ts` five times in a row, and 18 of Node's own tests of unhandled rejections
+  (`test-promise-unhandled-*.js`, `test-promises-unhandled-*.js`,
+  `test-event-capture-rejections.js` and five more). The new cases of `process.test.js`,
+  `worker.test.ts`, `module-graph.test.ts` and `hot.test.ts` also pass with
+  `BUN_JSC_validateExceptionChecks=1`.
+- The tables: `test/internal/builtins-table/` (149 pass, one skipped, in 32 minutes on the debug
+  build), and of `test/aot/` `builtins/realm-agreement`, `builtins/own-properties`,
+  `builtins/classes-with-inspect-method`, `builtins/name-classes`, `dom-environment` and
+  `compiler/names-compared-as-text` (208 pass). `builtins/exports.test.ts` aborts on a debug
+  build in the engine, see below. The bun-types test passes (30) with the new lines in two
+  fixtures, one of them the worker's side. The source lints pass (209) on the release build of
+  this commit. On the debug build two of them run into the limit of 5 seconds.
+
+Not done, and known.
+
+- The `error` twin. An uncaught exception on the main thread dispatches no `error` event on the
+  global object, and `reportError()` only prints. The same call shape would fit
+  `VirtualMachine::uncaught_exception`, with decisions of its own (`window.onerror` has five
+  arguments and cancels by returning `true`) and 23 callers.
+- A promise that an `async` listener returns and that rejects is an uncaught exception, for the
+  listeners of every event (`JSEventListener.cpp`, oven-sh/bun#19547, which is Node's rule for
+  its `EventTarget`). So `addEventListener("unhandledrejection", async event => { ... })` whose
+  body throws after an `await` ends the process, and a worker's `onmessage = async ...` that
+  throws ends the worker, with a canceling listener in place. A browser and Deno dispatch
+  `unhandledrejection` for both. Leaving the adoption out for the global object is a commit of
+  its own with a question of its own, and is not here. A rejection that a listener makes and does
+  not return is reported in turn, and a listener that rejects on every call is called without
+  end.
+- The rejection of the entry module, which a top-level `await` can cause, is an uncaught
+  exception and dispatches nothing, on the main thread and in a `Worker`. That is upstream's
+  choice (oven-sh/bun#31831) and HTML's channel for it is `error`. Only Deno dispatches
+  `unhandledrejection` there. An error in a `Bun.serve` handler goes to the server.
+- A listener that cancels and then reports in a timer or a request loses the report when the
+  rejection happens in the last callback of the program. The rejection is reported after
+  `beforeExit`, and nothing runs the loop again. It is the same for a listener of `process`, and
+  oven-sh/bun#45582 is open for it.
+- The target of the event is the object that stands for the global object in Bun's event code,
+  which is not `globalThis`: in an ES module `this` of a listener is `undefined`, and
+  `event.target === globalThis` is `false`. It is the same for `message` and `error` in a
+  `Worker` today. The types of the two handlers therefore declare no `this`. It was handed to
+  upstream's queue with oven-sh/bun#39102, which fixes it and was closed in a sweep, and a
+  session was started for it.
+- Inside a `Worker` that `bun test` started, the listeners of `process` are not called for a
+  rejection: `isBunTest` is one flag for the process. The listeners of the global object are
+  called there. Handed to upstream's queue with oven-sh/bun#36445, and a session was started.
+- A promise that was rejected by a `throw` inside a `.then()` callback, and reported, gets no
+  `rejectionhandled` for a late handler, and no `rejectionHandled` on `process`. Node.js emits
+  it. Bun 1.4.3 has the same gap on `process`. Handed to upstream's queue, and a session was
+  started.
+- While a test from `"vitest"` runs, a listener of `process` still takes the runner's report of
+  a test that never settles, and the run ends with `Ran 0 tests` and exit code 0. It was handed
+  to upstream's queue, which did not take it.
+- A rejection whose graph did not take it (`onError` answered no) is not marked as reported, and
+  gets no `rejectionhandled`. That is the wording of oven-sh/bun#43927.
+- `Bun.cron`, macros, `--hot` and the runner's own reports do not come through the queue. Their
+  promises get `unhandledrejection` (cron and `--hot`) and never `rejectionhandled`, on either
+  side. A cron job whose promise rejects after its first `await` is reported from a promise
+  reaction, so there a listener has to cancel before it returns, and one that was already
+  rejected when the job returned it is reported from the timer, where `await null` is in time
+  (both tried by hand).
+- In the default mode the microtasks do not run between two rejections that a listener of
+  `process` takes. After an event that was dispatched they do. oven-sh/bun#45597 is open for the
+  first, and makes `unhandled_rejection_owned` answer whether the caller owes a checkpoint. The
+  two returns of this commit answer no there: the dispatch has run its own.
+- A listener on the global object of a `node:vm` context or of a `ShadowRealm` is not asked. Only
+  the global object of the thread is.
+- The two handler attributes are own, enumerable properties of the global object, like
+  `onmessage` and `onerror`, so `Object.keys(globalThis)` has two more names.
+- In a trimmed executable, a listener that is added to the global object for a name other than
+  `error`, `message` and `messageerror`, or for a name that the compiler cannot read, may be
+  handed a `PromiseRejectionEvent`, whose `reason` is any value. The review estimated from the
+  table of sizes that such a program keeps 142 features where it kept 48, about 7.7 MB. No build
+  on this machine can trim, so neither that number nor the effect of the narrow overload was
+  measured. The table has no way to say "any name but these two".
+- `Bun.cron` was tried by hand on the debug build (the listener is called and can cancel) and
+  has no test: the test of `Bun.cron` that there is waits for the next minute. No test pins the
+  context that the listeners run in (`ErrorHandlerContextScope`).
+- The review asked for tests that pin three of the behaviours above as they are (the async
+  listener, the last callback, `.then()`), so that the pull requests that change them do it
+  knowingly. They are written down here and in the docs and are not in a test: the fork's
+  workflows run no test file, so a pin of a known fault would only go stale.
+- Windows and macOS did not run. `bun_jsc` and `bun_aot`, which hold the Rust that changed, pass
+  `cargo check` for `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`. The C++ has no line for
+  one platform.
+
+Seen on the way, in upstream, and not changed here. An executable of `bun build --compile --aot`
+that subtracts two BigInts aborts when it was made by a debug build:
+`ASSERTION FAILED: vm.isInitializingObject()` under `JSC::AOT::BigIntArithmetic::HeapPlace::finish`
+(`AOTBigIntArithmetic.h:73` of the engine). `const a = BigInt(process.argv.length) + 5n;
+console.log(String(a - 3n))` is enough. It is what fails `test/aot/builtins/exports.test.ts` on a
+debug build. It was handed to upstream's queue, which did not take it.
+
+The review. The finished first cut went through a review before the push, which found no reason
+to move it and 13 things to change. Taken: the checkpoint and the stack guard, no exception for
+`"vitest"`, macros, the two lines of oven-sh/bun#43927, the resolver's list, the fact of the
+table stated once and narrowed by name, the types without `this`, the docs (four sentences that
+were false, two snippets that failed when pasted, and the list of what is not reported), the
+licence headers of two files, and the tests for garbage collection, for the listener that is
+gone, for workers outside `bun test`, for `--hot` and for a `ShadowRealm`. Not taken, each with
+its reason above: the argument that names the reporter, the pins of known faults, and hiding
+Bun's three names under happy-dom. Four faults of upstream that the review met were handed on
+and not patched here. What this entry says of Chrome, of Deno and of Vitest is from the review's
+runs and from its reading of them, and was not run again on this machine.
+
+Rebase notes. 81 patches onto oven-sh/bun b15f51302d7, 8 commits after the base of 2026-11-20
+(7bb427f3be9). Nothing was dropped. Five patches stopped the rebase and three more did not build
+afterwards.
+
+- oven-sh/bun#49132 gives a reader and a writer a `File` or a `MaybeOwnedFile` where they took a
+  descriptor and a flag, and the shell's `IOReader` and `IOWriter` hold a `CloseOnDrop`. The `wc`
+  patch (2026-08-15) starts its unpolled read with `MaybeOwnedFile::Borrowed(fd)`, and the
+  comment that said a second start would close the descriptor is gone, because it no longer
+  would. `IOReader::init` takes a `File`, so `wc`, `head` and `tail`, `sort` and `uniq`, and
+  `cut` pass `File::from_fd(fd)`. The last three rebased without a conflict and did not compile.
+  Each fix is in its patch. `while` and `until` (2026-10-16) kept `is_broken_pipe` beside the new
+  signature of `IOWriter::init`.
+- oven-sh/bun#49352 makes a read and a write of a `Blob` one kind of job. `WriteFile` is an
+  `FdOp` of `FdJob`, and `FileOpener` and `FileCloser` are gone, which is where `append`
+  (2026-08-29) had its `open_flags()`. The option is a field of the operation now: `open()` asks
+  for `O_APPEND` in place of `O_TRUNC`, does not preallocate from offset 0, and `then()` says
+  that the file was not written whole. The Windows half is as it was.
+- oven-sh/bun#49203 lets a `Bun.Archive` hold a `Blob`, so that a slice is its range, where it
+  held the store. `Bun.write(destination, archive)` (2026-11-06) has a `Blob` in its `Rendering`
+  and `Outgoing::Data(Blob)` where it had the store, and asks `shared_view()` of the slice
+  whether the bytes are gzip already. zip (2026-11-06) had 19 hunks in `Archive.rs`, all of the
+  same kind, and its check of the size of `Archive` compares with `(Blob, Compression)` where it
+  said 16 bytes. Upstream's tests of slices and the stack's tests of zip are both in
+  `archive.test.ts`, which passes (298).
+- Found by the tests of today's feature and not by the rebase: `ReadableStream.prototype.lines`
+  (2026-08-18) was missing from `src/codegen/builtins/data/own-properties.txt`, and
+  `test/aot/builtins/own-properties.test.ts` failed for it. The line is in the `lines()` patch
+  now. Since when it failed is not known: the fork's workflows do not run that test.
+- Run on the debug build after the rebase: the seven builtins of the shell that read
+  (`wc` 27, `head` 41, `tail` 41, `sort` 37, `uniq` 26, `cut`, `cat` 12), `bunshell.test.ts`
+  (769), `parse`, `exec` and `wait`, `bun-write.test.js` (122), `filesink.test.ts` (94) and
+  `archive.test.ts` (298). `cargo fmt --all --check` passes, the source lints pass (209) on the
+  release binary, the bun-types test passes (30), and `cargo check` of `bun_runtime` passes for
+  `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`, which is where the Windows half of
+  `append` is compiled. The fork's three workflows were green for the push of 2026-11-20.
+- The rebased stack was pushed once before the feature, so that the ports were not only on this
+  machine.
+- Seen and left as it is: `bun fmt --plugin=prettier-plugin-organize-imports` of a build of this
+  tree, which is what upstream's format workflow runs, would change seven files of older patches
+  by 12 lines (the order of imports in five test files, a line break in `web_locks.ts` and in
+  `jwt.test.ts`, a space in `runtime.js`). Those patches were formatted with prettier. The files
+  of today's commit pass both. The fork runs that workflow for pull requests only.
+- Only the tip of the stack was built, as before.
+
+Files: `src/jsc/VirtualMachine.rs`, `src/jsc/VmHandle.rs`,
+`src/jsc/bindings/webcore/PromiseRejectionEvent.cpp`, `.h` and `.idl` (new),
+`src/jsc/bindings/webcore/JSPromiseRejectionEvent.cpp` and `.h` (new),
+`src/jsc/bindings/webcore/JSPromiseRejectionEventCustom.cpp` (new),
+`src/jsc/bindings/RejectedPromiseQueue.cpp` and `.h`, `src/jsc/bindings/GlobalEventScope.cpp`,
+`src/jsc/bindings/ZigGlobalObject.cpp`, `.h` and `.lut.txt`, `src/jsc/bindings/DOMStructureSlot.h`,
+`src/jsc/bindings/webcore/DOMConstructors.h`, `DOMIsoSubspaces.h`, `DOMClientIsoSubspaces.h`,
+`EventFactory.cpp`, `EventHeaders.h`, `EventInterfaces.h` and `EventNames.h`,
+`src/codegen/builtins/host/web-constructors.builtins.ts`, `globals.builtins.ts`,
+`features-web.builtins.ts`, `runtime-dependencies.builtins.ts` and `native-cells.ts`,
+`src/aot/builtins/resolve/mentions.rs`, `src/aot/builtins/resolve/tests/exposure.rs`,
+`src/trim/features/web.def`, `src/js/internal/test/environment.ts`,
+`src/aot/load/globals_of_a_window.rs`, `packages/bun-types/globals.d.ts`, `bun.d.ts` and
+`index.d.ts`, `docs/runtime/web-apis.mdx`, `docs/runtime/workers.mdx`, `docs/runtime/cron.mdx`,
+`docs/runtime/module-graph.mdx`, `docs/test/runtime-behavior.mdx`, `docs/snippets/cli/run.mdx`,
+`test/js/node/process/process.test.js`, `test/js/web/web-globals.test.js`,
+`test/js/web/workers/worker.test.ts`, `test/js/node/worker_threads/worker_threads.test.ts`,
+`test/js/bun/test/vitest-flavor.test.ts`, `test/js/bun/module-graph/module-graph.test.ts`,
+`test/cli/hot/hot.test.ts`, `test/js/third_party/wpt-unhandled-promise-rejections/` (new),
+`a-rejection-that-native-code-reports.js` (new) in
+`test/aot/parallel/the-global-object-comes-back-as-the-target-of-an-event/`,
+`test/aot/dom-environment.test.ts`,
+`test/integration/bun-types/fixture/globals.ts` and `worker.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

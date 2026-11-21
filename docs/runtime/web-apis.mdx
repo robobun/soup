@@ -29,7 +29,7 @@ Bun partially or completely supports the following Web APIs.
 | Errors                | [`reportError`](https://developer.mozilla.org/en-US/docs/Web/API/reportError)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | User interaction      | [`alert`](https://developer.mozilla.org/en-US/docs/Web/API/Window/alert), [`confirm`](https://developer.mozilla.org/en-US/docs/Web/API/Window/confirm), [`prompt`](https://developer.mozilla.org/en-US/docs/Web/API/Window/prompt) (intended for interactive CLIs)                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Realms                | [`ShadowRealm`](https://github.com/tc39/proposal-shadowrealm)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Events                | [`EventTarget`](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget), [`Event`](https://developer.mozilla.org/en-US/docs/Web/API/Event), [`ErrorEvent`](https://developer.mozilla.org/en-US/docs/Web/API/ErrorEvent), [`CloseEvent`](https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent), [`MessageEvent`](https://developer.mozilla.org/en-US/docs/Web/API/MessageEvent), [`ProgressEvent`](https://developer.mozilla.org/en-US/docs/Web/API/ProgressEvent)                                                                                                                                                                                                              |
+| Events                | [`EventTarget`](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget), [`Event`](https://developer.mozilla.org/en-US/docs/Web/API/Event), [`ErrorEvent`](https://developer.mozilla.org/en-US/docs/Web/API/ErrorEvent), [`CloseEvent`](https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent), [`MessageEvent`](https://developer.mozilla.org/en-US/docs/Web/API/MessageEvent), [`ProgressEvent`](https://developer.mozilla.org/en-US/docs/Web/API/ProgressEvent), [`PromiseRejectionEvent`](https://developer.mozilla.org/en-US/docs/Web/API/PromiseRejectionEvent). See [Unhandled rejections](#unhandled-rejections).                                                       |
 
 ## Web Storage
 
@@ -88,3 +88,34 @@ const server = Bun.serve({
 - A read that fails fires `error` and `loadend`, and no `loadstart` when it fails before its first chunk. `reader.error` is then a `DOMException` named `NotFoundError` for a file or an S3 object that does not exist and `NotReadableError` otherwise. Its `cause` is the error of the file system or of S3.
 - `abort()` fires `abort` and `loadend` before it returns, and sets `reader.error` to an `AbortError`.
 - A second read on a reader that is still reading throws an `InvalidStateError`. Use one reader for each blob, or wait for `loadend`.
+
+## Unhandled rejections
+
+When a promise is rejected and nothing handles the rejection, Bun dispatches [`unhandledrejection`](https://developer.mozilla.org/en-US/docs/Web/API/Window/unhandledrejection_event) on the global object, as a browser does on `window` and on the global object of a worker. The event is a [`PromiseRejectionEvent`](https://developer.mozilla.org/en-US/docs/Web/API/PromiseRejectionEvent) with the `promise` and the `reason`. A listener that calls `event.preventDefault()` has handled the rejection.
+
+```ts
+addEventListener("unhandledrejection", event => {
+  console.error("unhandled rejection:", event.reason);
+  event.preventDefault(); // Bun prints nothing itself, and the exit code stays 0
+});
+
+Promise.reject(new Error("boom"));
+```
+
+- The listeners are called before those of [`process.on("unhandledRejection")`](https://nodejs.org/api/process.html#event-unhandledrejection). If none of them cancels the event, everything goes on as it does without them: `process` is told, or Bun prints the error and the process ends with exit code 1.
+- `event.preventDefault()`, or `return false` from an `onunhandledrejection` handler, makes the rejection handled with every value of `--unhandled-rejections`. Nothing is printed, the exit code is not set, `process` is not told, and `strict` and `throw` raise no `uncaughtException`. A handler that a listener attaches to the promise does not cancel the event.
+- A listener can cancel the event until the microtasks that the listeners queued have run, as in a browser: after `await null` it still counts, after an `await` that waits for a timer or for I/O it is too late. Bun runs these microtasks once, after the last listener. A browser runs them after each listener, so there a second listener sees what a microtask of the first one did. Where Bun reports a rejection from inside a running callback, the listener has to cancel before it returns. That is so for a [`Bun.cron`](/runtime/cron#error-handling) job whose promise rejects after its first `await`.
+- Bun reports rejections from the event loop, when the callbacks that were due and their microtasks have run. A handler that another callback of the same turn attaches is in time, and nothing is reported. A browser queues a task for the report, and Node.js reports after each callback.
+- [`rejectionhandled`](https://developer.mozilla.org/en-US/docs/Web/API/Window/rejectionhandled_event) is dispatched when a promise that was reported gets its first handler later, before `process.on("rejectionHandled")` is told. It cannot be canceled. It is not dispatched for a handler that an `unhandledrejection` listener, or a microtask of one, attached. If the `unhandledrejection` of the promise was canceled, `process` hears of neither.
+- A [`Worker`](/runtime/workers#unhandledrejection) dispatches both events on its own global object. A rejection in a `node:vm` context or a `ShadowRealm` is reported on the global object of the thread.
+- What a listener throws is an uncaught exception, like what a listener of any other event throws. With a `process.on("uncaughtException")` listener, the other listeners and `process` are still asked about the rejection. Without one, the exception ends the process with exit code 1, and it ends a `Worker` before the other listeners are called.
+- The thread of [`bun test`](/test/runtime-behavior#custom-error-handling) that runs the tests does not dispatch the two events. Neither does a [macro](/bundler/macros).
+- A listener that cancels the event and reports in a timer or a request loses that report when the rejection happens in the last callback of the program: Bun reports the rejection when nothing else is left to run, and the process ends when the listeners have returned.
+
+These are not reported through the two events:
+
+- The rejection of the entry module, for example of a top-level `await`. It is an uncaught exception. With `--hot`, a reload that fails is reported through `unhandledrejection`, and the first load is not.
+- A promise that an `async` listener of an event of the global object returns, and that rejects. It is an uncaught exception too.
+- An uncaught exception. On the main thread it dispatches no `error` event on the global object.
+- An error in a [`Bun.serve`](/runtime/http/error-handling) handler, which goes to the `error` handler of the server.
+- A rejection that the `onError` of a [`Bun.ModuleGraph`](/runtime/module-graph#errors) takes.

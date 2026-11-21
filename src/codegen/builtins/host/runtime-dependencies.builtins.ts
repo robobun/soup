@@ -437,6 +437,8 @@ const eventTargetSources = [
   "native:Cpp:JSWebSocket.cpp:createWebSocketBindingForWs",
   "onerror",
   "onmessage",
+  "onrejectionhandled",
+  "onunhandledrejection",
   "EventTarget.prototype.addEventListener",
   "Performance.prototype.onresourcetimingbufferfull",
   ...messagePortSources,

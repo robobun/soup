@@ -122,7 +122,7 @@ A graph that was given no `onError` hands its errors to the `onError` of the gra
 
 ## What is shared
 
-The global object, `globalThis` properties, plugins and native addons are shared by every graph and the host. So is `process`, unless you replace it through `globals`. A graph's listeners on something the host owns are that object's, so they outlive `dispose()`. That includes signal, `process.stdin` and `'exit'` listeners on the shared `process`, and listeners on an emitter the host passed in. `ModuleGraph` separates instances of an app you trust from each other. It is not a security sandbox.
+The global object, `globalThis` properties, plugins and native addons are shared by every graph and the host. So is `process`, unless you replace it through `globals`. A graph's listeners on something the host owns are that object's, so they outlive `dispose()`. That includes signal, `process.stdin` and `'exit'` listeners on the shared `process`, listeners on the global object such as `addEventListener("unhandledrejection", ...)`, and listeners on an emitter the host passed in. `ModuleGraph` separates instances of an app you trust from each other. It is not a security sandbox.
 
 `http.globalAgent` and `https.globalAgent` are shared too. A connection belongs to the `Agent` that opened it, and an `Agent` to the script that made it, so a request a graph makes without an `agent` uses a connection that is not the graph's: `dispose()` does not close it, and it keeps the process running like any connection of the host's. Code whose connections should go with its graph passes an `Agent` it made itself.
 

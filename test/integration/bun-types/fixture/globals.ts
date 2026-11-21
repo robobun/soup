@@ -358,6 +358,26 @@ const writableStream = new WritableStream();
   // @ts-expect-error loaded is a number
   new ProgressEvent("progress", { loaded: "1" });
 }
+{
+  const rejection = new PromiseRejectionEvent("unhandledrejection", { promise: Promise.resolve(), reason: 1 });
+  expectType<Promise<any>>(rejection.promise);
+  expectType<boolean>(rejection.cancelable);
+  // @ts-expect-error the promise is required
+  new PromiseRejectionEvent("unhandledrejection", { reason: 1 });
+  addEventListener("unhandledrejection", event => {
+    expectType<PromiseRejectionEvent>(event);
+    expectType<Promise<any>>(event.promise);
+    event.preventDefault();
+  });
+  addEventListener("rejectionhandled", event => {
+    expectType<PromiseRejectionEvent>(event);
+  });
+  onunhandledrejection = event => {
+    expectType<PromiseRejectionEvent>(event);
+    return false;
+  };
+  onrejectionhandled = null;
+}
 
 atob("asf");
 btoa("asdf");

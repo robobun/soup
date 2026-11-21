@@ -210,6 +210,8 @@ process.on("unhandledRejection", (reason, promise) => {
 
 While a test or hook imported from `"vitest"` runs, an error that nothing handles goes to these listeners first. If there is a listener for it, the error doesn't fail the test, as in Vitest. While a test or hook from `bun:test` or `@jest/globals` runs, the error fails the test and the listeners aren't called, as in Jest.
 
+The listeners of the web's [`unhandledrejection`](/runtime/web-apis#unhandled-rejections) event aren't called on the thread that runs the tests, whichever module a test was imported from: Vitest doesn't ask them either. A `Worker` that a test starts dispatches the event on its own global object.
+
 ## CLI Flags Integration
 
 Several Bun CLI flags also work with `bun test`:

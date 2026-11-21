@@ -363,6 +363,9 @@ pub struct VirtualMachine {
     /// `bun test`: what is running is a test or a hook of Vitest's. There, an error that a `process` listener takes is
     /// not the runner's, and arrays of different lengths are never equal.
     pub is_running_vitest_entry: Cell<bool>,
+    /// A global object of this thread was given a listener for `unhandledrejection` or `rejectionhandled`. Never
+    /// cleared: it only spares a thread without one the call that asks.
+    pub(crate) has_rejection_event_listener: Cell<bool>,
     /// When set, `print_error_instance_body` calls this with the remapped
     /// `ZigException` (same lifecycle as the GitHub Actions annotation hook),
     /// so observers can read name/message/stack without re-running the
@@ -527,6 +530,21 @@ unsafe extern "C" {
         global: &JSGlobalObject,
         reason: JSValue,
         owner: JSValue,
+    ) -> bool;
+    /// PromiseRejectionEvent.cpp: dispatch `unhandledrejection` to the listeners of the thread's global object.
+    /// true: one of them canceled the event, and the rejection is handled.
+    safe fn Bun__dispatchUnhandledRejectionEvent(
+        global: &JSGlobalObject,
+        reason: JSValue,
+        promise: JSValue,
+    ) -> bool;
+    /// PromiseRejectionEvent.cpp: a promise that was reported got its first handler since. Dispatches
+    /// `rejectionhandled` if `dispatch`. true: its `unhandledrejection` had been canceled, so `process` knows
+    /// nothing of it.
+    safe fn Bun__dispatchRejectionHandledEvent(
+        global: &JSGlobalObject,
+        promise: JSValue,
+        dispatch: bool,
     ) -> bool;
 
     safe fn Process__dispatchOnBeforeExit(global: &JSGlobalObject, code: u8);
@@ -1735,7 +1753,26 @@ impl VirtualMachine {
         if self.is_shutting_down() {
             return true;
         }
+        if self.has_rejection_event_listener.get() {
+            let dispatch = self.asks_rejection_event_listeners();
+            let canceled = jsc::from_js_host_call_generic(global_object, || {
+                Bun__dispatchRejectionHandledEvent(global_object, promise, dispatch)
+            });
+            // `process` was not told of a rejection that a listener canceled, so it is not told of its handler.
+            if !matches!(canceled, Ok(false)) {
+                return true;
+            }
+        }
         Bun__emitHandledPromiseEvent(global_object, promise)
+    }
+
+    /// Whether this thread asks the `unhandledrejection` and `rejectionhandled` listeners of its global object.
+    /// The thread that runs `bun test` keeps its rejections for the runner, and what a macro rejects is the
+    /// transpiler's. A Worker that a test starts is not the runner.
+    fn asks_rejection_event_listeners(&self) -> bool {
+        self.has_rejection_event_listener.get()
+            && !self.macro_mode.get()
+            && !(isBunTest.load(core::sync::atomic::Ordering::Relaxed) && self.is_main_thread())
     }
 
     pub fn default_on_unhandled_rejection(
@@ -3154,6 +3191,7 @@ impl VirtualMachine {
             on_unhandled_rejection_exception_list: Cell::new(None),
             unhandled_error_counter: Cell::new(0),
             is_running_vitest_entry: Cell::new(false),
+            has_rejection_event_listener: Cell::new(false),
             on_print_error_zig_exception: Cell::new(None),
             is_handling_uncaught_exception: Cell::new(false),
             exit_on_uncaught_exception: Cell::new(false),
@@ -4193,6 +4231,18 @@ impl VirtualMachine {
         {
             let _ = self.event_loop().drain_microtasks();
             return;
+        }
+
+        // The `unhandledrejection` listeners of the global object go before `process` and before the mode. A
+        // rejection that one of them cancels is handled: nothing below hears of it. The dispatch has run the
+        // microtasks itself, and can find the thread stopping.
+        if self.asks_rejection_event_listeners() {
+            let canceled = jsc::from_js_host_call_generic(global_object, || {
+                Bun__dispatchUnhandledRejectionEvent(global_object, reason, promise)
+            });
+            if !matches!(canceled, Ok(false)) || !self.script_allowed() {
+                return;
+            }
         }
 
         if isBunTest.load(core::sync::atomic::Ordering::Relaxed) {

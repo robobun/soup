@@ -10,9 +10,12 @@ namespace WebCore {
 
 WTF_MAKE_TZONE_ALLOCATED_IMPL(GlobalEventScope);
 
+extern "C" void Bun__VM__noteRejectionEventListener();
+
 void GlobalEventScope::onDidChangeListenerImpl(EventTarget& self, const AtomString& eventType, OnDidChangeListenerKind kind)
 {
-    if (eventType == eventNames().messageEvent) {
+    auto& names = eventNames();
+    if (eventType == names.messageEvent) {
         auto& global = static_cast<GlobalEventScope&>(self);
         switch (kind) {
         case Add:
@@ -26,6 +29,9 @@ void GlobalEventScope::onDidChangeListenerImpl(EventTarget& self, const AtomStri
             break;
         }
         global.m_keepAlive.setActive(global.m_messageEventCount > 0);
+    } else if (kind == Add && (eventType == names.unhandledrejectionEvent || eventType == names.rejectionhandledEvent)) {
+        // From here on the thread asks the listeners about its rejections. Until then a rejection costs it nothing.
+        Bun__VM__noteRejectionEventListener();
     }
 };
 

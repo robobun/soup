@@ -834,6 +834,12 @@ pub extern "C" fn Bun__eventLoop__setKeptAlive(kept_alive: bool) {
     }
 }
 
+/// `GlobalEventScope`: the thread's global object got a listener for `unhandledrejection` or `rejectionhandled`.
+#[unsafe(no_mangle)]
+pub extern "C" fn Bun__VM__noteRejectionEventListener() {
+    VirtualMachine::get().has_rejection_event_listener.set(true);
+}
+
 /// Any thread: adjust the keep-alive on the VM's `kind` loop (no-op once the
 /// VM is closed).
 ///

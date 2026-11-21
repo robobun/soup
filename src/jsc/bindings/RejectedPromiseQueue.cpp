@@ -2,6 +2,7 @@
 #include "RejectedPromiseQueue.h"
 #include <JavaScriptCore/JSCellInlines.h>
 #include <JavaScriptCore/JSGlobalObjectInlines.h>
+#include <JavaScriptCore/JSWeakMap.h>
 #include <JavaScriptCore/JSWeakSet.h>
 #include <JavaScriptCore/SlotVisitorInlines.h>
 #include <JavaScriptCore/WeakMapImplInlines.h>
@@ -33,6 +34,33 @@ void RejectedPromiseQueue::markReported(JSC::JSGlobalObject* owner, JSC::JSPromi
         m_reported.set(vm, owner, reported);
     }
     reported->add(vm, promise);
+}
+
+// Only a promise that the queue reported gets the task of a late handler, which takes the outcome out again.
+NEVER_INLINE void RejectedPromiseQueue::noteEventOutcome(JSC::JSGlobalObject* owner, JSC::JSPromise* promise, uint8_t outcome)
+{
+    if (!m_reported || !wasReported(promise))
+        return;
+    JSC::VM& vm = owner->vm();
+    JSC::JSWeakMap* outcomes = m_eventOutcomes.get();
+    if (!outcomes) {
+        outcomes = JSC::JSWeakMap::create(vm, owner->weakMapStructure());
+        WTF::Locker locker { owner->cellLock() };
+        m_eventOutcomes.set(vm, owner, outcomes);
+    }
+    outcomes->add(vm, promise, JSC::jsNumber(outcome));
+}
+
+NEVER_INLINE uint8_t RejectedPromiseQueue::takeEventOutcome(JSC::JSPromise* promise)
+{
+    JSC::JSWeakMap* outcomes = m_eventOutcomes.get();
+    if (!outcomes)
+        return 0;
+    JSC::JSValue outcome = outcomes->get(promise);
+    if (!outcome.isInt32())
+        return 0;
+    outcomes->remove(promise);
+    return static_cast<uint8_t>(outcome.asInt32());
 }
 
 void RejectedPromiseQueue::drainTo(JSC::JSCell* owner, JSC::MarkedArgumentBuffer& promises, JSC::MarkedArgumentBuffer& rejectionOwners)
@@ -79,6 +107,7 @@ void RejectedPromiseQueue::visit(JSC::JSCell* owner, Visitor& visitor)
         }
     }
     visitor.append(m_reported);
+    visitor.append(m_eventOutcomes);
 }
 
 template void RejectedPromiseQueue::visit(JSC::JSCell*, JSC::AbstractSlotVisitor&);

@@ -2902,6 +2902,473 @@ describe("handling N rejected promises is O(N)", () => {
   );
 });
 
+// The web's two events for a rejection that nobody handled, on the global object. Their listeners are asked before
+// `process` is told, and a rejection that one of them cancels is handled, whatever --unhandled-rejections says.
+describe.concurrent("unhandledrejection and rejectionhandled on the global object", () => {
+  async function run(script, ...args) {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        ...args.filter(arg => arg.startsWith("--")),
+        "-e",
+        script,
+        ...args.filter(arg => !arg.startsWith("--")),
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // A warning names the process.
+    return { stdout: stdout.trim().split("\n"), stderr: stderr.replace(/\(node:\d+\)/g, "(node)"), exitCode };
+  }
+
+  const rejectsOnce = `
+    const kind = process.argv.find(argument => ["none", "listen", "cancel"].includes(argument));
+    if (kind !== "none")
+      addEventListener("unhandledrejection", event => {
+        console.log("web", event.reason.message);
+        if (kind === "cancel") event.preventDefault();
+      });
+    process.on("uncaughtException", (error, origin) => console.log("uncaughtException", origin, error.message));
+    if (process.argv.includes("process")) process.on("unhandledRejection", reason => console.log("process", reason.message));
+    Promise.reject(new Error("boom"));
+    setTimeout(() => console.log("alive"), 1);
+  `;
+  const modes = [
+    [],
+    ...["none", "warn", "warn-with-error-code", "strict", "throw"].map(mode => [`--unhandled-rejections=${mode}`]),
+  ];
+
+  describe.each(modes)("with %s", (...mode) => {
+    it.each([[], ["process"]])(
+      "a listener that does not cancel changes nothing after it %s",
+      async (...withProcess) => {
+        const [without, withListener] = await Promise.all([
+          run(rejectsOnce, ...mode, "none", ...withProcess),
+          run(rejectsOnce, ...mode, "listen", ...withProcess),
+        ]);
+        expect(withListener).toEqual({ ...without, stdout: ["web boom", ...without.stdout].filter(Boolean) });
+      },
+    );
+
+    it.each([[], ["process"]])("a listener that cancels is the last to hear of it %s", async (...withProcess) => {
+      expect(await run(rejectsOnce, ...mode, "cancel", ...withProcess)).toEqual({
+        stdout: ["web boom", "alive"],
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+  });
+
+  it("the event is a trusted, cancelable PromiseRejectionEvent with the promise and the reason", async () => {
+    const { stdout, stderr, exitCode } = await run(`
+      const reason = new Error("boom");
+      addEventListener("unhandledrejection", event => {
+        console.log(JSON.stringify({
+          constructor: event.constructor.name,
+          isEvent: event instanceof Event,
+          type: event.type,
+          promise: event.promise === promise,
+          reason: event.reason === reason,
+          cancelable: event.cancelable,
+          bubbles: event.bubbles,
+          isTrusted: event.isTrusted,
+          defaultPrevented: [event.defaultPrevented, (event.preventDefault(), event.defaultPrevented)],
+        }));
+      });
+      const promise = Promise.reject(reason);
+    `);
+    expect({ event: JSON.parse(stdout[0]), stderr, exitCode }).toEqual({
+      event: {
+        constructor: "PromiseRejectionEvent",
+        isEvent: true,
+        type: "unhandledrejection",
+        promise: true,
+        reason: true,
+        cancelable: true,
+        bubbles: false,
+        isTrusted: true,
+        defaultPrevented: [false, true],
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it("onunhandledrejection is called, and cancels by returning false", async () => {
+    expect(
+      await run(`
+        onunhandledrejection = event => (console.log(event.type, event.reason), event.reason === "canceled" ? false : undefined);
+        process.on("unhandledRejection", reason => console.log("process", reason));
+        Promise.reject("canceled");
+        Promise.reject("left to process");
+      `),
+    ).toEqual({
+      stdout: ["unhandledrejection canceled", "unhandledrejection left to process", "process left to process"],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it("a listener that is added before the turn ends is called, also when nothing else keeps the process alive", async () => {
+    expect(
+      await run(`
+        Promise.reject(new Error("boom"));
+        addEventListener("unhandledrejection", event => (console.log("web", event.reason.message), event.preventDefault()));
+      `),
+    ).toEqual({ stdout: ["web boom"], stderr: "", exitCode: 0 });
+  });
+
+  // HTML reads the answer after the microtasks that the listeners queued. Bun runs them once for the event.
+  it.each([
+    ["await null", { stdout: ["canceled after: await null"], warned: false, exitCode: 0 }],
+    [
+      "await new Promise(resolve => setImmediate(resolve))",
+      { stdout: ["canceled after: await new Promise(resolve => setImmediate(resolve))"], warned: true, exitCode: 0 },
+    ],
+  ])("preventDefault() after `%s` in an async listener", async (wait, expected) => {
+    const { stdout, stderr, exitCode } = await run(
+      `
+      addEventListener("unhandledrejection", async event => {
+        ${wait};
+        event.preventDefault();
+        console.log("canceled after:", ${JSON.stringify(wait)});
+      });
+      Promise.reject(new Error("boom"));
+    `,
+      "--unhandled-rejections=warn",
+    );
+    expect({ stdout, warned: stderr.includes("UnhandledPromiseRejectionWarning: Error: boom"), exitCode }).toEqual(
+      expected,
+    );
+  });
+
+  it("the microtasks run once for the event: a second listener is called before those of the first", async () => {
+    expect(
+      await run(`
+        addEventListener("unhandledrejection", async event => {
+          await null;
+          event.preventDefault();
+          console.log("first cancels");
+        });
+        addEventListener("unhandledrejection", event => console.log("second sees", event.defaultPrevented));
+        process.on("unhandledRejection", () => console.log("process"));
+        Promise.reject(new Error("boom"));
+      `),
+    ).toEqual({ stdout: ["second sees false", "first cancels"], stderr: "", exitCode: 0 });
+  });
+
+  it("a rejection that is reported with script on the stack runs no microtasks of the caller", async () => {
+    // expect(fn).toThrow() reports the rejections that fn made before it returns.
+    const { stdout, stderr, exitCode } = await run(`
+      const { expect } = require("bun:test");
+      addEventListener("unhandledrejection", event => {
+        console.log("web", event.reason.message);
+        if (event.reason.message === "canceled") event.preventDefault();
+      });
+      process.nextTick(() => console.log("tick"));
+      queueMicrotask(() => {
+        console.log("microtask");
+        Promise.reject(new Error("left alone"));
+      });
+      expect(() => {
+        Promise.reject(new Error("canceled"));
+        throw new Error("thrown");
+      }).toThrow("thrown");
+      console.log("after expect");
+    `);
+    expect({ stdout, reported: stderr.includes("error: left alone"), exitCode }).toEqual({
+      stdout: ["web canceled", "after expect", "tick", "microtask", "web left alone"],
+      reported: true,
+      exitCode: 1,
+    });
+  });
+
+  it("what a listener throws is an uncaught exception, and the other listeners and process are still asked", async () => {
+    expect(
+      await run(`
+        process.on("uncaughtException", (error, origin) => console.log(origin, error.message));
+        process.on("unhandledRejection", reason => console.log("process", reason.message));
+        addEventListener("unhandledrejection", () => {
+          console.log("first");
+          throw new Error("thrown by a listener");
+        });
+        addEventListener("unhandledrejection", () => console.log("second"));
+        Promise.reject(new Error("boom"));
+      `),
+    ).toEqual({
+      stdout: ["first", "uncaughtException thrown by a listener", "second", "process boom"],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it("a rejection that a listener makes is reported too, and the microtasks of one event run before the next", async () => {
+    expect(
+      await run(`
+        const order = [];
+        addEventListener("unhandledrejection", event => {
+          order.push("listener " + event.reason);
+          queueMicrotask(() => order.push("microtask " + event.reason));
+          if (event.reason === "b") Promise.reject("c");
+          event.preventDefault();
+        });
+        Promise.reject("a");
+        Promise.reject("b");
+        setTimeout(() => console.log(order.join(", ")), 1);
+      `),
+    ).toEqual({
+      stdout: ["listener a, microtask a, listener b, microtask b, listener c, microtask c"],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it.each([
+    ["a node:vm context", `require("node:vm").runInNewContext("Promise.reject(new Error('inside'))")`],
+    ["a ShadowRealm", `new ShadowRealm().evaluate("Promise.reject(new Error('inside')); 1")`],
+  ])("a rejection in %s is reported to the listeners of the global object of the thread", async (_, rejects) => {
+    expect(
+      await run(`
+        addEventListener("unhandledrejection", event => {
+          console.log(event.reason.message, Object.prototype.toString.call(event.promise), event.promise instanceof Promise);
+          event.preventDefault();
+        });
+        ${rejects};
+      `),
+    ).toEqual({ stdout: ["inside [object Promise] false"], stderr: "", exitCode: 0 });
+  });
+
+  // A promise that was reported and gets its first handler later. `kind` says what the unhandledrejection listener did.
+  const handledLate = `
+    const kind = process.argv.at(-1);
+    process.on("unhandledRejection", (reason, rejected) => console.log("process unhandledRejection", rejected === promise));
+    process.on("rejectionHandled", handled => console.log("process rejectionHandled", handled === promise));
+    addEventListener("unhandledrejection", event => {
+      console.log("web unhandledrejection");
+      if (kind.includes("microtask")) queueMicrotask(() => event.promise.catch(() => {}));
+      else if (kind.includes("attach")) event.promise.catch(() => {});
+      if (kind.includes("cancel")) event.preventDefault();
+    });
+    addEventListener("rejectionhandled", event => {
+      const { constructor, type, reason, cancelable, isTrusted } = event;
+      console.log("web rejectionhandled", constructor.name, type, event.promise === promise, reason.message, cancelable, isTrusted);
+      // It cannot be canceled.
+      event.preventDefault();
+    });
+    const promise = Promise.reject(new Error("boom"));
+    setImmediate(() => {
+      if (!kind.includes("attach")) promise.catch(() => {});
+      setImmediate(() => setImmediate(() => console.log("end")));
+    });
+  `;
+  const webHandled = "web rejectionhandled PromiseRejectionEvent rejectionhandled true boom false true";
+
+  it.each([
+    // Both are told, the global object first.
+    [
+      "listen",
+      ["web unhandledrejection", "process unhandledRejection true", webHandled, "process rejectionHandled true", "end"],
+    ],
+    // `process` was never told of the rejection, so it is not told of the handler.
+    ["cancel", ["web unhandledrejection", webHandled, "end"]],
+    // A handler that the listener attaches does not cancel, and is no late handler for the global object.
+    ["attach", ["web unhandledrejection", "process unhandledRejection true", "process rejectionHandled true", "end"]],
+    ["attach and cancel", ["web unhandledrejection", "end"]],
+    // So does one that a microtask of the listener attaches, as in HTML.
+    [
+      "attach in a microtask",
+      ["web unhandledrejection", "process unhandledRejection true", "process rejectionHandled true", "end"],
+    ],
+    ["attach in a microtask and cancel", ["web unhandledrejection", "end"]],
+  ])("a handler that comes after the report, when the listener did: %s", async (kind, stdout) => {
+    expect(await run(handledLate, kind)).toEqual({ stdout, stderr: "", exitCode: 0 });
+  });
+
+  it("a canceled rejection that is handled later warns about nothing", async () => {
+    const [canceled, left] = await Promise.all([
+      run(handledLate, "--unhandled-rejections=warn", "cancel"),
+      run(handledLate, "--unhandled-rejections=warn", "listen"),
+    ]);
+    expect(canceled).toEqual({ stdout: ["web unhandledrejection", webHandled, "end"], stderr: "", exitCode: 0 });
+    expect(left.stderr).toContain("PromiseRejectionHandledWarning");
+  });
+
+  it("rejectionhandled is dispatched without a listener for unhandledrejection, and onrejectionhandled is called", async () => {
+    expect(
+      await run(`
+        process.on("unhandledRejection", reason => console.log("process", reason));
+        onrejectionhandled = event => console.log("onrejectionhandled", event.type, event.reason);
+        const promise = Promise.reject("boom");
+        setImmediate(() => promise.catch(() => {}));
+      `),
+    ).toEqual({ stdout: ["process boom", "onrejectionhandled rejectionhandled boom"], stderr: "", exitCode: 0 });
+  });
+
+  // `process` was not told of the rejection, so it is not told of the handler: also when the listener is gone by then.
+  it.each(["removeEventListener", "an aborted signal", "once", "onunhandledrejection = null"])(
+    "a canceled rejection stays canceled when its listener is removed by %s",
+    async how => {
+      expect(
+        await run(
+          `
+          const how = process.argv.at(-1);
+          process.on("unhandledRejection", () => console.log("process unhandledRejection"));
+          process.on("rejectionHandled", () => console.log("process rejectionHandled"));
+          const controller = new AbortController();
+          const listener = event => {
+            console.log("web unhandledrejection");
+            event.preventDefault();
+          };
+          if (how.startsWith("onunhandledrejection")) onunhandledrejection = listener;
+          else addEventListener("unhandledrejection", listener, { once: how === "once", signal: controller.signal });
+          const promise = Promise.reject(new Error("boom"));
+          setImmediate(() => {
+            if (how === "removeEventListener") removeEventListener("unhandledrejection", listener);
+            else if (how === "an aborted signal") controller.abort();
+            else if (how.startsWith("onunhandledrejection")) onunhandledrejection = null;
+            promise.catch(() => {});
+            setImmediate(() => setImmediate(() => console.log("end")));
+          });
+        `,
+          how,
+        ),
+      ).toEqual({ stdout: ["web unhandledrejection", "end"], stderr: "", exitCode: 0 });
+    },
+  );
+
+  it("the events, their promises and what the listeners did survive garbage collection", async () => {
+    // Of 30 rejections: every second one is canceled, every fifth gets its handler in the listener, and every third
+    // is held by its event alone until the handlers are attached.
+    const { stdout, stderr, exitCode } = await run(`
+      const count = 30;
+      const counts = { web: 0, process: 0, webHandled: 0, processHandled: 0 };
+      const heldByEvent = [];
+      const heldByProgram = [];
+      addEventListener("unhandledrejection", event => {
+        const { n } = event.reason;
+        counts.web++;
+        if (n % 3 === 0) heldByEvent.push(event);
+        if (n % 5 === 0) event.promise.catch(() => {});
+        if (n % 2 === 0) event.preventDefault();
+        Bun.gc(true);
+      });
+      addEventListener("rejectionhandled", event => {
+        counts.webHandled++;
+        Bun.gc(true);
+      });
+      process.on("unhandledRejection", () => counts.process++);
+      process.on("rejectionHandled", () => counts.processHandled++);
+      for (let n = 0; n < count; n++) {
+        const promise = Promise.reject({ n });
+        if (n % 3 !== 0) heldByProgram.push(promise);
+      }
+      setImmediate(() => {
+        Bun.gc(true);
+        const reasons = [];
+        for (const event of heldByEvent) {
+          reasons.push(event.reason.n);
+          event.promise.catch(() => {});
+        }
+        for (const promise of heldByProgram) promise.catch(() => {});
+        setImmediate(() =>
+          setImmediate(() => {
+            Bun.gc(true);
+            console.log(JSON.stringify({ ...counts, reasons }));
+          }),
+        );
+      });
+    `);
+    expect({ result: JSON.parse(stdout[0]), stderr, exitCode }).toEqual({
+      result: {
+        web: 30,
+        // The 15 that were not canceled.
+        process: 15,
+        // All but the 6 whose handler came in the listener.
+        webHandled: 24,
+        processHandled: 15,
+        reasons: [0, 3, 6, 9, 12, 15, 18, 21, 24, 27],
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // Both kinds of Worker, each on its own thread, outside `bun test`: there the listeners of `process` are asked too.
+  describe.each(modes)("in a Worker with %s", (...mode) => {
+    it("a listener that does not cancel changes nothing after it, and one that cancels is the last to hear of it", async () => {
+      const { stdout, exitCode } = await run(
+        `
+        const { Worker: NodeWorker } = require("node:worker_threads");
+        const body = (kind, withProcess, say) => \`
+          const say = \${say};
+          if ("\${kind}" !== "none")
+            addEventListener("unhandledrejection", event => {
+              say("web " + event.reason.message);
+              if ("\${kind}" === "cancel") event.preventDefault();
+            });
+          if (\${withProcess}) process.on("unhandledRejection", reason => say("process " + reason.message));
+          Promise.reject(new Error("boom"));
+          setTimeout(() => say("alive"), 1);
+        \`;
+        const started = {
+          web(kind, withProcess) {
+            const source = body(kind, withProcess, "line => postMessage(line)");
+            const worker = new Worker(URL.createObjectURL(new Blob([source], { type: "text/javascript" })));
+            const result = { lines: [], error: null };
+            return new Promise(resolve => {
+              worker.addEventListener("message", event => result.lines.push(event.data));
+              // The message of the event has the source around the line, and the URL of the blob.
+              worker.addEventListener("error", event => (result.error = event.message.match(/^error: .*$/m)[0]));
+              worker.addEventListener("close", event => resolve({ ...result, code: event.code }));
+            });
+          },
+          node(kind, withProcess) {
+            const source = body(kind, withProcess, "line => require('node:worker_threads').parentPort.postMessage(line)");
+            const worker = new NodeWorker(source, { eval: true });
+            const result = { lines: [], error: null };
+            return new Promise(resolve => {
+              worker.on("message", line => result.lines.push(line));
+              worker.on("error", error => (result.error = "error: " + error.message));
+              worker.on("exit", code => resolve({ ...result, code }));
+            });
+          },
+        };
+        const results = {};
+        const pending = [];
+        for (const worker of ["web", "node"])
+          for (const withProcess of [false, true])
+            for (const kind of ["none", "listen", "cancel"])
+              pending.push(
+                started[worker](kind, withProcess).then(result => {
+                  results[[worker, kind, withProcess ? "with process" : "alone"].join(" ")] = result;
+                }),
+              );
+        Promise.all(pending).then(() => console.log(JSON.stringify(results)));
+      `,
+        ...mode,
+      );
+      const results = JSON.parse(stdout.at(-1));
+      const expected = {};
+      for (const worker of ["web", "node"])
+        for (const withProcess of ["alone", "with process"]) {
+          const without = results[`${worker} none ${withProcess}`];
+          expected[`${worker} none ${withProcess}`] = without;
+          expected[`${worker} listen ${withProcess}`] = { ...without, lines: ["web boom", ...without.lines] };
+          expected[`${worker} cancel ${withProcess}`] = { lines: ["web boom", "alive"], error: null, code: 0 };
+        }
+      expect(results).toEqual(expected);
+      // `strict` raises an uncaught exception before it asks the listeners of `process`, which ends the Worker.
+      if (!mode.includes("--unhandled-rejections=strict")) {
+        expect(results["web none with process"].lines).toContain("process boom");
+        expect(results["node none with process"].lines).toContain("process boom");
+      }
+      expect(exitCode).toBe(0);
+    });
+  });
+});
+
 it("process.execArgv", async () => {
   const fixtures = [
     ["index.ts --bun -a -b -c", [], ["--bun", "-a", "-b", "-c"]],

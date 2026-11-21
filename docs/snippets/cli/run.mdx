@@ -117,7 +117,8 @@ bun run <file or script>
 
 <ParamField path="--unhandled-rejections" type="string">
   One of <code>strict</code>, <code>throw</code>, <code>warn</code>, <code>none</code>, or{" "}
-  <code>warn-with-error-code</code>
+  <code>warn-with-error-code</code>. A rejection that an <code>unhandledrejection</code> listener of the global object
+  cancels is handled in every mode
 </ParamField>
 
 <ParamField path="--console-depth" type="number" default="2">

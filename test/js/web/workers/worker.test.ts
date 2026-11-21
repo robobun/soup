@@ -448,6 +448,83 @@ describe("web worker", () => {
     });
   });
 
+  // The worker's own global object is told of a rejection that nobody handled before the worker ends for it.
+  describe("unhandledrejection event", () => {
+    const workerOf = (source: string) =>
+      new Worker(URL.createObjectURL(new Blob([source], { type: "text/javascript" })));
+
+    test("a listener that cancels it keeps the worker running", async () => {
+      const worker = workerOf(`
+        self.addEventListener("unhandledrejection", event => {
+          postMessage("self: " + event.reason.message);
+          event.preventDefault();
+        });
+        globalThis.addEventListener("unhandledrejection", event => postMessage("globalThis: " + event.reason.message));
+        onunhandledrejection = event => postMessage("onunhandledrejection: " + event.constructor.name);
+        onmessage = event => postMessage("answers " + event.data);
+        Promise.reject(new Error("boom"));
+      `);
+      const messages: string[] = [];
+      const { promise: answered, resolve, reject } = Promise.withResolvers<void>();
+      worker.onerror = event => reject(new Error("the worker ended with: " + event.message));
+      worker.onmessage = event => {
+        messages.push(event.data);
+        // The three handlers have run, and the worker is asked whether it is still there.
+        if (messages.length === 3) worker.postMessage("a question");
+        if (messages.length === 4) resolve();
+      };
+      try {
+        await answered;
+      } finally {
+        worker.terminate();
+      }
+      expect(messages).toEqual([
+        "self: boom",
+        "globalThis: boom",
+        "onunhandledrejection: PromiseRejectionEvent",
+        "answers a question",
+      ]);
+    });
+
+    test("a listener that does not cancel it changes nothing: the worker ends with an error", async () => {
+      const worker = workerOf(`
+        self.addEventListener("unhandledrejection", event => postMessage("saw " + event.reason.message));
+        Promise.reject(new Error("boom"));
+      `);
+      const events: unknown[] = [];
+      worker.onmessage = event => events.push(event.data);
+      worker.onerror = event => events.push("error: " + event.message.includes("boom"));
+      const [closed] = await once(worker, "close");
+      expect({ events, code: closed.code }).toEqual({ events: ["saw boom", "error: true"], code: 1 });
+    });
+
+    test("rejectionhandled follows when the promise gets a handler later", async () => {
+      const worker = workerOf(`
+        addEventListener("unhandledrejection", event => {
+          event.preventDefault();
+          postMessage("unhandledrejection " + event.reason.message);
+          // From a microtask of the listener it would be no late handler.
+          setTimeout(() => event.promise.catch(() => {}), 0);
+        });
+        addEventListener("rejectionhandled", event => {
+          postMessage("rejectionhandled " + event.reason.message);
+          postMessage("done");
+        });
+        Promise.reject(new Error("boom"));
+      `);
+      const messages: string[] = [];
+      const { promise: done, resolve, reject } = Promise.withResolvers<void>();
+      worker.onerror = event => reject(new Error("the worker ended with: " + event.message));
+      worker.onmessage = event => (event.data === "done" ? resolve() : messages.push(event.data));
+      try {
+        await done;
+      } finally {
+        worker.terminate();
+      }
+      expect(messages).toEqual(["unhandledrejection boom", "rejectionhandled boom"]);
+    });
+  });
+
   // As in browsers (and Node's Web Worker), the worker's implicit port opens once the entry's
   // synchronous part has run: a message dispatched while no 'message' handler exists is dropped.
   // node:worker_threads' parentPort is what queues until a listener is attached. #40141

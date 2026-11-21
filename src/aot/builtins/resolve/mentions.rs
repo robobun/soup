@@ -59,8 +59,13 @@ fn exposes_members(id: BuiltinId) -> bool {
     }
 }
 
-const EVENTS_THAT_NATIVE_CODE_DISPATCHES_ON_GLOBAL_OBJECT: [&[u8]; 3] =
-    [b"error", b"message", b"messageerror"];
+const EVENTS_THAT_NATIVE_CODE_DISPATCHES_ON_GLOBAL_OBJECT: [&[u8]; 5] = [
+    b"error",
+    b"message",
+    b"messageerror",
+    b"rejectionhandled",
+    b"unhandledrejection",
+];
 
 fn hands_out_global_object(id: BuiltinId) -> bool {
     table::ENTRIES_THAT_HAND_OUT_THE_GLOBAL_OBJECT.contains(&table::canonical_id(id))

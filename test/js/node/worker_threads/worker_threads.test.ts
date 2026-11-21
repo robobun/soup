@@ -3276,6 +3276,67 @@ describe("no JS entry after a worker's termination has been thrown", () => {
   }
 });
 
+// The parent's terminate() lands while the worker is inside a listener of `unhandledrejection`. What was to be
+// reported after it is nobody's: no listener of the global object and none of `process` is called for it.
+test("terminate() during an unhandledrejection listener: nothing is told of the rejections behind it", async () => {
+  const sab = new SharedArrayBuffer(4 * 4);
+  const counts = new Int32Array(sab);
+  const w = new Worker(
+    `
+    const { parentPort, workerData } = require("node:worker_threads");
+    const counts = new Int32Array(workerData.sab);
+    addEventListener("unhandledrejection", () => {
+      if (Atomics.add(counts, 0, 1) > 0) return;
+      parentPort.postMessage("stuck");
+      // Stuck in native code each iteration, so no JIT tier can turn this into a poll-free loop.
+      for (;;) Atomics.wait(counts, 3, 0, 5);
+    });
+    addEventListener("rejectionhandled", () => Atomics.add(counts, 1, 1));
+    process.on("unhandledRejection", () => Atomics.add(counts, 2, 1));
+    Promise.reject(new Error("first"));
+    Promise.reject(new Error("second"));
+  `,
+    { eval: true, workerData: { sab } },
+  );
+  const errors: unknown[] = [];
+  w.on("error", error => errors.push(error));
+  expect(await once(w, "message")).toEqual(["stuck"]);
+  await w.terminate();
+  expect({ unhandledrejection: counts[0], rejectionhandled: counts[1], process: counts[2], errors }).toEqual({
+    unhandledrejection: 1,
+    rejectionhandled: 0,
+    process: 0,
+    errors: [],
+  });
+});
+
+test("a node:worker_threads Worker asks the unhandledrejection listeners of its global object before process", async () => {
+  const w = new Worker(
+    `
+    const { parentPort } = require("node:worker_threads");
+    addEventListener("unhandledrejection", event => {
+      parentPort.postMessage("web " + event.reason.message);
+      if (event.reason.message === "canceled") event.preventDefault();
+    });
+    process.on("unhandledRejection", reason => parentPort.postMessage("process " + reason.message));
+    Promise.reject(new Error("canceled"));
+    parentPort.once("message", () => parentPort.postMessage("still there"));
+  `,
+    { eval: true },
+  );
+  const messages: string[] = [];
+  const { promise: answered, resolve, reject } = Promise.withResolvers<void>();
+  w.on("error", reject);
+  w.on("message", message => {
+    messages.push(message);
+    if (message === "web canceled") w.postMessage("a question");
+    if (message === "still there") resolve();
+  });
+  await answered;
+  expect(messages).toEqual(["web canceled", "still there"]);
+  expect(await once(w, "exit")).toEqual([0]);
+});
+
 test("the main thread never reads a torn cwd while a Web Worker calls process.chdir()", async () => {
   using dir = tempDir("worker-chdir-cwd-readers", {
     "x/.keep": "",

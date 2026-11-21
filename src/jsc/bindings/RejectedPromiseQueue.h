@@ -8,6 +8,7 @@
 #include <wtf/Vector.h>
 
 namespace JSC {
+class JSWeakMap;
 class JSWeakSet;
 }
 
@@ -27,6 +28,16 @@ public:
     void release(JSC::JSCell* owner, size_t mark);
     // Right before a drained promise is reported as unhandled.
     void markReported(JSC::JSGlobalObject* owner, JSC::JSPromise*);
+    // What the global's `unhandledrejection` listeners did with a reported promise, kept for its late handler.
+    enum EventOutcome : uint8_t {
+        // preventDefault(): nothing else was told of the rejection.
+        Canceled = 1 << 0,
+        // A listener gave the promise its first handler, which is then not a late one.
+        HandledInEvent = 1 << 1,
+    };
+    void noteEventOutcome(JSC::JSGlobalObject* owner, JSC::JSPromise*, uint8_t outcome);
+    // Takes it out again. 0 if there is none.
+    uint8_t takeEventOutcome(JSC::JSPromise*);
     template<typename Visitor> void visit(JSC::JSCell* owner, Visitor&);
     bool isEmpty() const { return m_entries.isEmpty(); }
 
@@ -44,6 +55,8 @@ private:
     WTF::Vector<Entry> m_held;
     // Promises reported as unhandled. Weak: a reported promise that dies leaves it.
     JSC::WriteBarrier<JSC::JSWeakSet> m_reported;
+    // Reported promise to its EventOutcome. Made by the first listener that leaves one.
+    JSC::WriteBarrier<JSC::JSWeakMap> m_eventOutcomes;
 };
 
 // Inlined into promiseRejectionTracker, their one caller.

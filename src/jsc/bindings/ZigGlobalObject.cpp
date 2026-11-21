@@ -141,6 +141,7 @@
 #include "JSPerformanceMeasure.h"
 #include "JSPerformanceObserver.h"
 #include "JSPerformanceObserverEntryList.h"
+#include "JSPromiseRejectionEvent.h"
 #include "streams/JSReadableByteStreamController.h"
 #include "streams/JSReadableStream.h"
 #include "streams/JSReadableStreamBYOBReader.h"
@@ -1713,47 +1714,28 @@ static Zig::GlobalObject* globalObjectForEventHandler(JSC::JSGlobalObject* lexic
     return defaultGlobalObject(lexicalGlobalObject);
 }
 
-JSC_DEFINE_CUSTOM_GETTER(globalOnMessage,
-    (JSC::JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue,
-        JSC::PropertyName))
-{
-    Zig::GlobalObject* thisObject = globalObjectForEventHandler(lexicalGlobalObject, thisValue);
-    return JSValue::encode(eventHandlerAttribute(thisObject->eventTarget(), eventNames().messageEvent, thisObject->world()));
-}
-
-JSC_DEFINE_CUSTOM_GETTER(globalOnError,
-    (JSC::JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue,
-        JSC::PropertyName))
-{
-    Zig::GlobalObject* thisObject = globalObjectForEventHandler(lexicalGlobalObject, thisValue);
-    return JSValue::encode(eventHandlerAttribute(thisObject->eventTarget(), eventNames().errorEvent, thisObject->world()));
-}
-
-JSC_DEFINE_CUSTOM_SETTER(setGlobalOnMessage,
-    (JSC::JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue,
-        JSC::EncodedJSValue encodedValue, JSC::PropertyName property))
-{
-    auto& vm = JSC::getVM(lexicalGlobalObject);
-    JSValue value = JSValue::decode(encodedValue);
-    auto* thisObject = globalObjectForEventHandler(lexicalGlobalObject, thisValue);
-    setEventHandlerAttribute<JSEventListener>(thisObject->eventTarget(), eventNames().messageEvent, value, *thisObject);
-    vm.writeBarrier(thisObject, value);
-    ensureStillAliveHere(value);
-    return true;
-}
-
-JSC_DEFINE_CUSTOM_SETTER(setGlobalOnError,
-    (JSC::JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue,
-        JSC::EncodedJSValue encodedValue, JSC::PropertyName property))
-{
-    auto& vm = JSC::getVM(lexicalGlobalObject);
-    JSValue value = JSValue::decode(encodedValue);
-    auto* thisObject = globalObjectForEventHandler(lexicalGlobalObject, thisValue);
-    setEventHandlerAttribute<JSEventListener>(thisObject->eventTarget(), eventNames().errorEvent, value, *thisObject);
-    vm.writeBarrier(thisObject, value);
-    ensureStillAliveHere(value);
-    return true;
-}
+#define BUN_DEFINE_GLOBAL_EVENT_HANDLER_ATTRIBUTE(getterName, setterName, eventName)                                                     \
+    JSC_DEFINE_CUSTOM_GETTER(getterName, (JSC::JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))  \
+    {                                                                                                                                    \
+        Zig::GlobalObject* thisObject = globalObjectForEventHandler(lexicalGlobalObject, thisValue);                                     \
+        return JSValue::encode(eventHandlerAttribute(thisObject->eventTarget(), eventNames().eventName, thisObject->world()));           \
+    }                                                                                                                                    \
+    JSC_DEFINE_CUSTOM_SETTER(setterName,                                                                                                 \
+        (JSC::JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, JSC::EncodedJSValue encodedValue, JSC::PropertyName)) \
+    {                                                                                                                                    \
+        auto& vm = JSC::getVM(lexicalGlobalObject);                                                                                      \
+        JSValue value = JSValue::decode(encodedValue);                                                                                   \
+        auto* thisObject = globalObjectForEventHandler(lexicalGlobalObject, thisValue);                                                  \
+        setEventHandlerAttribute<JSEventListener>(thisObject->eventTarget(), eventNames().eventName, value, *thisObject);                \
+        vm.writeBarrier(thisObject, value);                                                                                              \
+        ensureStillAliveHere(value);                                                                                                     \
+        return true;                                                                                                                     \
+    }
+BUN_DEFINE_GLOBAL_EVENT_HANDLER_ATTRIBUTE(globalOnMessage, setGlobalOnMessage, messageEvent)
+BUN_DEFINE_GLOBAL_EVENT_HANDLER_ATTRIBUTE(globalOnError, setGlobalOnError, errorEvent)
+BUN_DEFINE_GLOBAL_EVENT_HANDLER_ATTRIBUTE(globalOnUnhandledRejection, setGlobalOnUnhandledRejection, unhandledrejectionEvent)
+BUN_DEFINE_GLOBAL_EVENT_HANDLER_ATTRIBUTE(globalOnRejectionHandled, setGlobalOnRejectionHandled, rejectionhandledEvent)
+#undef BUN_DEFINE_GLOBAL_EVENT_HANDLER_ATTRIBUTE
 
 WebCore::EventTarget& GlobalObject::eventTarget()
 {
@@ -1799,6 +1781,7 @@ WEBCORE_GENERATED_CONSTRUCTOR_GETTER(PerformanceObserverEntryList)
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(PerformanceResourceTiming)
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(PerformanceServerTiming)
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(PerformanceTiming)
+WEBCORE_GENERATED_CONSTRUCTOR_GETTER(PromiseRejectionEvent)
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(ReadableByteStreamController)
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(ReadableStream)
 WEBCORE_GENERATED_CONSTRUCTOR_GETTER(ReadableStreamBYOBReader)
@@ -3787,6 +3770,8 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     // TODO: this should be usable on the lookup table. it crashed las time i tried it
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onmessage"_s), JSC::CustomGetterSetter::create(vm, globalOnMessage, setGlobalOnMessage), 0);
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onerror"_s), JSC::CustomGetterSetter::create(vm, globalOnError, setGlobalOnError), 0);
+    putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onunhandledrejection"_s), JSC::CustomGetterSetter::create(vm, globalOnUnhandledRejection, setGlobalOnUnhandledRejection), 0);
+    putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "onrejectionhandled"_s), JSC::CustomGetterSetter::create(vm, globalOnRejectionHandled, setGlobalOnRejectionHandled), 0);
 
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "EventSource"_s), JSC::CustomGetterSetter::create(vm, getEventSourceConstructor, nullptr), PropertyAttribute::CustomValue | 0);
     putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "FileReader"_s), JSC::CustomGetterSetter::create(vm, getFileReaderConstructor, nullptr), PropertyAttribute::CustomValue | PropertyAttribute::DontEnum);
@@ -4131,7 +4116,9 @@ void GlobalObject::handleRejectedPromises()
             if (promise->isHandled())
                 continue;
             // From here on a handler on this promise is late: promiseRejectionTracker(Handle) owes it 'rejectionHandled'.
-            m_aboutToBeNotifiedRejectedPromises.markReported(this, promise);
+            // A rejection a Bun.ModuleGraph is given is never reported to the process, so it is owed none.
+            if (!rejectionOwners.at(i).isCell())
+                m_aboutToBeNotifiedRejectedPromises.markReported(this, promise);
 
             Bun__handleRejectedPromise(this, promise, JSValue::encode(rejectionOwners.at(i)));
             if (auto ex = scope.exception()) {
