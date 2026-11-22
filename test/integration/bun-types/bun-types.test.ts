@@ -664,7 +664,7 @@ describe("@types/bun integration test", () => {
       "DiffObject.bind.ts: hunks() is Hunk[] | undefined, not Hunk[]",
       "DiffObject.bind.ts: createPatch() is string | undefined, not string",
       // An S3File is a Blob with more members, which C++ adds and no schema describes.
-      "S3Client.bind.ts: new S3Client().file() has no readable, bucket, presign, copyTo",
+      "S3Client.bind.ts: new S3Client().file() has no readable, bucket, presign, presignPost, copyTo",
       "S3Client.bind.ts: new S3Client().file().stat() is Promise<unknown> | undefined, not Promise<S3Stats>",
       "S3Client.bind.ts: new S3Client().file().lastModified is not published",
       // bun.d.ts and s3.d.ts do not declare these.

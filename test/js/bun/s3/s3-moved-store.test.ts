@@ -32,6 +32,22 @@ describe.concurrent("S3 file whose store moves into a Response", () => {
       "true",
     ],
     [
+      "presignPost() throws after the move",
+      `move(); try { file.presignPost(); } catch (e) { console.log(e.code); }`,
+      "ERR_INVALID_THIS",
+    ],
+    [
+      "presignPost() signs the original key when an option getter moves and frees the store",
+      `console.log(file.presignPost({ get expiresIn() { moveAndFree(); return 60; } }).fields.key === key);`,
+      "true",
+    ],
+    [
+      "presignPost() signs the original key when the text of a field moves and frees the store",
+      `const value = Object.assign(new String("x"), { toString() { moveAndFree(); return "private"; } });
+       console.log(file.presignPost({ fields: { acl: value } }).fields.key === key);`,
+      "true",
+    ],
+    [
       "copyTo() throws after the move",
       `move(); try { file.copyTo("b"); } catch (e) { console.log(e.code); }`,
       "ERR_INVALID_THIS",

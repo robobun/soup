@@ -234,8 +234,8 @@ declare module "bun" {
     /**
      * Use a virtual hosted-style endpoint, where the bucket name is part of the
      * hostname. Defaults to `false`. When `true`, if `endpoint` is provided, the
-     * `bucket` option is ignored. A copy is the exception: see
-     * {@link S3CopyOptions}.
+     * `bucket` option is ignored. A copy and a POST form are the exceptions:
+     * see {@link S3CopyOptions} and {@link S3PresignPostOptions}.
      *
      * @example
      * ```ts
@@ -423,7 +423,8 @@ declare module "bun" {
      * copy with `metadataDirective: "REPLACE"`, which has room for 232 keys.
      *
      * In a presigned URL the metadata is signed as headers: a `PUT` or a
-     * `POST` to that URL has to send the same `x-amz-meta-*` headers.
+     * `POST` to that URL has to send the same `x-amz-meta-*` headers. In the
+     * form of {@link S3Client.presignPost} each entry is a field.
      *
      * @see https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html#UserMetadata
      *
@@ -509,6 +510,155 @@ declare module "bun" {
      * ```
      */
     method?: "GET" | "POST" | "PUT" | "DELETE" | "HEAD";
+  }
+
+  /**
+   * A condition of the policy of a POST form, see
+   * {@link S3Client.presignPost}. The service refuses a form that does not
+   * meet each one.
+   *
+   * - `["eq", "$field", value]`: the field has exactly this value.
+   * - `["starts-with", "$field", prefix]`: the value of the field begins with
+   *   `prefix`. An empty `prefix` accepts each value.
+   * - `["content-length-range", min, max]`: the size of the file in bytes is
+   *   from `min` to `max`.
+   * - `{ field: value }`: the same as `["eq", "$field", value]`.
+   *
+   * The name of a field is not case-sensitive. The service also refuses a
+   * form that has a field without a condition, except the file and the fields
+   * whose names start with `x-ignore-`.
+   *
+   * @see https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+   */
+  type S3PostPolicyCondition =
+    | readonly ["eq", `$${string}`, string]
+    | readonly ["starts-with", `$${string}`, string]
+    | readonly ["content-length-range", number, number]
+    | Readonly<Record<string, string>>;
+
+  /**
+   * Options for {@link S3Client.presignPost} and {@link S3File.presignPost}.
+   *
+   * The options that describe an upload are fields of the form, each with a
+   * condition that it has this value: `acl` is the field `acl`, `type` is
+   * `Content-Type`, `contentDisposition` is `Content-Disposition`,
+   * `contentEncoding` is `Content-Encoding`, `storageClass` is
+   * `x-amz-storage-class` and each entry of `metadata` is `x-amz-meta-<key>`.
+   * The `acl`, the `storageClass` and the `metadata` that the client or the
+   * file was made with apply too.
+   *
+   * Bun writes no field for `requestPayer`. For a bucket with Requester Pays,
+   * the request that sends the form needs the header
+   * `x-amz-request-payer: requester`. `fetch()` can send that header, and an
+   * HTML form cannot.
+   *
+   * With `virtualHostedStyle` and an `endpoint`, the policy names the bucket
+   * of a host name of Amazon S3 or of R2. For a host name of another service,
+   * set `bucket`: Bun throws without it.
+   */
+  interface S3PresignPostOptions extends S3Options {
+    /**
+     * The `Content-Type` field of the form, which is the type of the new
+     * object. The policy accepts this type and no other.
+     *
+     * Bun does not take it from the extension of the key, or from the type
+     * that a file was made with. Without it the form has no `Content-Type`
+     * field, and the service chooses the type of the object. To let the
+     * sender of the form choose the type, leave it out and add a condition:
+     * `["starts-with", "$Content-Type", "image/"]`.
+     */
+    type?: string | undefined;
+
+    /**
+     * Number of seconds from now until the policy expires. After that the
+     * service refuses the form. The default is 86400 (1 day). Bun reads the
+     * number as `presign()` does, and throws for a number that is not greater
+     * than 0.
+     */
+    expiresIn?: number | undefined;
+
+    /**
+     * Conditions of the policy, in addition to the ones that Bun writes for
+     * the bucket, for the key and for each field of the result.
+     *
+     * Use it to limit the size of the file, and to accept a field that the
+     * sender of the form chooses. That field is not in the result: the sender
+     * adds it to the form.
+     *
+     * A browser sends each line break of a value as CR LF, so Bun writes a
+     * lone CR or LF of a value as CR LF into the policy.
+     *
+     * Bun throws for a condition in another form than the four of
+     * {@link S3PostPolicyCondition}, for a field without the `$`, and for
+     * sizes that are not integers from 0 to `Number.MAX_SAFE_INTEGER` with
+     * `min` not above `max`.
+     *
+     * @example
+     * ```ts
+     * const { url, fields } = s3.presignPost("avatars/1042.png", {
+     *   conditions: [
+     *     ["content-length-range", 1, 2 * 1024 * 1024], // at most 2 MiB
+     *     ["starts-with", "$Content-Type", "image/"], // the browser adds Content-Type
+     *   ],
+     * });
+     * ```
+     */
+    conditions?: readonly S3PostPolicyCondition[] | null | undefined;
+
+    /**
+     * More fields for the form, for example `success_action_status` or
+     * `Cache-Control`. Each one is in the result, and the policy gets a
+     * condition that the field has this value.
+     *
+     * A field replaces the field of the same name that an option stands for:
+     * `fields: { "Content-Type": "image/png" }` wins over `type`. Names are
+     * not case-sensitive.
+     *
+     * A browser sends each line break of a value as CR LF, so Bun writes a
+     * lone CR or LF of a value as CR LF into the result and into the policy.
+     *
+     * Amazon S3 refuses a form with more than 20 KB of fields in front of the
+     * file. The `Policy` field repeats each field of the result in base64.
+     *
+     * Bun throws for a value that is not a string, for an empty name, for two
+     * names that differ only in case, and for `file` and the fields that Bun
+     * writes: `key`, `bucket`, `Policy`, `X-Amz-Algorithm`,
+     * `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Security-Token` and
+     * `X-Amz-Signature`.
+     *
+     * @example
+     * ```ts
+     * const { url, fields } = s3.presignPost("reports/2026.pdf", {
+     *   fields: { success_action_status: "201", "Cache-Control": "max-age=3600" },
+     * });
+     * ```
+     */
+    fields?: Readonly<Record<string, string>> | null | undefined;
+  }
+
+  /**
+   * What {@link S3Client.presignPost} and {@link S3File.presignPost} return:
+   * where to send a form that uploads a file, and the fields that the form
+   * needs.
+   */
+  interface S3PresignedPost {
+    /**
+     * The URL of the bucket. Send the form to it with the method `POST` and
+     * the content type `multipart/form-data`, which an HTML form with
+     * `enctype="multipart/form-data"` and a `fetch()` with a `FormData` body
+     * both do.
+     */
+    url: string;
+    /**
+     * The fields of the form. The file is one more field, named `file`, and
+     * it has to come after all of them: the service does not read what comes
+     * after the file.
+     *
+     * `Policy` is the policy document in base64 and `X-Amz-Signature` is its
+     * signature. The service refuses the form if a field has another value
+     * than the policy accepts.
+     */
+    fields: Record<string, string>;
   }
 
   interface S3Stats {
@@ -948,6 +1098,50 @@ declare module "bun" {
     presign(options?: S3FilePresignOptions): string;
 
     /**
+     * Signs a form that uploads to the key of this file with an HTTP `POST`,
+     * for example from a browser, without your credentials and without
+     * your server in the way of the bytes.
+     *
+     * Unlike a presigned `PUT` URL, the form has a policy that the service
+     * checks before it stores the file: the most bytes the file can have, the
+     * `Content-Type` it can have, and whatever else `conditions` say.
+     *
+     * If the key has `${filename}` in it, the service puts the name of the
+     * uploaded file there, and the policy accepts each key that starts with
+     * what is in front of `${filename}`. The same holds for the value of
+     * each field of `fields`, and of each option that is a field. Take
+     * `${filename}` out of text that comes from a user before you put the
+     * text in the key.
+     *
+     * Bun makes no request: it computes the result from the credentials.
+     * Amazon S3 accepts such a form. Before you rely on another service with
+     * an S3 API, check that it supports `PostObject`.
+     *
+     * Bun throws for a key that has a line break other than CR LF, which a
+     * form cannot send.
+     *
+     * @param options The conditions and fields of the form, and how long it is good for
+     * @returns The URL and the fields of the form
+     *
+     * @example
+     * ```ts
+     * // On the server
+     * const { url, fields } = s3.file("avatars/1042.png").presignPost({
+     *   expiresIn: 600,
+     *   type: "image/png",
+     *   conditions: [["content-length-range", 1, 2 * 1024 * 1024]],
+     * });
+     *
+     * // In the browser
+     * const form = new FormData();
+     * for (const [name, value] of Object.entries(fields)) form.append(name, value);
+     * form.append("file", input.files[0]); // the file comes last
+     * const response = await fetch(url, { method: "POST", body: form });
+     * ```
+     */
+    presignPost(options?: S3PresignPostOptions): S3PresignedPost;
+
+    /**
      * Deletes the file from S3.
      *
      * @returns Promise that resolves when deletion is complete
@@ -1382,6 +1576,28 @@ declare module "bun" {
     presign(path: string, options?: S3FilePresignOptions): string;
 
     /**
+     * Signs a form that uploads a file to `path` with an HTTP `POST`, for
+     * example from a browser. The form has a policy that the service checks
+     * before it stores the file. See {@link S3File.presignPost}.
+     *
+     * @param path The key of the new object. `${filename}` in it stands for the name of the uploaded file, and the form can then write each key that starts with the text in front of it
+     * @param options The conditions and fields of the form, and how long it is good for
+     * @returns The URL and the fields of the form
+     *
+     * @example
+     * ```ts
+     * const { url, fields } = bucket.presignPost("uploads/" + user.id + "/${filename}", {
+     *   expiresIn: 3600,
+     *   conditions: [
+     *     ["content-length-range", 0, 10 * 1024 * 1024],
+     *     ["starts-with", "$Content-Type", "image/"],
+     *   ],
+     * });
+     * ```
+     */
+    presignPost(path: string, options?: S3PresignPostOptions): S3PresignedPost;
+
+    /**
      * Generate a presigned URL that grants temporary access to a file, for
      * uploads or downloads, without exposing credentials.
      *
@@ -1415,6 +1631,25 @@ declare module "bun" {
      * ```
      */
     static presign(path: string, options?: S3FilePresignOptions): string;
+
+    /**
+     * Signs a form that uploads a file to `path` with an HTTP `POST`, with
+     * the credentials of the environment or of `options`. See
+     * {@link S3File.presignPost}.
+     *
+     * @param path The key of the new object. `${filename}` in it stands for the name of the uploaded file, and the form can then write each key that starts with the text in front of it
+     * @param options S3 credentials, the conditions and fields of the form, and how long it is good for
+     * @returns The URL and the fields of the form
+     *
+     * @example
+     * ```ts
+     * const { url, fields } = S3Client.presignPost("uploads/" + user.id + "/${filename}", {
+     *   ...credentials,
+     *   conditions: [["content-length-range", 0, 10 * 1024 * 1024]],
+     * });
+     * ```
+     */
+    static presignPost(path: string, options?: S3PresignPostOptions): S3PresignedPost;
 
     /**
      * Delete a file from the bucket.

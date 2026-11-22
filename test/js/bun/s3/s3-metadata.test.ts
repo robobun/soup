@@ -399,6 +399,7 @@ describe("s3 - metadata", () => {
       );
       expect(() => file.writer(invalid)).toThrow(message);
       expect(() => file.presign({ ...invalid, method: "PUT" })).toThrow(message);
+      expect(() => file.presignPost(invalid)).toThrow(message);
       expect(() => client.file("invalid.txt", invalid)).toThrow(message);
       expect(() => new S3Client({ ...options, ...invalid })).toThrow(message);
       expect(server.requests.length).toBe(before);

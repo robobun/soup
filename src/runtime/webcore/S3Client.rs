@@ -450,6 +450,24 @@ impl S3Client {
         S3File::get_presign_url_from(&blob, global, options)
     }
 
+    pub(crate) fn presign_post(
+        &self,
+        cx: &mut JsScope<'_>,
+        path: JsLocal<'_>,
+        options: JsLocal<'_>,
+    ) -> JsResult<JSValue> {
+        let global = cx.global();
+        let options = opt_js(options.to_js());
+        let blob = self.blob_for_path(
+            global,
+            path.to_js(),
+            options,
+            "presign a POST to",
+            MissingPathError::MissingOrInvalid,
+        )?;
+        S3File::get_presign_post_from(&blob, global, options)
+    }
+
     pub(crate) fn exists(
         &self,
         cx: &mut JsScope<'_>,
@@ -707,6 +725,22 @@ impl S3Client {
         let blob =
             S3File::s3_blob_from_js(global, path, options, "Expected a S3 or path to presign")?;
         S3File::get_presign_url_from(&blob, global, options)
+    }
+
+    pub(crate) fn static_presign_post(
+        cx: &mut JsScope<'_>,
+        path: JsLocal<'_>,
+        options: JsLocal<'_>,
+    ) -> JsResult<JSValue> {
+        let global = cx.global();
+        let options = opt_js(options.to_js());
+        let blob = S3File::s3_blob_from_js(
+            global,
+            path.to_js(),
+            options,
+            "Expected a S3 or path to presign a POST to",
+        )?;
+        S3File::get_presign_post_from(&blob, global, options)
     }
 
     pub(crate) fn static_exists(

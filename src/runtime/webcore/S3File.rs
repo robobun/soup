@@ -468,6 +468,79 @@ pub(crate) fn get_presign_url_from(
     )
 }
 
+/// `file.presignPost(options)`: the fields of a form that uploads to the key of this file.
+pub(crate) fn get_presign_post_from(
+    this: &Blob,
+    global: &JSGlobalObject,
+    extra_options: Option<JSValue>,
+) -> JsResult<JSValue> {
+    use crate::webcore::s3::post_policy_jsc::{
+        PostPolicy, presigned_post_to_js, with_form_line_breaks,
+    };
+
+    let mut expires: u64 = 86400; // 1 day default, as for a presigned URL
+    let mut policy = PostPolicy::default();
+
+    // Our own ref: the option getters below can detach it from `this`.
+    let store = s3_store(this, global, "presignPost")?.clone();
+    let s3 = store.data.as_s3();
+
+    if let Some(options) = extra_options.filter(|options| options.is_object()) {
+        if let Some(expires_in) = options.get_optional::<i32>(global, "expiresIn")? {
+            if expires_in <= 0 {
+                return Err(global
+                    .throw_invalid_arguments(format_args!("expiresIn must be greater than 0")));
+            }
+            expires = expires_in as u64;
+        }
+        policy = PostPolicy::from_js(global, options)?;
+    }
+    let options = s3.get_credentials_with_options(extra_options, global)?;
+    let credentials = &options.credentials;
+    // The policy names the bucket. Only a host of Amazon S3 or of R2 says which of its labels are one.
+    if credentials.virtual_hosted_style
+        && credentials.bucket.is_empty()
+        && bun_s3_signing::copy::bucket_in_endpoint(credentials).is_none()
+    {
+        return Err(global
+            .err(
+                bun_jsc::ErrorCode::S3_INVALID_PATH,
+                format_args!(
+                    "presignPost needs the name of the bucket, and this virtual hosted-style endpoint does not tell it: set the \"bucket\" option"
+                ),
+            )
+            .throw());
+    }
+    let path = s3.path();
+    if with_form_line_breaks(path) != path {
+        return Err(global
+            .err(
+                bun_jsc::ErrorCode::S3_INVALID_PATH,
+                format_args!(
+                    "presignPost cannot sign a key with a line break that is not CR LF: a form sends CR LF for each line break"
+                ),
+            )
+            .throw());
+    }
+
+    let result = credentials.presign_post(&bun_s3_signing::post_policy::PostOptions {
+        path,
+        expires,
+        conditions: &policy.conditions(),
+        fields: &policy.fields(),
+        acl: options.acl,
+        storage_class: options.storage_class,
+        content_type: options.content_type.as_deref(),
+        content_disposition: options.content_disposition.as_deref(),
+        content_encoding: options.content_encoding.as_deref(),
+        metadata: options.metadata.as_deref(),
+    });
+    match result {
+        Ok(post) => presigned_post_to_js(global, &post),
+        Err(sign_err) => Err(s3::throw_sign_error(sign_err.into(), global)),
+    }
+}
+
 fn get_bucket_name(this: &Blob) -> Option<&[u8]> {
     let store = this.store.get().as_ref()?;
     if !matches!(store.data, blob::store::Data::S3(_)) {
@@ -537,6 +610,7 @@ pub(crate) fn to_js_unchecked(global: &JSGlobalObject, this: bun_ptr::RefPtr<Blo
 
 // Symbols exported with C linkage and JSC calling convention.
 // JSS3File__presign     -> raw shim wrapping get_presign_url_from (method-with-context)
+// JSS3File__presignPost -> raw shim wrapping get_presign_post_from (method-with-context)
 // JSS3File__bucket      -> get_bucket
 // JSS3File__stat        -> raw shim wrapping S3BlobStatTask::stat (method-with-context)
 // JSS3File__copyTo      -> raw shim wrapping copy_to (method-with-context)
@@ -558,6 +632,15 @@ pub(crate) mod exports {
     fn JSS3File__presign(this: &Blob, global: &JSGlobalObject, options: JSValue) -> JSValue {
         bun_jsc::to_js_host_call(global, || {
             super::get_presign_url_from(this, global, (!options.is_empty()).then_some(options))
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    #[bun_jsc::host_call]
+    fn JSS3File__presignPost(this: &Blob, global: &JSGlobalObject, options: JSValue) -> JSValue {
+        bun_jsc::to_js_host_call(global, || {
+            let options = (!options.is_undefined_or_null()).then_some(options);
+            super::get_presign_post_from(this, global, options)
         })
     }
 

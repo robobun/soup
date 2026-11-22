@@ -213,6 +213,14 @@ pub fn bucket_mismatch(credentials: &S3Credentials) -> Option<&[u8]> {
     }
 }
 
+/// The bucket in the host of a virtual hosted-style endpoint of Amazon S3 or of R2, which every request goes to.
+pub fn bucket_in_endpoint(credentials: &S3Credentials) -> Option<&[u8]> {
+    if !credentials.virtual_hosted_style || credentials.endpoint.is_empty() {
+        return None;
+    }
+    bucket_in_host(without_port(split_endpoint(&credentials.endpoint).0))
+}
+
 /// The `host[:port]` and the path of an endpoint, as `sign_request` splits it.
 fn split_endpoint(endpoint: &[u8]) -> (&[u8], &[u8]) {
     match strings::index_of_char_usize(endpoint, b'/') {

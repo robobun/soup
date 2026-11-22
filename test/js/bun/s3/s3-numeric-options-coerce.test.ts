@@ -33,6 +33,33 @@ describe("presign expiresIn coercion", () => {
   });
 });
 
+describe("presignPost expiresIn coercion", () => {
+  // The seconds from the time of the form to the expiration of its policy.
+  function postExpires(expiresIn: unknown): number {
+    const { fields } = Bun.s3.presignPost("k", { ...base, expiresIn: expiresIn as number });
+    const [, y, mo, d, h, mi, s] = /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)Z$/.exec(fields["X-Amz-Date"])!;
+    const policy = JSON.parse(Buffer.from(fields.Policy, "base64").toString());
+    return (Date.parse(policy.expiration) - Date.UTC(+y, +mo - 1, +d, +h, +mi, +s)) / 1000;
+  }
+
+  test.each([
+    ["3600", 3600],
+    ["60", 60],
+    [1.5, 1],
+    [3599.9999, 3599],
+    [Infinity, 2 ** 31 - 1],
+    [2 ** 31, 2 ** 31 - 1],
+    [null, 86400],
+    [undefined, 86400],
+  ] as const)("expiresIn: %p -> %d seconds", (input, expected) => {
+    expect(postExpires(input)).toBe(expected);
+  });
+
+  test("expiresIn: 0 still throws (field-specific validation)", () => {
+    expect(() => postExpires(0)).toThrow("expiresIn must be greater than 0");
+  });
+});
+
 describe("S3Client upload options coercion", () => {
   function make(opts: Record<string, unknown>) {
     return new Bun.S3Client({ ...base, region: "us-east-1", ...opts } as any);

@@ -22,6 +22,7 @@ using namespace WebCore;
 // External C functions declarations
 extern "C" {
 SYSV_ABI EncodedJSValue JSS3File__presign(void* ptr, JSC::JSGlobalObject*, EncodedJSValue options);
+SYSV_ABI EncodedJSValue JSS3File__presignPost(void* ptr, JSC::JSGlobalObject*, EncodedJSValue options);
 SYSV_ABI EncodedJSValue JSS3File__stat(void* ptr, JSC::JSGlobalObject*);
 SYSV_ABI EncodedJSValue JSS3File__bucket(void* ptr, JSC::JSGlobalObject*);
 SYSV_ABI EncodedJSValue JSS3File__copyTo(void* ptr, JSC::JSGlobalObject*, EncodedJSValue destination, EncodedJSValue options);
@@ -29,6 +30,7 @@ SYSV_ABI EncodedJSValue JSS3File__copyTo(void* ptr, JSC::JSGlobalObject*, Encode
 
 // Forward declarations
 JSC_DECLARE_HOST_FUNCTION(functionS3File_presign);
+JSC_DECLARE_HOST_FUNCTION(functionS3File_presignPost);
 JSC_DECLARE_HOST_FUNCTION(functionS3File_stat);
 JSC_DECLARE_HOST_FUNCTION(functionS3File_copyTo);
 static JSC_DECLARE_CUSTOM_GETTER(getterS3File_bucket);
@@ -48,6 +50,7 @@ static JSC_DEFINE_CUSTOM_GETTER(getterS3File_bucket, (JSC::JSGlobalObject * glob
 static const HashTableValue JSS3FilePrototypeTableValues[] = {
     { "copyTo"_s, static_cast<unsigned>(PropertyAttribute::Function | PropertyAttribute::ReadOnly), NoIntrinsic, { HashTableValue::NativeFunctionType, functionS3File_copyTo, 1 } },
     { "presign"_s, static_cast<unsigned>(PropertyAttribute::Function | PropertyAttribute::ReadOnly), NoIntrinsic, { HashTableValue::NativeFunctionType, functionS3File_presign, 1 } },
+    { "presignPost"_s, static_cast<unsigned>(PropertyAttribute::Function | PropertyAttribute::ReadOnly), NoIntrinsic, { HashTableValue::NativeFunctionType, functionS3File_presignPost, 1 } },
     { "stat"_s, static_cast<unsigned>(PropertyAttribute::Function | PropertyAttribute::ReadOnly), NoIntrinsic, { HashTableValue::NativeFunctionType, functionS3File_stat, 1 } },
     { "bucket"_s, static_cast<unsigned>(PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, getterS3File_bucket, 0 } },
 };
@@ -96,6 +99,18 @@ JSC_DEFINE_HOST_FUNCTION(functionS3File_presign, (JSGlobalObject * globalObject,
 
     // `presign(undefined)` signs with the `acl` and `storageClass` of the store, `presign()` without.
     return JSS3File__presign(thisObject->wrapped(), globalObject, JSValue::encode(callframe->argumentCount() ? callframe->uncheckedArgument(0) : JSValue()));
+}
+
+JSC_DEFINE_HOST_FUNCTION(functionS3File_presignPost, (JSGlobalObject * globalObject, CallFrame* callframe))
+{
+    auto* thisObject = dynamicDowncast<JSS3File>(callframe->thisValue());
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!thisObject) {
+        Bun::throwError(globalObject, scope, Bun::ErrorCode::ERR_INVALID_THIS, "Expected a S3File instance"_s);
+        return {};
+    }
+    RELEASE_AND_RETURN(scope, JSS3File__presignPost(thisObject->wrapped(), globalObject, JSValue::encode(callframe->argument(0))));
 }
 
 JSC_DEFINE_HOST_FUNCTION(functionS3File_stat, (JSGlobalObject * globalObject, CallFrame* callframe))

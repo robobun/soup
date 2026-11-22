@@ -24,6 +24,7 @@ const members = (prefix: "" | "static_") =>
       length: 2,
       rustName: `${prefix}presign`,
     },
+    presignPost: { ...pathMethod, returns: b.any.returning("object"), rustName: `${prefix}presign_post` },
     size: {
       ...pathMethod,
       returns: prefix === "" ? method.returns : b.any.returning("number", "Promise"),

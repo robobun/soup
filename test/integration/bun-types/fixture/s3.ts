@@ -92,3 +92,50 @@ async function doCopy(file: Bun.S3File) {
 }
 
 doCopy(s3.file("a.txt"));
+
+function doPresignPost(file: Bun.S3File) {
+  expectType(s3.presignPost("uploads/${filename}")).is<Bun.S3PresignedPost>();
+  expectType(file.presignPost()).is<Bun.S3PresignedPost>();
+  const credentials = { accessKeyId: "key", secretAccessKey: "secret", bucket: "uploads" };
+  expectType(Bun.S3Client.presignPost("avatar.png", credentials)).is<Bun.S3PresignedPost>();
+
+  const conditions: Bun.S3PostPolicyCondition[] = [
+    ["content-length-range", 1, 2 * 1024 * 1024],
+    ["starts-with", "$Content-Type", "image/"],
+    ["eq", "$Cache-Control", "no-store"],
+    { "x-amz-meta-origin": "form" },
+  ];
+  const { url, fields } = s3.presignPost("avatar.png", {
+    expiresIn: 600,
+    type: "image/png",
+    acl: "public-read",
+    metadata: { user: "1042" },
+    conditions,
+    fields: { success_action_status: "201" },
+  });
+  expectType(url).is<string>();
+  expectType(fields).is<Record<string, string>>();
+  file.presignPost({ conditions: null, fields: null, expiresIn: undefined });
+
+  const frozen = [
+    ["content-length-range", 0, 10],
+    ["starts-with", "$key", "uploads/"],
+  ] as const;
+  s3.presignPost("avatar.png", { conditions: frozen, fields: { acl: "private" } as const });
+  s3.presignPost("avatar.png", { conditions: [["eq", "$acl", "private"] as const, { acl: "private" } as const] });
+
+  // @ts-expect-error
+  s3.presignPost();
+  // @ts-expect-error
+  s3.presignPost("avatar.png", { conditions: [["starts-with", "Content-Type", "image/"]] });
+  // @ts-expect-error
+  s3.presignPost("avatar.png", { conditions: [["content-length-range", "1", "10"]] });
+  // @ts-expect-error
+  s3.presignPost("avatar.png", { conditions: [["ends-with", "$key", ".png"]] });
+  // @ts-expect-error
+  s3.presignPost("avatar.png", { fields: { success_action_status: 201 } });
+  // @ts-expect-error
+  s3.presignPost("avatar.png", { method: "POST" });
+}
+
+doPresignPost(s3.file("avatar.png"));

@@ -12838,6 +12838,290 @@ Files: `src/jsc/VirtualMachine.rs`, `src/jsc/VmHandle.rs`,
 `test/aot/dom-environment.test.ts`,
 `test/integration/bun-types/fixture/globals.ts` and `worker.ts`.
 
+### 2026-11-22: presigned POST for S3, `presignPost()`: an upload form with a policy for what it can upload
+
+The one upload that Bun's S3 client could presign is a `PUT` URL, and whoever holds that URL can
+put any bytes of any size under the key. Amazon S3 has a second way for a browser to upload, the
+POST policy: a form whose fields carry a signed document that says how large the file can be,
+what `Content-Type` it can have and which keys it can be stored under, and S3 checks the form
+against it before it stores anything. oven-sh/bun#16667 (open since January 2025, 12 upvotes)
+asks for it and lists what a project does without it: keep `@aws-sdk/s3-presigned-post` and the
+AWS client next to Bun's for this one call, check the size in the browser, or send the upload
+through its own server. oven-sh/bun#37148 (open) signs `content-length` into a presigned `PUT`
+URL, which fixes one exact size and nothing else. No pull request has the policy. Now:
+
+```ts
+import { s3 } from "bun";
+
+// on the server
+const { url, fields } = s3.presignPost("avatars/1042/${filename}", {
+  expiresIn: 600,
+  acl: "public-read",
+  conditions: [
+    ["content-length-range", 1, 2 * 1024 * 1024], // 1 byte to 2 MiB
+    ["starts-with", "$Content-Type", "image/"], // the browser says which image
+  ],
+  fields: { success_action_status: "201" },
+});
+
+// in the browser
+const form = new FormData();
+for (const [name, value] of Object.entries(fields)) form.append(name, value);
+form.append("Content-Type", file.type);
+form.append("file", file); // the file comes last
+await fetch(url, { method: "POST", body: form }); // 201, or 400 EntityTooLarge, or 403 AccessDenied
+```
+
+`presignPost(path, options)` is a method of an `S3Client`, `presignPost(options)` of an `S3File`,
+and `S3Client.presignPost(path, options)` takes the credentials of the environment or of its
+options. Nothing is sent: the result is computed. The name, `conditions`, `fields` and the result
+are what the issue proposes, and the example of the issue runs as it is written.
+
+What it does, and the decisions in it.
+
+- The result is `{ url, fields }`, which is what `createPresignedPost` of the AWS SDK for
+  JavaScript and `generate_presigned_post` of boto3 return, so a page that was written for one of
+  them takes Bun's answer as it is. `url` is the URL of the bucket:
+  `https://s3.<region>.amazonaws.com/<bucket>` for path style,
+  `https://<bucket>.s3.<region>.amazonaws.com/` for virtual hosted-style, and the `endpoint` with
+  its path and the bucket for another service. `fields` has `key`, then the fields of the call
+  and of its options, then `bucket`, `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`,
+  `X-Amz-Security-Token` for temporary credentials, `Policy` and `X-Amz-Signature`, with the
+  names as the JavaScript SDK writes them.
+- The policy has the `conditions` of the call first, as they are, and then one condition for each
+  field of the result, that the form has this value. S3 refuses a form with a field that no
+  condition covers, so this is what makes the answer a form that works, and it is what both SDKs
+  do.
+- `conditions` takes the four forms that S3 has: `["eq", "$field", value]`,
+  `["starts-with", "$field", prefix]`, `["content-length-range", min, max]` and
+  `{ field: value }`. Anything else throws where it is written, with the index of the condition:
+  another operator, a field without its `$`, a value that is not a string, sizes that are not
+  integers from 0 to `Number.MAX_SAFE_INTEGER` or that have `min` above `max`. The JavaScript
+  SDK signs whatever it is given, and the mistake shows up as a 403 in a browser.
+- The options that describe an upload are fields: `acl` is `acl`, `type` is `Content-Type`,
+  `contentDisposition` and `contentEncoding` are their headers, `storageClass` is
+  `x-amz-storage-class`, and each entry of `metadata` (2026-09-27) is `x-amz-meta-<key>`. The
+  `acl`, the `storageClass` and the `metadata` that the client or the file was made with apply,
+  with or without options. That is not what `presign(path)` does, which leaves them out when it
+  has no options argument. The type that a file was made with, and the type that the extension
+  of a key gives to an upload by Bun, do not apply: a condition that nobody wrote would refuse
+  the `Content-Type` that the browser sends.
+- `requestPayer` is not a field, because a form has none for it: the request that sends the form
+  needs the header `x-amz-request-payer: requester`, which `fetch()` can send and an HTML form
+  cannot. The option is accepted and does nothing, and the docs and the types say so.
+- `fields` adds fields, `success_action_status` or `Cache-Control` for example. One of them
+  replaces the field that an option stands for, in any case of its name. The fields that Bun
+  writes, and `file`, throw, and so do an empty name, a value that is not a string and two names
+  that differ only in case.
+- `${filename}`. S3 puts the name of the uploaded file in its place, in the value of every field,
+  before it reads the policy. So for a field with `${filename}` in it the policy says
+  `starts-with` and the text in front of it: `avatars/1042/${filename}` accepts every key below
+  `avatars/1042/`, and `contentDisposition: 'attachment; filename="${filename}"'` works. The
+  JavaScript SDK does this for a key that ends with the variable and nowhere else. Only the key,
+  the fields of the call and the fields of the options get the wider condition. `bucket` and the
+  `X-Amz-*` fields are exact whatever their text is. The docs say what follows from it: a key
+  that is built from the text of a user accepts more than that key if the text has the variable.
+- A line break. A browser sends each line break of a value as CR LF. A lone CR or LF in a value
+  of `fields` or of a condition is written as CR LF, into the field and into the policy, so that
+  what the form sends is what the policy has. A key with a lone CR or LF throws, because a key
+  is not text that Bun may change.
+- A `\` in the key is a `/`, as in every request for the same path: `file.presignPost()` and
+  `file.write()` name one object.
+- The bucket is the one of the client, or the first part of the path for a client without one, as
+  for a request. A `bucket` with a `/` in it throws: a request puts what follows the `/` in front
+  of the key, and a form has one key. With `virtualHostedStyle` and an `endpoint`, the bucket is
+  read from a host name of Amazon S3 or of R2, whatever `bucket` says, because that is where the
+  form goes. For the host of another service the `bucket` option is needed, and the call throws
+  without it: a name that is read from an unknown host is a guess, and a wrong one is a 403.
+- `expiresIn` is in seconds, its default is 86400 and a number that is not greater than 0
+  throws, all as for `presign()`, which also reads `"60"` as 60. The policy has the time of
+  expiration without parts of a second, as boto3 writes it.
+- A key over 1024 bytes and a bucket over 63 characters throw. So does a key that is not UTF-8,
+  which a path that is given as bytes can be: the field and its condition would not be the same
+  bytes. The same check is there for a session token and an access key of the environment, and
+  has no test.
+
+How it is built.
+
+- `src/s3_signing/post_policy.rs` writes the policy and signs it, without JSC:
+  `S3Credentials::presign_post` takes a `PostOptions` and returns the URL and the fields in the
+  order of the form. The policy is written with `bun_core::fmt::format_json_string_utf8`, and the
+  signature is one HMAC of its base64 text with the key that signs a request.
+- `src/runtime/webcore/s3/post_policy_jsc.rs` reads `conditions` and `fields` into owned UTF-8
+  before anything is signed, so a getter, a `Proxy` or a `toString()` of the caller runs once and
+  cannot change what was already read. It also makes the result. A name of a field can be a
+  number, so the object is filled with `put_may_be_index`.
+- `get_presign_post_from` in `S3File.rs` is the one entry point, under the three methods. It
+  takes its own reference to the store before it reads an option, as `presign()` does, because a
+  getter can move the file.
+- The host of a request and the signing key of the day were two blocks inside `sign_request`.
+  They are `S3Credentials::host_and_path_prefix` and `S3Credentials::signing_key` now, which
+  `sign_request` and `presign_post` both call. The check that keeps a bucket name from changing
+  the host is in the first one and no longer relies on its caller: every byte of the bucket has
+  to be one that a URL-encoded name has, except the `/`. The second one derives the day from the
+  number that the cache is keyed by, so the two cannot differ, and it wipes the buffer that held
+  `AWS4` and the secret.
+- `bucket_in_endpoint` in `src/s3_signing/copy.rs` reads the bucket from the host with the parser
+  that the copy patch (2026-10-25) has for its source.
+- The table of built-ins of the ahead-of-time compiler has `presignPost` in the line of
+  `%S3File%.prototype` (`src/codegen/builtins/data/own-properties.txt`), where `copyTo` is.
+  `test/aot/builtins/own-properties.test.ts` fails without it, and its update mode wrote the
+  line. The two methods of `S3Client` come into the table from the schema.
+- For a program that never calls `presignPost()`, by the code and not measured: three more host
+  functions, and one more name in each of the three tables of methods. A request is signed with
+  the same hashes and the same cache as before, and with one allocation fewer when the client has
+  no `endpoint` (a copy of the host that nothing read). No release build was made today, so the
+  size of the executable was not compared.
+
+Tests. 131 cases in the new `test/js/bun/s3/s3-presign-post.test.ts`, against the S3 server of
+upstream's tests (`test/packages/s3-server`, oven-sh/bun#44054). That server was written before
+this commit and without it: it verifies the signature of the policy, and it refuses a field
+without a condition, a field that fails its condition, a file outside of `content-length-range`
+and a policy that has expired.
+
+- What is tested: the signer of the test against the known answer of the AWS documentation, the
+  result and its order, an upload for each way to call it, each form of a condition at the
+  server (400 `EntityTooSmall`, 400 `EntityTooLarge`, 403 `AccessDenied` with the condition in the
+  message), 27 conditions and 17 `fields` that throw, each option as a field and as a property
+  of the stored object, the defaults of a client and of a file, a field that replaces an option,
+  Requester Pays with a bucket of another account (403 without the header, stored with it),
+  `${filename}` in a key, in an option and in a field, the exact conditions of the signer's
+  fields, text that JSON escapes, text that JavaScriptCore keeps as Latin-1, CR and LF, a
+  backslash, the limits at 1024 and 1025 bytes and at 63 and 64 characters, `expiresIn` and a
+  policy that the server's clock has passed, a session token, a form that was changed after it
+  was signed, another secret, missing credentials in a child process, seven shapes of `url` with
+  their regions, the host names of Amazon S3 and of R2, 13 places where script of the caller
+  throws while the options are read, and a getter that shortens the list of conditions.
+- 130 of the 131 fail on Bun 1.4.3. The other one checks the test's own signer. The file passes
+  in three random orders (`--randomize --seed`) and with `BUN_JSC_validateExceptionChecks=1`.
+- Rows in the files that were there: `s3-moved-store.test.ts` (three: the call after the store
+  was moved, and a getter or a `toString()` that moves and frees the store while the options are
+  read), `s3-numeric-options-coerce.test.ts` (nine, the table of `presign()` for `expiresIn`),
+  `s3-argument-validation.test.ts` (two rows and the list of the prototype) and
+  `s3-metadata.test.ts` (the invalid metadata that an upload refuses). With the new file the five
+  pass on the debug build (225).
+- Every snippet of the docs and of the JSDoc ran as it is written, in a child process with the
+  credentials in its environment, against the same server: 11 calls and 12 uploads, with the
+  statuses that the docs name (204, 201, 400 `EntityTooSmall`, 400 `EntityTooLarge`, 403).
+- Also run on the debug build: the 25 files of `test/js/bun/s3` (725 pass, and 277 are skipped,
+  most of them for the credentials of a real service). The type tests pass (30), with new lines
+  in the S3 fixture for each overload, for `as const` lists and for six calls that must not
+  compile. The source lints pass on the release binary (210). `cargo fmt`, `clang-format`,
+  prettier and `bun fmt` are clean, `cargo clippy` has nothing for `bun_s3_signing` and
+  `bun_runtime`, and no comment of two lines or more is new in `src/`, which is the rule of
+  upstream's comment-cop workflow.
+- The tables: `test/internal/builtins-table/` (149 pass, one skipped, in 33 minutes on the debug
+  build), and of `test/aot/builtins/` the files `own-properties` (16), `realm-agreement` (8),
+  `native-contract` (6), `module-exports` (6), `name-classes` (4), `proven-returns` (3),
+  `omitted-operands` (2) and `classes-with-inspect-method` (1).
+- What failed, and why it is not the commit. `s3-list-objects.test.ts` runs its cases at the same
+  time, and one of them parses a large listing for 7 seconds on the debug build. One to three
+  of the others run out of their 5 seconds next to it, other ones in each run, and the one that
+  was tried alone passes in 37 ms. `test/js/web/fetch/fetch.test.ts` was run for the change of
+  `sign_request`: 385 pass, three need the internet, and seven run out of 5 seconds on the debug
+  build with three other test files beside them.
+
+Not done, and known.
+
+- It was not run against Amazon S3, R2 or MinIO. What this entry and the docs say of the service
+  (the 20 KB of fields, the statuses, `${filename}` in every field, CR LF) is from the AWS
+  documentation and from upstream's model of it. What it says of the two SDKs is from their
+  sources as remembered, and was not run today.
+- Amazon S3 refuses a form with more than 20 KB of fields in front of the file, and the policy
+  repeats every field in base64. Bun does not count. The docs and the types give the limit.
+- No option stands for a checksum, for server-side encryption or for tags. They are fields of
+  the form (`x-amz-checksum-sha256`, `x-amz-server-side-encryption`, `tagging`), and `fields`
+  takes them.
+- `expiresIn` has no upper limit, as in `presign()`. What Amazon S3 answers to a policy that is
+  good for longer than the credentials that signed it was not tried.
+- `options` that is not an object is no options, and `expiresIn` is read as a 32-bit integer
+  (`1.5` is 1, `Infinity` is 2147483647). Both are what `presign()` does, and the tests pin them.
+- The time of the form is the time of the call. There is no option for another time.
+- Windows and macOS did not run. The workspace passes `cargo check` for
+  `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`, and nothing in the commit is specific to a
+  platform.
+
+The review. The finished first cut went through a review before the push: six readers, each with
+one concern (the protocol, the native code, the change of `sign_request`, the API with its types
+and docs, the tests, and inputs that are meant to break it), and a second reader for each who
+tried to refute what the first one found. 42 findings, of which 34 stood, many of them one
+finding from two sides. Taken: the `\`, the bucket of a virtual hosted-style host, the line
+breaks, the bytes that are not UTF-8, the exact conditions for the signer's fields, the `bucket`
+with a `/`, a set in place of a quadratic search for two fields of one name, the day that
+`signing_key` took twice, the host check that relied on its caller, the comments that the split
+had left in the wrong function, `readonly` in the types and `type` stated again for this call,
+the docs (the CORS rule that `fetch()` needs, a key with the id of the user in front of
+`${filename}`, Requester Pays, the 20 KB) and the tests (the moved store, the guessed region, the
+getters, cases that had read the object of another case). Refuted, and left: the way
+`expiresIn` is read and `options` that is not an object, which are the contract of `presign()`
+with tests that pin it, and a name with a `$` in the object form of a condition, which is the
+name of a field to S3. One finding stood and was not taken: the 20 KB limit is written down
+and not enforced.
+
+Relation to open pull requests of upstream. This commit needs the metadata patch of 2026-09-27
+and the copy patch of 2026-10-25 under it (`AmzHeaders`, `bucket_and_key!` and the parser of host
+names), so a cherry-pick onto upstream is the three commits. Of the pull requests that the copy
+entry lists, oven-sh/bun#46746 and oven-sh/bun#45440 were closed unmerged. Still open, and none
+merged: oven-sh/bun#39210 rewrites `sign_request`, where this commit now has two calls in place
+of two blocks. oven-sh/bun#44818 has a parser for the bucket of a host name, which
+`bucket_in_endpoint` would call. oven-sh/bun#46863 gives an upload the `contentDisposition` of
+its client, and the form would get it the same way. oven-sh/bun#37148 is about `presign()` and
+touches no line of this commit.
+
+Rebase notes. 82 patches onto oven-sh/bun 25c4fca9ea9, 7 commits after the base of 2026-11-21
+(b15f51302d7). Nothing was dropped. 17 patches stopped the rebase, and eight more rebased
+without a conflict and did not compile.
+
+- oven-sh/bun#49146 makes `bun_paths::Path` the one type for a path. `resolve_path`, the
+  `platform` types, `AutoAbsPath`, `is_sep_native` and the local `path_literal!` are gone, and
+  most call sites that took a buffer from the pool build a `Path` now. This is most of the work
+  of today's rebase, and every port is the same kind: `Path::resolve`, `Path::join`,
+  `Path::relative` or `Path::from_parts` where the patch had `join_abs_string_buf` and a buffer,
+  `is_sep` for `is_sep_native`, `into_portable()` or `to_portable_in_place` for the platform
+  type. With a conflict: the `ignore` option of `Bun.Glob`, `append`, `--last-failed` (its cache
+  directory is `user_cache_dir(leaf)` beside upstream's `find_cache_dir`), `#semver:`,
+  `testMatch`, `bun pm sbom`, `--filter '[rev]'` (which finds git with the new
+  `bun_which::which` and keeps upstream's `abs_posix_dir`), `jsr:`, `alias`, the piped script
+  and `clean`. Without a conflict, and found by the compiler: the watch of `.env` files, the
+  suggestion for a mistyped command, `bun serve` (its entry point is upstream's new
+  `synthetic_entry_point`), `--watch-path`, `collectCoverageFrom`, `legalComments`,
+  `--localstorage-file` and the HTML coverage report.
+- oven-sh/bun#49407 deletes `ThisPtr`: a callback that can free its receiver takes
+  `self: RefPtr<Self>`, and `ref_guard()` is gone. Ported: the encoded copies of a static route
+  (compression), the git runner of `#semver:`, `redis.multi()` and the cursors of `Bun.SQL`.
+- Two of the 17 conflicts were in the lines around a patch and changed no line of it: the reply
+  of an S3 copy and the empty operand of the shell builtins.
+- oven-sh/bun#49411 gives the resolver's debug indent an owner. The `jsr:` patch lost its
+  `decrease_indent` calls.
+- oven-sh/bun#49372 ports `URLPattern` to Rust and takes it out of the list of
+  `DOMStructureSlot.h`, where yesterday's `JSPromiseRejectionEvent` is. The list was made again.
+- Five files that were ported needed `cargo fmt`. Those lines went into their patches.
+- Run after the rebase, before the feature: `cargo check` of the workspace for Linux,
+  `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`, a debug build, and 33 test files of the
+  ported patches on it, among them `bun-build-api` (121), `bundler_comments` (76),
+  `bun-add-filter` (148), `bun-install-git-deps` (206), `bun-pm` (194), `bun-pm-sbom` (22), `jsr`
+  (92), `filter-workspace` (188), `run-eval` (82), `run_command` (41), `static-server` (10),
+  `bun-test` (309), `coverage` (80), `test-last-failed` (8), `watch` (38), `hot` (53),
+  `bun-serve-compress` (22), `bun-write` (122), `filesink` (94), `postgres-cursor` (106),
+  `valkey` (80, and 1006 that this machine skips), `storage` (36), the shell's `rm`, `mkdir`,
+  `touch`, `cp`, `mv` and `ls`, and the S3 files. Three compile cases of
+  `bundler/cli.test.ts` ran out of 5 seconds beside three other files and pass alone. The six
+  recursive scans of `glob/scan.test.ts` walk this checkout with its build directories and take
+  27 to 30 seconds each on the debug build, against a limit of 30, as on earlier days.
+- Only the tip of the stack was built, as before.
+
+Files: `src/s3_signing/post_policy.rs` (new), `src/s3_signing/credentials.rs`
+(`host_and_path_prefix`, `signing_key`, `unix_time`, `amz_date_at`), `src/s3_signing/copy.rs`
+(`bucket_in_endpoint`), `src/s3_signing/lib.rs`, `src/runtime/webcore/s3/post_policy_jsc.rs`
+(new), `src/runtime/webcore/S3File.rs` (`get_presign_post_from`),
+`src/runtime/webcore/S3Client.rs`, `src/runtime/webcore/S3Client.bind.ts`,
+`src/runtime/webcore.rs`, `src/jsc/bindings/JSS3File.cpp`,
+`src/codegen/builtins/data/own-properties.txt`, `packages/bun-types/s3.d.ts`,
+`docs/runtime/s3.mdx`, `test/js/bun/s3/s3-presign-post.test.ts` (new),
+`test/js/bun/s3/s3-argument-validation.test.ts`, `test/js/bun/s3/s3-moved-store.test.ts`,
+`test/js/bun/s3/s3-numeric-options-coerce.test.ts`, `test/js/bun/s3/s3-metadata.test.ts`,
+`test/integration/bun-types/fixture/s3.ts`, `test/integration/bun-types/bun-types.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

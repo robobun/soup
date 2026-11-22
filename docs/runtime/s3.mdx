@@ -471,6 +471,146 @@ Response (0 KB) {
 
 ---
 
+## Presigning a POST form
+
+A presigned `PUT` URL lets its holder upload any bytes of any size. To limit what a browser can upload, sign a POST form instead. `presignPost()` returns the URL of the bucket and the fields of an HTML form. One of the fields is a signed policy. S3 checks the form against the policy before it stores the file.
+
+```ts server.ts icon="/icons/typescript.svg"
+import { s3 } from "bun";
+
+const { url, fields } = s3.presignPost("avatars/1042.png", {
+  expiresIn: 600, // 10 minutes. The default is 24 hours.
+  type: "image/png",
+  conditions: [
+    ["content-length-range", 1, 2 * 1024 * 1024], // 1 byte to 2 MiB
+  ],
+});
+```
+
+Send `url` and `fields` to the browser. The browser adds each field to a form, then the file, and sends the form to `url`:
+
+```ts upload.ts icon="/icons/typescript.svg"
+const form = new FormData();
+for (const [name, value] of Object.entries(fields)) {
+  form.append(name, value);
+}
+form.append("file", input.files[0]); // the file is the last field
+
+const response = await fetch(url, { method: "POST", body: form });
+console.log(response.status); // 204
+```
+
+A `fetch()` from a page of another origin needs a CORS rule on the bucket that allows `POST` from that origin. An HTML form needs no such rule, and sends the same request when it has:
+
+- `url` as its `action`, `method="post"` and `enctype="multipart/form-data"`
+- one hidden `<input>` for each field
+- an `<input type="file" name="file">` after them
+
+`presignPost()` makes no request. It is a method of `S3Client` instances, of `S3File`, and a static method of `S3Client`.
+
+### Fields
+
+`fields` has the fields that the form needs:
+
+```ts
+{
+  key: "avatars/1042.png",
+  "Content-Type": "image/png",
+  bucket: "my-bucket",
+  "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+  "X-Amz-Credential": "AKIAIOSFODNN7EXAMPLE/20261122/us-east-1/s3/aws4_request",
+  "X-Amz-Date": "20261122T130000Z",
+  Policy: "eyJleHBpcmF0aW9uIjoi...",
+  "X-Amz-Signature": "005504a6f41e03d6...",
+}
+```
+
+The options that describe an upload become fields:
+
+| Option               | Field                 |
+| -------------------- | --------------------- |
+| `acl`                | `acl`                 |
+| `type`               | `Content-Type`        |
+| `contentDisposition` | `Content-Disposition` |
+| `contentEncoding`    | `Content-Encoding`    |
+| `storageClass`       | `x-amz-storage-class` |
+| `metadata`           | `x-amz-meta-<key>`    |
+
+The `acl`, the `storageClass` and the [`metadata`](#metadata) that the client or the file was made with apply too. The type does not: Bun takes the `Content-Type` field from the `type` of the call only, not from the extension of the key and not from the type of the file. Without `type` the form has no `Content-Type` field, and S3 chooses the type of the object.
+
+Bun writes no field for `requestPayer`. For a bucket with Requester Pays, send the header `x-amz-request-payer: requester` with the request that sends the form.
+
+To add other fields, pass `fields`. A field of `fields` replaces the field of the same name that an option stands for.
+
+```ts
+const { url, fields } = s3.presignPost("reports/2026.pdf", {
+  fields: {
+    success_action_status: "201", // S3 answers 201 with an XML document
+    "Cache-Control": "max-age=3600",
+  },
+});
+```
+
+The policy has a condition for each field of the result: the form has to send the field with this value. S3 answers `403 AccessDenied` to a form with another value, and to a form with a field that the policy has no condition for. A field with `${filename}` in its value is the exception: see [File names in keys](#file-names-in-keys).
+
+A browser sends each line break of a value as CR LF. Bun writes a lone CR or LF of a value as CR LF, into the field and into the policy, so that the two agree.
+
+Amazon S3 refuses a form with more than 20 KB of fields in front of the file. The `Policy` field repeats each field of the result in base64.
+
+### Conditions
+
+`conditions` adds conditions to the policy. A condition has one of four forms:
+
+| Condition                            | S3 accepts the form when                             |
+| ------------------------------------ | ---------------------------------------------------- |
+| `["content-length-range", min, max]` | the size of the file in bytes is from `min` to `max` |
+| `["starts-with", "$field", prefix]`  | the value of the field starts with `prefix`          |
+| `["eq", "$field", value]`            | the field has this value                             |
+| `{ field: value }`                   | the field has this value                             |
+
+Use `starts-with` or `eq` for a field that the browser chooses. That field is not in `fields`: the browser adds it to the form, in front of the file. An empty prefix accepts every value.
+
+```ts
+const { url, fields } = s3.presignPost("uploads/photo", {
+  conditions: [
+    ["content-length-range", 1, 10 * 1024 * 1024],
+    ["starts-with", "$Content-Type", "image/"],
+  ],
+});
+
+// In the browser
+form.append("Content-Type", file.type); // "image/jpeg"
+```
+
+S3 answers `400 EntityTooLarge` or `400 EntityTooSmall` to a file outside of the range.
+
+### File names in keys
+
+S3 replaces `${filename}` in the value of a field with the name of the uploaded file, before it checks the policy. For a field with `${filename}` in its value, the policy accepts every value that starts with the text in front of it:
+
+```ts
+const { url, fields } = s3.presignPost("uploads/1042/${filename}", {
+  contentDisposition: 'attachment; filename="${filename}"',
+});
+// S3 stores a file named "cat.png" as "uploads/1042/cat.png"
+```
+
+The holder of this form can write every key that starts with `uploads/1042/`, and can send every `Content-Disposition` that starts with `attachment; filename="`. Put the part that the uploader must not change in front of `${filename}`, for example the id of the user. If a key has text from a user, take `${filename}` out of that text first.
+
+Without `${filename}`, the policy accepts the key of the call and no other.
+
+### Expiration
+
+`expiresIn` is the number of seconds until the policy expires. The default is 86400 (24 hours). S3 answers `403 AccessDenied` to a form with an expired policy.
+
+### Services
+
+Amazon S3 accepts an upload with a form, and its API reference calls the operation `PostObject`. Check that a service with an S3 API supports `PostObject` before you sign a POST form for it.
+
+The policy names the bucket. With a [virtual hosted-style endpoint](#using-buns-s3client-with-s3-virtual-hosted-style-endpoints), Bun reads the bucket from a host name of Amazon S3 or of R2. For a virtual hosted-style endpoint of another service, set `bucket`.
+
+---
+
 ## Support for S3-Compatible Services
 
 Bun's S3 implementation works with any S3-compatible storage service. Specify the appropriate endpoint:
@@ -614,7 +754,7 @@ const r2WithEndpoint = new S3Client({
 });
 ```
 
-A [copy](#copying-files) names its source to the service as a bucket and a key. Bun reads the bucket from a host name of these two services. For a virtual hosted-style endpoint of another service, set `bucket` to the first part of the host name.
+A [copy](#copying-files) names its source to the service as a bucket and a key, and the policy of a [POST form](#presigning-a-post-form) names its bucket. Bun reads the bucket from a host name of these two services. For a virtual hosted-style endpoint of another service, set `bucket` to the first part of the host name.
 
 ---
 
@@ -771,6 +911,7 @@ interface S3File extends Blob {
   unlink(options?: S3Options): Promise<void>;
   delete(options?: S3Options): Promise<void>;
   presign(options?: S3Options): string;
+  presignPost(options?: S3PresignPostOptions): { url: string; fields: Record<string, string> };
 
   stat(options?: S3Options): Promise<S3Stat>;
   copyTo(destination: string | S3File, options?: S3CopyOptions): Promise<{ etag: string; lastModified: Date }>;
@@ -901,6 +1042,28 @@ const url = S3Client.presign("my-file.txt", {
 ```
 
 This is equivalent to calling `new S3Client(credentials).presign("my-file.txt", { expiresIn: 3600 })`.
+
+### `S3Client.presignPost` (static)
+
+To sign a POST form that uploads a file, use the `S3Client.presignPost` static method. See [Presigning a POST form](#presigning-a-post-form).
+
+```ts s3.ts icon="/icons/typescript.svg" highlight={10-13}
+import { S3Client } from "bun";
+
+const credentials = {
+  accessKeyId: "your-access-key",
+  secretAccessKey: "your-secret-key",
+  bucket: "my-bucket",
+  // endpoint: "https://s3.us-east-1.amazonaws.com",
+};
+
+const { url, fields } = S3Client.presignPost("uploads/1042/${filename}", {
+  ...credentials,
+  conditions: [["content-length-range", 0, 10 * 1024 * 1024]],
+});
+```
+
+This is equivalent to calling `new S3Client(credentials).presignPost("uploads/1042/${filename}", { conditions })`.
 
 ### `S3Client.list` (static)
 

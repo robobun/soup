@@ -284,6 +284,118 @@ impl S3Credentials {
         })
     }
 
+    /// The host for the URL-encoded `bucket`, and the path of the endpoint, which every request path starts with.
+    pub(crate) fn host_and_path_prefix(
+        &self,
+        region: &[u8],
+        bucket: &[u8],
+    ) -> Result<(Box<[u8]>, &[u8]), SignError> {
+        let no_prefix: &[u8] = b"";
+        if !self.endpoint.is_empty() {
+            if self.endpoint.len() >= 2048 {
+                return Err(SignError::InvalidEndpoint);
+            }
+            // only the host part is needed here
+            return Ok(match strings::index_of(&self.endpoint, b"/") {
+                Some(index) => (Box::from(&self.endpoint[..index]), &self.endpoint[index..]),
+                None => (self.endpoint.clone(), no_prefix),
+            });
+        }
+        if !is_valid_host_component(region) {
+            return Err(SignError::InvalidEndpoint);
+        }
+        if !self.virtual_hosted_style {
+            let host = alloc_print!("s3.{}.amazonaws.com", BStr::new(region));
+            return Ok((host.into_boxed_slice(), no_prefix));
+        }
+        // virtual hosted style requires a bucket name if an endpoint is not provided
+        if bucket.is_empty() {
+            return Err(SignError::InvalidEndpoint);
+        }
+        // The bucket goes into the host, where the `/` that encode_uri_component can write names another host.
+        let is_in_host_name =
+            |c: &u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~' | b'%');
+        if !bucket.iter().all(is_in_host_name) {
+            return Err(SignError::InvalidEndpoint);
+        }
+        // default to https://<BUCKET_NAME>.s3.<REGION>.amazonaws.com/
+        let host = alloc_print!(
+            "{}.s3.{}.amazonaws.com",
+            BStr::new(bucket),
+            BStr::new(region)
+        );
+        Ok((host.into_boxed_slice(), no_prefix))
+    }
+
+    /// The Signature Version 4 key of `region` for the day that starts at `numeric_day`, cached per secret and region.
+    pub(crate) fn signing_key(
+        &self,
+        region: &[u8],
+        numeric_day: u64,
+    ) -> Result<[u8; DIGESTED_HMAC_256_LEN], SignError> {
+        let mut cache_key = [0u8; bun_sha_hmac::sha::hashers::SHA256::DIGEST];
+        {
+            let mut hasher = bun_sha_hmac::sha::hashers::SHA256::init();
+            hasher.update(region);
+            hasher.update(b"\0");
+            hasher.update(SERVICE_NAME.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(&self.secret_access_key);
+            hasher.r#final(&mut cache_key);
+        }
+        // `AWS_SIGNATURE_CACHE` is a process static here (it was in the rare data of the VM).
+        if let Some(cached) = aws_cache_get(numeric_day, &cache_key) {
+            return Ok(cached);
+        }
+        // not cached yet lets generate a new one
+        let day = amz_date_at(numeric_day);
+        let amz_day = &day.date[0..8];
+        // we hash the hash so we need 2 buffers
+        let mut hmac_sig_service = [0u8; bun_sha_hmac::hmac::EVP_MAX_MD_SIZE];
+        let mut hmac_sig_service2 = [0u8; bun_sha_hmac::hmac::EVP_MAX_MD_SIZE];
+        let mut aws4_key_buffer = [0u8; 4096];
+        let aws4_key = buf_print(
+            &mut aws4_key_buffer,
+            format_args!("AWS4{}", BStr::new(&self.secret_access_key)),
+        )
+        .map_err(|_| SignError::NoSpaceLeft)?;
+        let sig_date = bun_sha_hmac::generate(
+            aws4_key,
+            amz_day,
+            bun_sha_hmac::Algorithm::Sha256,
+            &mut hmac_sig_service,
+        );
+        bun_core::secure_zero(&mut aws4_key_buffer);
+        let sig_date = sig_date.ok_or(SignError::FailedToGenerateSignature)?;
+        let sig_date_region = bun_sha_hmac::generate(
+            sig_date,
+            region,
+            bun_sha_hmac::Algorithm::Sha256,
+            &mut hmac_sig_service2,
+        )
+        .ok_or(SignError::FailedToGenerateSignature)?;
+        let sig_date_region_service = bun_sha_hmac::generate(
+            sig_date_region,
+            SERVICE_NAME.as_bytes(),
+            bun_sha_hmac::Algorithm::Sha256,
+            &mut hmac_sig_service,
+        )
+        .ok_or(SignError::FailedToGenerateSignature)?;
+        let _result = bun_sha_hmac::generate(
+            sig_date_region_service,
+            b"aws4_request",
+            bun_sha_hmac::Algorithm::Sha256,
+            &mut hmac_sig_service2,
+        )
+        .ok_or(SignError::FailedToGenerateSignature)?;
+
+        let digest: [u8; DIGESTED_HMAC_256_LEN] = hmac_sig_service2[0..DIGESTED_HMAC_256_LEN]
+            .try_into()
+            .expect("infallible: size matches");
+        aws_cache_set(numeric_day, &cache_key, digest);
+        Ok(digest)
+    }
+
     pub fn sign_request<const ALLOW_EMPTY_PATH: bool>(
         &self,
         sign_options: &SignOptions<'_>,
@@ -363,57 +475,7 @@ impl S3Credentials {
         // Default to https. Only use http if they explicit pass "http://" as the endpoint.
         let protocol: &str = if self.insecure_http { "http" } else { "https" };
 
-        // detect service name and host from region or endpoint
-        let mut endpoint_owned: Option<Vec<u8>> = None;
-        let mut extra_path: &[u8] = b"";
-        let host: Box<[u8]> = 'brk_host: {
-            if !self.endpoint.is_empty() {
-                if self.endpoint.len() >= 2048 {
-                    return Err(SignError::InvalidEndpoint);
-                }
-                let mut host: &[u8] = &self.endpoint;
-                if let Some(index) = strings::index_of(&self.endpoint, b"/") {
-                    host = &self.endpoint[..index];
-                    extra_path = &self.endpoint[index..];
-                }
-                // only the host part is needed here
-                break 'brk_host Box::<[u8]>::from(host);
-            } else {
-                if !is_valid_host_component(region) {
-                    return Err(SignError::InvalidEndpoint);
-                }
-                if self.virtual_hosted_style {
-                    // virtual hosted style requires a bucket name if an endpoint is not provided
-                    if bucket.is_empty() {
-                        return Err(SignError::InvalidEndpoint);
-                    }
-                    // The bucket is interpolated into the host; a `/` (or `\`,
-                    // which encode_uri_component normalizes to `/`) would let a
-                    // crafted bucket redirect the signed request to another host.
-                    if strings::contains_char(bucket, b'/') {
-                        return Err(SignError::InvalidEndpoint);
-                    }
-                    // default to https://<BUCKET_NAME>.s3.<REGION>.amazonaws.com/
-                    let mut v = Vec::new();
-                    write!(
-                        &mut v,
-                        "{}.s3.{}.amazonaws.com",
-                        BStr::new(bucket),
-                        BStr::new(region)
-                    )
-                    .unwrap();
-                    endpoint_owned = Some(v.clone());
-                    break 'brk_host v.into_boxed_slice();
-                }
-                let mut v = Vec::new();
-                write!(&mut v, "s3.{}.amazonaws.com", BStr::new(region))
-                    .expect("infallible: in-memory write");
-                endpoint_owned = Some(v.clone());
-                break 'brk_host v.into_boxed_slice();
-            }
-        };
-        let _ = endpoint_owned; // not read after this point.
-        // `host` (Box<[u8]>) drops on `?`.
+        let (host, extra_path) = self.host_and_path_prefix(region, bucket)?;
 
         let normalized_path: &[u8] = 'brk: {
             if self.virtual_hosted_style {
@@ -466,74 +528,15 @@ impl S3Credentials {
             None => SignedHeaders::get(header_key, &mut signed_headers_buf),
         };
 
-        let service_name: &str = "s3";
+        let service_name: &str = SERVICE_NAME;
 
         let aws_content_hash: &[u8] = content_hash.unwrap_or(b"UNSIGNED-PAYLOAD");
         let mut tmp_buffer = [0u8; 4096];
 
         let mut authorization: Box<[u8]> = 'brk: {
-            // we hash the hash so we need 2 buffers
             let mut hmac_sig_service = [0u8; bun_sha_hmac::hmac::EVP_MAX_MD_SIZE];
-            let mut hmac_sig_service2 = [0u8; bun_sha_hmac::hmac::EVP_MAX_MD_SIZE];
 
-            let sig_date_region_service_req: [u8; DIGESTED_HMAC_256_LEN] = 'brk_sign: {
-                let mut cache_key = [0u8; bun_sha_hmac::sha::hashers::SHA256::DIGEST];
-                {
-                    let mut hasher = bun_sha_hmac::sha::hashers::SHA256::init();
-                    hasher.update(region);
-                    hasher.update(b"\0");
-                    hasher.update(service_name.as_bytes());
-                    hasher.update(b"\0");
-                    hasher.update(&self.secret_access_key);
-                    hasher.r#final(&mut cache_key);
-                }
-                // was `bun_jsc::VirtualMachine::get*().rare_data().aws_cache()`.
-                // Storage moved DOWN — `AWS_SIGNATURE_CACHE` is a process static here.
-                if let Some(cached) = aws_cache_get(date_result.numeric_day, &cache_key) {
-                    break 'brk_sign cached;
-                }
-                // not cached yet lets generate a new one
-                let aws4_key = buf_print(
-                    &mut tmp_buffer,
-                    format_args!("AWS4{}", BStr::new(&self.secret_access_key)),
-                )
-                .map_err(|_| SignError::NoSpaceLeft)?;
-                let sig_date = bun_sha_hmac::generate(
-                    aws4_key,
-                    amz_day,
-                    bun_sha_hmac::Algorithm::Sha256,
-                    &mut hmac_sig_service,
-                )
-                .ok_or(SignError::FailedToGenerateSignature)?;
-                let sig_date_region = bun_sha_hmac::generate(
-                    sig_date,
-                    region,
-                    bun_sha_hmac::Algorithm::Sha256,
-                    &mut hmac_sig_service2,
-                )
-                .ok_or(SignError::FailedToGenerateSignature)?;
-                let sig_date_region_service = bun_sha_hmac::generate(
-                    sig_date_region,
-                    service_name.as_bytes(),
-                    bun_sha_hmac::Algorithm::Sha256,
-                    &mut hmac_sig_service,
-                )
-                .ok_or(SignError::FailedToGenerateSignature)?;
-                let _result = bun_sha_hmac::generate(
-                    sig_date_region_service,
-                    b"aws4_request",
-                    bun_sha_hmac::Algorithm::Sha256,
-                    &mut hmac_sig_service2,
-                )
-                .ok_or(SignError::FailedToGenerateSignature)?;
-
-                let digest: [u8; DIGESTED_HMAC_256_LEN] = hmac_sig_service2
-                    [0..DIGESTED_HMAC_256_LEN]
-                    .try_into()
-                    .expect("infallible: size matches");
-                aws_cache_set(date_result.numeric_day, &cache_key, digest);
-                break 'brk_sign digest;
-            };
+            let sig_date_region_service_req = self.signing_key(region, date_result.numeric_day)?;
 
             if sign_query {
                 let mut token_encoded_buffer = [0u8; 2048]; // token is normaly like 600-700 but can be up to 2k
@@ -894,22 +897,26 @@ impl S3Credentials {
 // DateResult / getAMZDate
 // ──────────────────────────────────────────────────────────────────────────
 
-struct DateResult {
+pub(crate) struct DateResult {
     /// numeric representation of year, month and day (excluding time components)
-    numeric_day: u64,
-    date: Box<[u8]>,
+    pub(crate) numeric_day: u64,
+    pub(crate) date: Box<[u8]>,
 }
 
 fn get_amz_date() -> DateResult {
-    // We can also use Date.now() but would be slower and would add jsc dependency
-    // the code below is the same as new Date(Date.now()).toISOString()
-    // Date.now() ISO string via JS removed; uses libc gmtime_r
+    amz_date_at(unix_time())
+}
 
-    // Create UTC timestamp.
-    let secs: u64 = std::time::SystemTime::now()
+/// Seconds since the Unix epoch.
+pub(crate) fn unix_time() -> u64 {
+    // We can also use Date.now() but would be slower and would add jsc dependency
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
+        .as_secs()
+}
+
+pub(crate) fn amz_date_at(secs: u64) -> DateResult {
     let (year, month, day, hours, minutes, seconds, day_seconds) = epoch_to_utc_components(secs);
 
     DateResult {
@@ -929,7 +936,7 @@ fn get_amz_date() -> DateResult {
 
 // Gregorian Y/M/D from Unix-epoch seconds, using Howard Hinnant's
 // `civil_from_days` algorithm (public domain).
-fn epoch_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32, u64) {
+pub(crate) fn epoch_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32, u64) {
     // returns (year, month(1-based), day(1-based), hours, minutes, seconds, seconds_into_day)
     let day_seconds = secs % 86_400;
     let hours = u32::try_from(day_seconds / 3600).expect("int cast");
@@ -951,7 +958,10 @@ fn epoch_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32, u64) {
     (year, month, day, hours, minutes, seconds, day_seconds)
 }
 
-const DIGESTED_HMAC_256_LEN: usize = 32;
+pub(crate) const DIGESTED_HMAC_256_LEN: usize = 32;
+
+/// The service of the credential scope.
+pub(crate) const SERVICE_NAME: &str = "s3";
 
 // ──────────────────────────────────────────────────────────────────────────
 // SignResult

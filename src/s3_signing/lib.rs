@@ -4,6 +4,7 @@ pub mod copy;
 pub mod crate_error;
 pub mod error;
 pub mod metadata;
+pub mod post_policy;
 pub mod storage_class;
 pub mod upload;
 
