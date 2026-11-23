@@ -133,6 +133,70 @@ test("renders the page", async () => {
 - If the file doesn't exist, Bun creates it, except in CI.
 - `--update-snapshots` rewrites a file that doesn't match.
 
+## Image Snapshots
+
+`.toMatchImageSnapshot()` compares an image with a PNG stored in `__image_snapshots__` beside the test file. Use it for visual regression tests: take a screenshot with [`Bun.WebView`](/runtime/webview), or render an image with [`Bun.Image`](/runtime/image), and let the test fail when a pixel changes.
+
+```ts title="page.test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("the home page", async () => {
+  await using view = new Bun.WebView({ width: 1280, height: 720 });
+  await view.navigate("http://localhost:3000");
+
+  expect(await view.screenshot()).toMatchImageSnapshot();
+});
+```
+
+The first run writes `__image_snapshots__/page-test-ts-the-home-page-1-snap.png`. Commit it. Later runs decode the image and the snapshot and compare their pixels. When they differ, the test fails and Bun writes a picture of the difference:
+
+```txt
+error: expect(received).toMatchImageSnapshot(options)
+
+Expected image to match or be a close match to snapshot but was 2% different from snapshot (18432 differing pixels).
+See diff for details: /app/__image_snapshots__/__diff_output__/page-test-ts-the-home-page-1-snap-diff.png
+```
+
+The picture shows the snapshot, the difference and the received image side by side. Pixels that differ are red. Pixels that differ only because an edge is anti-aliased another way are yellow, and they don't count.
+
+- The image is the bytes of a PNG, JPEG, WebP, GIF or BMP file, in a `Buffer`, a typed array, an `ArrayBuffer` or a `Blob`. For a file on disk, pass `await Bun.file(path).bytes()`.
+- If the snapshot doesn't exist, Bun creates it, except in CI.
+- `--update-snapshots` rewrites a snapshot that doesn't match.
+- `.toMatchImageSnapshot()` counts among the test's snapshots. The number in the file name is the number of the snapshot in its test.
+- In a [concurrent](/test#concurrent-test-execution) test, use the `expect` of the [test context](/test/writing-tests#test-context), as for every snapshot.
+
+Rendering is rarely identical across machines. Fonts, GPUs and browser versions move pixels. Allow for that with the options:
+
+```ts
+expect(screenshot).toMatchImageSnapshot({
+  // Fail when more than 1% of the pixels differ. Without `failureThresholdType`, a number of pixels.
+  failureThreshold: 0.01,
+  failureThresholdType: "percent",
+  // How far apart two colors are before the pixels differ, from 0 to 1. The default is 0.01.
+  customDiffConfig: { threshold: 0.1 },
+});
+```
+
+| Option                     | Default                               | Description                                                                                                  |
+| -------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `failureThreshold`         | `0`                                   | How much of the image may differ: a number of pixels, or a share of them from `0` to `1`                     |
+| `failureThresholdType`     | `"pixel"`                             | `"pixel"` or `"percent"`                                                                                     |
+| `customDiffConfig`         | `{ threshold: 0.01 }`                 | `threshold`: how far apart two colors may be, from `0` to `1`. `includeAA`: count anti-aliased pixels        |
+| `allowSizeMismatch`        | `false`                               | Compare images of different sizes instead of failing                                                         |
+| `customSnapshotIdentifier` | from the test                         | The file's name without `.png`, or a function that returns it                                                |
+| `customSnapshotsDir`       | `__image_snapshots__`                 | Where the snapshots are                                                                                      |
+| `customDiffDir`            | `__image_snapshots__/__diff_output__` | Where the pictures of a difference go                                                                        |
+| `diffDirection`            | `"horizontal"`                        | `"vertical"` stacks the snapshot, the difference and the received image                                      |
+| `onlyDiff`                 | `false`                               | Write the difference alone                                                                                   |
+| `storeReceivedOnFailure`   | `false`                               | Also write the received image, to `customReceivedDir` (`__image_snapshots__/__received_output__` by default) |
+| `updatePassedSnapshot`     | `false`                               | With `--update-snapshots`, also rewrite a snapshot that the image matches within the thresholds              |
+
+The matcher is compatible with [`jest-image-snapshot`](https://github.com/americanexpress/jest-image-snapshot). The options have the same names, the pixels are compared the way [`pixelmatch`](https://github.com/mapbox/pixelmatch) compares them, and the files have the same names in the same directories. A project that moves from Jest keeps its `__image_snapshots__`. A relative `customSnapshotsDir`, `customDiffDir` or `customReceivedDir` is relative to the working directory, as it is there.
+
+Remove the `expect.extend({ toMatchImageSnapshot })` of `jest-image-snapshot` from your setup file: the package reads Jest's internal snapshot state, which `bun test` does not have, and a matcher that `expect.extend()` adds replaces the built-in one. Where the setup file called `configureToMatchImageSnapshot()` for options that every test shares, keep those options in an object and spread it into each call.
+
+Bun does not have the `"ssim"` comparison method or the `blur` option. A test that asks for one of them fails.
+
 ## Advanced Snapshot Usage
 
 ### Complex Objects

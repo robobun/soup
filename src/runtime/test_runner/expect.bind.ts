@@ -173,6 +173,7 @@ export const Expect = b.class({
     toIncludeRepeated: { ...matcher, args: { substring: b.any, count: b.any } },
     toMatch: matcherWithExpected,
     toMatchFileSnapshot: { ...matcher, args: { path: b.any, hint: b.any }, length: 1 },
+    toMatchImageSnapshot: { ...matcher, args: { options: b.any }, length: 0 },
     /** The snapshot is written over the call's arguments in the source, where `(undefined)` is not `()`. */
     toMatchInlineSnapshot: { ...matcher, args: { args: b.any.variadic }, length: 1 },
     toMatchObject: matcherWithExpected,

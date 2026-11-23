@@ -281,6 +281,10 @@ impl Snapshots {
 
     #[optimize(size)]
     fn name_of(expect: &Expect, format: Format, hint: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(Self::escape_line_breaks(format, Self::name_as_written(expect, format, hint)?))
+    }
+
+    fn name_as_written(expect: &Expect, format: Format, hint: &[u8]) -> Result<Vec<u8>, Error> {
         let parent = expect.parent.as_ref().ok_or(Error::NoTest)?;
         let buntest = parent.bun_test().ok_or(Error::TestNotActive)?;
         let active = parent.phase.entry(&buntest).ok_or(Error::SnapshotInConcurrentGroup)?;
@@ -292,7 +296,7 @@ impl Snapshots {
             name.extend_from_slice(format.hint_separator());
             name.extend_from_slice(hint);
         }
-        Ok(Self::escape_line_breaks(format, name))
+        Ok(name)
     }
 
     /// Jest's keys spell a line break as `\r` or `\n`.
@@ -647,6 +651,16 @@ impl Snapshots {
             }
             Err(err) => FileOutcome::Failed(err.with_path(path)),
         }
+    }
+
+    /// Counts an image snapshot among the snapshots of the running test, as jest-image-snapshot does: the count is
+    /// the number in the name of its file. Returns the test's file, its name as Jest writes it, and the count.
+    #[cold]
+    pub(crate) fn count_image(&mut self, expect: &Expect) -> Result<(TestFile, Vec<u8>, usize), Error> {
+        let format = self.format_of(expect)?;
+        let test_file = self._current_file.as_ref().map(|file| file.test_file).ok_or(Error::NoTest)?;
+        let (_, count) = self.add_count(expect, format, b"")?;
+        Ok((test_file, Self::name_as_written(expect, Format::Jest, b"")?, count))
     }
 
     #[optimize(size)]

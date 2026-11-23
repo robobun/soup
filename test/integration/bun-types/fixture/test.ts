@@ -735,6 +735,32 @@ expectType(expect(Promise.resolve("text")).resolves.toMatchFileSnapshot("./text.
 // @ts-expect-error
 expect("text").toMatchFileSnapshot();
 
+declare const screenshot: Blob;
+expectType(expect(screenshot).toMatchImageSnapshot()).is<void>();
+expectType(
+  expect(new Uint8Array(8)).toMatchImageSnapshot({ failureThreshold: 0.01, failureThresholdType: "percent" }),
+).is<void>();
+expectType(expect(Promise.resolve(screenshot)).resolves.toMatchImageSnapshot()).is<Promise<void>>();
+const imageSnapshotOptions: import("bun:test").ImageSnapshotOptions = {
+  customDiffConfig: { threshold: 0.1, includeAA: true },
+  customSnapshotIdentifier: ({ testPath, currentTestName, counter, defaultIdentifier }) =>
+    counter > 1 ? `${currentTestName}-${counter}` : defaultIdentifier || testPath,
+  customSnapshotsDir: "shots",
+  customDiffDir: "shots/diffs",
+  diffDirection: "vertical",
+  onlyDiff: false,
+  allowSizeMismatch: true,
+  storeReceivedOnFailure: true,
+  customReceivedDir: "shots/received",
+  customReceivedPostfix: "-new",
+  updatePassedSnapshot: true,
+};
+expect(screenshot).toMatchImageSnapshot({ ...imageSnapshotOptions, customSnapshotIdentifier: "home" });
+// @ts-expect-error
+expect(screenshot).toMatchImageSnapshot({ failureThresholdType: "pixels" });
+// @ts-expect-error
+expect(screenshot).toMatchImageSnapshot("home");
+
 expect.addSnapshotSerializer({
   test: value => value instanceof Date,
   serialize: (value, config, indentation, depth, refs, printer) =>

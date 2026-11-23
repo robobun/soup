@@ -1,8 +1,11 @@
 import { $ } from "bun";
 import { describe, expect, it, test } from "bun:test";
-import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { bunEnv, bunExe, DirectoryTree, isDebug, isWindows, MAX_PATH_BYTES, tempDir, tempDirWithFiles } from "harness";
+import { kebabCase } from "lodash";
 import { join } from "path";
+import pixelmatch from "pixelmatch";
+import { inflateSync } from "zlib";
 
 const isolationFlags: [string[]][] = [[[]], [["--isolate"]], [["--isolate=modules"]]];
 
@@ -2107,6 +2110,602 @@ describe.concurrent("toMatchFileSnapshot()", () => {
     });
     expect(readdirSync(String(dir)).sort()).toEqual(["__snapshots__", "a.test.js"]);
     expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+  });
+});
+
+describe.concurrent("toMatchImageSnapshot()", () => {
+  type Color = number[];
+  const white: Color = [255, 255, 255, 255];
+  const black: Color = [0, 0, 0, 255];
+
+  // An 8-bit RGBA PNG whose pixel at (x, y) is `color(x, y)`. The fixtures have it as `png.js`.
+  const pngModule = `
+    const { deflateSync } = require("node:zlib");
+    function png(width, height, color) {
+      const chunk = (type, data) => {
+        const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+        const out = Buffer.alloc(8 + body.length);
+        out.writeUInt32BE(data.length);
+        out.set(body, 4);
+        out.writeUInt32BE(Bun.hash.crc32(body), 4 + body.length);
+        return out;
+      };
+      const rows = Buffer.alloc(height * (width * 4 + 1));
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) rows.set(color(x, y), y * (width * 4 + 1) + 1 + x * 4);
+      }
+      const header = Buffer.alloc(13);
+      header.writeUInt32BE(width, 0);
+      header.writeUInt32BE(height, 4);
+      header.set([8, 6, 0, 0, 0], 8);
+      const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+      return Buffer.concat([signature, chunk("IHDR", header), chunk("IDAT", deflateSync(rows)), chunk("IEND", Buffer.alloc(0))]);
+    }
+    module.exports = { png };
+  `;
+  const png: (width: number, height: number, color: (x: number, y: number) => ArrayLike<number>) => Buffer =
+    new Function("require", "module", pngModule + "return png;")(require, {});
+
+  // The pixels of a PNG that Bun wrote: 8-bit RGBA, not interlaced.
+  function pixelsOf(file: Buffer) {
+    const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+    const [width, height] = [view.getUint32(16), view.getUint32(20)];
+    expect([...file.subarray(24, 29)]).toEqual([8, 6, 0, 0, 0]);
+    const data: Uint8Array[] = [];
+    for (let at = 8; at < file.length; at += 12 + view.getUint32(at)) {
+      if (file.subarray(at + 4, at + 8).toString() === "IDAT")
+        data.push(file.subarray(at + 8, at + 8 + view.getUint32(at)));
+    }
+    const rows = inflateSync(Buffer.concat(data));
+    const stride = width * 4;
+    const rgba = new Uint8Array(stride * height);
+    for (let y = 0; y < height; y++) {
+      const filter = rows[y * (stride + 1)];
+      for (let i = 0; i < stride; i++) {
+        const left = i >= 4 ? rgba[y * stride + i - 4] : 0;
+        const up = y > 0 ? rgba[(y - 1) * stride + i] : 0;
+        const upLeft = i >= 4 && y > 0 ? rgba[(y - 1) * stride + i - 4] : 0;
+        const [byLeft, byUp, byUpLeft] = [left, up, upLeft].map(value => Math.abs(left + up - upLeft - value));
+        const paeth = byLeft <= byUp && byLeft <= byUpLeft ? left : byUp <= byUpLeft ? up : upLeft;
+        rgba[y * stride + i] = rows[y * (stride + 1) + 1 + i] + [0, left, up, (left + up) >> 1, paeth][filter];
+      }
+    }
+    return {
+      width,
+      height,
+      rgba,
+      at: (x: number, y: number) => [...rgba.subarray((y * width + x) * 4).subarray(0, 4)],
+    };
+  }
+
+  const header = `
+    import { test, expect, describe } from "bun:test";
+    import { png } from "./png.js";
+    const white = [255, 255, 255, 255], black = [0, 0, 0, 255];
+    const inDir = text => text.replaceAll(process.cwd(), "<dir>").replaceAll("\\\\", "/");
+    const message = f => { try { f(); return "pass"; } catch (error) { return inDir(error.message); } };
+  `;
+  const shots = (dir: unknown, ...path: string[]) => join(String(dir), "__image_snapshots__", ...path);
+  const signature = "expect(received).toMatchImageSnapshot(options)\n\n";
+  const differs = (pixels: number, of: number, diff: string) =>
+    `${signature}Expected image to match or be a close match to snapshot but was ${(pixels / of) * 100}% different from snapshot (${pixels} differing pixels).\nSee diff for details: <dir>/${diff}\n`;
+
+  async function run(cwd: unknown, env: Record<string, string>, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", ...args],
+      env: { ...bunEnv, CI: "false", ...env },
+      cwd: String(cwd),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const at = stdout.indexOf("{");
+    return { printed: at < 0 ? undefined : JSON.parse(stdout.slice(at)), stderr, exitCode };
+  }
+
+  test("writes the snapshot, then passes, fails with a picture of the difference, and updates", async () => {
+    using dir = tempDir("image-snapshot", {
+      "png.js": pngModule,
+      "page.test.js": `${header}
+          const dot = process.env.DOT === "black" ? black : white;
+          const shade = process.env.DOT === "black" ? [254, 254, 254, 255] : white;
+          const updatePassedSnapshot = true;
+          describe("the page", () => {
+            test("looks right", () => {
+              expect("text").toMatchSnapshot();
+              expect(png(4, 2, (x, y) => (x === 1 && y === 1 ? dot : white))).toMatchImageSnapshot();
+              expect(new Uint8Array(png(2, 2, () => shade))).toMatchImageSnapshot();
+              expect(new Uint8Array(png(2, 2, () => shade)).buffer).toMatchImageSnapshot({ updatePassedSnapshot });
+            });
+          });
+        `,
+    });
+    const names = [2, 3, 4].map(count => `page-test-js-the-page-looks-right-${count}-snap.png`);
+    const saved = () => names.map(name => pixelsOf(readFileSync(shots(dir, name))).at(1, 1));
+    const diff = shots(dir, "__diff_output__", names[0].replace(".png", "-diff.png"));
+
+    // The test's text snapshot is its first snapshot, as for jest-image-snapshot.
+    const first = await run(dir, {});
+    expect(first.stderr).toContain("snapshots: +4 added");
+    expect(readdirSync(shots(dir)).sort()).toEqual(names);
+    // A PNG is kept as it came.
+    expect(readFileSync(shots(dir, names[0])).equals(png(4, 2, () => white))).toBe(true);
+    expect(first.exitCode).toBe(0);
+
+    const same = await run(dir, { CI: "true" });
+    expect(same.stderr).toContain(" 4 snapshots, 4 expect() calls");
+    expect(same.exitCode).toBe(0);
+
+    const changed = await run(dir, { CI: "true", DOT: "black" });
+    expect(changed.stderr.replaceAll(String(dir), "<dir>").replaceAll("\\", "/")).toContain(
+      "error: " + differs(1, 8, "__image_snapshots__/__diff_output__/" + names[0].replace(".png", "-diff.png")),
+    );
+    expect(changed.stderr).toContain("snapshots: 1 passed, 1 failed");
+    // The snapshot, pixelmatch's picture of the difference, and the received image, side by side.
+    const picture = pixelsOf(readFileSync(diff));
+    expect([picture.width, picture.height]).toEqual([12, 2]);
+    expect([picture.at(1, 1), picture.at(5, 1), picture.at(9, 1)]).toEqual([white, [255, 0, 0, 255], black]);
+    expect([picture.at(0, 0), picture.at(4, 0), picture.at(8, 0)]).toEqual([white, white, white]);
+    expect(saved()).toEqual([white, white, white]);
+    expect(changed.exitCode).toBe(1);
+
+    // --update-snapshots writes the image that fails, and one that passes only where the test asks for it.
+    const updated = await run(dir, { CI: "true", DOT: "black" }, "--update-snapshots");
+    expect(saved()).toEqual([black, white, [254, 254, 254, 255]]);
+    expect(existsSync(diff)).toBe(false);
+    expect(updated.exitCode).toBe(0);
+  });
+
+  test("counts what differs as jest-image-snapshot does", async () => {
+    const diagonal = (edge: Color) => png(6, 6, (x, y) => (x < y ? black : x === y ? edge : white));
+    using dir = tempDir("image-snapshot-thresholds", {
+      "png.js": pngModule,
+      "__image_snapshots__/white.png": png(8, 8, () => white),
+      "__image_snapshots__/diagonal.png": diagonal(white),
+      "a.test.js": `${header}
+          const dots = count => png(8, 8, (x, y) => (y === 0 && x < count ? black : white));
+          const diagonal = png(6, 6, (x, y) => (x < y ? black : x === y ? [128, 128, 128, 255] : white));
+          const compare = (image, name, options) => message(() => expect(image).toMatchImageSnapshot({ customSnapshotIdentifier: name, ...options }));
+          test("t", () => {
+            console.log(JSON.stringify({
+              "the same": compare(dots(0), "white"),
+              "one pixel": compare(dots(1), "white"),
+              "one pixel where one may differ": compare(dots(1), "white", { failureThreshold: 1 }),
+              "two pixels where one may differ": compare(dots(2), "white", { failureThreshold: 1, failureThresholdType: "pixel" }),
+              "one pixel where 2% may differ": compare(dots(1), "white", { failureThreshold: 0.02, failureThresholdType: "percent" }),
+              "two pixels where 2% may differ": compare(dots(2), "white", { failureThreshold: 0.02, failureThresholdType: "percent" }),
+              "a color that is close": compare(png(8, 8, () => [250, 250, 250, 255]), "white"),
+              "a color that is close, with pixelmatch's own threshold": compare(png(8, 8, () => [250, 250, 250, 255]), "white", { customDiffConfig: { threshold: 0.1 } }),
+              "an edge that is anti-aliased": compare(diagonal, "diagonal"),
+              "an edge that is anti-aliased, when that counts": compare(diagonal, "diagonal", { customDiffConfig: { includeAA: true } }),
+              "another size": compare(png(8, 10, () => white), "white"),
+              "another size where that is allowed": compare(png(8, 10, () => white), "white", { allowSizeMismatch: true }),
+              "another size where that and its pixels are allowed": compare(png(8, 10, () => white), "white", { allowSizeMismatch: true, failureThreshold: 8 }),
+              "a smaller size": compare(png(4, 8, () => white), "white", { failureThreshold: 1000 }),
+            }, null, 2));
+          });
+        `,
+    });
+    const { printed, stderr, exitCode } = await run(dir, { CI: "true" });
+    const [whiteDiff, diagonalDiff] = ["white", "diagonal"].map(
+      name => `__image_snapshots__/__diff_output__/${name}-diff.png`,
+    );
+    expect(printed).toEqual({
+      "the same": "pass",
+      "one pixel": differs(1, 64, whiteDiff),
+      "one pixel where one may differ": "pass",
+      "two pixels where one may differ": differs(2, 64, whiteDiff),
+      "one pixel where 2% may differ": "pass",
+      "two pixels where 2% may differ": differs(2, 64, whiteDiff),
+      "a color that is close": differs(64, 64, whiteDiff),
+      "a color that is close, with pixelmatch's own threshold": "pass",
+      "an edge that is anti-aliased": "pass",
+      "an edge that is anti-aliased, when that counts": differs(6, 36, diagonalDiff),
+      "another size": `${signature}Expected image to be the same size as the snapshot (8x8), but was different (8x10).\nSee diff for details: <dir>/${whiteDiff}\n`,
+      "another size where that is allowed": differs(8, 80, whiteDiff),
+      "another size where that and its pixels are allowed": "pass",
+      "a smaller size": `${signature}Expected image to be the same size as the snapshot (8x8), but was different (4x8).\nSee diff for details: <dir>/${whiteDiff}\n`,
+    });
+    expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+  });
+
+  test("agrees with pixelmatch on what differs and on the picture of it", async () => {
+    // Flat areas, edges, gradients and noise, and then what a renderer does to them.
+    let seed = 1;
+    const random = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const int = (below: number) => Math.floor(random() * below);
+    const color = () => [int(256), int(256), int(256), random() < 0.8 ? 255 : int(256)];
+    function scene(width: number, height: number) {
+      const [kind, colors, centerX, centerY, radius] = [
+        int(5),
+        [color(), color(), color(), color()],
+        int(width),
+        int(height),
+        1 + int(24),
+      ];
+      const rgba = new Uint8Array(width * height * 4);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const pixel =
+            kind === 0
+              ? colors[x * 3 > y * 2 ? 1 : 0]
+              : kind === 1
+                ? colors[(x - centerX) ** 2 + (y - centerY) ** 2 < (radius * radius) / 4 ? 0 : 1]
+                : kind === 2
+                  ? [Math.floor((x * 255) / width), Math.floor((y * 255) / height), colors[0][2], 255]
+                  : kind === 3
+                    ? color()
+                    : colors[((x >> 2) + (y >> 2)) % 4];
+          rgba.set(pixel, (y * width + x) * 4);
+        }
+      }
+      return rgba;
+    }
+    function rendered(scene: Uint8Array, width: number) {
+      const [rgba, how] = [new Uint8Array(scene), int(6)];
+      for (let at = 0; at < rgba.length; at += 4) {
+        if (how === 1 && random() < 0.05) rgba[at] ^= 1 + int(255);
+        if (how === 2 && random() < 0.3) rgba[at + 1] = Math.min(255, rgba[at + 1] + int(4));
+        if (how === 3 && at % (width * 4) > 0) rgba.set(scene.subarray(at - 4, at), at);
+        if (how === 4 && at % (width * 4) > 0 && random() < 0.2)
+          rgba.set(
+            [0, 1, 2, 3].map(i => (scene[at + i] + scene[at - 4 + i]) >> 1),
+            at,
+          );
+        if (how === 5 && random() < 0.2) rgba[at + 3] = int(256);
+      }
+      return rgba;
+    }
+
+    const files: DirectoryTree = {};
+    const cases = Array.from({ length: 150 }, (_, index) => {
+      const [width, height] = [1 + int(24), 1 + int(24)];
+      const snapshot = scene(width, height);
+      const received = rendered(snapshot, width);
+      const options = { threshold: [0.01, 0.1, 0, 0.5][int(4)], includeAA: random() < 0.3 };
+      const picture = new Uint8Array(width * height * 4);
+      const differing = pixelmatch(received, snapshot, picture, width, height, options);
+      const file = (rgba: Uint8Array) =>
+        png(width, height, (x, y) => rgba.subarray((y * width + x) * 4).subarray(0, 4));
+      files[`__image_snapshots__/case-${index}.png`] = file(snapshot);
+      files[`received/${index}.png`] = file(received);
+      return { width, height, options, differing, picture };
+    });
+    expect(cases.filter(({ differing }) => differing > 0).length).toBeGreaterThan(30);
+    expect(cases.filter(({ differing }) => differing === 0).length).toBeGreaterThan(30);
+
+    using dir = tempDir("image-snapshot-pixelmatch", {
+      ...files,
+      "png.js": pngModule,
+      "a.test.js": `${header}
+          import { readFileSync } from "node:fs";
+          test("t", () => {
+            const differing = ${JSON.stringify(cases.map(({ options }) => options))}.map((customDiffConfig, index) => {
+              const options = { customSnapshotIdentifier: "case-" + index, customDiffConfig, onlyDiff: true };
+              const said = message(() => expect(readFileSync(import.meta.dir + "/received/" + index + ".png")).toMatchImageSnapshot(options));
+              return said === "pass" ? 0 : Number(/\\((\\d+) differing pixels\\)/.exec(said)?.[1] ?? said);
+            });
+            console.log(JSON.stringify({ differing }));
+          });
+        `,
+    });
+    const { printed, stderr, exitCode } = await run(dir, { CI: "true" });
+    expect(printed).toEqual({ differing: cases.map(({ differing }) => differing) });
+    for (const [index, { width, height, differing, picture }] of cases.entries()) {
+      const diff = shots(dir, "__diff_output__", `case-${index}-diff.png`);
+      if (differing === 0) {
+        expect(existsSync(diff)).toBe(false);
+        continue;
+      }
+      const drawn = pixelsOf(readFileSync(diff));
+      expect([drawn.width, drawn.height]).toEqual([width, height]);
+      expect(Buffer.from(drawn.rgba).equals(picture)).toBe(true);
+    }
+    expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+  });
+
+  test("puts the files where the options say", async () => {
+    using dir = tempDir("image-snapshot-files", {
+      "png.js": pngModule,
+      "__image_snapshots__/side-by-side.png": png(4, 2, () => white),
+      "__image_snapshots__/stacked.png": png(4, 2, () => white),
+      "__image_snapshots__/alone.png": png(4, 2, () => white),
+      "__image_snapshots__/edges.png": png(6, 6, (x, y) => (x < y ? black : white)),
+      "sub/a.test.js": `${header.replace("./png.js", "../png.js")}
+          const dot = png(4, 2, (x, y) => (x === 1 && y === 1 ? black : white));
+          const edges = png(6, 6, (x, y) => (x < y || (x === 5 && y === 0) ? black : x === y ? [128, 128, 128, 255] : white));
+          const compare = (image, options) => message(() => expect(image).toMatchImageSnapshot(options));
+          const asked = [];
+          const inRoot = { customSnapshotsDir: "__image_snapshots__" };
+          describe("d", () => {
+            test("t", () => {
+              console.log(JSON.stringify({
+                "side by side": compare(dot, { ...inRoot, customSnapshotIdentifier: "side-by-side", diffDirection: "horizontal" }),
+                "stacked": compare(dot, { ...inRoot, customSnapshotIdentifier: "stacked", diffDirection: "vertical", storeReceivedOnFailure: true }),
+                "alone": compare(dot, { ...inRoot, customSnapshotIdentifier: "alone", onlyDiff: true }),
+                "edges": compare(edges, { ...inRoot, customSnapshotIdentifier: "edges", onlyDiff: true }),
+                "written where the options say": compare(png(2, 2, () => white), {
+                  customSnapshotIdentifier: "nested/custom", customSnapshotsDir: "shots", customDiffDir: import.meta.dir + "/../diffs",
+                }),
+                "compared where the options say": compare(png(2, 2, () => black), {
+                  customSnapshotIdentifier: "nested/custom", customSnapshotsDir: "shots", customDiffDir: import.meta.dir + "/../diffs",
+                  storeReceivedOnFailure: true, customReceivedDir: "received", customReceivedPostfix: "-new",
+                }),
+                "named by a function": compare(dot, {
+                  customSnapshotIdentifier: test => (asked.push({ ...test, testPath: inDir(test.testPath) }), "by-function-" + test.counter),
+                }),
+                "named by a function that returns nothing": compare(dot, { customSnapshotIdentifier: () => {} }),
+                asked,
+              }, null, 2));
+            });
+          });
+        `,
+    });
+    const { printed, stderr, exitCode } = await run(dir, {});
+    const differsIn = (diff: string) => differs(1, 8, diff);
+    expect(printed).toEqual({
+      "side by side": differsIn("__image_snapshots__/__diff_output__/side-by-side-diff.png"),
+      "stacked": differsIn("__image_snapshots__/__diff_output__/stacked-diff.png"),
+      "alone": differsIn("__image_snapshots__/__diff_output__/alone-diff.png"),
+      "edges": differs(1, 36, "__image_snapshots__/__diff_output__/edges-diff.png"),
+      "written where the options say": "pass",
+      "compared where the options say": differs(4, 4, "diffs/nested/custom-diff.png"),
+      "named by a function": "pass",
+      "named by a function that returns nothing": "pass",
+      asked: [
+        {
+          testPath: "<dir>/sub/a.test.js",
+          currentTestName: "d t",
+          counter: 7,
+          defaultIdentifier: "a-test-js-d-t-7",
+        },
+      ],
+    });
+    const read = (...path: string[]) => pixelsOf(readFileSync(join(String(dir), ...path)));
+    const sizes = Object.fromEntries(
+      ["side-by-side", "stacked", "alone", "edges"].map(name => {
+        const { width, height } = read("__image_snapshots__", "__diff_output__", name + "-diff.png");
+        return [name, [width, height]];
+      }),
+    );
+    expect(sizes).toEqual({ "side-by-side": [12, 2], stacked: [4, 6], alone: [4, 2], edges: [6, 6] });
+    // The snapshot above the difference above the received image.
+    const stacked = read("__image_snapshots__", "__diff_output__", "stacked-diff.png");
+    expect([stacked.at(1, 1), stacked.at(1, 3), stacked.at(1, 5)]).toEqual([white, [255, 0, 0, 255], black]);
+    // What differs as anti-aliasing does is yellow, what differs is red, and the rest is the image, paler.
+    const edges = read("__image_snapshots__", "__diff_output__", "edges-diff.png");
+    expect([edges.at(2, 2), edges.at(5, 0), edges.at(0, 5), edges.at(4, 1)]).toEqual([
+      [255, 255, 0, 255],
+      [255, 0, 0, 255],
+      [229, 229, 229, 255],
+      white,
+    ]);
+    expect(read("__image_snapshots__", "__received_output__", "stacked-received.png").at(1, 1)).toEqual(black);
+    expect(read("shots", "nested", "custom.png").at(0, 0)).toEqual(white);
+    expect(read("diffs", "nested", "custom-diff.png").width).toBe(6);
+    expect(read("received", "nested", "custom-new.png").at(0, 0)).toEqual(black);
+    expect(readdirSync(join(String(dir), "sub", "__image_snapshots__")).sort()).toEqual([
+      "a-test-js-d-t-8.png",
+      "by-function-7.png",
+    ]);
+    expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+  });
+
+  test("names a snapshot as jest-image-snapshot does", async () => {
+    const names = [
+      "renders the page",
+      "rendersTheHomePage",
+      "XMLHttpRequest and HTMLElement on iOS15",
+      "v2 of the API_client (beta)",
+      "the 1st, the 2ND, the 3rd and the 11th",
+      "doesn't crash when it's empty",
+      "affiche le r\u00e9sum\u00e9 \u00e0 Z\u00fcrich, Stra\u00dfe, \u00c6sir, \u0152uvre",
+      "\u0442\u0435\u0441\u0442 \u0418\u043c\u044f",
+      "\u30c6\u30b9\u30c8 works",
+      "works \u2705",
+      "100% of $ and a/b\\c",
+      "   spaces   and\ttabs ",
+    ];
+    using dir = tempDir("image-snapshot-names", {
+      "png.js": pngModule,
+      "Some_Component.test.tsx": `${header}
+          const image = png(1, 1, () => white);
+          describe("a group", () => {
+            describe("", () => {
+              for (const name of ${JSON.stringify(names)}) test(name, () => expect(image).toMatchImageSnapshot());
+            });
+            test("twice", () => {
+              expect(image).toMatchImageSnapshot();
+              expect(image).toMatchImageSnapshot();
+            });
+          });
+        `,
+    });
+    const { stderr, exitCode } = await run(dir, {});
+    // jest-image-snapshot: kebabCase(`${path.basename(testPath)}-${currentTestName}-${counter}`) + "-snap"
+    const expected = [
+      ...names.map(name => kebabCase(`Some_Component.test.tsx-a group  ${name}-1`) + "-snap"),
+      kebabCase("Some_Component.test.tsx-a group twice-1") + "-snap",
+      kebabCase("Some_Component.test.tsx-a group twice-2") + "-snap",
+    ];
+    expect(expected).toContain("some-component-test-tsx-a-group-xml-http-request-and-html-element-on-i-os-15-1-snap");
+    expect(readdirSync(shots(dir)).sort()).toEqual(expected.map(name => name + ".png").sort());
+    expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+  });
+
+  test("belongs to its test in concurrent tests, through the expect of the test", async () => {
+    using dir = tempDir("image-snapshot-concurrent", {
+      "png.js": pngModule,
+      "a.test.js": `${header.replace('"bun:test"', '"vitest"')}
+          let withTheGlobalExpect;
+          describe.concurrent("pages", () => {
+            for (const [name, shade] of [["home", 10], ["about", 20], ["pricing", 30]]) {
+              test(name, async ({ expect }) => {
+                await Bun.sleep(1);
+                expect(png(2, 2, () => [shade, shade, shade, 255])).toMatchImageSnapshot();
+                await Bun.sleep(1);
+                expect(png(2, 2, () => [shade, 0, 0, 255])).toMatchImageSnapshot();
+              });
+            }
+            test("the global expect", async () => {
+              await Bun.sleep(1);
+              withTheGlobalExpect = message(() => expect(png(2, 2, () => white)).toMatchImageSnapshot());
+            });
+          });
+          test("after them", () => console.log(JSON.stringify({ withTheGlobalExpect })));
+        `,
+    });
+    const { printed, stderr, exitCode } = await run(dir, {});
+    expect(printed).toEqual({ withTheGlobalExpect: "Snapshot matchers are not supported in concurrent tests" });
+    const saved = Object.fromEntries(
+      readdirSync(shots(dir)).map(name => [name, pixelsOf(readFileSync(shots(dir, name))).at(0, 0)]),
+    );
+    expect(saved).toEqual({
+      "a-test-js-pages-home-1-snap.png": [10, 10, 10, 255],
+      "a-test-js-pages-home-2-snap.png": [10, 0, 0, 255],
+      "a-test-js-pages-about-1-snap.png": [20, 20, 20, 255],
+      "a-test-js-pages-about-2-snap.png": [20, 0, 0, 255],
+      "a-test-js-pages-pricing-1-snap.png": [30, 30, 30, 255],
+      "a-test-js-pages-pricing-2-snap.png": [30, 0, 0, 255],
+    });
+    expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+    // The same images match what the first run wrote.
+    expect((await run(dir, { CI: "true" })).exitCode).toBe(0);
+  });
+
+  test("takes an image in any form that holds its bytes, and of any format that Bun decodes", async () => {
+    using dir = tempDir("image-snapshot-inputs", {
+      "png.js": pngModule,
+      "a.test.js": `${header}
+          test("t", async () => {
+            const file = png(4, 4, (x, y) => [x * 60, y * 60, 128, 255]);
+            const named = { customSnapshotIdentifier: "png" };
+            expect(file).toMatchImageSnapshot(named);
+            expect(new Uint8Array(file)).toMatchImageSnapshot(named);
+            expect(Buffer.concat([Buffer.alloc(3), file]).subarray(3)).toMatchImageSnapshot(named);
+            expect(new Uint8Array(file).buffer).toMatchImageSnapshot(named);
+            expect(new DataView(new Uint8Array(file).buffer)).toMatchImageSnapshot(named);
+            expect(new Blob([file], { type: "image/png" })).toMatchImageSnapshot(named);
+            await expect(Promise.resolve(file)).resolves.toMatchImageSnapshot(named);
+            await expect(new Bun.Image(file).png().bytes()).resolves.toMatchImageSnapshot(named);
+
+            // The snapshot is a PNG of the image's pixels whatever the format of the image.
+            const jpeg = await new Bun.Image(file).jpeg({ quality: 90 }).bytes();
+            expect(jpeg).toMatchImageSnapshot({ customSnapshotIdentifier: "jpeg" });
+            expect(jpeg).toMatchImageSnapshot({ customSnapshotIdentifier: "jpeg" });
+            const webp = await new Bun.Image(file).webp({ lossless: true }).bytes();
+            expect(webp).toMatchImageSnapshot(named);
+          });
+        `,
+    });
+    const { stderr, exitCode } = await run(dir, {});
+    expect(stderr).toContain("snapshots: 9 passed, 2 added");
+    const [saved, jpeg] = ["png.png", "jpeg.png"].map(name => pixelsOf(readFileSync(shots(dir, name))));
+    expect([saved.at(0, 0), saved.at(3, 2)]).toEqual([
+      [0, 0, 128, 255],
+      [180, 120, 128, 255],
+    ]);
+    expect([jpeg.width, jpeg.height]).toEqual([4, 4]);
+    expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+  });
+
+  test("what it refuses", async () => {
+    using dir = tempDir("image-snapshot-errors", {
+      "png.js": pngModule,
+      "__image_snapshots__/not-an-image.png": "text",
+      "a.test.js": `${header}
+          const image = png(1, 1, () => white);
+          const outside = message(() => expect(image).toMatchImageSnapshot());
+          const options = options => message(() => expect(image).toMatchImageSnapshot(options)).replace("\\n\\nMatcher error: ", "").trim();
+          test("t", () => {
+            console.log(JSON.stringify({
+              outside,
+              not: message(() => expect(image).not.toMatchImageSnapshot()),
+              "a string": message(() => expect("iVBORw0KGgo=").toMatchImageSnapshot()),
+              "bytes that are no image": message(() => expect(Buffer.from("<svg></svg>")).toMatchImageSnapshot()),
+              "a PNG that is cut off": message(() => expect(image.subarray(0, 40)).toMatchImageSnapshot()),
+              "a file": message(() => expect(Bun.file(import.meta.dir + "/png.js")).toMatchImageSnapshot()),
+              "a snapshot that is no image": message(() => expect(image).toMatchImageSnapshot({ customSnapshotIdentifier: "not-an-image" })),
+              options: [
+                options(5),
+                options({ failureThreshold: -1 }),
+                options({ failureThreshold: "1" }),
+                options({ failureThresholdType: "pixels" }),
+                options({ customDiffConfig: 0.1 }),
+                options({ customDiffConfig: { threshold: 2 } }),
+                options({ diffDirection: "diagonal" }),
+                options({ comparisonMethod: "ssim" }),
+                options({ comparisonMethod: "pixelmatch", blur: 2 }),
+                options({ customSnapshotIdentifier: 5 }),
+                options({ customSnapshotIdentifier: () => 5 }),
+                options({ customSnapshotsDir: 5 }),
+                options({ customDiffDir: "a\\0b" }),
+              ],
+              // These change nothing about what is compared, so a test that has them runs as it is.
+              ignored: options({ comparisonMethod: "pixelmatch", blur: 0, dumpDiffToConsole: true, noColors: true, runInProcess: true, customSnapshotIdentifier: "ignored" }),
+              // jest-image-snapshot reads these with \`||\`.
+              "empty strings": options({ customSnapshotIdentifier: "", customSnapshotsDir: "" }),
+            }, null, 2));
+          });
+        `,
+    });
+    const { printed, stderr, exitCode } = await run(dir, {});
+    const matcherError = (text: string) => `${signature}Matcher error: ${text}\n`;
+    expect(printed).toEqual({
+      outside: "Snapshot matchers are not supported in concurrent tests",
+      not: "expect(received).not.toMatchImageSnapshot()\n\nMatcher error: Snapshot matchers cannot be used with not\n",
+      "a string": matcherError(
+        'received value must be an image in a Buffer, a typed array, an ArrayBuffer or a Blob\n\nReceived: "iVBORw0KGgo="',
+      ),
+      "bytes that are no image": matcherError("received value is not an image that Bun can decode. It has 11 bytes"),
+      "a PNG that is cut off": matcherError("received value is not an image that Bun can decode. It has 40 bytes"),
+      "a file": matcherError("received value is a file that has not been read. Pass await file.bytes()"),
+      "a snapshot that is no image":
+        "toMatchImageSnapshot() can't decode the snapshot (UnknownFormat). Run with --update-snapshots to write it again: <dir>/__image_snapshots__/not-an-image.png",
+      options: [
+        "Expected first argument to be an object",
+        "Expected failureThreshold to be a number that is not negative",
+        "Expected failureThreshold to be a number that is not negative",
+        'Expected failureThresholdType to be "pixel" or "percent"',
+        "Expected customDiffConfig to be an object",
+        "Expected customDiffConfig.threshold to be a number from 0 to 1",
+        'Expected diffDirection to be "horizontal" or "vertical"',
+        'comparisonMethod "ssim" is not supported: Bun compares with pixelmatch',
+        "blur is not supported",
+        "Expected customSnapshotIdentifier to be a string without null bytes",
+        "Expected what customSnapshotIdentifier returns to be a string without null bytes",
+        "Expected customSnapshotsDir to be a string without null bytes",
+        "Expected customDiffDir to be a string without null bytes",
+      ],
+      ignored: "pass",
+      "empty strings": "pass",
+    });
+    expect(readdirSync(shots(dir)).sort()).toEqual(["a-test-js-t-4-snap.png", "ignored.png", "not-an-image.png"]);
+    expect({ stderr: exitCode ? stderr : "", exitCode }).toEqual({ stderr: "", exitCode: 0 });
+  });
+
+  test("writes no snapshot in CI, unless it is told to update", async () => {
+    using dir = tempDir("image-snapshot-ci", {
+      "png.js": pngModule,
+      "a.test.js": `${header}
+          test("t", () => expect(png(1, 1, () => white)).toMatchImageSnapshot());
+        `,
+    });
+    const refused = await run(dir, { CI: "true" });
+    expect(refused.stderr.replaceAll(String(dir), "<dir>").replaceAll("\\", "/")).toContain(
+      'error: Snapshot creation is disabled in CI environments unless --update-snapshots is used\nTo override, set the environment variable CI=false.\n\nSnapshot file: "<dir>/__image_snapshots__/a-test-js-t-1-snap.png"',
+    );
+    expect(readdirSync(String(dir)).sort()).toEqual(["a.test.js", "png.js"]);
+    expect(refused.exitCode).toBe(1);
+
+    const written = await run(dir, { CI: "true" }, "--update-snapshots");
+    expect(readdirSync(shots(dir))).toEqual(["a-test-js-t-1-snap.png"]);
+    expect(written.exitCode).toBe(0);
   });
 });
 

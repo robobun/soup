@@ -13122,6 +13122,244 @@ Files: `src/s3_signing/post_policy.rs` (new), `src/s3_signing/credentials.rs`
 `test/js/bun/s3/s3-numeric-options-coerce.test.ts`, `test/js/bun/s3/s3-metadata.test.ts`,
 `test/integration/bun-types/fixture/s3.ts`, `test/integration/bun-types/bun-types.test.ts`.
 
+### 2026-11-23: `expect(image).toMatchImageSnapshot()`, visual regression tests in `bun test`
+
+`Bun.WebView` takes a screenshot and `Bun.Image` writes an image, and `bun test` could not say
+whether either is the picture it was yesterday. The matcher that Jest projects have for that is
+`toMatchImageSnapshot()` of jest-image-snapshot (1,035,902 downloads from npm in the week to
+2026-11-22). It does not run in `bun test`. It reads `this.snapshotState`, which is Jest's own,
+and the first call ends with
+`TypeError: undefined is not an object (evaluating 'snapshotState._counters')`, on Bun 1.4.3 and
+on today's `main`. A project with image snapshots could not move its tests, and a new one had to
+decode the two files and compare them by hand. No issue and no pull request of oven-sh/bun has
+the matcher (searched for `toMatchImageSnapshot`, `jest-image-snapshot` and "visual regression").
+Now it is a matcher of `bun:test`:
+
+```ts
+import { test, expect } from "bun:test";
+
+test("the home page", async () => {
+  await using view = new Bun.WebView({ width: 1280, height: 720 });
+  await view.navigate("http://localhost:3000");
+
+  expect(await view.screenshot()).toMatchImageSnapshot();
+});
+```
+
+```ts
+// Rendering differs a little from one machine to the next. Say how much is the same picture.
+expect(screenshot).toMatchImageSnapshot({
+  failureThreshold: 0.01, // at most 1% of the pixels
+  failureThresholdType: "percent",
+  customDiffConfig: { threshold: 0.1 }, // how far apart two colors are before a pixel differs
+});
+```
+
+```txt
+error: expect(received).toMatchImageSnapshot(options)
+
+Expected image to match or be a close match to snapshot but was 2% different from snapshot (18432 differing pixels).
+See diff for details: /app/__image_snapshots__/__diff_output__/page-test-ts-the-home-page-1-snap-diff.png
+```
+
+The options, the comparison, the names of the files and the two failure messages are those of
+jest-image-snapshot, so a project that moves from Jest keeps its `__image_snapshots__`
+directories as they are, and a snapshot passes or fails in Bun as it does there.
+
+- The image is the bytes of an image file in a `Buffer`, a typed array, a `DataView`, an
+  `ArrayBuffer` or a `Blob`, which is what `view.screenshot()` returns. It goes through the
+  decoders of `Bun.Image`: PNG, JPEG, WebP, GIF and BMP everywhere, and HEIC, AVIF and TIFF where
+  the system decodes them. A `Blob` that is a file (`Bun.file()`) is refused with a message that
+  says to pass `await file.bytes()`: a matcher does not wait for a read.
+- The snapshot is `__image_snapshots__/<name>.png` beside the test file. The name is
+  `kebabCase("<test file>-<test name>-<count>")` and `-snap`:
+  `page-test-ts-the-home-page-1-snap.png`. The count is the number of the snapshot in its test,
+  and text snapshots count too, as in jest-image-snapshot, which takes the count from Jest's
+  snapshot state.
+- If the snapshot is not there, the matcher writes it and passes. A PNG is written byte for
+  byte. An image of another format is written as a PNG of its pixels, with its color profile. In
+  CI nothing is written and the test fails with the message that `toMatchSnapshot()` has for
+  that. `--update-snapshots` writes the file in CI too.
+- If it is there, both images are decoded to RGBA and compared pixel by pixel, the way
+  pixelmatch 5.3 does it: the difference of two colors in YIQ, a `threshold` from 0 to 1 on it
+  (`0.01` by default, as in jest-image-snapshot), and a test for anti-aliasing, so that an edge
+  that is smoothed another way does not count. `customDiffConfig.includeAA` counts it.
+- The test fails when more pixels differ than `failureThreshold` allows: a number of pixels, or
+  a share of them from 0 to 1 with `failureThresholdType: "percent"`. The default is 0.
+- An image of another size than the snapshot fails with
+  `Expected image to be the same size as the snapshot (8x8), but was different (8x10).` With
+  `allowSizeMismatch` both are put on a canvas that holds both and compared there.
+- A failure writes `__image_snapshots__/__diff_output__/<name>-diff.png`: the snapshot, the
+  picture of the difference and the received image side by side, or one above the other with
+  `diffDirection: "vertical"`, or the difference alone with `onlyDiff`. In the difference a pixel
+  that differs is red, one that differs as anti-aliasing does is yellow, and the rest is the
+  image in pale gray. `storeReceivedOnFailure` also writes the received image, to
+  `__received_output__/<name>-received.png`. The next comparison of that snapshot removes both
+  files first.
+- `--update-snapshots` writes the snapshot again when the image fails, and leaves it when the
+  image passes within the thresholds. `updatePassedSnapshot` writes it then too. This is what
+  jest-image-snapshot does, so that an update does not touch every PNG of a repository.
+- `customSnapshotIdentifier` names the file, and a `/` in it makes directories. It can be a
+  function of `{ testPath, currentTestName, counter, defaultIdentifier }`. If the function
+  returns nothing, the name is `defaultIdentifier`, which has no `-snap`, as in the package.
+  `customSnapshotsDir`, `customDiffDir`, `customReceivedDir` and `customReceivedPostfix` say
+  where the files go. A relative directory is relative to the working directory and not to the
+  test file, because jest-image-snapshot gives it to `path.join()`.
+- The image counts among the snapshots of the run: `snapshots: 2 passed, 1 added, 1 failed`.
+- In concurrent tests it works through the `expect` of the test context, like every snapshot
+  matcher, and each test has its own count. With the global `expect` it throws what
+  `toMatchSnapshot()` throws there. `.not` is refused. `.resolves` works.
+- `comparisonMethod: "ssim"` and a `blur` above 0 fail the test with a message. They change
+  what a difference is, and Bun has neither. `dumpDiffToConsole`, `dumpInlineDiffToConsole`,
+  `noColors`, `runInProcess`, `maxChildProcessBufferSizeInBytes` and `runtimeHooksPath` are
+  ignored: a test that has them runs.
+- The `expect.extend({ toMatchImageSnapshot })` of the package has to go from a setup file. A
+  matcher that `expect.extend()` adds replaces the built-in one, and the one of the package
+  still throws. The docs say so, and what to do about `configureToMatchImageSnapshot()`.
+
+How it is built.
+
+- `src/runtime/test_runner/image_snapshot.rs` has what needs no JavaScript: the decode through
+  `crate::image::codecs`, the comparison, the picture of the difference, the names and the
+  files. Nothing is linked that was not there. The PNG encoder and the decoders are those of
+  `Bun.Image`.
+- The comparison is a port of pixelmatch 5.3.0, the version that jest-image-snapshot 6.4.0
+  depends on: `colorDelta`, `antialiased`, `hasManySiblings` and the drawing. The arithmetic is
+  `f64` in pixelmatch's order, so a color is at the threshold in Bun exactly when it is there.
+- It runs twice at most. The first pass counts and draws nothing, and returns at once when the
+  two buffers are equal, which is the usual case. Only an image that fails is compared again to
+  draw the difference. An image of the size of its snapshot is compared where the decoder left
+  it, without a copy.
+- For two sizes, jest-image-snapshot copies each image to a canvas of the larger width and the
+  larger height and paints the rest black at a quarter opacity. Its test for "the rest" is
+  `x > width || y > height`, so the first column and the first row beside an image stay
+  transparent. The number of pixels that differ follows from that, so `on_canvas` does the same.
+- The name is a port of lodash's `kebabCase`, which jest-image-snapshot calls: `deburr` with its
+  table for Latin-1 and Latin Extended-A (made from lodash by a script and checked against it),
+  the apostrophes, and the alternatives of its word pattern, ordinals such as `21st` included.
+  One thing differs, and the function says so: lodash makes a word of each emoji, and here an
+  emoji that touches a letter is part of that word.
+- `Snapshots::count_image` in `snapshot.rs` counts the image with the test's other snapshots and
+  returns the test's name as Jest writes it. `name_of` is split for it: a key of Jest's `.snap`
+  file has its line breaks escaped, and the name of a PNG starts from the name as it is written.
+- `expect/to_match_image_snapshot.rs` is the matcher: the options, the bytes of the received
+  value, the paths and the messages. It copies the bytes before it calls
+  `customSnapshotIdentifier`, which is script and could change the buffer.
+- The matcher is in `expect.bind.ts`, in the list of matchers in
+  `src/codegen/builtins/host/modules.builtins.ts` and in the table of `docs/test/writing-tests.mdx`.
+- `LICENSE.md` names pixelmatch (ISC), jest-image-snapshot (Apache 2.0) and lodash (MIT).
+- `pixelmatch` 5.3.0 is now a dependency of `test/package.json`. It was in `test/bun.lock`
+  already, through `jimp`, so the lockfile gains one line.
+
+What was checked.
+
+- Nine tests in `test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts`, each a `bun test`
+  run or several in a temporary directory, with PNG files that the test makes and reads with
+  `node:zlib`: write, pass, fail with the picture, update; the thresholds, anti-aliasing and two
+  sizes; 150 generated pairs of images compared with the real pixelmatch, the count and every
+  pixel of the picture; where the files go for each option; the names of twelve tests compared
+  with lodash; the forms and formats of the input; concurrent tests; what is refused; CI. They
+  fail on Bun 1.4.3 with `toMatchImageSnapshot is not a function`. The file passes on the debug
+  build (191 pass, 1 skip) with `FORCE_COLOR=1`. Without it the older test `error snapshots`
+  fails: its inline snapshot has ANSI colors in it. The nine pass on the release build too.
+- Against the packages themselves, on generated input and on the release build, outside the test
+  suite. 5,000 pairs of images against pixelmatch 5.3.0, 2,053 of which differ: no difference in
+  a count or in a pixel of a picture. 15,000 test names against `kebabCase` of lodash 4.17.21,
+  name by name: letters, digits, punctuation, line breaks, ordinals, apostrophes, accented
+  Latin, Cyrillic, Japanese, Chinese, and emoji between spaces, and no difference. 1,400 more
+  names have every code point from U+00A0 to U+017F in six places each, and none differs. 5,000
+  comparisons against `diffImageToSnapshot` of jest-image-snapshot 6.4.0, 2,445 of them of two
+  sizes, with every option that both have: the same verdict, the same line of the message down
+  to the digits of the percentage, the same pixels in the composed picture and the same received
+  file.
+- A test with a real `Bun.WebView` (Chrome on this machine) wrote its snapshot, passed the
+  second time, and failed with a picture when the page changed its color.
+- `cargo check --workspace` for `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+  `aarch64-apple-darwin` and `x86_64-unknown-freebsd`, `cargo clippy --workspace --no-deps` and
+  `cargo fmt --all --check` pass. clippy found one thing in the new code, `chunks_exact_mut(4)`.
+  The source lints pass on the release build (223). On the debug build two of them run into their
+  5 second limit, as before. The bun-types test passes (30), with `AOT_ENGINE_DIRECTORY` set to
+  the engine of the build cache, as before.
+
+What it costs, measured on two release builds from one directory and one toolchain (linux x64,
+ThinLTO): the commit before this one and this one.
+
+- The stripped executable is 157,546,312 and 157,570,888 bytes, 24,576 more. `size` has 26,996
+  more bytes of text (157,351,096 and 157,378,092) and the same data and bss.
+- A process that does not run tests makes nothing new. The static table of `Expect.prototype`
+  has one more entry, which becomes a property when `bun test` first makes the prototype.
+- No other matcher does more work. `Snapshots::name_of` is `name_as_written` followed by the
+  escape of line breaks that it had inside, for the same callers.
+- A comparison, on a screenshot of a page of text from Chrome, 1280 by 633 pixels and 307 KB as
+  a PNG: 3.5 ms when it is the snapshot (two decodes and one comparison of the bytes), 5.9 ms
+  when it differs and is within the threshold (the pixels are compared), and 38 ms when it fails
+  (the picture of the difference is drawn, composed with the other two, encoded and written).
+
+Not in this commit.
+
+- The `"ssim"` comparison and `blur`.
+- A report of snapshot files that no test asked for. jest-image-snapshot has a reporter for
+  that, and `bun test` removes obsolete entries only from `.snap` files.
+- Options for every test of a project, which `configureToMatchImageSnapshot()` gives. A
+  `bunfig.toml` section could hold them.
+- A `Blob` that is a file. The matcher would have to return a promise for it, as
+  `toMatchFileSnapshot()` does.
+
+The rebase of the day.
+
+- Upstream moved by 11 commits, to dac8e3b0f4b. 82 patches went onto it. 13 of them stopped the
+  rebase, and one more was dropped.
+- Dropped: the built-in channels of `node:diagnostics_channel` (2026-11-14). oven-sh/bun#49415
+  brings the module to Node.js 26.12.1 and is a superset of the patch: the same
+  `http.server.*`, `net.*`, `child_process` and `worker_threads` events,
+  `TracingChannel#hasSubscribers`, a subscription that holds its channel, and the same test
+  files of Node.js. The patch conflicted with it in twelve files.
+- oven-sh/bun#49315 rewrites the POSIX `CopyFile` of `Bun.write(file, file)` as one function
+  with one copy loop. The `append` option (2026-08-29) is ported onto it: the field and the
+  parameter, `open_destination_flags(append)`, no `clonefile` and no `fallocate` for an append,
+  and the capped read and write loop in `copy_opened` before the kernel copies are tried.
+  `note_written` is `pub(super)` now, as upstream made it, and keeps the patch's `is_whole`. The
+  Windows half merged by itself. `bun-write.test.js` (122) and `filesink.test.ts` (94) pass.
+- oven-sh/bun#49207 changes how the Redis commands read their arguments. `redis.multi()`
+  (2026-10-20) makes `send` return a `JsResult`, so the two functions that conflicted are
+  upstream's, without the `Ok()` around the call. The five `multi()` cases that need no server
+  pass. The others need the `redis_unified` service of the test harness, which this machine
+  does not have.
+- oven-sh/bun#49415 adds a task tag. Three shell patches change the number that
+  `dispatch.rs` asserts for the tags (`wc`, the `for` loop, background commands), and git took
+  upstream's 83 for the first of them without a conflict. The build failed at the assertion.
+  Each of the three commits now has the number of its own tags: 84, 85 and 84.
+- The same pull request takes version 53 of the transpiler cache. The entry of
+  `import.meta.hot` (2026-11-05) is version 54 now.
+- oven-sh/bun#49291 adds `Bun.diff` to the line of `docs/runtime/bun-apis.mdx` that three
+  patches add to (`Bun.INI`, `Bun.CSV`, `Bun.msgpack`). With all of them the line is wider than
+  the table, so prettier pads every row again, in the `Bun.msgpack` commit and in the three
+  after it that touch the table.
+- Both sides kept, in lines that are next to each other: a module in `src/runtime/api.rs`
+  (`Bun.CSV`), an import in `ConsoleObject.rs` (`%c`), a row of `docs/compiler/compatibility.mdx`
+  (the `bytes` loader), tests at the end of `scan.test.ts`, `rm.test.ts`,
+  `bun-build-api.test.ts` and the Redis type fixture, and `names_two_files` beside
+  `reject_empty_path` in the shell (oven-sh/bun#49451).
+- oven-sh/bun#49474 raises the versions in `bench/package.json`. The `change-case` line of the
+  case functions (2026-11-03) is added to upstream's list and lockfile.
+- The hash at the head of `src/js/ahead-of-time/node/worker_threads.ts` is of the file as it
+  is after the Web Locks patch (2026-09-21), on top of upstream's change to it.
+- Run on the debug build after the rebase, before the feature: `bun-write` (122), `filesink`
+  (94), the shell's `rm` (22) and `mv` (22), and `glob/scan` (223, and the one recursive scan of
+  this checkout that runs into its 30 second limit on a debug build, as on earlier days). The
+  fork's three workflows were green for the push of 2026-11-22.
+- Only the tip of the stack was built, as before.
+
+Files: `src/runtime/test_runner/image_snapshot.rs` (new),
+`src/runtime/test_runner/expect/to_match_image_snapshot.rs` (new),
+`src/runtime/test_runner/snapshot.rs` (`count_image`, `name_as_written`),
+`src/runtime/test_runner/expect/snapshots.rs`, `src/runtime/test_runner/expect.rs`,
+`src/runtime/test_runner/expect.bind.ts`, `src/runtime/test_runner/mod.rs`,
+`src/codegen/builtins/host/modules.builtins.ts`, `packages/bun-types/test.d.ts`,
+`docs/test/snapshots.mdx`, `docs/test/writing-tests.mdx`, `docs/runtime/webview.mdx`,
+`LICENSE.md`, `test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts`,
+`test/integration/bun-types/fixture/test.ts`, `test/package.json`, `test/bun.lock`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
@@ -13145,3 +13383,8 @@ Files: `src/s3_signing/post_policy.rs` (new), `src/s3_signing/credentials.rs`
   `Bun.build` is a task that the bundle thread owns. The call needs a new way from the plugins to
   the bundle that waits for them, so it is a feature to write again and not a patch to port. The
   commit before it, which tells `onResolve` the right `kind`, stays.
+- 2026-11-14, the built-in channels of `node:diagnostics_channel` for HTTP servers, sockets,
+  child processes and workers: dropped on 2026-11-23. oven-sh/bun#49415 brings the module to
+  Node.js 26.12.1 upstream. It publishes the same `http.server.*`, `net.*`, `child_process` and
+  `worker_threads` events, has `TracingChannel#hasSubscribers`, and a subscription holds its
+  channel there too.

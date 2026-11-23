@@ -24,6 +24,7 @@ cfg_jsc! {
     #[path = "environment.rs"]    pub(crate) mod environment;
     #[path = "Execution.rs"]      pub(crate) mod execution;
     pub(crate) mod expect;
+    #[path = "image_snapshot.rs"] pub(crate) mod image_snapshot;
     #[path = "jest.rs"]           pub(crate) mod jest;
     #[path = "module_mock.rs"]    mod module_mock;
     #[path = "Order.rs"]          pub(crate) mod order;

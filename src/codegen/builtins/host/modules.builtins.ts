@@ -252,8 +252,8 @@ const matchers = [
   "toHaveBeenLastCalledWith", "toHaveBeenNthCalledWith", "toHaveLastResolvedWith", "toHaveLastReturnedWith",
   "toHaveLength", "toHaveNthResolvedWith", "toHaveNthReturnedWith", "toHaveProperty", "toHaveResolved",
   "toHaveResolvedTimes", "toHaveResolvedWith", "toHaveReturned", "toHaveReturnedTimes", "toHaveReturnedWith",
-  "toInclude", "toIncludeRepeated", "toMatch", "toMatchFileSnapshot", "toMatchInlineSnapshot", "toMatchObject",
-  "toMatchSnapshot", "toReturn", "toSatisfy", "toStartWith", "toStrictEqual", "toThrow", "toThrowError",
+  "toInclude", "toIncludeRepeated", "toMatch", "toMatchFileSnapshot", "toMatchImageSnapshot", "toMatchInlineSnapshot",
+  "toMatchObject", "toMatchSnapshot", "toReturn", "toSatisfy", "toStartWith", "toStrictEqual", "toThrow", "toThrowError",
   "toThrowErrorMatchingInlineSnapshot", "toThrowErrorMatchingSnapshot",
 ];
 // prettier-ignore

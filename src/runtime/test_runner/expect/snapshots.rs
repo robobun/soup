@@ -39,7 +39,7 @@ fn utf8<'a>(text: &'a Option<JSStringView<'_>>) -> Option<Utf8Bytes<'a>> {
 }
 
 #[optimize(size)]
-fn begin_snapshot<'a>(
+pub(super) fn begin_snapshot<'a>(
     this: This<'a>,
     cx: &'a mut JsScope<'_>,
     name: &'static str,

@@ -266,6 +266,8 @@ const png = await view.screenshot();
 await Bun.write("page.png", png);
 ```
 
+In a test, compare the screenshot with a saved one with [`expect(png).toMatchImageSnapshot()`](/test/snapshots#image-snapshots).
+
 ### Image format
 
 ```ts

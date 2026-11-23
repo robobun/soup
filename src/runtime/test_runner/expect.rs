@@ -46,6 +46,7 @@ mod numbers;
 mod predicates;
 mod snapshots;
 mod text;
+mod to_match_image_snapshot;
 mod to_throw;
 
 pub(crate) trait JSValueTestExt {

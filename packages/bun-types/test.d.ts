@@ -2550,6 +2550,31 @@ declare module "bun:test" {
     toMatchFileSnapshot(path: string, hint?: string): Promise<void>;
 
     /**
+     * Asserts that an image matches the PNG snapshot that is saved for it, pixel by pixel.
+     *
+     * The image is the bytes of a PNG, JPEG, WebP, GIF or BMP file in a `Buffer`, a typed array, an `ArrayBuffer`
+     * or a `Blob`, for example a screenshot from `Bun.WebView`.
+     *
+     * The snapshot is a file in `__image_snapshots__` beside the test file. If it doesn't exist, it's created,
+     * except in CI. When the image differs, the test fails and a picture of the difference is written to
+     * `__image_snapshots__/__diff_output__`. `--update-snapshots` rewrites a snapshot that differs.
+     *
+     * The options, the comparison and the file names are those of `jest-image-snapshot`.
+     *
+     * @example
+     * await using view = new Bun.WebView({ width: 1280, height: 720 });
+     * await view.navigate("http://localhost:3000");
+     * expect(await view.screenshot()).toMatchImageSnapshot();
+     *
+     * @example
+     * // Pass if at most 1% of the pixels differ.
+     * expect(png).toMatchImageSnapshot({ failureThreshold: 0.01, failureThresholdType: "percent" });
+     *
+     * @param options How to compare the image, and where its files are.
+     */
+    toMatchImageSnapshot(options?: ImageSnapshotOptions): R;
+
+    /**
      * Asserts that a function throws an error matching the most recent snapshot.
      *
      * @example
@@ -3030,6 +3055,109 @@ declare module "bun:test" {
       ? CustomMatcher<unknown, Parameters<CustomMatchersDetected[k]>>
       : CustomMatcher<unknown, any[]>;
   };
+
+  /** The options of {@link MatchersBuiltin.toMatchImageSnapshot}, with the names and the meaning that `jest-image-snapshot` gives them. */
+  export interface ImageSnapshotOptions {
+    /**
+     * How much of the image may differ before the test fails: a number of pixels, or a share of the pixels from
+     * `0` to `1` if {@link failureThresholdType} is `"percent"`.
+     *
+     * @default 0
+     */
+    failureThreshold?: number;
+    /**
+     * What {@link failureThreshold} counts.
+     *
+     * @default "pixel"
+     */
+    failureThresholdType?: "pixel" | "percent";
+    /** Options for the comparison of two pixels, which is the one `pixelmatch` makes. */
+    customDiffConfig?: {
+      /**
+       * How far apart the colors of two pixels may be before the pixels differ, from `0` to `1`. A lower value
+       * finds smaller differences.
+       *
+       * @default 0.01
+       */
+      threshold?: number;
+      /**
+       * Count the pixels that differ only because an edge is anti-aliased another way.
+       *
+       * @default false
+       */
+      includeAA?: boolean;
+    };
+    /**
+     * Pass when the image and the snapshot differ in size and the pixels that differ are within
+     * {@link failureThreshold}. The smaller of the two is compared as if it were padded.
+     *
+     * @default false
+     */
+    allowSizeMismatch?: boolean;
+    /**
+     * The name of the snapshot's file, without `.png`, or a function that returns it. A name with a `/` puts the
+     * file in a directory below the snapshots.
+     *
+     * By default the name is made of the test file's name, the test's name and the number of the snapshot in the
+     * test: `page-test-ts-renders-the-page-1-snap`.
+     */
+    customSnapshotIdentifier?:
+      | string
+      | ((test: {
+          testPath: string;
+          currentTestName: string;
+          counter: number;
+          defaultIdentifier: string;
+        }) => string | undefined);
+    /**
+     * The directory of the snapshots. A relative path is relative to the working directory.
+     *
+     * @default "__image_snapshots__" beside the test file
+     */
+    customSnapshotsDir?: string;
+    /**
+     * The directory for the pictures of a difference. A relative path is relative to the working directory.
+     *
+     * @default "__diff_output__" in the directory of the snapshots
+     */
+    customDiffDir?: string;
+    /**
+     * How the picture of a difference puts the snapshot, the difference and the received image beside each other.
+     *
+     * @default "horizontal"
+     */
+    diffDirection?: "horizontal" | "vertical";
+    /**
+     * Write the difference alone, without the snapshot and the received image beside it.
+     *
+     * @default false
+     */
+    onlyDiff?: boolean;
+    /**
+     * Also write the received image when it fails. To accept it, copy it over the snapshot.
+     *
+     * @default false
+     */
+    storeReceivedOnFailure?: boolean;
+    /**
+     * The directory for the received images that fail. A relative path is relative to the working directory.
+     *
+     * @default "__received_output__" in the directory of the snapshots
+     */
+    customReceivedDir?: string;
+    /**
+     * What the file of a received image that fails has after the snapshot's name.
+     *
+     * @default "-received"
+     */
+    customReceivedPostfix?: string;
+    /**
+     * With `--update-snapshots`, also rewrite a snapshot that the image matches within the thresholds.
+     *
+     * @default false
+     */
+    updatePassedSnapshot?: boolean;
+  }
 
   /** Prints a value nested inside the one a {@link SnapshotSerializer} is printing. */
   export type SnapshotPrinter = (
