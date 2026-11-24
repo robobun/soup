@@ -204,6 +204,7 @@ pub(crate) mod pm_diff_semantic;
 pub(crate) mod pm_fetch_command;
 #[path = "pm_licenses_command.rs"]
 pub(crate) mod pm_licenses_command;
+pub(crate) mod pm_ls_json;
 #[path = "pm_pkg_command.rs"]
 pub(crate) mod pm_pkg_command;
 #[path = "pm_sbom_command.rs"]

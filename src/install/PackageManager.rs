@@ -143,6 +143,7 @@ impl PackageManagerCommand {
   <d>├<r> <cyan>--all<r>                     list the entire tree of installed dependencies
   <d>├<r> <cyan>--trusted<r>                 list only trusted dependencies
   <d>├<r> <cyan>--prod<r>                    omit devDependencies
+  <d>├<r> <cyan>--json<r>                    output as JSON
   <d>└<r> <cyan>-g<r>                        list the tree of <b>globally<r> installed dependencies
   <b><green>bun pm<r> <blue>why<r> <d>\<pkg\><r>            show dependency tree explaining why a package is installed
   <b><green>bun pm<r> <blue>diff<r> <d>[a] [b]<r>         show what changed between two versions of a package (or vs a folder/tarball)

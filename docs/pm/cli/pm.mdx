@@ -210,6 +210,83 @@ bun list --global
 └── typescript@5.0.4
 ```
 
+To get the list as JSON, pass `--json`. The document has the shape of the one that `pnpm ls --json` prints: an array with the root package in it, and its dependencies under the `package.json` section that has them.
+
+```bash terminal icon="terminal"
+bun pm ls --json
+# or
+bun list --json
+```
+
+```json
+[
+  {
+    "name": "my-app",
+    "version": "1.0.0",
+    "path": "/path/to/project",
+    "private": true,
+    "dependencies": {
+      "react": {
+        "from": "react",
+        "version": "18.2.0",
+        "resolved": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+        "path": "/path/to/project/node_modules/react"
+      }
+    },
+    "devDependencies": {
+      "typescript": {
+        "from": "typescript",
+        "version": "5.0.4",
+        "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.0.4.tgz",
+        "path": "/path/to/project/node_modules/typescript"
+      }
+    }
+  }
+]
+```
+
+- The key of an entry is the name that the package is installed under, and `from` is the name of the package. They differ for an alias such as `"my-react": "npm:react@18.2.0"`.
+- `version` is what the text list prints after the `@`, with `/` in a path on every platform. `resolved` is the tarball of a package that comes from a registry.
+- `path` is the real path of a folder that has the package: the one that its dependent loads, or another one if that folder does not have the package. The isolated linker keeps the packages of a registry in its store, so their paths are there. An entry has no `path` when no folder on disk has the package.
+- The root package has `dependencies`, `devDependencies` and `optionalDependencies`, as in pnpm's document, and two sections of Bun's own: `peerDependencies`, and `workspaces` with every workspace member. A section that lists nothing is left out.
+
+With `--all`, or with package names, an entry also has the `dependencies` that `bun.lock` resolved for that package. This is the dependency graph, and not the tree of `node_modules` folders that the text list prints. A package that is not on disk is left out, unless it leads to a package on disk that nothing else on disk depends on. Then it is listed without a `path`.
+
+A package that is in the document more than once has its dependencies in one entry, the one nearest to the root. If it has dependencies, its other entries have `"deduped": true` and a `dedupedDependenciesCount`: the number of entries below the entry that has them.
+
+```bash terminal icon="terminal"
+bun pm ls --all --json
+```
+
+```json
+"dependencies": {
+  "debug": {
+    "from": "debug",
+    "version": "4.3.4",
+    "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+    "path": "/path/to/project/node_modules/debug",
+    "dependencies": {
+      "ms": {
+        "from": "ms",
+        "version": "2.1.2",
+        "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.2.tgz",
+        "path": "/path/to/project/node_modules/ms"
+      },
+      "supports-color": {
+        "from": "supports-color",
+        "version": "8.1.1",
+        "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-8.1.1.tgz",
+        "path": "/path/to/project/node_modules/supports-color",
+        "deduped": true,
+        "dedupedDependenciesCount": 1
+      }
+    }
+  }
+}
+```
+
+With package names, the document keeps the entries that lead to a package that is installed under one of the names. `--trusted` adds `"trusted": true` to each trusted entry, and with `--all` it keeps the entries that lead to one. `--production`, `--omit`, `--depth=0` and `-g` mean what they mean for the text list.
+
 ## licenses
 
 List every installed package grouped by license, as read from each package's `package.json` in `node_modules`. Bun lists packages without a `license` field under `Unknown`. Bun marks packages only reachable through `devDependencies` with `(dev)`.

@@ -21,6 +21,7 @@ use crate::cli::did_you_mean;
 use crate::cli::pm_cache_prune_command::{DEFAULT_MAX_AGE_DAYS, PmCachePruneCommand};
 use crate::cli::pm_diff_command as PmDiffCommand;
 use crate::cli::pm_licenses_command::{BunStore, LicensesFlags, PmLicensesCommand};
+use crate::cli::pm_ls_json;
 use crate::cli::pm_pkg_command::PmPkgCommand;
 use crate::cli::pm_sbom_command::{PmSbomCommand, SbomFlags};
 use crate::cli::pm_trusted_command::{
@@ -646,6 +647,10 @@ impl PackageManagerCommand {
             let load_lockfile = pm.load_lockfile_from_cwd::<true>();
             // Before the first `bun add -g`, and after the last package was removed.
             if global && matches!(load_lockfile, LoadResult::NotFound) {
+                if pm.options.json_output {
+                    pm_ls_json::print_without_lockfile();
+                    Global::exit(0);
+                }
                 Output::println(format_args!(
                     "{} node_modules{}",
                     bstr::BStr::new(Fs::FileSystem::get().top_level_dir_without_trailing_slash()),
@@ -695,6 +700,22 @@ impl PackageManagerCommand {
                 (!trusted_only || is_trusted(pm, dep_id))
                     && (names.is_empty() || names.contains(&name))
             };
+
+            if pm.options.json_output {
+                let selected: &dyn Fn(DependencyID) -> bool = &selected;
+                let trusted: &dyn Fn(DependencyID) -> bool = &|dep_id| is_trusted(pm, dep_id);
+                let found = pm_ls_json::Listing {
+                    lockfile,
+                    features,
+                    wanted: &wanted,
+                    is_installed: &mut is_installed,
+                    selected: (trusted_only || !names.is_empty()).then_some(selected),
+                    trusted: trusted_only.then_some(trusted),
+                    all,
+                }
+                .print();
+                exit_listed(found, names, log_level);
+            }
 
             let mut iterator =
                 tree::Iterator::<{ tree::IteratorPathStyle::NodeModules }>::init(lockfile);
@@ -791,16 +812,7 @@ impl PackageManagerCommand {
                 !sorted_dependencies.is_empty()
             };
 
-            if !found && !names.is_empty() {
-                if log_level != LogLevel::Silent {
-                    Output::err_generic(
-                        "no packages match: {}",
-                        (bstr::BStr::new(&names.join(&b", "[..])),),
-                    );
-                }
-                Global::exit(1);
-            }
-            Global::exit(0);
+            exit_listed(found, names, log_level);
         } else if strings::eql_comptime(subcommand, b"migrate") {
             if !pm.options.enable.force_save_lockfile() {
                 for name in [bun_core::zstr!("bun.lock"), bun_core::zstr!("bun.lockb")] {
@@ -893,6 +905,20 @@ impl PackageManagerCommand {
             Global::exit(0);
         }
     }
+}
+
+/// The end of `bun pm ls`. Names that no package has are an error.
+fn exit_listed(found: bool, names: &[&[u8]], log_level: LogLevel) -> ! {
+    if !found && !names.is_empty() {
+        if log_level != LogLevel::Silent {
+            Output::err_generic(
+                "no packages match: {}",
+                (bstr::BStr::new(&names.join(&b", "[..])),),
+            );
+        }
+        Global::exit(1);
+    }
+    Global::exit(0);
 }
 
 fn print_node_modules_folder_structure(

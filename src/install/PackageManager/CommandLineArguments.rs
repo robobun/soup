@@ -375,7 +375,7 @@ const PM_SUBCOMMAND_FLAGS: &[(&[u8], &[&[u8]])] = &[
         ],
     ),
     (b"licenses", &[b"--json", b"--filter", b"--dev", b"--long"]),
-    (b"ls", &[b"--all", b"--trusted", b"--depth"]),
+    (b"ls", &[b"--all", b"--trusted", b"--depth", b"--json"]),
     (b"pack", &[b"--destination", b"--filename", b"--gzip-level"]),
     (b"pkg", &[b"--json"]),
     (b"trust", &[b"--all"]),

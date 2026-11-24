@@ -438,7 +438,7 @@ fn tree_locations(lockfile: &Lockfile) -> Vec<Option<Box<[u8]>>> {
     out
 }
 
-fn read_package_info(dir: &[u8], log: &mut Log) -> Option<PackageInfo> {
+pub(crate) fn read_package_info(dir: &[u8], log: &mut Log) -> Option<PackageInfo> {
     let path = Path::from_parts(&[dir, b"package.json"]);
     let contents = File::read_from(Fd::cwd(), &path).ok()?;
     bun_ast::initialize_store_or_reset();

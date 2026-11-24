@@ -302,6 +302,7 @@ _bun_pm_completion() {
             pmargs=(
                 "--all[list the entire tree of installed dependencies]"
                 "--trusted[list only trusted dependencies]"
+                "--json[output as JSON]"
                 "-g[list the tree of globally installed dependencies]"
             )
 

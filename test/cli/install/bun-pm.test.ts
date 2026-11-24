@@ -15,8 +15,18 @@ import {
   tmpdirSync,
   unprivilegedSpawnOptions,
 } from "harness";
-import { cpSync, mkdirSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { basename, join, sep } from "path";
+import {
+  cpSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, join, relative, sep } from "path";
 import { TestRegistry } from "registry";
 import {
   dummyAfterAll,
@@ -348,21 +358,53 @@ describe.concurrent("bun pm ls lists what's on disk", () => {
       bunfigOpts,
       files: Object.fromEntries(Object.entries(files).map(([path, json]) => [path, JSON.stringify(json)])),
     });
+    async function run(...args: string[]) {
+      await using proc = spawn({
+        cmd: [bunExe(), ...args],
+        cwd: packageDir,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+        env: { ...env, BUN_INSTALL_CACHE_DIR: join(packageDir, ".bun-cache") },
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout, stderr, exitCode };
+    }
     return {
       packageDir,
       async bun(...args: string[]) {
-        await using proc = spawn({
-          cmd: [bunExe(), ...args],
-          cwd: packageDir,
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: "ignore",
-          env: { ...env, BUN_INSTALL_CACHE_DIR: join(packageDir, ".bun-cache") },
-        });
-        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        const { stdout, stderr, exitCode } = await run(...args);
         return { stdout: stdout.replaceAll(packageDir, "<dir>"), stderr, exitCode };
       },
+      /** The root package of the `--json` document. Each `path` is relative to the project and has `/` in it. */
+      async json(...args: string[]) {
+        const { stdout, stderr, exitCode } = await run(...args, "--json");
+        if (!stdout.startsWith("[")) expect({ stdout, stderr, exitCode }).toEqual({ stdout: "a JSON document" });
+        const real = realpathSync(packageDir);
+        const document = JSON.parse(stdout, (key, value) =>
+          key === "path" ? relative(real, value).replaceAll(sep, "/") : value,
+        );
+        expect(document).toBeArrayOfSize(1);
+        return { root: document[0], stderr, exitCode };
+      },
     };
+  }
+  const sections = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "workspaces"];
+  /** The entries of a `--json` document as `name@version`, each with whether its `path` is a folder of that package. */
+  function entriesOf(packageDir: string, root: Record<string, any>) {
+    const real = realpathSync(packageDir);
+    const entries: [string, boolean][] = [];
+    const read = (group: Record<string, any> = {}) => {
+      for (const [name, { from, version, resolved, path, dependencies }] of Object.entries(group)) {
+        const manifest = path === undefined ? {} : JSON.parse(readFileSync(join(real, path, "package.json"), "utf8"));
+        // A package of the registry has its version in package.json.
+        const onDisk = manifest.name === from && (resolved === undefined || manifest.version === version);
+        entries.push([`${name}@${version}`, onDisk]);
+        read(dependencies);
+      }
+    };
+    for (const section of sections) read(root[section]);
+    return entries.sort();
   }
   const listed = (...lines: string[]) => ({ stdout: lines.join("\n") + "\n", stderr: "", exitCode: 0 });
 
@@ -373,8 +415,11 @@ describe.concurrent("bun pm ls lists what's on disk", () => {
     "%j",
     async bunfigOpts => {
       const isolated = bunfigOpts.linker === "isolated";
-      const { packageDir, bun } = await project(bunfigOpts, { "package.json": { name: "foo", dependencies } });
+      const { packageDir, bun, json } = await project(bunfigOpts, { "package.json": { name: "foo", dependencies } });
       expect(await bun("install")).toMatchObject({ exitCode: 0 });
+      // `--json` lists what the text lists. `--all --json` has no-deps in one-fixed-dep.
+      const asJson = async (...args: string[]) => entriesOf(packageDir, (await json("pm", "ls", ...args)).root);
+      const [aDep, noDeps, oneFixedDep] = ["a-dep@1.0.1", "no-deps@1.0.0", "one-fixed-dep@1.0.0"];
 
       expect(await bun("pm", "ls")).toEqual(
         listed("<dir> node_modules (3 installed)", "├── a-dep@1.0.1", "└── one-fixed-dep@1.0.0"),
@@ -382,6 +427,15 @@ describe.concurrent("bun pm ls lists what's on disk", () => {
       expect(await bun("pm", "ls", "--all")).toEqual(
         listed("<dir> node_modules", "├── a-dep@1.0.1", "├── no-deps@1.0.0", "└── one-fixed-dep@1.0.0"),
       );
+      expect(await asJson()).toEqual([
+        [aDep, true],
+        [oneFixedDep, true],
+      ]);
+      expect(await asJson("--all")).toEqual([
+        [aDep, true],
+        [noDeps, true],
+        [oneFixedDep, true],
+      ]);
 
       // The project can't load a-dep anymore. The isolated store still has it, which is what the count and `--all`
       // show.
@@ -397,6 +451,8 @@ describe.concurrent("bun pm ls lists what's on disk", () => {
           "└── one-fixed-dep@1.0.0",
         ),
       );
+      expect(await asJson()).toEqual([[oneFixedDep, true]]);
+      expect(await asJson("--all")).toEqual([...(isolated ? [[aDep, true]] : []), [noDeps, true], [oneFixedDep, true]]);
 
       // A transitive dependency is nowhere but in the store under the isolated linker.
       await rm(join(packageDir, "node_modules", ...(isolated ? [".bun", "no-deps@1.0.0"] : ["no-deps"])), {
@@ -408,6 +464,8 @@ describe.concurrent("bun pm ls lists what's on disk", () => {
       expect(await bun("pm", "ls", "--all")).toEqual(
         listed("<dir> node_modules", ...(isolated ? ["├── a-dep@1.0.1"] : []), "└── one-fixed-dep@1.0.0"),
       );
+      expect(await asJson()).toEqual([[oneFixedDep, true]]);
+      expect(await asJson("--all")).toEqual([...(isolated ? [[aDep, true]] : []), [oneFixedDep, true]]);
 
       // With no node_modules, it lists what's in bun.lock.
       await rm(join(packageDir, "node_modules"), { recursive: true });
@@ -417,6 +475,15 @@ describe.concurrent("bun pm ls lists what's on disk", () => {
       expect(await bun("pm", "ls", "--all")).toEqual(
         listed("<dir> node_modules", "├── a-dep@1.0.1", "├── no-deps@1.0.0", "└── one-fixed-dep@1.0.0"),
       );
+      expect(await asJson()).toEqual([
+        [aDep, false],
+        [oneFixedDep, false],
+      ]);
+      expect(await asJson("--all")).toEqual([
+        [aDep, false],
+        [noDeps, false],
+        [oneFixedDep, false],
+      ]);
     },
   );
 
@@ -505,6 +572,264 @@ describe.concurrent("bun pm ls lists what's on disk", () => {
     ];
     const results = await Promise.all(cases.map(([cmd]) => bun(...cmd.split(" "))));
     expect(results.map((result, i) => [cases[i][0], result])).toEqual(cases);
+  });
+
+  // https://github.com/oven-sh/bun/issues/8283
+  describe.each(["hoisted", "isolated"] as const)("--json, %s", linker => {
+    const files = {
+      "package.json": {
+        name: "foo",
+        version: "1.2.3",
+        private: true,
+        workspaces: ["packages/*"],
+        dependencies: { "one-fixed-dep": "1.0.0", aliased: "npm:no-deps@1.0.1" },
+        devDependencies: { "a-dep": "1.0.1" },
+        // a-dep-b and b-dep-a depend on each other.
+        optionalDependencies: { "a-dep-b": "1.0.0" },
+        peerDependencies: { "no-deps": "1.0.0" },
+        trustedDependencies: ["a-dep", "b-dep-a"],
+      },
+      "packages/member/package.json": {
+        name: "member",
+        version: "0.0.1",
+        dependencies: { "one-fixed-dep": "1.0.0" },
+      },
+    };
+    // An entry of a package of the registry. `hoisted`: where the hoisted linker puts it.
+    const entry = (name: string, version: string, hoisted = `node_modules/${name}`) => ({
+      from: name,
+      version,
+      resolved: `${registry.url}${name}/-/${name}-${version}.tgz`,
+      path: linker === "hoisted" ? hoisted : `node_modules/.bun/${name}@${version}/node_modules/${name}`,
+    });
+    const root = { name: "foo", version: "1.2.3", path: "", private: true };
+    const member = { from: "member", version: "workspace:packages/member", path: "packages/member" };
+    const direct = () => ({
+      dependencies: {
+        aliased: entry("no-deps", "1.0.1", "node_modules/aliased"),
+        "one-fixed-dep": entry("one-fixed-dep", "1.0.0"),
+      },
+      devDependencies: { "a-dep": entry("a-dep", "1.0.1") },
+      optionalDependencies: { "a-dep-b": entry("a-dep-b", "1.0.0") },
+      peerDependencies: { "no-deps": entry("no-deps", "1.0.0") },
+      workspaces: { member },
+    });
+    const document = (groups: object) => ({ root: { ...root, ...groups }, stderr: "", exitCode: 0 });
+
+    test("the direct dependencies, by the section of package.json that has them", async () => {
+      const { bun, json } = await project({ linker }, files);
+      expect(await bun("install")).toMatchObject({ exitCode: 0 });
+      const { dependencies, devDependencies, optionalDependencies, peerDependencies, workspaces } = direct();
+
+      const all = await json("pm", "ls");
+      expect(all).toEqual(document(direct()));
+      expect(Object.keys(all.root)).toEqual(["name", "version", "path", "private", ...sections]);
+      expect(Object.keys(all.root.dependencies.aliased)).toEqual(["from", "version", "resolved", "path"]);
+      // What JSON.stringify() prints, as `pnpm ls --json` does.
+      const { stdout } = await bun("pm", "ls", "--json");
+      expect(stdout).toBe(JSON.stringify(JSON.parse(stdout), null, 2) + "\n");
+
+      const cases: [string, object][] = [
+        ["list", direct()],
+        ["pm ls --depth=0 --all", direct()],
+        ["pm ls --production", { dependencies, optionalDependencies, peerDependencies, workspaces }],
+        ["pm ls --omit=optional --omit=peer", { dependencies, devDependencies, workspaces }],
+        ["pm ls --trusted", { devDependencies: { "a-dep": { ...devDependencies["a-dep"], trusted: true } } }],
+        // `aliased` is no-deps under another name, and a name is the one that the package is installed under.
+        ["pm ls no-deps a-dep member --depth=0", { devDependencies, peerDependencies, workspaces }],
+      ];
+      const results = await Promise.all(cases.map(([cmd]) => json(...cmd.split(" "))));
+      expect(results.map((result, i) => [cases[i][0], result])).toEqual(
+        cases.map(([cmd, groups]) => [cmd, document(groups)]),
+      );
+    });
+
+    test("--all and package names: the dependencies of a dependency, in it once", async () => {
+      const { packageDir, bun, json } = await project({ linker }, files);
+      expect(await bun("install")).toMatchObject({ exitCode: 0 });
+      const { dependencies, devDependencies, optionalDependencies, peerDependencies } = direct();
+      const oneFixedDep = {
+        ...dependencies["one-fixed-dep"],
+        dependencies: { "no-deps": entry("no-deps", "1.0.0") },
+      };
+      // A package has its dependencies where it is nearest to the root, and elsewhere the number of entries below it.
+      const deduped = (entry: object, dedupedDependenciesCount: number) => ({
+        ...entry,
+        deduped: true,
+        dedupedDependenciesCount,
+      });
+      const memberOfAll = {
+        ...member,
+        dependencies: { "one-fixed-dep": deduped(dependencies["one-fixed-dep"], 1) },
+      };
+      const aDepB = (bDepA: object) => ({
+        "a-dep-b": {
+          ...optionalDependencies["a-dep-b"],
+          dependencies: {
+            "b-dep-a": { ...bDepA, dependencies: { "a-dep-b": deduped(optionalDependencies["a-dep-b"], 2) } },
+          },
+        },
+      });
+
+      const all = await json("pm", "ls", "--all");
+      expect(all).toEqual(
+        document({
+          dependencies: { aliased: dependencies.aliased, "one-fixed-dep": oneFixedDep },
+          devDependencies,
+          optionalDependencies: aDepB(entry("b-dep-a", "1.0.0")),
+          peerDependencies,
+          workspaces: { member: memberOfAll },
+        }),
+      );
+      // Each `path` is a folder of that package.
+      expect(entriesOf(packageDir, all.root).filter(([, onDisk]) => !onDisk)).toEqual([]);
+
+      // A name keeps what leads to a package that is installed under it.
+      expect(await json("pm", "ls", "no-deps")).toEqual(
+        document({
+          dependencies: { "one-fixed-dep": oneFixedDep },
+          peerDependencies,
+          workspaces: { member: memberOfAll },
+        }),
+      );
+      expect(await json("list", "one-fixed-dep", "--production")).toEqual(
+        document({
+          dependencies: { "one-fixed-dep": dependencies["one-fixed-dep"] },
+          workspaces: { member: { ...member, dependencies: { "one-fixed-dep": dependencies["one-fixed-dep"] } } },
+        }),
+      );
+      expect(await json("pm", "ls", "nope", "a-dep", "--production")).toEqual({
+        root,
+        stderr: "error: no packages match: nope, a-dep\n",
+        exitCode: 1,
+      });
+
+      // With `--trusted` too, and there an entry says that it is trusted.
+      expect(await json("pm", "ls", "--all", "--trusted")).toEqual(
+        document({
+          devDependencies: { "a-dep": { ...devDependencies["a-dep"], trusted: true } },
+          optionalDependencies: aDepB({ ...entry("b-dep-a", "1.0.0"), trusted: true }),
+        }),
+      );
+    });
+  });
+
+  test("--json: the copy of a package that its dependent loads, and no other version in its place", async () => {
+    const { packageDir, bun, json } = await project(
+      { linker: "hoisted" },
+      {
+        "package.json": {
+          name: "foo",
+          dependencies: {
+            "bundled-1": "1.0.0",
+            "has-bin-entries": "1.0.0",
+            "no-deps": "2.0.0",
+            "one-fixed-dep": "1.0.0",
+          },
+        },
+      },
+    );
+    expect(await bun("install")).toMatchObject({ exitCode: 0 });
+    const entry = (name: string, version: string, path?: string) => ({
+      from: name,
+      version,
+      resolved: `${registry.url}${name}/-/${name}-${version}.tgz`,
+      ...(path && { path }),
+    });
+    // The root has no-deps@2.0.0, so each package that depends on no-deps@1.0.0 has a copy of its own.
+    const copy = (dependent: string) => `node_modules/${dependent}/node_modules/no-deps`;
+    const dependencies = (ofHasBinEntries?: string, ofOneFixedDep?: string) => ({
+      "bundled-1": {
+        ...entry("bundled-1", "1.0.0", "node_modules/bundled-1"),
+        dependencies: { "no-deps": entry("no-deps", "1.0.0", copy("bundled-1")) },
+      },
+      "has-bin-entries": {
+        ...entry("has-bin-entries", "1.0.0", "node_modules/has-bin-entries"),
+        dependencies: { "no-deps": entry("no-deps", "1.0.0", ofHasBinEntries) },
+      },
+      "no-deps": entry("no-deps", "2.0.0", "node_modules/no-deps"),
+      "one-fixed-dep": {
+        ...entry("one-fixed-dep", "1.0.0", "node_modules/one-fixed-dep"),
+        dependencies: { "no-deps": entry("no-deps", "1.0.0", ofOneFixedDep) },
+      },
+    });
+    const all = async () => (await json("pm", "ls", "--all")).root.dependencies;
+    const otherVersion = (dependent: string, version: string) =>
+      writeFile(join(packageDir, copy(dependent), "package.json"), JSON.stringify({ name: "no-deps", version }));
+    expect(await all()).toEqual(dependencies(copy("has-bin-entries"), copy("one-fixed-dep")));
+
+    // A tarball can have another version of a bundled dependency in it. That folder is still the dependency.
+    await otherVersion("bundled-1", "0.9.0");
+    expect(await all()).toEqual(dependencies(copy("has-bin-entries"), copy("one-fixed-dep")));
+
+    // Without its own copy, the path is another folder that has no-deps@1.0.0, and not one of another version.
+    await rm(join(packageDir, copy("one-fixed-dep")), { recursive: true });
+    expect(await all()).toEqual(dependencies(copy("has-bin-entries"), copy("has-bin-entries")));
+
+    await otherVersion("has-bin-entries", "9.9.9");
+    expect(await all()).toEqual(dependencies());
+  });
+
+  test("--json: a package that is on disk under another name is not on disk under this one", async () => {
+    const { packageDir, bun, json } = await project(
+      { linker: "hoisted" },
+      { "package.json": { name: "foo", dependencies: { aliased: "npm:no-deps@1.0.0", "one-fixed-dep": "1.0.0" } } },
+    );
+    expect(await bun("install")).toMatchObject({ exitCode: 0 });
+    await rm(join(packageDir, "node_modules", "no-deps"), { recursive: true });
+
+    const noMatch = { stderr: "error: no packages match: no-deps\n", exitCode: 1 };
+    expect(await bun("pm", "ls", "no-deps")).toEqual({ stdout: "<dir> node_modules\n", ...noMatch });
+    expect(await json("pm", "ls", "no-deps")).toEqual({ root: { name: "foo", path: "", private: false }, ...noMatch });
+    const { root } = await json("pm", "ls", "--all");
+    expect(entriesOf(packageDir, root)).toEqual([
+      ["aliased@1.0.0", true],
+      ["one-fixed-dep@1.0.0", true],
+    ]);
+  });
+
+  test("--json: a package that is not on disk is listed for what is below it, and has no path", async () => {
+    const { packageDir, bun, json } = await project(
+      { linker: "hoisted" },
+      {
+        "package.json": { name: "foo", workspaces: ["member"], dependencies: { "one-fixed-dep": "1.0.0" } },
+        "member/package.json": { name: "member" },
+      },
+    );
+    expect(await bun("install")).toMatchObject({ exitCode: 0 });
+    const entry = (name: string) => ({
+      from: name,
+      version: "1.0.0",
+      resolved: `${registry.url}${name}/-/${name}-1.0.0.tgz`,
+    });
+    const document = (noDeps: object) => ({
+      root: {
+        name: "foo",
+        path: "",
+        private: false,
+        dependencies: { "one-fixed-dep": { ...entry("one-fixed-dep"), dependencies: { "no-deps": noDeps } } },
+        workspaces: { member: { from: "member", version: "workspace:member", path: "member" } },
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+
+    // no-deps is in the node_modules of the root, so it is still there.
+    await rm(join(packageDir, "node_modules", "one-fixed-dep"), { recursive: true });
+    expect(await bun("pm", "ls", "--all")).toEqual(
+      listed("<dir> node_modules", "├── member@workspace:member", "└── no-deps@1.0.0"),
+    );
+    expect(await json("pm", "ls", "--all")).toEqual(document({ ...entry("no-deps"), path: "node_modules/no-deps" }));
+    expect(await json("pm", "ls", "no-deps")).toMatchObject({ stderr: "", exitCode: 0 });
+    expect(await json("pm", "ls", "one-fixed-dep")).toMatchObject({
+      stderr: "error: no packages match: one-fixed-dep\n",
+      exitCode: 1,
+    });
+    expect(Object.keys((await json("pm", "ls")).root)).toEqual(["name", "path", "private", "workspaces"]);
+
+    // Without a node_modules it is what bun.lock has.
+    await rm(join(packageDir, "node_modules"), { recursive: true });
+    expect(await json("pm", "ls", "--all")).toEqual(document(entry("no-deps")));
   });
 });
 
@@ -3396,6 +3721,35 @@ describe.concurrent("without a package.json", () => {
     expect(await readdirSorted(project.globalDir)).toEqual([]);
   });
 
+  test("bun pm ls -g --json has no dependencies before any global install, and then the global packages", async () => {
+    using project = fresh("pm-ls-global-json");
+    const globalDir = join(realpathSync(project.root), "bun-install", "install", "global");
+    const empty = {
+      stdout: JSON.stringify([{ path: globalDir, private: false }], null, 2) + "\n",
+      stderr: "",
+      exitCode: 0,
+    };
+    expect(await project.run("pm", "ls", "-g", "--json")).toEqual(empty);
+    expect(await project.run("list", "--all", "--json", "--global")).toEqual(empty);
+    expect(await readdirSorted(project.globalDir)).toEqual([]);
+
+    expect(await project.run("add", "-g", join(project.root, "pkg"))).toMatchObject({ exitCode: 0 });
+    const { stdout, stderr, exitCode } = await project.run("pm", "ls", "-g", "--json");
+    expect({ document: JSON.parse(stdout), stderr, exitCode }).toEqual({
+      document: [
+        {
+          path: globalDir,
+          private: false,
+          dependencies: {
+            pkg: { from: "pkg", version: "../../../pkg", path: join(globalDir, "node_modules", "pkg") },
+          },
+        },
+      ],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
   test("bun pm ls -g prints an empty listing after the last global package was removed", async () => {
     using project = fresh("pm-ls-global-removed");
     expect(await project.run("add", "-g", join(project.root, "pkg"))).toMatchObject({ exitCode: 0 });
@@ -3468,11 +3822,9 @@ describe.concurrent("without a package.json", () => {
 });
 
 describe.concurrent("bun pm refuses a flag that only other subcommands take", () => {
-  const json = "`bun pm diff`, `bun pm licenses`, `bun pm pkg`, `bun pm view`";
+  const json = "`bun pm diff`, `bun pm licenses`, `bun pm ls`, `bun pm pkg`, `bun pm view`";
   test.each([
     ["pm why x --json", "--json", json],
-    ["pm ls --json", "--json", json],
-    ["list --all --json", "--json", json],
     ["pm untrusted --json", "--json", json],
     ["pm hash --json", "--json", json],
     ["pm bin --json", "--json", json],
@@ -3547,11 +3899,12 @@ describe.concurrent("usage text keeps its indent", () => {
     );
     expect(lines).toContain("  └ --json                    one JSON document (files, patch text, notes, totals)");
     const ls = lines.indexOf("  bun pm ls                   list the tree of installed dependencies");
-    expect(lines.slice(ls + 1, ls + 7)).toEqual([
+    expect(lines.slice(ls + 1, ls + 8)).toEqual([
       "  ├ names ...                 list every installed package with one of these names",
       "  ├ --all                     list the entire tree of installed dependencies",
       "  ├ --trusted                 list only trusted dependencies",
       "  ├ --prod                    omit devDependencies",
+      "  ├ --json                    output as JSON",
       "  └ -g                        list the tree of globally installed dependencies",
       "  bun pm why <pkg>            show dependency tree explaining why a package is installed",
     ]);

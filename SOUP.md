@@ -13360,6 +13360,352 @@ Files: `src/runtime/test_runner/image_snapshot.rs` (new),
 `LICENSE.md`, `test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts`,
 `test/integration/bun-types/fixture/test.ts`, `test/package.json`, `test/bun.lock`.
 
+### 2026-11-24: `bun pm ls --json`, the installed dependencies as a document with the shape of `pnpm ls --json`
+
+`bun pm ls` prints a tree for people. A script that wants to know which version of a package is
+installed, or a tool that draws the dependency graph, had to read `├── react@18.2.0` lines, or
+parse `bun.lock` by itself. `npm ls --json` and `pnpm ls --json` exist for that. oven-sh/bun#8283
+asks for the flag since January 2024 (12 thumbs up), and one comment there wants it to add Bun to
+node-modules-inspector. Four pull requests wrote it and none was merged: oven-sh/bun#26223 and
+oven-sh/bun#35251 by Md. Mohiuddin Khaled Maruf, and oven-sh/bun#22676 and oven-sh/bun#40045 by
+robobun. The last one put `--json` on every `bun pm` command at once and was closed by the
+inactivity sweep on 2026-11-21 without a review. On upstream `main` the flag is an error:
+`--json is only supported by` and then `bun pm diff`, `bun pm licenses`, `bun pm pkg` and
+`bun pm view`. Now `bun pm ls` and `bun list` take it:
+
+```sh
+bun pm ls --json                 # the direct dependencies
+bun pm ls --json --all           # and what each of them depends on
+bun pm ls --json ms              # what leads to a package that is installed as "ms"
+bun pm ls --json --production    # without devDependencies
+bun list -g --json               # the global packages
+
+bun pm ls --json | jq -r '.[0].dependencies.react.version'
+```
+
+```json
+[
+  {
+    "name": "my-app",
+    "version": "1.0.0",
+    "path": "/path/to/project",
+    "private": true,
+    "dependencies": {
+      "debug": {
+        "from": "debug",
+        "version": "4.3.4",
+        "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+        "path": "/path/to/project/node_modules/debug",
+        "dependencies": {
+          "ms": {
+            "from": "ms",
+            "version": "2.1.2",
+            "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.2.tgz",
+            "path": "/path/to/project/node_modules/ms"
+          },
+          "supports-color": {
+            "from": "supports-color",
+            "version": "8.1.1",
+            "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-8.1.1.tgz",
+            "path": "/path/to/project/node_modules/supports-color",
+            "deduped": true,
+            "dedupedDependenciesCount": 1
+          }
+        }
+      }
+    },
+    "devDependencies": {
+      "supports-color": {
+        "from": "supports-color",
+        "version": "8.1.1",
+        "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-8.1.1.tgz",
+        "path": "/path/to/project/node_modules/supports-color",
+        "dependencies": {
+          "has-flag": {
+            "from": "has-flag",
+            "version": "4.0.0",
+            "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-4.0.0.tgz",
+            "path": "/path/to/project/node_modules/has-flag"
+          }
+        }
+      }
+    }
+  }
+]
+```
+
+The document has the shape of pnpm's, so that a tool which reads `pnpm ls --json` can read it. It
+was compared with pnpm 10.34.9 on the same `package.json` files, see below.
+
+- It is an array with the root package in it: `name` and `version` from its `package.json` (left
+  out when the file has none), `path`, `private`, and then its dependencies under the section of
+  `package.json` that has them. A section that lists nothing is left out. pnpm has
+  `dependencies`, `devDependencies` and `optionalDependencies`. Two more are Bun's:
+  `peerDependencies`, which pnpm lists among `dependencies`, and `workspaces`, which has every
+  workspace member, as the text list has. A dependency that two sections declare is in both.
+- An entry has `from`, `version`, `resolved` and `path`, in this order. The key is the name that
+  the package is installed under and `from` is the name of the package: `"my-ms": "npm:ms@2.1.2"`
+  is `"my-ms": { "from": "ms" }`. `version` is what the text list prints after the `@`, with `/`
+  in a path on every platform, and with the password of a URL taken out, as the text list does.
+  `resolved` is the tarball of a package from a registry.
+- `path` is the real path of a folder that has the package. It is the folder that the dependent
+  loads: the nearest `node_modules` at or above the dependent that has the name, inside the
+  project. So two copies of one version in two folders are told apart, and with the isolated
+  linker the path is the one in the store. A folder counts only if its `package.json` has the
+  name of the package, and for an npm package the version. If the dependent does not lead to
+  one, the path is another folder where the text list found the package, or its folder in the
+  store. If none of these has the package, the entry has no `path`. That is every entry when
+  there is no `node_modules`. A bundled dependency is the folder inside its dependent, also when
+  the tarball has another version in it than `bun.lock` resolved.
+- Without `--all` the entries are the direct dependencies, chosen by the test of the text list.
+  With `--all`, and with package names, an entry has `dependencies` too: the packages that
+  `bun.lock` resolved for it. This is the dependency graph. The text list prints the tree of
+  `node_modules` folders of the hoisted linker, under both linkers.
+- With `--all` a dependency is listed if the text list of `--all` has that package under that
+  name. A package that is not on disk is left out. The exception is a package on disk that
+  nothing else on disk depends on, for example after its dependent was removed: what leads to it
+  is listed, without a `path`, because the graph needs a place for it. So the entries that have a
+  `path` are the packages of the text list, and after `bun install --production` the document
+  has no devDependencies in it.
+- A package that is in the document more than once has its dependencies once, where it is
+  nearest to the root. Its other entries have `"deduped": true` and `dedupedDependenciesCount`,
+  the number of entries below the one that has the dependencies. These are pnpm's two keys, and
+  they end a cycle too. So the document has one entry for each dependency of each package: 1,499
+  entries for a project with 559 packages.
+- With package names, the document keeps the entries that lead to a package that is on disk
+  under one of the names, which is what `pnpm ls <name> --depth Infinity` keeps. With
+  `--depth=0` the names select among the direct dependencies. A name that nothing matches is the
+  error of the text list on stderr and exit code 1, after a document with the root package alone.
+- `--trusted` adds `"trusted": true` to each trusted entry that is on disk. With `--all` the
+  entries that lead to one are in the document too, and the key tells them apart.
+- `--production`, `--omit`, `--depth=0` and `-g` do what they do for the text list. Another
+  `--depth` is refused, as it is there. `bun pm ls -g --json` before any global install is the
+  root package alone.
+- stdout has the document and nothing else. It is the text that `JSON.stringify(document, null, 2)`
+  gives, with a line break at the end.
+
+What the earlier pull requests decided, and what is different here. The shape is the one of
+oven-sh/bun#35251, whose author is a co-author of this commit: the document of pnpm, grouped by
+section. oven-sh/bun#40045 took it and then refused `--all` with `--json`. Its
+list for `--all` came from the hoisted tree, whose folders do not exist under the isolated linker,
+and a flat list has no edges that a tool can follow. Here `--all` is the graph, with a `path` that
+is looked up on disk and checked, so it is one document under both linkers. Entries also have
+`resolved` now, package names work, and a section without entries is left out, as pnpm does.
+
+Where the document is not pnpm's, for the same project.
+
+- A peer dependency of the root is under `peerDependencies` and not under `dependencies`, and
+  there is a `workspaces` section. pnpm lists a workspace member that the root depends on as
+  `link:packages/a`, and the other members only with `-r`.
+- pnpm expands a repeated package where a depth-first walk reaches it first. Here it is the entry
+  nearest to the root, so a direct dependency has its dependencies in its own entry unless
+  another direct dependency has them. The counts differ with that: `express > body-parser` says
+  65 in pnpm's document and 17 here, and both documents have 127 entries.
+- For a tarball, a folder and a git dependency `version` is what the text list prints (the URL,
+  the path, `github:owner/repo#commit`), and there is no `resolved`. pnpm has the version of the
+  manifest there.
+- A name selects by the name that a package is installed under, as in the text list. pnpm also
+  matches the name of the package behind an alias.
+- Without a lockfile the command fails as the text list does. pnpm prints the root package.
+
+How it is built.
+
+- `src/runtime/cli/pm_ls_json.rs` is new and has all of it. The `ls` branch of
+  `package_manager_command.rs` gives it what it has already computed for the text list: the
+  packages that `--production` and `--omit` leave, the closure that says whether a row of a
+  `node_modules` folder is installed, and the closure for names and `--trusted`. The end of the
+  branch, the error for names that match nothing, is now the function `exit_listed`, and both
+  lists call it.
+- `Listing::rows` has the rows of `buffers.dependencies` that are listed for each package, by
+  name, and for the root by section first. Without `--all` only the root has rows, and they pass
+  the test of the text list: enabled by the flags, and linked into the root's `node_modules`.
+  With `--all` it takes the rows of every package that the root reaches in `bun.lock`.
+- `Listing::on_disk` walks the hoisted tree with the loop and the test of the text list, and
+  keeps what passes as pairs of a package and the name that it is installed under. A row is on
+  disk if its pair is. A package that is on disk as `my-ms` is not on disk as `ms`.
+- `OnDisk::reached` has the pairs that rows on disk lead to from the root. A row on disk whose
+  pair is not among them is stranded. `leading_to` marks the packages that have such a row below
+  them, by a walk up the reversed edges, and `retain` then keeps the rows that are on disk and
+  the rows that lead to a stranded one. The same two functions run once more for names and
+  `--trusted`. The root is below no package, so a workspace member that depends on the root does
+  not lead to everything.
+- `Nesting::of` decides where a package is expanded. It walks breadth first from the root, so the
+  first row that reaches a package is one nearest to the root. Then it counts the entries below
+  each package from the last one reached to the first, which is the number that the other entries
+  of the package print.
+- `Document::entries` writes a section with a list of open objects instead of recursion, so a
+  long chain of dependencies cannot use up the stack. Strings go through
+  `bun_core::printer::json_stringify`, which writes what JavaScript writes.
+- `Paths::of` finds the folder. `Paths::loaded` looks for the name as Node.js does, from the
+  folder of the dependent up to the root of the project, and for a dependent outside of the
+  project (the global store) only in the `node_modules` beside it. It asks once for each
+  directory whether it has a `node_modules`. `Paths::anywhere` is the second try: every place
+  where the tree has the package, then the store. `Paths::holds` reads the `package.json` of a
+  folder once, with `read_package_info` of `bun pm licenses`, which is `pub(crate)` now. A path
+  is made real with one `open` and one read of the path of the descriptor, and with `realpath()`
+  if that fails for another reason than a missing folder. `realpath()` alone reads every
+  component, which was 29,171 `readlink` calls for the 559 packages.
+- The sections are `DependencyGroup`'s constants, and `DependencyGroup::prop_for_behavior` says
+  which one a dependency of the root is in.
+- `--json` is in the table of the flags that each `bun pm` subcommand takes, for `ls`. The line
+  of the help text and of the zsh completion are added.
+
+What two reviews of the diff found. The diff was read from four sides before the commit: the
+graph code, the paths, the conventions of the repository, and the behaviour of the command. The
+rework was then read again from two. What changed:
+
+- `path` could be the folder of another version. The first version took the nearest folder with
+  the name and did not look into it. With `node_modules/express/node_modules/debug` removed,
+  `express > debug` was 2.6.9 with the path of `node_modules/debug`, which is 4.3.4. Now a folder
+  counts only if its `package.json` is the one of the package. The same check drops the path of
+  a stale folder: `bun.lock` says 6.0.0, the folder has 7.0.0.
+- The walk up went past the project. A project that is itself inside a `node_modules` folder
+  could get the path of a package beside it. Now the walk ends at the root of the project.
+- With `--all`, a package on disk was lost when its only dependent was not. With
+  `node_modules/express` removed, the text list had 67 packages and the document 41, and
+  `bun pm ls send --json` failed where `bun pm ls send` found it. Now the dependent stays as an
+  entry without a `path`.
+- The first form of that rule kept every package that leads to something on disk. After an
+  install without devDependencies the document then had `eslint`, `jest` and `webpack` in it,
+  91 packages that are not installed, because their dependencies are shared with packages that
+  are. A package with `"cpu": "none"` in `bun.lock` came back the same way. Now only a package
+  that would have no place otherwise brings in what leads to it.
+- "On disk" was a test of the package. A package that is there as `my-ms` made `debug > ms`
+  listed after `node_modules/ms` was removed, and `bun pm ls ms --json` exited with 0 where the
+  text list exits with 1. Now it is a test of the package and the name.
+- A row that resolves to the root package made every package above it "lead" to whatever was
+  selected. `bun pm ls debug --json` in a workspace whose member depends on the root had 7
+  entries, and has 1 now.
+- `--trusted --all` did not say which entries are trusted, because the entries that lead to
+  them are listed too. Hence the `trusted` key.
+- Without `--all`, `--production` left out a root peer dependency that the text list prints (an
+  optional peer whose package a devDependency provides). The first version asked one more test
+  than the text list. Now it is the same test.
+- No `path` for: a `link:` dependency without its link in `node_modules`, a folder or git
+  dependency whose `package.json` has no name, a bundled dependency whose tarball has another
+  version, a folder that can be entered and not listed, and everything on a system without
+  `/proc`. A dependency on the root package printed `deduped` with the count of the whole
+  document. A workspace member got the path of an alias of the package that it loads. All fixed.
+- The strings were escaped with `format_json_string_utf8`, which is not byte for byte what
+  `JSON.stringify` writes for U+2028 and for control characters.
+- The tests had no case where a package is not on disk, no package with two copies, and none
+  where the checks of the rework decide the result. They have them now, and the global store.
+- Not taken: to share the JSON writer of `bun pm sbom`. That file is a patch of this stack, and
+  each patch has to apply to upstream alone. Not taken either: to decide "on disk" by the
+  `package.json` of each folder and not by its name. The text list decides by the name, and the
+  document lists what the text list has. Such an entry has no `path`.
+
+Where the text list and the document still differ, as the second review measured on trees with
+folders removed at random: with `--production` or `--omit`, the text list prints a folder whose
+package another section still needs, also under a name that only the omitted section uses. The
+document lists the dependencies of the sections that are left. `bun pm ls --production my-ms` is
+a match for the text list and none for the document when `my-ms` is a devDependency and `ms` is
+needed elsewhere.
+
+What was checked.
+
+- Tests in `test/cli/install/bun-pm.test.ts`, in the block for what is on disk, against the test
+  registry. For the hoisted and the isolated linker: the direct dependencies by section with an
+  alias, a peer, a workspace member and each flag; `--all` with a cycle, package names, a name
+  that matches nothing, and `--trusted`. One version of a package in three folders, each the
+  path of its own dependent; a bundled folder with another version in it; a copy that is removed,
+  and then one that has another version. A package that is on disk under another name only. A
+  dependent that is removed, and a name that matches only that dependent. No `node_modules`. The
+  three cases that remove folders step by step (hoisted, isolated, isolated with the global
+  store) now ask the same of `--json` at each step, and read the `package.json` at each `path`.
+  `-g` before and after a global install. The table of refused flags and the help text are
+  updated. The file passes on the debug build (200). The new cases fail on Bun 1.4.3, which
+  prints the text list.
+- Against pnpm 10.34.9, for a project with express 4.18.2 and body-parser 1.20.1:
+  `--all --json` and `pnpm ls --json --depth Infinity` have 127 entries each, 22 of them deduped,
+  27 packages expanded, and the same dependencies with the same `resolved` under each expanded
+  package. `bun pm ls ms --json` and `pnpm ls ms --json --depth Infinity` have 13 entries each,
+  with the same ones. For a project with an alias, a devDependency, an optional dependency and a
+  peer, the two documents without `--all` differ in two places: the section of the peer, and the
+  folder of the alias.
+- Paths: each entry has a real path whose `package.json` has the name and the version of the
+  entry. That holds for the 1,499 entries of a project with 559 packages (next, jest, webpack,
+  eslint, @aws-sdk/client-s3) under both linkers, for the 2,238 entries of a copy of this
+  repository's own `test/` install (1,182 packages, isolated), for a hoisted project with a
+  workspace and three versions of `ms` in eight folders, and for tarball, folder, `link:` and
+  GitHub dependencies.
+- The text list and the document have the same packages: for fifteen states of seven projects,
+  eight of them with folders removed or never installed, and three sets of flags each, the
+  packages of `bun pm ls --all` are the entries of `--all --json` that have a `path`.
+- Random graphs: 600 generated lockfiles with cycles, dependencies on itself, aliases, two
+  versions, workspaces and all sections, 8,664 runs with `--all`, `--omit`, names and
+  `--depth=0`, against a model of the rules that was written apart from the code. No document,
+  order of keys, JSON text or exit code differs. The same lockfiles with a hoisted `node_modules`
+  made for them, and folders removed at random: the text list and the document differ only as
+  said above for `--production` and `--omit`. Both generators are from the reviews.
+- `cargo check -p bun_runtime` for `x86_64-pc-windows-msvc`, `aarch64-apple-darwin` and
+  `x86_64-unknown-freebsd`, `cargo clippy -p bun_runtime --no-deps` and `cargo fmt --all --check`
+  pass. The source lints pass on the release build (224). On the debug build two of them run
+  into their 5 second limit, as before. The tests of `bun pm licenses` pass (85).
+- Not run: Windows and macOS. The paths there come from the same calls, `Dir::open` and
+  `get_fd_path`.
+
+What it costs.
+
+- Without `--json`: the `ls` branch asks `json_output` once. Nothing else runs.
+- The size of a release build was not measured. No release build was made today.
+- With `--json`, counted with `qemu-x86_64 -strace` on the debug build, for the project with 559
+  packages under the isolated linker: `bun pm ls` is 1,442 system calls and `bun pm ls --json` is
+  903, because it does not count the installed packages for the header. `bun pm ls --all` is
+  4,466 and `bun pm ls --all --json` is 10,277: 2,089 `open`, 2,064 `readlink` of a descriptor,
+  1,152 `read` for about 560 `package.json` files, and 1,455 `stat` where the text list has 600.
+  It takes 0.38 s on the debug build, and the text list 0.19 s. The document is 619 KB. For the
+  1,182 packages of this repository's `test/` install it is 0.70 s and 0.27 s.
+
+Not in this commit.
+
+- A `--depth` other than 0, which the text list refuses too.
+- `resolved`, and the version of the manifest, for tarball and git dependencies.
+- One element of the array for each workspace member (pnpm's `-r`), `--long` and `--parseable`.
+- A name that matches the package behind an alias.
+- `--json` for `bun why` and for the other `bun pm` commands of oven-sh/bun#40045.
+
+The rebase of the day.
+
+- Upstream moved by 16 commits, to bd92f9bef31. 83 patches went onto it. 5 of them stopped the
+  rebase, and none was dropped.
+- oven-sh/bun#49316 fixes `Bun.write` to a descriptor that was opened with `O_APPEND`: no
+  `fallocate` there. The `append` option (2026-08-29) has `!self.append` in front of that test,
+  so both are in `write_file.rs`. `bun-write.test.js` passes (128).
+- oven-sh/bun#49442 ports the WebSocket server to Rust and changes the lines of `reload` in
+  `server_body.rs` that take the new WebSocket handlers. The `compress` block of response
+  compression (2026-09-04) stays in front of them. `bun-serve-compress.test.ts` passes (22).
+- oven-sh/bun#49210, oven-sh/bun#49526 and oven-sh/bun#49533 change the Redis client.
+  `redis.multi()` (2026-10-20) met them in five places. Git stopped at the imports, which take
+  both sides, and at `Client::goes_now`, which now asks `is_connected()`: that is what
+  `is_ready()` was before upstream made the SELECT of the handshake a step of `Opening`. The
+  build failed at `Client::is_active()`, which is gone. The patch used it in
+  `JSValkeyClient::send` to ask for a transaction only when no connection was in sight. `send`
+  now asks `is_transaction` first and calls `ensure_dialing` for every command, as upstream
+  does. The unit tests failed at `has_pending_commands`, which is `has_commands` now. One case
+  of the test file failed: it awaited `connect()` before a transaction, to see that nothing is
+  written ahead of the reply to SELECT. `connect()` now settles with that reply, so the case
+  sends the transaction without the wait. Passing now: the unit tests of `bun_valkey` (52),
+  `connection-failures.test.ts` (154), the five `multi()` cases of `valkey.test.ts` that need no
+  server, and a run of `multi()` by hand against the Redis of this machine. The other cases need
+  the `redis_unified` service, which this machine does not have.
+- oven-sh/bun#49358 gives temporary files an owner, and `_exec` of `bun upgrade` returns the exit
+  code. `bun upgrade <version>` (2026-11-19) keeps its `release` parameter and its two error
+  texts inside upstream's new shape. `bun-upgrade.test.ts` passes (50).
+- `Cargo.toml` has the profile of `bun_blake3` (2026-11-18) beside upstream's new one for
+  `bun_websocket`.
+- Also run on the debug build after the rebase: the shell's `mv` (22), `perf_hooks` (29),
+  `jsr` (92), `proxy` (148), `run-eval` (82) and `node:sea` (4). The fork's three workflows were
+  green for the push of 2026-11-23.
+- Only the tip of the stack was built, as before.
+
+Files: `src/runtime/cli/pm_ls_json.rs` (new), `src/runtime/cli/package_manager_command.rs` (the
+`--json` branch of `ls`, `exit_listed`), `src/runtime/cli/mod.rs`,
+`src/runtime/cli/pm_licenses_command.rs` (`read_package_info` is `pub(crate)`),
+`src/install/PackageManager/CommandLineArguments.rs` (the flag table),
+`src/install/PackageManager.rs` (help), `completions/bun.zsh`, `docs/pm/cli/pm.mdx`,
+`test/cli/install/bun-pm.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.
