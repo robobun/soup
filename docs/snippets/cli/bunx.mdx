@@ -21,6 +21,10 @@ Execute an npm package executable (CLI). If the package isn't installed in `node
   Skip installation if package is not already installed
 </ParamField>
 
+<ParamField path="--no-cache" type="boolean">
+  Resolve the package and its dependencies again before running, and install what changed
+</ParamField>
+
 <ParamField path="--cwd" type="string">
   Set the working directory
 </ParamField>
@@ -75,6 +79,9 @@ bunx uglify-js@3.14.0 app.js
 
 # Use --package when binary name differs from package name
 bunx -p @angular/cli ng new my-app
+
+# Check for a newer version now, not once a day
+bunx --no-cache create-vite my-app
 
 # Force running with Bun instead of Node.js, even if the executable contains a Node shebang
 bunx --bun vite dev foo.js

@@ -13706,6 +13706,233 @@ Files: `src/runtime/cli/pm_ls_json.rs` (new), `src/runtime/cli/package_manager_c
 `src/install/PackageManager.rs` (help), `completions/bun.zsh`, `docs/pm/cli/pm.mdx`,
 `test/cli/install/bun-pm.test.ts`.
 
+### 2026-11-25: `bunx --no-cache`, the package resolved again now and not once a day
+
+`bunx my-cli` runs the copy that an earlier `bunx` installed, for a day. Someone who has just
+published a version of a tool, or who runs a tool from a GitHub branch, gets the copy from this
+morning. oven-sh/bun#12245 asks for a `--no-cache` flag since June 2024 (16 thumbs up), and a
+member of the Bun team answered there that "a temporary no-cache flag" should exist.
+oven-sh/bun#27379 asks the same for `bunx github:user/repo#HEAD`. The flag was already accepted:
+`bunx` skipped it as the negation of npm's `cache` option, with a `true` or `false` behind it. So
+`bunx --no-cache my-cli` ran without an error, and ran the old copy. Only `my-cli@latest` asked
+the registry on every run, and only for the package itself. For a range (`my-cli@^2`), for a
+GitHub repository and for the dependencies there was `bun pm cache rm`, which clears everything.
+Now the flag does what it says, and `bun create` passes it on.
+
+```sh
+bunx --no-cache my-cli                 # what the registry has now
+bunx --no-cache my-cli@^2              # the newest 2.x
+bunx --no-cache github:my-org/my-cli   # the branch as it is now
+bun create --no-cache my-template      # the same for create-my-template
+```
+
+- It resolves the package and its dependencies again, for a name, a dist-tag, a range, a GitHub
+  repository and a tarball URL, also one whose bytes changed and whose version did not. It
+  installs what changed. The tree is the one that a run without the flag uses, so the next
+  `bunx my-cli` runs the new copy and asks nothing.
+- When nothing was published, the run asks for the manifests (two requests for a tool with one
+  dependency) and links nothing again.
+- If the registry cannot be reached, it exits with 1 and does not run the copy it has. A 503 is
+  tried six times, as for a first install. The tree is left as it was for the runs that may use
+  it.
+- It does not change where `bunx` looks first. A package that the project has installed still
+  runs, and so does a command of that name on `PATH`. `bunx --no-cache my-cli@latest` skips
+  both, as a version always did.
+- It goes before the package name. After the name it is a flag of the tool, as before.
+- `--no-cache=true` and `--no-cache true` are the flag too, because npm spells it so and `bunx`
+  swallowed those forms before. `--no-cache=false` and `--no-cache false` are still skipped with
+  their value.
+- With `--no-install`, in any of its seven spellings and in either order, it is an error before
+  anything runs: `--no-cache may install the package, which --no-install forbids`.
+- In `BUN_OPTIONS` it is the flag for every `bunx` and for `bun create`. There it gives way to a
+  `--no-install` on the same run, so `npx --no-install commitlint` in a git hook keeps working
+  for someone who exported `BUN_OPTIONS=--no-cache`. A flag in `BUN_OPTIONS` does not take the
+  first word of the command line for its value.
+- `bun create --no-cache <template>`, `--no-cache=true`, `bun c` and `bun --no-cache create`
+  pass it to the `bunx create-<template>` that they run. `npx --no-cache` in a package.json
+  script gets it through `bun run`.
+
+How it is built.
+
+- `bunx`'s own options have `no_cache`, set by one arm of `Options::parse` in
+  `src/runtime/cli/bunx_command.rs`. The arm is in front of the guard that skips what
+  `BUN_OPTIONS` has and `bunx` does not know. A word behind the flag counts as its value only if
+  it comes from the same place as the flag (the command line or `BUN_OPTIONS`). The check
+  against `--no-install` is behind the loop, so the order of the two does not matter.
+- `look_for_existing_bin` is the switch that already kept a dist-tag run from running the tree
+  unasked. The flag is one more term of it, and the five places that read it do the rest: the
+  tree is not looked at before the lock, a tree without a bin is installed, the tree is not run
+  under the lock, `bun add` is told that there is no copy to fall back on (so it tries again
+  after a 503), and a registry that cannot be reached is exit code 1.
+- `refresh` is new and is true for a day-old tree and for the flag. It is read in three places:
+  the tree's `bun.lock` is removed, because it would pin the version inside a range, the commit
+  of a GitHub repository and every dependency; `bun add` gets `--no-cache`, also for a tree that
+  is not there yet; and the third place is the age of the tree, below.
+- A fresh tree that has its bin gets no `--force`. `--force` links every package again, also
+  when nothing moved, and it does so under a tool that an earlier run started from the same
+  tree. Two runs with the flag at the same time are what a status line or an editor does.
+- The day that a tree is good for starts again only after a refresh that resolved every
+  dependency and linked every package again. A run with the flag on a fresh tree gives
+  `package.json` its old time back, as a dist-tag run does. So the refresh with `--force` comes
+  when it was due.
+- `bun_create` in `src/runtime/cli/mod.rs` reads the flag in its scan of what is in front of the
+  template and pushes it into the arguments for `bunx`, beside `--bun`.
+- Nothing changes in `bun add` and there is no new environment variable.
+
+What the design review decided, before the code. Six designs were compared: the flag at
+`bunx`'s switch (this one), a refresh that the `bun add` child decides, one enum for the whole
+decision of `BunxCommand::exec`, the smallest patch at the arm that skips flags, no change, and
+npx's default of asking on every run.
+
+- Only `BunxCommand::exec` can stop the reuse. A fresh tree spawns no `bun add`, so the child
+  cannot act.
+- The default of once a day stays. Asking on every run was measured at about 964 more system
+  calls and one more process for each warm `bunx <name>`, and it would not make the flag act.
+- The smallest patch leaves `bun create`, `--no-cache=true` and `BUN_OPTIONS` ignored and turns
+  `--no-cache false` on.
+- The first draft of this commit treated a fresh tree as a day-old one, which adds `--force`.
+  When nothing was published, that replaces every package folder on each run (21 of 21 in the
+  measurement below), and in the review's model of four runs at once 5 of 20 tools failed with
+  `MODULE_NOT_FOUND`. So `--force` stays tied to a tree that has no usable install.
+- Only `--no-cache`. `--force`, `-f`, `--prefer-online` and `--ignore-existing` stay skipped
+  flags. npm's `--force` has no cache meaning, and `--force true` has to keep working.
+- One thing is not as the review picked it: it made `BUN_OPTIONS=--no-cache` with a typed
+  `--no-install` the error. That turns a hook that works today into a failure for a flag the
+  user did not type on that line, so here the typed flag wins.
+
+What the review of the diff found. Five readers took one side each (the parser, the reuse logic,
+`bun create` and the docs, the tests, the conventions of the repository), and each concern went
+to one more reader whose job was to refute it. Of 24 concerns 18 held and 6 held in part.
+
+- `--no-cache=true true a` dropped the `true` and ran `a`. The arm looked at the next word for
+  both spellings. Now only the bare spelling has a value behind it.
+- `BUN_OPTIONS=--no-cache bunx true a` did the same, and a typed package named `false` switched
+  the exported flag off, because the `bunx` executable has no `x` between `BUN_OPTIONS` and the
+  command line. Hence the rule that the value comes from where the flag comes from.
+- The run with the flag started the day again without `--force`. A tree with a missing file
+  stayed broken, and each run with the flag moved its repair another day away. Now the old time
+  is kept.
+- The one-line descriptions said "install again". When nothing was published nothing is
+  installed, so they say "resolve again, and install what changed". The error message changed
+  with them.
+- The docs named only the project as what still runs first. A command on `PATH` does too.
+- No test failed when `bunx` stopped passing `--no-cache` to `bun add` for the flag. The cases
+  used a second registry for "after the publish", and the manifest cache is kept per registry.
+  They use one registry now and move its tags.
+- Added: a tarball URL, a command on `PATH`, the flag twice, a typed flag with `--no-install`
+  in `BUN_OPTIONS`, and the two cases for a package named `true`. The case for runs at the same
+  time was skipped on Windows without a reason, and is not skipped now.
+- The table in `create.mdx` did not pass the formatter.
+- Not taken: `--no-cache=false` as a way to take the flag back. No other flag of `bunx` has
+  that, and `bun add --no-cache=false` is an error.
+
+Known, and not solved here. A run with the flag removes `bun.lock` and links only what changed.
+`bun add` then keeps a nested copy that the new layout no longer has: with `a` depending on
+`c@^1`, a tool that moves from `c@^2` to `c@^1` gets `c` 1.1.0 at the top and leaves
+`a/node_modules/c` 1.0.0 in place, which `a` keeps loading. Every range is still satisfied, and
+the refresh with `--force` removes the copy within a day. `--force` on every run with the flag
+would remove it at once, at the price named above. The cause is in `bun install`: the same steps
+with a project, a deleted `bun.lock` and `bun install` leave the same copy, on the build of this
+stack (whose installer is upstream's) and on Bun 1.4.3, and `bun prune --check` reports it. It
+was handed off to upstream's queue with that repro.
+
+What was checked.
+
+- Tests: 41 cases in a `--no-cache` block of `test/cli/install/bunx.test.ts`, in the part about
+  the cached tree, on the file's own registry and sandbox helpers. On the debug build the file
+  passes (289, and 2 skipped). On the build of the stack without this commit 35 of the 41 fail,
+  and the two `--help` cases with them. Six pass on both, and each of them is a limit of the
+  new arm: the two `false` forms, the word behind `--no-cache=true`, the word behind a flag in
+  `BUN_OPTIONS`, a command on `PATH`, and an unfinished tree with a 503. On Bun 1.4.3 37 of the
+  41 fail.
+- What a run without the flag pays, counted with `qemu-x86_64 -strace` on the debug builds
+  with and without the commit, five warm runs of `bunx tool` each, in turn: 711, 713, 713, 713
+  and 713 system calls without it, 712, 713, 713, 713 and 713 with it. What differs between two
+  runs differs inside one build too (`pidfd_open` or `wait4` for the exit of the tool). No
+  `flock`, no `connect`, one `vfork`, 28 `newfstatat` and 27 `openat` in both. `size_of` of
+  `bunx`'s `Options` is 152 bytes before and after (gdb).
+- What a run with the flag does, read from the test registry: 2 requests and 0 of 2 packages
+  linked again when nothing was published, 4 requests after a publish of the tool and of its
+  dependency, 6 attempts and exit code 1 for a 503, and 0 requests for the run without the flag
+  that follows. Four runs with the flag at once: 8 requests, four times exit code 0, nothing
+  linked again.
+- What leaving out `--force` saves, for a tree of 21 packages with nothing published, counted
+  on the `bun add` child: 0 `linkat`, 1 `unlinkat` and 2 `renameat`, and no folder replaced.
+  With `--force`: 22, 56 and 22, and 21 of 21 folders replaced.
+- `test/cli/bun.test.ts`, `test/aot/shell-completions-list-flags.test.ts`, `bun-create.test.ts`,
+  `bunx-concurrent.test.ts` and `bunx-directories-bin.test.ts` pass (212).
+  `cargo fmt --all --check` passes, and prettier passes on the changed files. The source lints
+  pass on the release binary (224). On the debug build two of them run into their five seconds,
+  as before.
+- Not run: Windows and macOS. The changed lines have no line for one platform. Two of the new
+  cases are not for Windows, because they reach Bun through a symlink. The size and the
+  instruction count of a release build were not measured: no release build was made today.
+  `completions/bun-cli.json` was edited by hand.
+
+What it costs.
+
+- Without the flag: two more tests of a boolean in `bunx`, and nothing else.
+- With the flag: one `bun add` process and the manifest requests on every run.
+- Someone who has `--no-cache` in `BUN_OPTIONS` for `bun install` now has it for every `bunx`
+  and `bun create` too. Those runs need the registry where they used the copy.
+- A line with a typed `--no-cache` and `--no-install` exits with 1 where it ran the copy.
+
+Not in this commit.
+
+- A way to clean only `bunx`'s trees, the other half of oven-sh/bun#12245.
+- The templates of `bun create` that do not go through `bunx` (a GitHub repository, a local
+  folder, a `.jsx` file). They skip the flag, as before.
+- A failed refresh leaves the tree without `bun.lock`, with or without the flag. The tree still
+  runs.
+- A way to switch off a `--no-cache` from `BUN_OPTIONS` for one `bun create`. `BUN_OPTIONS=`
+  in front of the command does it.
+
+The rebase of the day.
+
+- Upstream moved by 14 commits, to 0966e99d8f3. 84 patches went onto it. 4 of them stopped the
+  rebase, and none was dropped.
+- oven-sh/bun#49499, oven-sh/bun#49527, oven-sh/bun#49529, oven-sh/bun#49548 and
+  oven-sh/bun#49577 change the Redis client: a command takes `{ buffer: true }`, a raw `MULTI`
+  and `EXEC` are followed, and a reconnect returns to the database that the client selected.
+  `redis.multi()` (2026-10-20) met them in six files.
+  - Upstream's `Expect` has `Database`, `Multi` and `Exec` now, and the patch's `Transaction`
+    is beside them. Upstream has an `Event::Executed` of its own, for a raw `send("EXEC")`. The
+    event of the patch is `Event::Transacted`.
+  - `Event::Resolved` has `reply` where it had `as_buffer`. The replies of a transaction are
+    converted with upstream's `reply_to_js`. A reply whose keys are not text is the error object
+    in its place in the array, as for a raw `EXEC`.
+  - New in the patch: a `SELECT` in a transaction is remembered. Without that, the rule of
+    oven-sh/bun#49548 would not hold for `redis.multi().select(2).exec()`. `Transaction` keeps
+    where each `SELECT` is, and the last one that `EXEC` answers with `OK` is the database of
+    the next handshake. The unit test is
+    `the_last_select_that_ran_is_the_database_of_the_next_handshake`.
+  - The command methods are upstream's, with their new `reply`, without the `Ok()` around the
+    call. The address of a transaction has upstream's new `origin`. The fixture of the types has
+    both blocks.
+  - Passing: the unit tests of `bun_valkey` (59), `connection-failures.test.ts` (169),
+    `valkey.test.ts` (80), `valkey-gc.test.ts` (29) and `redis-client-types.test.ts` (8).
+- oven-sh/bun#49518 renames `contains_newline_or_cr` in `credentials_jsc.rs`, beside the
+  function that S3 metadata (2026-09-27) adds there. Both stay. `s3-metadata.test.ts` passes
+  (38).
+- oven-sh/bun#49528 adds `ERR_PATCH_DOES_NOT_APPLY` at the end of `ErrorCode.ts`, where
+  `node:sea` (2026-10-17) adds its two codes. Upstream's is first. `sea.test.ts` passes (4).
+- oven-sh/bun#49568 adds a test at the end of `test/bundler/cli.test.ts`, where `alias`
+  (2026-10-21) adds its block. Both stay. The file passes (100).
+- Also run on the debug build after the rebase: 48 more test files that the stack adds or
+  changes, among them S3 copy and presigned POST, response compression, the proxy tests, SMTP,
+  `run-eval`, in-source tests, the bundler API, `--hot`, `Bun.inspect`, `bun pm ls` and the
+  shell builtins. 3,718 cases pass and none fails.
+- `test/integration/bun-types` passes except
+  `promises nothing that a schema of the bindgen breaks`, which needs the engine's generator
+  folder of a WebKit checkout. This machine has none. The fork's three workflows were green for
+  the push of 2026-11-24.
+- Only the tip of the stack was built, as before.
+
+Files: `src/runtime/cli/bunx_command.rs`, `src/runtime/cli/mod.rs` (the forward in `bun_create`,
+two help texts), `docs/pm/bunx.mdx`, `docs/snippets/cli/bunx.mdx`,
+`docs/runtime/templating/create.mdx`, `completions/bun.bash`, `completions/bun.fish`,
+`completions/bun.zsh`, `completions/bun-cli.json`, `test/cli/install/bunx.test.ts`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

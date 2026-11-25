@@ -198,7 +198,7 @@ _bun_completions() {
             COMPREPLY=( $(compgen -f -W "--recursive --filter --access --tag --otp --auth-type --gzip-level --tolerate-republish --dry-run --ignore-scripts --registry --config --silent --verbose --cwd --help -r -F -c -h" -- "${cur_word}") );
             return;;
         x)
-            COMPREPLY=( $(compgen -W "--bun --package --no-install --cwd --env-file --minimum-release-age --trust --verbose --silent --help -p -h" -- "${cur_word}") );
+            COMPREPLY=( $(compgen -W "--bun --package --no-install --no-cache --cwd --env-file --minimum-release-age --trust --verbose --silent --help -p -h" -- "${cur_word}") );
             return;;
         compile)
             COMPREPLY=( $(compgen -f -W "--outfile --target --define --env --asset --external --minify --sourcemap --tsconfig-override --compile-exec-argv --disallow-code-generation-from-strings --explain --aot-huge-heap --aot-allow-code-from-disk --aot-harden --aot-order --aot-record-order --obfuscate --compile-inspector --compile-in-place --no-compile-function-source --no-aot --trim --trim-locales --library --outdir --no-script --cwd --help -h" -- "${cur_word}") );
@@ -213,7 +213,7 @@ _bun_completions() {
             COMPREPLY=( $(compgen -f -W "--config --no-config --no-editorconfig --init --doctor --print-width --tab-width --use-tabs --no-semi --single-quote --jsx-single-quote --quote-props --trailing-comma --no-bracket-spacing --bracket-same-line --arrow-parens --object-wrap --single-attribute-per-line --html-whitespace-sensitivity --vue-indent-script-and-style --prose-wrap --embedded-language-formatting --end-of-line --no-insert-final-newline --sort-imports --sort-tailwindcss --sort-package-json --jsdoc --svelte --no-svelte --staged --changed --stdin-filepath --ignore-path --ignore-pattern --with-node-modules --no-error-on-unmatched-pattern --ignore-unknown --allow-unsupported --list-files --cwd --check --list-different --log-level --format --color --no-color --timing --threads --debug-check --no-script --version --help --all --help-all --write --config-precedence --find-config-path --parser --plugin --require-pragma --check-ignore-pragma --insert-pragma --range-start --range-end --cursor-offset --experimental-ternaries --experimental-operator-position --jsx-bracket-same-line --flavor --disable-nested-config -u -c -l -f -v -h -w" -- "${cur_word}") );
             return;;
         create|c)
-            COMPREPLY=( $(compgen -W "--force --no-install --help --no-git --verbose --no-package-json --open next react" -- "${cur_word}") );
+            COMPREPLY=( $(compgen -W "--force --no-install --no-cache --help --no-git --verbose --no-package-json --open next react" -- "${cur_word}") );
             return;;
         upgrade)
             COMPREPLY=( $(compgen -W "--canary --stable --help -h" -- "${cur_word}") );

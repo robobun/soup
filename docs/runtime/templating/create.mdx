@@ -130,6 +130,12 @@ bunx create-remix
 
 Refer to the `create-<template>` package's documentation for usage instructions. For `react` and `next`, Bun doesn't run a package; it only prints a message pointing to `react-app`/`vite` and `next-app`.
 
+Like `bunx`, `bun create` runs the copy of `create-<template>` that it installed earlier that day. To check for a newer version first, pass [`--no-cache`](/pm/bunx) before the template name:
+
+```sh terminal icon="terminal"
+bun create --no-cache remix
+```
+
 ## From GitHub
 
 `bun create <user>/<repo>` downloads the contents of the GitHub repo to disk.
@@ -221,13 +227,14 @@ After cloning a template, `bun create` removes the `"bun-create"` section from `
 
 ### CLI flags
 
-| Flag               | Description                            |
-| ------------------ | -------------------------------------- |
-| `--force`          | Overwrite existing files               |
-| `--no-install`     | Skip installing `node_modules` & tasks |
-| `--ignore-scripts` | Skip tasks & lifecycle scripts         |
-| `--no-git`         | Don't initialize a git repository      |
-| `--open`           | Start & open in-browser after finish   |
+| Flag               | Description                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------ |
+| `--force`          | Overwrite existing files                                                                               |
+| `--no-install`     | Skip installing `node_modules` & tasks                                                                 |
+| `--ignore-scripts` | Skip tasks & lifecycle scripts                                                                         |
+| `--no-git`         | Don't initialize a git repository                                                                      |
+| `--open`           | Start & open in-browser after finish                                                                   |
+| `--no-cache`       | For a template from npm: check for a newer `create-<template>` first. Pass it before the template name |
 
 ### Environment variables
 

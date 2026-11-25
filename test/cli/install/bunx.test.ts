@@ -327,8 +327,8 @@ function plantMarkers(tree: string, ...packages: string[]) {
  * Stands in for api.github.com (bun install honors `GITHUB_API_URL`): every
  * `/repos/<owner>/<repo>/tarball/<ref>` request gets the one fixture repository.
  */
-async function localGithub(owner: string, repo: string, files: Record<string, string>) {
-  const bytes = await githubTarball(`${owner}-${repo}-0123abc`, files);
+async function localGithub(owner: string, repo: string, files: Record<string, string>, commit = "0123abc") {
+  const bytes = await githubTarball(`${owner}-${repo}-${commit}`, files);
   return fixtureServer(pathname => (pathname.startsWith(`/repos/${owner}/${repo}/tarball/`) ? bytes : undefined));
 }
 
@@ -2047,6 +2047,353 @@ describe("a cached tree", () => {
     },
   );
 
+  describe("--no-cache", () => {
+    const old = { stdout: "tool 1.0.0 with dep 1.0.0\n", exitCode: 0 };
+    const updated = { stdout: "tool 1.0.1 with dep 1.0.1\n", exitCode: 0 };
+    const hoursOld = (tree: string) => (Date.now() - statSync(join(tree, "package.json")).mtimeMs) / (60 * 60 * 1000);
+
+    it.concurrent.each(["tool", "tool@latest", "tool@1", "tool@^1"])(
+      "bunx --no-cache %s installs what was published since, inside the day that a tree is good for",
+      async spec => {
+        using registry = await localRegistry(...release("1.0.0"), ...release("1.0.1"));
+        const publish = (version: string) => ["tool", "dep"].forEach(name => registry.tagLatest(name, version));
+        publish("1.0.0");
+        using box = sandbox(registry);
+        expect(await box.run([spec])).toMatchObject(old);
+        const tree = box.tree(spec.includes("@") ? spec : "tool@latest");
+        age(tree, 23);
+        const markers = plantMarkers(tree, "tool", "dep");
+
+        publish("1.0.1");
+        // Only a dist-tag asks without the flag, and not for the dependencies.
+        if (spec !== "tool@latest") expect(await box.run([spec])).toMatchObject({ ...old, requests: [] });
+
+        const flagged = await box.run(["--no-cache", spec]);
+        expect(flagged).toMatchObject(updated);
+        expect(flagged.requests.toSorted()).toEqual([
+          "/dep",
+          "/dep/-/dep-1.0.1.tgz",
+          "/tool",
+          "/tool/-/tool-1.0.1.tgz",
+        ]);
+        // Both packages have a new version, so both are linked again.
+        expect(markers()).toEqual([false, false]);
+
+        // A run without the flag uses this tree. The refresh that links every package again is due when it was.
+        expect(await box.run([spec.replace("@latest", "")])).toMatchObject({ ...updated, requests: [] });
+        expect(hoursOld(tree)).toBeGreaterThan(22);
+      },
+    );
+
+    it.concurrent("asks the registry and links nothing again when nothing was published", async () => {
+      using registry = await localRegistry(...toolWithDep());
+      using box = sandbox(registry);
+      expect(await box.run(["tool"])).toMatchObject({ stdout: ran, exitCode: 0 });
+      const tree = box.tree("tool@latest");
+      age(tree, 23);
+      const markers = plantMarkers(tree, "tool", "dep");
+
+      expect(await box.run(["--no-cache", "tool"])).toMatchObject({
+        stdout: ran,
+        exitCode: 0,
+        requests: ["/tool", "/dep"],
+      });
+      expect(markers()).toEqual([true, true]);
+      expect(hoursOld(tree)).toBeGreaterThan(22);
+      expect(await box.run(["tool"])).toMatchObject({ stdout: ran, stderr: "", exitCode: 0, requests: [] });
+    });
+
+    it.concurrent("downloads a GitHub repository again", async () => {
+      const repo = (version: string) => ({
+        "package.json": JSON.stringify({ name: "cowsay", version, bin: { cowsay: "cli.js" } }),
+        "cli.js": echoBin(`cowsay ${version}`),
+      });
+      using before = await localGithub("bunx-fixture", "cowsay", repo("1.0.0"));
+      using since = await localGithub("bunx-fixture", "cowsay", repo("1.0.1"), "4567def");
+      using box = sandbox();
+      const spec = "github:bunx-fixture/cowsay";
+      const env = { ...box.env, GITHUB_API_URL: before.url };
+      expect(await box.run([spec], { env })).toMatchObject({ stdout: "cowsay 1.0.0\n", exitCode: 0 });
+
+      env.GITHUB_API_URL = since.url;
+      expect(await box.run([spec], { env })).toMatchObject({ stdout: "cowsay 1.0.0\n", exitCode: 0 });
+      expect(since.requests).toEqual([]);
+      expect(await box.run(["--no-cache", spec], { env })).toMatchObject({ stdout: "cowsay 1.0.1\n", exitCode: 0 });
+      expect(since.requests).toEqual(["/repos/bunx-fixture/cowsay/tarball/"]);
+    });
+
+    it.concurrent("downloads a tarball URL again, also when its version did not change", async () => {
+      const build = (label: string) =>
+        githubTarball("package", {
+          "package.json": JSON.stringify({ name: "tool", version: "1.0.0", bin: { tool: "cli.js" } }),
+          "cli.js": echoBin(label),
+        });
+      let bytes = await build("build A");
+      using tarballs = fixtureServer(pathname => (pathname === "/tool.tgz" ? bytes : undefined));
+      using box = sandbox(tarballs);
+      const spec = `tool@${tarballs.url}/tool.tgz`;
+      expect(await box.run([spec])).toMatchObject({ stdout: "build A\n", exitCode: 0, requests: ["/tool.tgz"] });
+
+      bytes = await build("build B");
+      expect(await box.run([spec])).toMatchObject({ stdout: "build A\n", exitCode: 0, requests: [] });
+      expect(await box.run(["--no-cache", spec])).toMatchObject({
+        stdout: "build B\n",
+        exitCode: 0,
+        requests: ["/tool.tgz"],
+      });
+      expect(await box.run([spec])).toMatchObject({ stdout: "build B\n", exitCode: 0, requests: [] });
+    });
+
+    it.concurrent.each([
+      { flags: ["--no-cache=true"], acts: true },
+      { flags: ["--no-cache", "true"], acts: true },
+      { flags: ["--no-cache=false"], acts: false },
+      { flags: ["--no-cache", "false"], acts: false },
+      // Like the other flags of bunx, it is not taken back.
+      { flags: ["--no-cache", "--no-cache=false"], acts: true },
+    ])("$flags is the flag: $acts, and its value is not the package", async ({ flags, acts }) => {
+      using registry = await localRegistry(...release("1.0.0"), ...release("1.0.1"));
+      const publish = (version: string) => ["tool", "dep"].forEach(name => registry.tagLatest(name, version));
+      publish("1.0.0");
+      using box = sandbox(registry);
+      expect(await box.run(["tool@^1"])).toMatchObject(old);
+
+      publish("1.0.1");
+      const { requests, ...result } = await box.run([...flags, "tool@^1"]);
+      expect(result).toMatchObject(acts ? updated : old);
+      expect(requests.filter(path => path === "/true" || path === "/false")).toEqual([]);
+      expect(requests.length > 0).toBe(acts);
+    });
+
+    // `--no-cache true` is npm's spelling of the flag with its value. `--no-cache=true` has its value already.
+    it.concurrent("the word after --no-cache=true is the package, also when it is `true`", async () => {
+      using registry = await localRegistry(
+        fixturePackage("true", "1.0.0", "true"),
+        fixturePackage("hello", "1.0.0", "hello"),
+      );
+      using box = sandbox(registry);
+      // Where PATH has a `true`, that is what runs. `hello` is its argument either way.
+      const { stdout, exitCode, requests } = await box.run(["--no-cache=true", "true", "hello"]);
+      expect(requests).not.toContain("/hello");
+      expect(stdout).not.toContain("hello 1.0.0");
+      expect(exitCode).toBe(0);
+    });
+
+    it.concurrent.each([
+      { name: "bun --no-cache x tool", bunx: [bunExe(), "--no-cache", "x"], args: ["tool"] },
+      { name: "bun x --no-cache -p tool tool", bunx: [bunExe(), "x"], args: ["--no-cache", "-p", "tool", "tool"] },
+      { name: "bun x -p tool --no-cache tool", bunx: [bunExe(), "x"], args: ["-p", "tool", "--no-cache", "tool"] },
+    ])("$name", async ({ bunx, args }) => {
+      using before = await localRegistry(...release("1.0.0"));
+      using since = await localRegistry(...release("1.0.0"), ...release("1.0.1"));
+      using box = sandbox(before);
+      expect(await box.run(["tool"])).toMatchObject(old);
+
+      const env = { ...box.env, npm_config_registry: since.url };
+      expect(await box.run(args, { env, bunx })).toMatchObject(updated);
+    });
+
+    // `bun run` runs `bun x` where a script says `npx`. Not on Windows: the script finds Bun through a symlink on PATH.
+    it.concurrent.skipIf(isWindows)("npx --no-cache in a script that bun run runs", async () => {
+      using before = await localRegistry(...release("1.0.0"));
+      using since = await localRegistry(...release("1.0.0"), ...release("1.0.1"));
+      using box = sandbox(before, {
+        cwd: { "package.json": JSON.stringify({ scripts: { tool: "npx --no-cache tool" } }) },
+      });
+      expect(await box.run(["tool"])).toMatchObject(old);
+
+      symlinkSync(bunExe(), join(box.dir, isDebug ? "bun-debug" : "bun"));
+      const env = { ...box.env, PATH: box.dir + delimiter + box.env.PATH, npm_config_registry: since.url };
+      expect(await box.run(["run", "--silent", "tool"], { env, bunx: [bunExe()] })).toMatchObject(updated);
+    });
+
+    it.concurrent("a package that the project has installed is still the one that runs", async () => {
+      using registry = await localRegistry(...toolWithDep());
+      using box = sandbox(registry);
+      expect(await box.run(["tool"])).toMatchObject({ stdout: ran, exitCode: 0 });
+
+      addLocalPackage(box.cwd, "tool", "0.5.0", "tool");
+      expect(await box.run(["--no-cache", "tool"])).toEqual({
+        stdout: "tool of tool 0.5.0\n",
+        stderr: "",
+        exitCode: 0,
+        requests: [],
+      });
+      // Without it, the flag is about the tree that the first run installed.
+      rmSync(join(box.cwd, "node_modules"), { recursive: true });
+      expect(await box.run(["--no-cache", "tool"])).toMatchObject({
+        stdout: ran,
+        exitCode: 0,
+        requests: ["/tool", "/dep"],
+      });
+    });
+
+    it.concurrent(
+      "a command of that name on PATH is still the one that runs, unless the package has a version",
+      async () => {
+        using registry = await localRegistry(...toolWithDep());
+        using onPath = tempDir(
+          "bunx-on-path",
+          isWindows ? { "tool.cmd": "@echo tool from PATH\r\n" } : { "tool": '#!/bin/sh\necho "tool from PATH"\n' },
+        );
+        if (!isWindows) chmodSync(join(String(onPath), "tool"), 0o755);
+        using box = sandbox(registry);
+        const env = { ...box.env, PATH: `${onPath}${delimiter}${box.env.PATH}` };
+
+        expect(await box.run(["--no-cache", "tool"], { env })).toMatchObject({
+          stdout: expect.stringContaining("tool from PATH"),
+          exitCode: 0,
+          requests: [],
+        });
+        expect(await box.run(["--no-cache", "tool@latest"], { env })).toMatchObject({ stdout: ran, exitCode: 0 });
+      },
+    );
+
+    it.concurrent("after the package it is a flag of the tool", async () => {
+      using registry = await localRegistry(fixturePackage("tool", "1.0.0", "tool"));
+      using box = sandbox(registry);
+      expect(await box.run(["tool"])).toMatchObject({ stdout: "tool 1.0.0\n", exitCode: 0 });
+      expect(await box.run(["tool", "--no-cache"])).toMatchObject({
+        stdout: "tool 1.0.0 --no-cache\n",
+        exitCode: 0,
+        requests: [],
+      });
+      expect(await box.run(["--no-cache", "tool", "--no-cache"])).toMatchObject({
+        stdout: "tool 1.0.0 --no-cache\n",
+        exitCode: 0,
+        requests: ["/tool"],
+      });
+    });
+
+    it.concurrent.each([
+      { tree: "a fresh tree", status: 503 },
+      { tree: "a fresh tree", status: 404 },
+      { tree: "a day-old tree", status: 503 },
+      { tree: "an unfinished tree", status: 503 },
+    ])("does not run the copy that it was told not to use: $tree, and a $status", async ({ tree, status }) => {
+      using registry = await localRegistry(...toolWithDep());
+      using box = sandbox(registry);
+      expect(await box.run(["tool"])).toMatchObject({ stdout: ran, exitCode: 0 });
+      if (tree === "a day-old tree") age(box.tree("tool@latest"));
+      // bunx writes this before it installs, and `bun add` replaces it once everything is linked.
+      if (tree === "an unfinished tree") writeFileSync(join(box.tree("tool@latest"), "package.json"), "{}\n");
+
+      registry.down.set("/tool", status);
+      const refused = await box.run(["--no-cache", "tool"]);
+      expect(refused.stderr).not.toContain("using cached");
+      // A 503 is tried again, as it is when there is no tree.
+      expect(refused).toMatchObject({ stdout: "", exitCode: 1, requests: Array(status === 503 ? 6 : 1).fill("/tool") });
+      if (tree !== "a fresh tree") return;
+      // The tree is as good as it was for a run that may use it.
+      expect(await box.run(["tool"])).toMatchObject({ stdout: ran, stderr: "", exitCode: 0, requests: [] });
+    });
+
+    const refused = {
+      stdout: "",
+      stderr: "error: --no-cache may install the package, which --no-install forbids\n",
+      exitCode: 1,
+      requests: [],
+    };
+
+    it.concurrent.each([
+      [["--no-install"]],
+      [["--no"]],
+      [["--no-yes"]],
+      [["--yes=false"]],
+      [["--yes", "false"]],
+      [["-n"]],
+      [["--offline"]],
+    ])("with %j is an error, in either order and whatever the project has", async noInstall => {
+      using box = sandbox();
+      addLocalBin(box.cwd, "tool", `console.log("local");`);
+      expect(await box.run(["--no-cache", ...noInstall, "tool"])).toEqual(refused);
+      expect(await box.run([...noInstall, "--no-cache", "tool"])).toEqual(refused);
+    });
+
+    it.concurrent.each(["--no-install", "--offline"])("with %s in BUN_OPTIONS is the same error", async noInstall => {
+      using box = sandbox();
+      addLocalBin(box.cwd, "tool", `console.log("local");`);
+      expect(await box.run(["--no-cache", "tool"], { env: { ...box.env, BUN_OPTIONS: noInstall } })).toEqual(refused);
+    });
+
+    it.concurrent("in BUN_OPTIONS it is the flag, and gives way to --no-install", async () => {
+      using before = await localRegistry(...release("1.0.0"));
+      using since = await localRegistry(...release("1.0.0"), ...release("1.0.1"));
+      using box = sandbox(before);
+      expect(await box.run(["tool"])).toMatchObject(old);
+
+      const env = { ...box.env, npm_config_registry: since.url, BUN_OPTIONS: "--no-cache" };
+      expect(await box.run(["--no-install", "tool"], { env })).toMatchObject({ ...old, stderr: "" });
+      expect(since.requests).toEqual([]);
+      expect(await box.run(["tool"], { env })).toMatchObject(updated);
+    });
+
+    // BUN_OPTIONS is in front of the command line, and `bunx` has no `x` between the two. Not on
+    // Windows: `bunx` is a symlink to the executable.
+    it.concurrent.skipIf(isWindows)("in BUN_OPTIONS it does not take the package for its value", async () => {
+      using registry = await localRegistry(
+        fixturePackage("true", "1.0.0", "true"),
+        fixturePackage("hello", "1.0.0", "hello"),
+      );
+      using box = sandbox(registry);
+      symlinkSync(bunExe(), join(box.dir, "bunx"));
+      const env = { ...box.env, BUN_OPTIONS: "--no-cache" };
+      // Where PATH has a `true`, that is what runs. `hello` is its argument either way.
+      const { stdout, exitCode, requests } = await box.run(["true", "hello"], { env, bunx: [join(box.dir, "bunx")] });
+      expect(requests).not.toContain("/hello");
+      expect(stdout).not.toContain("hello 1.0.0");
+      expect(exitCode).toBe(0);
+    });
+
+    it.concurrent("concurrent runs each ask the registry, and link nothing again", async () => {
+      using registry = await localRegistry(...toolWithDep());
+      using box = sandbox(registry);
+      expect(await box.run(["tool"])).toMatchObject({ stdout: ran, exitCode: 0 });
+      const markers = plantMarkers(box.tree("tool@latest"), "tool", "dep");
+
+      const before = registry.requests.length;
+      const results = await Promise.all(Array.from({ length: 4 }, () => box.run(["--no-cache", "tool"])));
+      expect(outcomes(results)).toEqual(Array.from({ length: 4 }, () => ({ stdout: ran, exitCode: 0 })));
+      expect(registry.requests.slice(before).toSorted()).toEqual([...Array(4).fill("/dep"), ...Array(4).fill("/tool")]);
+      expect(markers()).toEqual([true, true]);
+    });
+
+    it.concurrent.each([
+      { name: "bun create --no-cache", create: ["create", "--no-cache"] },
+      { name: "bun create --no-cache=true", create: ["create", "--no-cache=true"] },
+      { name: "bun c --no-cache", create: ["c", "--no-cache"] },
+      { name: "bun --no-cache create", create: ["--no-cache", "create"] },
+      { name: "BUN_OPTIONS=--no-cache bun create", create: ["create"], BUN_OPTIONS: "--no-cache" },
+    ])("$name <template> checks for a newer create-<template>", async ({ create, BUN_OPTIONS }) => {
+      using before = await localRegistry(fixturePackage("create-thing", "1.0.0", "create-thing"));
+      using since = await localRegistry(
+        fixturePackage("create-thing", "1.0.0", "create-thing"),
+        fixturePackage("create-thing", "1.0.1", "create-thing"),
+      );
+      using box = sandbox(before);
+      const ranOld = { stdout: "create-thing 1.0.0 dir\n", exitCode: 0 };
+      expect(await box.run(["thing", "dir"], { bunx: [bunExe(), "create"] })).toMatchObject(ranOld);
+
+      const env = { ...box.env, npm_config_registry: since.url };
+      expect(await box.run(["thing", "dir"], { bunx: [bunExe(), "create"], env })).toMatchObject(ranOld);
+      expect(since.requests).toEqual([]);
+      expect(
+        await box.run(["thing", "dir"], { bunx: [bunExe(), ...create], env: { ...env, BUN_OPTIONS } }),
+      ).toMatchObject({
+        stdout: "create-thing 1.0.1 dir\n",
+        exitCode: 0,
+      });
+      const installed = ["/create-thing", "/create-thing/-/create-thing-1.0.1.tgz"];
+      expect(since.requests).toEqual(installed);
+      // After the template it is a flag of the template.
+      expect(await box.run(["thing", "--no-cache"], { bunx: [bunExe(), "create"], env })).toMatchObject({
+        stdout: "create-thing 1.0.1 --no-cache\n",
+        exitCode: 0,
+      });
+      expect(since.requests).toEqual(installed);
+    });
+  });
+
   it.concurrent("a dist-tag run doesn't delay the refresh of the dependencies", async () => {
     using registry = await localRegistry(...toolWithDep());
     using box = sandbox(registry);
@@ -3466,7 +3813,9 @@ describe("flags", () => {
     using box = sandbox();
     const { stdout, stderr, exitCode } = await box.run([flag]);
     expect(stderr).toContain("Usage: bunx [flags] <package><@version>");
-    for (const name of ["--cwd", "--env-file", "--minimum-release-age", "--trust"]) expect(stderr).toContain(name);
+    for (const name of ["--cwd", "--env-file", "--minimum-release-age", "--trust", "--no-cache"]) {
+      expect(stderr).toContain(name);
+    }
     // `--trust` is not scoped to the package that is named.
     expect(stderr).toContain("Run the lifecycle scripts of the package and of ALL of its dependencies");
     expect({ stdout, exitCode }).toEqual({ stdout: "", exitCode: 0 });

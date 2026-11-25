@@ -490,6 +490,7 @@ complete -c bun -n "__fish_seen_subcommand_from publish" -l "cwd" -r -d "Set a s
 complete -c bun -n "__fish_seen_subcommand_from x" -l "bun" -d "Force the command to run with Bun instead of Node.js" -f
 complete -c bun -n "__fish_seen_subcommand_from x" -s "p" -l "package" -r -d "Package to install when the binary name differs from the package name" -f
 complete -c bun -n "__fish_seen_subcommand_from x" -l "no-install" -d "Skip installation if the package is not already installed" -f
+complete -c bun -n "__fish_seen_subcommand_from x" -l "no-cache" -d "Resolve the package again and install what changed" -f
 complete -c bun -n "__fish_seen_subcommand_from x" -l "cwd" -r -d "Set the working directory"
 complete -c bun -n "__fish_seen_subcommand_from x" -l "env-file" -r -d "Load environment variables from the specified file(s)"
 complete -c bun -n "__fish_seen_subcommand_from x" -l "minimum-release-age" -r -d "Only install packages published at least N seconds ago" -f

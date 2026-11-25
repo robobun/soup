@@ -50,6 +50,20 @@ On macOS and Linux, if the project has the package but the file of its executabl
 
 `bunx my-cli` asks the registry for newer versions of the package and of its dependencies once a day. If the registry cannot be reached or answers with a 5xx, 429 or 408 status, it warns and runs the version it has. `bunx my-cli@latest` asks on every run.
 
+To ask now, pass `--no-cache` before the package name:
+
+```bash terminal icon="terminal"
+bunx --no-cache my-cli
+bunx --no-cache my-cli@^2
+bunx --no-cache github:my-org/my-cli
+```
+
+`bunx --no-cache` resolves the package and its dependencies again, for a name, a version range, a dist-tag and a git or tarball URL. It installs what changed, and the next `bunx my-cli` runs that copy. If the registry cannot be reached, it exits with an error. It does not run the copy it has.
+
+`--no-cache` does not change where `bunx` looks first. A package that the project has installed still runs, and so does a `my-cli` command on your `PATH`, such as a global install. `bunx` does not ask the registry in that case. To skip both, add a version or a tag: `bunx --no-cache my-cli@latest`.
+
+`bunx` exits with an error if you pass both `--no-cache` and `--no-install`. If `--no-cache` comes only from [`BUN_OPTIONS`](/runtime/environment-variables#configuring-bun), `--no-install` wins.
+
 ## Arguments and flags
 
 To pass additional command-line flags and arguments through to the executable, place them after the executable name.

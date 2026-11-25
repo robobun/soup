@@ -1761,6 +1761,7 @@ pub(crate) mod command {
         let mut positionals: [&[u8]; 2] = [b"", b""];
         let mut positional_i: usize = 0;
         let mut dash_dash_bun = false;
+        let mut no_cache = false;
         let mut print_help = false;
 
         if args.len() > 2 {
@@ -1779,6 +1780,8 @@ pub(crate) mod command {
                     if slice[0] == b'-' {
                         if slice == b"--bun" {
                             dash_dash_bun = true;
+                        } else if slice == b"--no-cache" || slice == b"--no-cache=true" {
+                            no_cache = true;
                         } else if slice == b"--help" || slice == b"-h" {
                             print_help = true;
                         }
@@ -1841,11 +1844,17 @@ To create a project with the official Next.js scaffolding tool, run
             && example_tag != ExampleTag::LocalFolder;
 
         if use_bunx {
-            let mut bunx_args: Vec<&ZStr> =
-                Vec::with_capacity(3 + args.len() - template_name_start + (dash_dash_bun as usize));
+            let mut bunx_args: Vec<&ZStr> = Vec::with_capacity(
+                3 + args.len() - template_name_start
+                    + (dash_dash_bun as usize)
+                    + (no_cache as usize),
+            );
             bunx_args.push(bun_core::zstr!("bunx"));
             if dash_dash_bun {
                 bunx_args.push(bun_core::zstr!("--bun"));
+            }
+            if no_cache {
+                bunx_args.push(bun_core::zstr!("--no-cache"));
             }
             bunx_args.extend(Global::ca_store_flag());
             // `add_create_prefix` returns an owned NUL-terminated buffer.
@@ -1988,6 +1997,7 @@ Flags:
   <cyan>--bun<r>                  Force the command to run with Bun instead of Node.js
   <cyan>-p, --package <blue>\\<package\\><r>    Specify package to install when binary name differs from package name
   <cyan>--no-install<r>           Skip installation if package is not already installed
+  <cyan>--no-cache<r>             Resolve the package and its dependencies again before running, and install what changed
   <cyan>--cwd <blue>\\<path\\><r>            Set the working directory
   <cyan>--env-file <blue>\\<file\\><r>       Load environment variables from the specified file(s)
   <cyan>--minimum-release-age <blue>\\<seconds\\><r>  Only install packages published at least N seconds ago (security feature)
@@ -2136,7 +2146,7 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/test<r>
   <b><magenta>bun create \\<MyReactComponent.(jsx|tsx)\\><r>
 
 <b>Templates<r><d>:<r>
-  • NPM: Runs <b><magenta>bunx create-\\<template\\><r> with given arguments
+  • NPM: Runs <b><magenta>bunx create-\\<template\\><r> with given arguments. <cyan>--no-cache<r> before the template checks for a newer version first
   • GitHub: Downloads repository contents as template
   • Local: Uses templates from $HOME/.bun-create/\\<name\\> or ./.bun-create/\\<name\\>
 

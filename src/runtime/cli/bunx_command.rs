@@ -127,6 +127,8 @@ pub(crate) struct Options {
     pub(crate) silent_install: bool,
     /// Only run the target command if it is already downloaded; otherwise `bunx` exits with an error.
     pub(crate) no_install: bool,
+    /// Resolve the package again instead of running the tree that an earlier `bunx` installed.
+    pub(crate) no_cache: bool,
     /// Passes `--trust` to `bun add`, so the lifecycle scripts of the package and of everything it
     /// depends on run.
     pub(crate) trust: bool,
@@ -179,6 +181,7 @@ impl Options {
         let mut opts = Options::default();
         opts.passthrough_list.reserve_exact(argv.len());
         let mut ca_store_flags: Vec<&[u8]> = Vec::new();
+        let mut no_cache_is_typed = false;
 
         // `BUN_OPTIONS` applies to every command, so flags in it that bunx doesn't know are meant
         // for something else.
@@ -187,6 +190,12 @@ impl Options {
             .unwrap_or_default();
         let is_from_bun_options =
             |arg: &ZStr| bun_options.iter().any(|option| core::ptr::eq(*option, arg));
+        // A flag in `BUN_OPTIONS` does not take the first word of the command line for its value.
+        let value_after = |i: usize| {
+            (argv.get(i + 1))
+                .filter(|next| is_from_bun_options(**next) == is_from_bun_options(argv[i]))
+                .map(|next| next.as_bytes())
+        };
 
         while i < argv.len() {
             let positional: &[u8] = argv[i].as_bytes();
@@ -274,6 +283,15 @@ impl Options {
                     Global::exit(0);
                 } else if Global::is_ca_store_flag(positional) {
                     ca_store_flags.push(positional);
+                } else if positional == b"--no-cache=true"
+                    || (positional == b"--no-cache" && value_after(i) != Some(b"false".as_slice()))
+                {
+                    // The `false` forms are skipped below with their value, like npm's booleans.
+                    opts.no_cache = true;
+                    no_cache_is_typed |= !is_from_bun_options(argv[i]);
+                    i += usize::from(
+                        positional == b"--no-cache" && value_after(i) == Some(b"true".as_slice()),
+                    );
                 } else if positional == b"--" || is_from_bun_options(argv[i]) {
                 } else if let Some(value_is_next_arg) = CommandLineArguments::bunx_skips_flag(
                     positional,
@@ -300,6 +318,18 @@ impl Options {
         }
 
         Global::set_ca_store_from_flags(|flag| ca_store_flags.contains(&flag));
+
+        if opts.no_cache && opts.no_install {
+            if no_cache_is_typed {
+                Output::err_generic(
+                    "--no-cache may install the package, which --no-install forbids",
+                    (),
+                );
+                Global::exit(1);
+            }
+            // From `BUN_OPTIONS` alone it is a default, which `--no-install` on this run overrides.
+            opts.no_cache = false;
+        }
 
         let maybe_package_name = maybe_package_name.filter(|name| !name.is_empty());
         if let Some(specified_package) = opts.specified_package {
@@ -1062,9 +1092,11 @@ impl BunxCommand {
 
         let is_versioned = !update_request.version.literal.is_empty();
         // An explicit dist-tag (`pkg@latest`, `pkg@next`) checks the registry on every run, except
-        // with `--no-install`.
-        let look_for_existing_bin =
-            opts.no_install || !is_versioned || update_request.version.tag() != VersionTag::DistTag;
+        // with `--no-install`. With `--no-cache` every spec does.
+        let look_for_existing_bin = !opts.no_cache
+            && (opts.no_install
+                || !is_versioned
+                || update_request.version.tag() != VersionTag::DistTag);
         let package_with_bin = opts.binary_name.is_none().then_some(result_package_name);
 
         let find_on_path = || {
@@ -1231,6 +1263,8 @@ impl BunxCommand {
         // Checked under the lock, because the process that held it before may have just installed
         // the tree.
         let tree = Self::tree_state(bunx_cache_dir);
+        // `--no-cache` adds no `--force`: a fresh tree with its bin links again only what changed.
+        let refresh = tree == Tree::Stale || opts.no_cache;
         let installed = if tree == Tree::Fresh {
             match Self::find_in_cache(
                 this_transpiler,
@@ -1240,7 +1274,7 @@ impl BunxCommand {
                 package_with_bin,
                 &path_for_bin_dirs,
             ) {
-                // The version that the dist-tag points to now may have a bin, so install it.
+                // The version that the spec resolves to now may have a bin, so install it.
                 Err(crate::Error::NoBinFound) if !look_for_existing_bin => None,
                 found => Self::exit_if_no_bin(found, update_request.name)?,
             }
@@ -1277,17 +1311,16 @@ impl BunxCommand {
         if finished_package_json.is_none() {
             write_package_json(Self::EMPTY_PACKAGE_JSON);
         }
-        if tree == Tree::Stale {
+        if refresh {
             // The lockfile would pin what the refresh is meant to update: the version within a
             // range and every dependency.
             for lockfile in [bun_core::zstr!("bun.lock"), bun_core::zstr!("bun.lockb")] {
                 let _ = bun_sys::unlinkat(bunx_install_dir.fd, lockfile);
             }
         }
-        // An install into a fresh tree only updates the requested package, so package.json gets its
-        // old mtime back afterward. Otherwise the dependencies' refresh would be postponed again.
+        // A new day starts only when every dependency was resolved and every package linked again.
         let package_json_path = Path::from_parts(&[bunx_cache_dir, b"package.json"]);
-        let last_refresh = (tree == Tree::Fresh)
+        let last_refresh = (tree == Tree::Fresh && !(refresh && installed.is_none()))
             .then(|| bun_sys::stat(&package_json_path).ok())
             .flatten();
 
@@ -1316,7 +1349,7 @@ impl BunxCommand {
             install_param.as_slice(),
             b"--no-summary",
         ];
-        if update_request.version.tag() == VersionTag::DistTag || tree == Tree::Stale {
+        if update_request.version.tag() == VersionTag::DistTag || refresh {
             // No manifest cache, so that @latest is fetched from the registry.
             args.push(b"--no-cache");
         }

@@ -1253,6 +1253,7 @@ _bun() {
                 '-p[Package to install when the binary name differs from the package name]:package' \
                 '--package[Package to install when the binary name differs from the package name]:package' \
                 '--no-install[Skip installation if the package is not already installed]' \
+                '--no-cache[Resolve the package again and install what changed]' \
                 '--cwd[Set the working directory]:cwd:_files -/' \
                 '*--env-file[Load environment variables from the specified file(s)]:env-file:_files' \
                 '--minimum-release-age[Only install packages published at least N seconds ago]:seconds' \

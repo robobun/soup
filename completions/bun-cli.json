@@ -206,6 +206,13 @@
           "multiple": false
         },
         {
+          "name": "no-cache",
+          "description": "Resolve the package and its dependencies again before running, and install what changed",
+          "hasValue": false,
+          "required": false,
+          "multiple": false
+        },
+        {
           "name": "cwd",
           "description": "Set the working directory",
           "hasValue": true,
