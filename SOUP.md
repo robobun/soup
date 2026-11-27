@@ -14219,6 +14219,387 @@ Files: `src/runtime/api/Glob.bind.ts`, `src/runtime/api/glob.rs`, `src/glob/igno
 `test/integration/bun-types/fixture/bun.ts`,
 `test/aot/parallel/what-a-glob-scans/a-list-of-patterns-is-read-when-the-glob-is-made.js`.
 
+### 2026-11-27: `db.backup()` in `bun:sqlite`, a copy of a database that is in use, a few pages in each turn of the event loop
+
+A program had two ways to copy its SQLite database, and each is one blocking call. On a 308 MB
+database `VACUUM INTO` stalled the event loop for 414 ms, and `db.serialize()` with `Bun.write`
+for 321 ms with the whole database in memory (the release build of upstream). `backup()` of
+`node:sqlite` is in Bun, but it copies everything inside the call too: 185 ms, where Node.js
+v26.3.0 ran 446 timer callbacks and 236 queries during the same copy. oven-sh/bun#22954 asks for
+a backup in `bun:sqlite` since September 2025 (4 thumbs up, ENG-20627). theshadow27 wrote a
+`backupTo()` twice: oven-sh/bun#26880 was closed on 2026-10-17 with the note that a synchronous
+copy exists already and that the shape is one decision, and oven-sh/bun#26884 was closed by the
+inactivity sweep on 2026-11-27 without a review. better-sqlite3, which `bun:sqlite` follows, has
+`db.backup()`. Now `bun:sqlite` has it, with that signature:
+
+```ts
+import { Database } from "bun:sqlite";
+
+const db = new Database("app.sqlite");
+
+await db.backup(`backup-${Date.now()}.sqlite`);
+
+const { totalPages } = await db.backup("backup.sqlite", {
+  attached: "main",
+  progress({ totalPages, remainingPages }) {
+    console.log(
+      `${(((totalPages - remainingPages) / totalPages) * 100).toFixed(1)}%`,
+    );
+    return 200; // the pages of the next steps. 0 pauses, and a throw cancels.
+  },
+});
+```
+
+- It copies with the Online Backup API of SQLite: 100 pages, then the event loop runs, then the
+  next 100. For a copy of the 308 MB database to a new file, the longest gap between two turns of
+  the event loop was 6.7 ms (the median of 10 runs on the debug build, where `VACUUM INTO` was
+  one gap of 862 ms and `backup()` of `node:sqlite` one of 513 ms).
+- What the same `Database` writes during the copy is in the backup: SQLite copies a page again
+  when that connection changes it. The promise resolves to `{ totalPages, remainingPages: 0 }`.
+- A write by another connection, and every write to a database in memory, makes SQLite start
+  the copy again from the first page. A database that is written in every turn of the event loop
+  would never be copied at 100 pages a turn. So each time the copy starts again, the steps get
+  twice as large, until one step copies every page. A number that `progress` returns does not
+  make a step smaller than that. better-sqlite3 and Node.js do not do this.
+- While the `Database` is inside a write transaction of its own, and while another connection
+  holds a lock that a step needs, the copy tries again after 1 ms, then after 2 ms more, and so
+  on up to 256 ms. A step does not wait inside SQLite for the `busy_timeout` of the `Database`.
+- `progress` is called before the first page is copied and after each step that leaves pages.
+  A number that it returns is the size of the next steps, `0` pauses, `Infinity` copies the rest
+  in one step, and what it throws cancels the copy. It runs in the async context of the call.
+- A file that is not at the destination is made, written without a wait for the disk, and
+  synced once at the end. If the copy does not end, the file is removed.
+- A database that is at the destination is replaced in place, in one transaction of SQLite. If
+  the copy fails or is cancelled, that database is as it was. One in write-ahead mode is changed
+  to rollback mode first. The docs say what else such a copy means: other connections to that
+  database can get `SQLITE_BUSY`, a killed process leaves a `-journal` that SQLite needs, and the
+  thread of the program waits for the disk every few megabytes.
+- `close()` of the `Database`, with and without `true`, cancels a copy that has not copied its
+  last page: the promise is rejected with `Database has closed`.
+- Every failure is a rejection, as in better-sqlite3, with its messages for the arguments. A
+  destination that is the file of the database itself is a `TypeError`, under any name: a
+  symbolic link, a hard link, another spelling of the path. A second backup to a file is
+  rejected while the first one runs.
+- A copy keeps the process alive. `process.exit()`, the termination of its Worker, the disposal
+  of the `Bun.ModuleGraph` whose script started it, and the next file of `bun test --isolate`
+  cancel it and settle nothing.
+
+How it is built.
+
+- One class does the copy: `DatabaseBackup` in `src/jsc/bindings/sqlite/JSSQLStatement.cpp`,
+  beside the connection that it copies from. The thread of the connection calls
+  `sqlite3_backup_step()`, because a connection of Bun has no mutex (`SQLITE_CONFIG_MULTITHREAD`
+  in `Bun__initializeSQLite`), and a mutex costs every row of every query.
+- A step is a task on the queue that runs after the event loop has polled
+  (`ScriptExecutionContext::postTaskAfterYield`). A copy without a `progress` callback makes no
+  JavaScript object in a step.
+- The copies that have not ended are in a list of the VM (`JSVMClientData::sqliteBackups`). What
+  is queued for a copy (a task, a timer, work on the pool) carries the id of the copy and looks
+  it up there, so nothing that is queued holds a copy that has ended. `VersionSqlite3` has no
+  new member.
+- A step is a call on the connection that no script made. So it does what `CHECK_NOT_BUSY` does
+  for a call of script: it waits while a statement of the connection is inside a callback, and
+  it finalizes the statements that the collector left for the next call. Such a statement can
+  hold the write lock that the step waits for.
+- Before a step the copy reads `PRAGMA busy_timeout` of the source and sets it to 0 for the
+  step. With the timeout in place, a step whose source is locked by another connection sleeps
+  inside SQLite, on the thread of the program, for as long as the program allowed its own
+  queries to wait.
+- A copy that waits has a `setInterval` timer of the runtime, which the fake timers of a test
+  do not replace. It is a timer that repeats because the runtime does not call a timer while a
+  termination is pending, and the VM outlives the termination that the `timeout` of `node:vm`
+  makes. A timer that fires once was lost there, and the copy with it. For the same reason a
+  step whose `progress` callback is terminated is queued again, and a copy whose timer could
+  not be armed gets a task.
+- Nothing but SQLite opens the file of the destination while a connection has it. To close any
+  descriptor of a file gives up every lock that the process holds on the file, so a sync
+  through a second descriptor would leave the copy without its locks.
+- SQLite opens the destination without the flag that makes a file. If the file is not there,
+  Bun makes it with `O_CREAT | O_EXCL` and SQLite opens it. Only that file is the copy's to
+  remove, and only while it is empty: SQLite has rolled back what the copy wrote by then.
+- A file that the copy made gets `PRAGMA synchronous=OFF`. After the last page, SQLite is done
+  with the source and the copy alone has the destination. Then the file is synced through
+  SQLite's own descriptor (`SQLITE_FCNTL_FILE_POINTER` and `xSync`), its directory is synced,
+  and the connection is closed. For 1,024 pages or more a thread of the work pool does that,
+  and the promise waits for it. A library that was built without mutexes
+  (`sqlite3_threadsafe()` is 0) does it on the thread of the connection.
+- A database that the copy replaces keeps SQLite's `synchronous=FULL`. Its commit is in the
+  last step, on the thread of the program, and it syncs what the whole copy has written. So the
+  copy syncs the file itself after each 1,024 pages, and the commit finds little to sync.
+- A destination in write-ahead mode is changed to rollback mode before the first page
+  (`PRAGMA journal_mode=DELETE`, with `SQLITE_FCNTL_PERSIST_WAL` cleared for the library of
+  macOS). Through a log, one write of the program to a page that is copied already made SQLite
+  compute the checksum of every frame again in one step, and the close wrote every page once
+  more. A log also refuses a source with another page size.
+- `VersionSqlite3::close()` ends the copies of its connection first: SQLite keeps a connection
+  that a backup reads until the backup has finished. With no copy in the VM, `close()` tests
+  one list of the VM for being empty.
+- On macOS, where Bun loads the SQLite of the system, `sqlite3_threadsafe` is looked up by the
+  first large backup and not when the library is loaded.
+- `db.backup()` in `src/js/bun/sqlite.ts` is an `async` method with the checks and the messages
+  of better-sqlite3. It makes the native function when it is first called (`$newCppFunction`),
+  so a program that imports `bun:sqlite` and never copies has one more function executable and
+  no more function objects than before.
+- Four small functions in Rust over `bun_sys` (`src/jsc/sqlite_backup.rs`) do what SQLite does
+  not do with the file: make it, remove it, sync its directory, and answer whether two paths
+  name one file (device and inode, and no answer on a file system without file ids).
+- `bun test --isolate` retires the realm of a test file on a VM that lives on.
+  `Zig__GlobalObject__retireForTestIsolation` ends the copies there, as the disposal of a graph
+  does for `--isolate=modules`. A step would call the `progress` callback of the file.
+
+What the design review decided, before the code. It compared six designs: a loop in
+`sqlite.ts` over `setImmediate` (what better-sqlite3 does), one native job on the queue after the
+poll, the same job with the work pool for the sync of the file, every step on the work pool
+behind a hand-over of the connection, `backupTo()` of oven-sh/bun#26884 as it was written, and no
+change.
+
+- It picked the native job with the work pool for the file, with a confidence of 0.72.
+- The loop in JavaScript lost because `backup()` of `node:sqlite` has no JavaScript to share it
+  with, because it makes a timer object for each step, and because a copy that waits for a lock
+  runs the event loop about 1.8 million times a second.
+- Steps on the work pool lost because they put a second thread into a connection without a
+  mutex, behind a gate that is checked and not held.
+- `backupTo()` lost because its default call is one `sqlite3_backup_step(-1)`, nothing in it
+  gives the event loop a turn, and a `Database` as the destination crashed in six of seven
+  orders of calls.
+- It left one question for a maintainer: does `backup()` of `node:sqlite` move onto the job in
+  the same commit, or in a second one? It said that the pick is the same either way.
+
+The commit is not the pick as the design review wrote it. Three parts of its plan did not hold,
+and the review of the diff is the evidence for each. A fourth thing was not in the plan.
+
+- The plan synced the file before the last step from the work pool, through a descriptor that
+  the pool opens by the path. That gives up SQLite's locks (see below). The sync now goes
+  through SQLite's descriptor: once at the end on the work pool for a file that the copy made,
+  and in pieces on the thread of the connection for a database that the copy replaces.
+- The plan parked a copy whose connection is inside a write transaction on the commit hook.
+  The hook slots can belong to an extension (see below). The copy waits on a timer.
+- The plan wrote the job as a template with a policy for each SQLite module, and `node:sqlite`
+  as the second policy. This commit has one class and no second module (see below).
+- The plan did not know that SQLite starts the copy of a database in memory again on every
+  commit. The steps that get larger are the answer to it.
+
+What the review of the diff found. It read a first cut of this commit, which was not pushed.
+Its verdict: the method and its signature are wanted, and the cut was not ready. These are its
+findings and what the commit does now.
+
+- The first cut synced the destination from the work pool through a descriptor of its own,
+  opened by the path. The close of that descriptor gave up SQLite's locks on the file, with the
+  journal on the disk. The review showed `/proc/locks` empty after the sync, and three outcomes
+  of one read by another process in that window: a malformed backup, a destroyed old backup, and
+  a promise that resolved over the old database. That sync is gone. Nothing but SQLite opens the
+  destination.
+- The first cut took the commit hook and the rollback hook of the connection, to go on right
+  after a `COMMIT`. A connection has one slot for each, and a loaded extension can own it: the
+  review counted 1 commit where an extension was due 4. The hooks are gone, and a copy waits on
+  the timer only. The price is in "Known".
+- A statement that the collector had left for the next call kept the write lock, and the copy
+  waited for ever. A step finalizes those statements now.
+- The copy took a file for its own when a first open failed and a second open with the create
+  flag worked. With no descriptor left for the first open, that was an existing database, and
+  the copy removed it later. The exclusive create is the answer. The removal also asks whether
+  the file is still empty, and a second copy into one file is rejected.
+- The test for "the same file" compared device and inode without a guard for a file system
+  that gives 0 for both. It compares the names first now, and ids only if there are ids.
+- The docs said that a database at the destination is unchanged if the copy does not complete.
+  That holds for `close()`, a throw and `process.exit()`. It does not hold for a killed process
+  or for a reader during the copy. The docs say each case now.
+- A file that the copy made ran at `synchronous=FULL`: 4 to 6 syncs on the thread of the
+  program for a file that is removed on every failure. It runs without a sync now, with one
+  sync at the end.
+- `PRAGMA busy_timeout` of the source blocked the event loop for that long in each try. See
+  above.
+- The number that `progress` returns replaced the doubled size of a step, so a callback that
+  always returns `100` never copied a database in memory that is written all the time. The
+  doubled size is a floor now.
+- A termination that the VM outlives left the copy with nothing queued. See above. The test for
+  it found the two other cases: the timer that the runtime does not call, and the timer that
+  cannot be armed.
+- `graph.dispose()` left the promise of a copy that the host had started on a database of the
+  graph without an answer. It is rejected with `Database has closed` now.
+- `bun test --isolate` ended no copy when it went to the next file. See above.
+- `{ attached: undefined }` was an error, and the types allow it. It means `"main"` now.
+- The close of a small file went to the work pool too, where it can wait behind other work. Only
+  a file of 1,024 pages or more goes there.
+- No test reached the work pool: the largest database had 450 pages. No test wrote the source
+  through another connection, finished a copy in a Worker, or counted what is held after copies
+  that failed. There are tests for each now.
+- A `static_assert` on the size of `VersionSqlite3` was compiled out in every build that was
+  tested. It is gone.
+
+The review also asked for four things that this commit does otherwise.
+
+- `backup()` of `node:sqlite` on the same job, in this commit or before it. The first cut had a
+  base class with five virtual functions "for both modules" and one class of it. The review is
+  right that this is the wrong way round. Here one feature is one commit, and `node:sqlite` is a
+  change of an API that exists, with two tests that pin its answer for a locked destination. So
+  the base class is gone: `DatabaseBackup` is one plain class of `bun:sqlite`. The comment in
+  `NodeSqlite.cpp` that proposed steps on the work pool now names this class and says why the
+  pool cannot step a connection. See "Not in this commit".
+- A default step of about 400 KB at every page size. The step stays at 100 pages, the number of
+  better-sqlite3 and of `rate` in `node:sqlite`. The docs say "at the default page size", and a
+  test pins 100 pages for 512 and 65,536 bytes.
+- Steps that get smaller again after SQLite has stopped starting the copy again, and a bound on
+  their size. A bound means a copy that never ends while the writes go on. The size only grows,
+  inside one copy.
+- The path of the destination and the failed operation in the message of a `SQLiteError`. The
+  errors of a backup are built as every other `SQLiteError` of the module is.
+
+Known, and not solved here.
+
+- `backup()` of `node:sqlite` still copies everything inside the call.
+- A step runs at the start of a turn of the event loop. A program whose write transactions
+  follow each other with no turn between the `COMMIT` and the next `BEGIN` gives the copy no
+  step. A test pins it, and the docs say it.
+- A database in memory that is written during the copy is copied in one step in the end, which
+  blocks as `serialize()` does. A snapshot with `sqlite3_serialize` and a write on the work pool
+  would not block, and is not built.
+- A copy onto a database of the same size takes about twice as long as a copy to a new file,
+  because SQLite writes each old page to its journal first. Its longest turn is the last one,
+  which removes that journal: 42 ms at 308 MB and 15 ms at 82 MB on the debug build.
+- A destination in write-ahead mode that another connection has open stays in that mode. Its
+  pages go through the log, with the costs that the change of mode avoids.
+- A dangling symbolic link at the destination is an error: the exclusive create does not follow
+  it.
+- Two processes that start a backup to one new file at the same moment: one of them is
+  rejected with `unable to open database file`, or, if the one that made the file fails, the
+  other writes into a file that has no name anymore.
+- The sizes count pages: a step of a database with pages of 64 KB is 6.4 MB, and a database
+  that is replaced is synced every 64 MB then.
+- The termination of a Worker waits for the sync that the work pool has started. `process.exit()`
+  does not. The file has every page in both cases, and after the exit the disk may not have it
+  yet.
+- A copy that `close()` cancels and that nobody waits for is an unhandled rejection.
+- There is no `AbortSignal`: `close()`, a throw from `progress` and the end of the process
+  cancel a copy.
+- The branch for a library without mutexes runs in no test: no build of Bun has such a library.
+- A library that reads a name with `file:` in front as a URI (the SQLite of a Linux
+  distribution does, and the one in Bun does not) rejects such a destination if the file is
+  not there. The copy has made a file with the whole name by then, and removes it.
+
+What was checked.
+
+- Tests, on the debug build: `describe("db.backup()")` in `test/js/bun/sqlite/sqlite.test.js` has
+  85 cases. All of `test/js/bun/sqlite/` passes (767, and 2 are skipped, as before), with
+  `BUN_JSC_validateExceptionChecks=1` for the 85 too. `node-sqlite.test.ts` passes (155), and so
+  do the rows of `bun:sqlite` in `members-of-prototype-objects-for-any-receiver.test.ts`.
+- On the release build of upstream, the 85 cases fail.
+- The cases that another cut failed: a copy of 1,200 pages with `close()`, `process.exit()` and
+  the termination of its Worker after the last page, a copy that ends in a Worker, `close()`
+  while the copy waits for a lock and while it is paused, a write by another connection to a
+  source in rollback mode and in write-ahead mode, a destination in write-ahead mode (with
+  another page size, with a log that a process left behind, with a write to a page that is
+  copied already), a `busy_timeout` of 10 seconds, two `node:vm` timeouts, a statement that the
+  collector left, `bun test --isolate`, and 101 rounds of five copies that end in five ways,
+  after which the process holds no `SQLDatabase` and as many protected objects as before.
+- Nine mutations, in four builds. Without the change to rollback mode, the two cases for a
+  destination in write-ahead mode fail. Without the finalizing of the collector's statements,
+  that case waits for ever. With the busy timeout left in place, its case takes 10 seconds.
+  Without the check for a second copy into one file, without the end of the copies at the next
+  test file, without the queueing after a termination, without the task for a timer that
+  cannot be armed, and with a timer that fires once, the case of each fails. Without the floor
+  under the size of a step, four cases fail. A tenth mutation failed no test: a guard for a
+  step that starts while a termination is pending. The runtime starts no step then, and the
+  guard is gone.
+- `cargo check -p bun_jsc` for the 12 targets of CI, `cargo clippy -p bun_jsc`,
+  `cargo fmt --all --check`, `clang-format` and prettier on the changed files, and
+  `test/integration/bun-types` (30) pass. The source lints pass on the release build of upstream
+  (233). On the debug build two of them take longer than their 5 seconds, with and without this
+  commit.
+- macOS loads the SQLite of the system through `lazy_sqlite3.h`. A debug build for Linux that
+  loads SQLite the same way (`--static-sqlite=off`, SQLite 3.46.1 of the distribution) passes
+  the 85 cases. Its first link failed: a step called `sqlite3_column_int`, which that header
+  does not have. The step reads the column with `sqlite3_column_int64` now.
+- The branch for a library without mutexes, by hand on that build: with a SQLite that was
+  compiled with `SQLITE_THREADSAFE=0` and loaded through `Database.setCustomSQLite()`, the two
+  syncs of a new file of 1,305 pages are on the thread of the program. With the library of the
+  distribution they are on a thread of the work pool.
+- `test/internal/builtins-table/` passed for the first cut (149). The rows of the native
+  function did not change since, and the four files that read them pass for this cut (27).
+- Not run: macOS and Windows, beyond `cargo check`. No release build of this commit: the
+  machine could not link one. So every time below is from the debug build with ASAN, and the
+  sizes are from one object file that was compiled with the flags of the release build.
+
+What it costs. The times are the longest gap between two turns of the event loop, in
+milliseconds, as the lowest, the median and the highest of 10 runs that took turns.
+
+| 308 MB, a source in write-ahead mode                      | gap                 | the copy takes |
+| --------------------------------------------------------- | ------------------- | -------------- |
+| nothing but a timer                                       | 1.6, 2.4, 3.9       |                |
+| `db.backup()` to a new file                               | 6.4, 6.7, 6.9       | 587 ms         |
+| `db.backup()` onto the last backup                        | 37.1, 41.6, 43.4    | 1,135 ms       |
+| the same, with one write to a page that is copied already | 38.0, 40.9, 51.0    | 1,072 ms       |
+| `VACUUM INTO`                                             | 796.6, 862.0, 899.0 | 861 ms         |
+| `backup()` of `node:sqlite`                               | 487.4, 513.1, 591.2 | 512 ms         |
+
+| 82 MB, a source in rollback mode   | gap                 | the copy takes |
+| ---------------------------------- | ------------------- | -------------- |
+| nothing but a timer                | 1.9, 2.5, 3.5       |                |
+| `db.backup()` to a new file        | 6.2, 6.3, 7.2       | 178 ms         |
+| `db.backup()` onto the last backup | 14.4, 15.4, 16.8    | 352 ms         |
+| `VACUUM INTO`                      | 221.6, 244.5, 276.6 | 243 ms         |
+| `backup()` of `node:sqlite`        | 137.6, 143.0, 168.4 | 142 ms         |
+
+- A program that never calls `backup()`: the module of `bun:sqlite` is 1,121 bytes larger
+  (18,069 to 19,190 in the debug build), with one more function executable and no more
+  function objects in a realm that imports it. `close()` tests one list of the VM for being
+  empty. The six host functions of a query and of `close()` have the same instructions as
+  before (`llvm-objdump` of the object file, with the addresses taken out). A connection has the
+  size that it had. The text of `JSSQLStatement.cpp.o` grows by 10,161 bytes (125,429 to
+  135,590). On macOS a process looks up no symbol more when it loads SQLite.
+- A copy to a new file of 308 MB: no `fsync` on the thread of the program, and two on a thread
+  of the work pool (the file and its directory). The thread of the program makes 75,190
+  `pread64` and 75,191 `pwrite64`, at most 524 between two waits of the event loop. The promise
+  resolves when the work pool is done: about 120 ms after the last step here.
+- A copy onto a database of the same size: 422 `fsync` on the thread of the program, the
+  longest of them 4.9 ms. 68 are the copy's, for the database (one after each 11 steps), and the
+  others are SQLite's, for its journal. Without those 68 the last step synced the whole file:
+  the gaps were 191.9, 220.5 and 285.2 ms. The thread makes 150,557 `pread64` and 301,122
+  `pwrite64`: each old page goes to the journal before its new content is written.
+- Each step prepares, runs and finalizes `PRAGMA busy_timeout` on the source.
+- A copy that waits makes a timer object each time its delay doubles, and none once the delay
+  is 256 ms: that timer repeats. A copy whose lock was released after 3 seconds went on 87 ms
+  later.
+- A copy holds two or three objects for the collector (the promise, the `Database`, and the
+  callback if there is one), and one more while it waits (the timer). After its end it holds
+  none.
+
+Not in this commit.
+
+- `backup()` of `node:sqlite` on the steps of this class, so that it stops blocking. That is a
+  commit of its own: it changes when the promise of an API that exists settles, and two cases
+  in `node-sqlite.test.ts` (a backup onto its own file, and onto a locked destination) pin what
+  it answers today. The class then needs what that module decides otherwise: the name of the
+  target database, the flags of the open, and what a step that never advanced means.
+- A backup for the SQLite adapter of `Bun.SQL`, which still has `VACUUM INTO` only.
+- A copy of a database in memory through `sqlite3_serialize` and the work pool.
+- An `AbortSignal` option.
+- A copy to a second file that is renamed over the destination. SQLite's documentation says
+  what a rename does to a database that another connection has open, and the review of the diff
+  said no to it.
+
+The rebase of the day.
+
+- Upstream moved by 2 commits, to d82a8a7b96a (oven-sh/bun#49636). 86 patches went onto it. None
+  stopped the rebase, and none was dropped.
+- The fork's three workflows were green for the push of 2026-11-26.
+- Upstream moved by 5 more commits while this commit was written, to c43e176916f. The stack is
+  not on them. A rebase onto them stops at the second patch, the `wc` builtin of the shell
+  (2026-08-15): oven-sh/bun#49670 changes who owns a queued task, and `src/runtime/dispatch.rs`
+  of the patch has a task of the old kind. 68 of the 86 patches touch a file that the 5 commits
+  touch. That is the work of the next rebase.
+- Only the tip of the stack was built, as a debug build.
+
+Files: `src/jsc/bindings/sqlite/JSSQLStatement.cpp`, `src/jsc/bindings/sqlite/JSSQLStatement.h`,
+`src/jsc/bindings/sqlite/lazy_sqlite3.h`, `src/jsc/bindings/sqlite/NodeSqlite.cpp` (a comment),
+`src/jsc/bindings/BunClientData.h`, `src/jsc/bindings/ZigGlobalObject.cpp`,
+`src/jsc/sqlite_backup.rs`, `src/jsc/lib.rs`, `src/js/bun/sqlite.ts`,
+`src/codegen/builtins/host/features-bun.builtins.ts`,
+`src/codegen/builtins/host/native-functions.builtins.ts`, `packages/bun-types/sqlite.d.ts`,
+`docs/runtime/sqlite.mdx`, `test/js/bun/sqlite/sqlite.test.js`,
+`test/integration/bun-types/fixture/sqlite.ts`,
+`test/js/node/__snapshots__/members-of-prototype-objects-for-any-receiver.test.ts.snap`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

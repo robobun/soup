@@ -87,4 +87,7 @@ Structure* createJSSQLDatabaseStructure(JSGlobalObject* globalObject);
 
 JSValue createJSSQLStatementConstructor(Zig::GlobalObject* globalObject);
 
+// db.backup() of bun:sqlite.
+JSC_DECLARE_HOST_FUNCTION(jsSQLStatementBackupFunction);
+
 } // namespace WebCore

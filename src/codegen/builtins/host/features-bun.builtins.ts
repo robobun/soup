@@ -273,7 +273,11 @@ export default b.declarations(
     "node:sqlite",
     ...nativeBindings("Cpp", "JSSQLStatement.cpp", "createJSSQLStatementConstructor"),
   ),
-  extendAll(["Sqlite"], "bun:sqlite"),
+  extendAll(
+    ["Sqlite"],
+    "bun:sqlite",
+    ...nativeBindings("NewCppFunction", "JSSQLStatement.cpp", "jsSQLStatementBackupFunction"),
+  ),
 
   extendAll(
     ["Sql", "X509", ...tlsSocketFeatures, "Int32Array", "Float32Array"],

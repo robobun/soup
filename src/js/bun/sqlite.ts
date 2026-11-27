@@ -38,6 +38,16 @@ const { 0: SQL, 1: internalFieldTuple }: { 0: CppSQL; 1: $Node.SQLChangesTuple }
   "createJSSQLStatementConstructor",
 );
 
+// db.backup() makes it when it is first called.
+let startBackup:
+  | ((
+      handle: $Node.SQLDatabase,
+      destination: string,
+      attached: string,
+      progress: ((progress: SqliteTypes.BackupProgress) => number | void) | undefined,
+    ) => Promise<SqliteTypes.BackupProgress>)
+  | undefined;
+
 function createChangesObject(): Changes {
   return {
     changes: $getInternalField(internalFieldTuple, 0),
@@ -463,6 +473,28 @@ class Database implements SqliteTypes.Database {
 
   serialize(optionalName?: string) {
     return SQL.serialize(this.#handle, optionalName || "main");
+  }
+
+  // The arguments and the errors are those of better-sqlite3, where an option that is undefined is an error:
+  // https://github.com/WiseLibs/better-sqlite3/blob/master/lib/methods/backup.js
+  async backup(destination, options) {
+    if (options == null) options = {};
+    if (typeof destination !== "string") throw new TypeError("Expected first argument to be a string");
+    if (typeof options !== "object") throw new TypeError("Expected second argument to be an options object");
+
+    destination = destination.trim();
+    const attached = options.attached === undefined ? "main" : options.attached;
+    const progress = options.progress;
+
+    if (!destination) throw new TypeError("Backup filename cannot be an empty string");
+    if (destination === ":memory:") throw new TypeError('Invalid backup filename ":memory:"');
+    if (typeof attached !== "string") throw new TypeError('Expected the "attached" option to be a string');
+    if (!attached) throw new TypeError('The "attached" option cannot be an empty string');
+    if (progress != null && typeof progress !== "function")
+      throw new TypeError('Expected the "progress" option to be a function');
+
+    startBackup ??= $newCppFunction("JSSQLStatement.cpp", "jsSQLStatementBackupFunction", 4);
+    return startBackup(this.#handle, destination, attached, progress ?? undefined);
   }
 
   static deserialize(

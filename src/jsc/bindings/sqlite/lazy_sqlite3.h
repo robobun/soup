@@ -2,6 +2,7 @@
 
 #include "root.h"
 #include "sqlite3.h"
+#include <mutex>
 #include <wtf/Lock.h>
 
 #if !OS(WINDOWS)
@@ -111,6 +112,7 @@ typedef int (*lazy_sqlite3_backup_step_type)(sqlite3_backup*, int nPage);
 typedef int (*lazy_sqlite3_backup_finish_type)(sqlite3_backup*);
 typedef int (*lazy_sqlite3_backup_remaining_type)(sqlite3_backup*);
 typedef int (*lazy_sqlite3_backup_pagecount_type)(sqlite3_backup*);
+typedef int (*lazy_sqlite3_threadsafe_type)(void);
 typedef int (*lazy_sqlite3session_create_type)(sqlite3*, const char* zDb, sqlite3_session** ppSession);
 typedef void (*lazy_sqlite3session_delete_type)(sqlite3_session*);
 typedef int (*lazy_sqlite3session_attach_type)(sqlite3_session*, const char* zTab);
@@ -212,6 +214,7 @@ inline lazy_sqlite3_backup_step_type lazy_sqlite3_backup_step;
 inline lazy_sqlite3_backup_finish_type lazy_sqlite3_backup_finish;
 inline lazy_sqlite3_backup_remaining_type lazy_sqlite3_backup_remaining;
 inline lazy_sqlite3_backup_pagecount_type lazy_sqlite3_backup_pagecount;
+inline lazy_sqlite3_threadsafe_type lazy_sqlite3_threadsafe;
 inline lazy_sqlite3session_create_type lazy_sqlite3session_create;
 inline lazy_sqlite3session_delete_type lazy_sqlite3session_delete;
 inline lazy_sqlite3session_attach_type lazy_sqlite3session_attach;
@@ -519,6 +522,18 @@ inline int lazyLoadSQLite(WTF::String* errorMessage = nullptr)
 {
     WTF::Locker locker { sqlite3_handle_lock };
     return lazyLoadSQLiteUnlocked(errorMessage);
+}
+
+// Only the end of a backup asks this. The first one looks the function up, so a process that loads SQLite for anything
+// else does not.
+inline void lazyLoadSQLiteForBackup()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        WTF::Locker locker { sqlite3_handle_lock };
+        if (sqlite3_handle)
+            lazy_sqlite3_threadsafe = (lazy_sqlite3_threadsafe_type)dlsym(sqlite3_handle, "sqlite3_threadsafe");
+    });
 }
 
 #if OS(WINDOWS)

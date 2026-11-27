@@ -7331,6 +7331,10 @@ bun:sqlite.Database.prototype serialize("a", 1)
   throws TypeError: Cannot access invalid private field <- every object, a number, a string
   throws TypeError: undefined is not an object <- undefined
   throws TypeError: null is not an object <- null
+bun:sqlite.Database.prototype backup()
+  object Promise <- every receiver
+bun:sqlite.Database.prototype backup("a", 1)
+  object Promise <- every receiver
 bun:sqlite.Database.prototype fileControl()
   throws TypeError: Cannot access invalid private field <- every object, a number, a string
   throws TypeError: undefined is not an object <- undefined

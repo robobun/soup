@@ -420,6 +420,7 @@ pub mod posix_signal_handle;
 pub mod resolve_path_jsc;
 #[path = "resolver_jsc.rs"]
 pub mod resolver_jsc;
+pub mod sqlite_backup;
 #[path = "virtual_machine_exports.rs"]
 pub mod virtual_machine_exports;
 

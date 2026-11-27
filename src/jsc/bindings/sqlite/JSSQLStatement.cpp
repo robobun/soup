@@ -67,8 +67,13 @@ static constexpr int32_t kOwnedByDatabaseFlag = 1 << 3;
 #endif
 /* ******************************************************************************** */
 
+#include "AsyncContextFrame.h"
+#include "PhonyWorkQueue.h"
 #include "SqliteCallbackRoots.h"
 #include "SqliteUserFunction.h"
+#include "headers.h"
+#include <JavaScriptCore/JSPromise.h>
+#include <string>
 #include <wtf/SetForScope.h>
 
 #if !USE(SYSTEM_MALLOC)
@@ -121,7 +126,7 @@ extern "C" void Bun__initializeSQLite()
     std::call_once(onceFlag, [] {
         // Statistics put one process-wide mutex around every malloc and free.
         sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0);
-        // A connection is only used by the thread that opened it, so it gets a mutex only with SQLITE_OPEN_FULLMUTEX.
+        // A connection is used by one thread at a time, so it gets a mutex only with SQLITE_OPEN_FULLMUTEX.
         sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
         enableFastMallocForSQLite();
     });
@@ -160,6 +165,9 @@ static constexpr int MAX_SQLITE_PREPARE_FLAG = SQLITE_PREPARE_PERSISTENT | SQLIT
 namespace WebCore {
 class JSSQLStatement;
 static ASCIILiteral finalizedMessage(const JSSQLStatement* statement);
+// The copies that db.backup() started: defined with DatabaseBackup.
+static void abortBackupsOf(VersionSqlite3&);
+static void abortBackupsWithoutScript(JSC::VM&, ScriptExecutionContextIdentifier callerGraph = 0);
 }
 
 DECLARE_ALLOCATOR_WITH_HEAP_IDENTIFIER(VersionSqlite3);
@@ -260,6 +268,7 @@ extern "C" void Bun__sqliteCheckpointForTermination(sqlite3* db)
 // Not inlined: the link cuts the Sqlite feature at this call, and link-time optimization would copy the body into the caller's guard.
 extern "C" NEVER_INLINE void Bun__closeAllSQLiteDatabasesForTermination(JSC::JSGlobalObject* globalObject)
 {
+    WebCore::abortBackupsWithoutScript(globalObject->vm());
     for (auto* record : WebCore::clientData(globalObject->vm())->sqliteDatabases()) {
         if (record->inCallback)
             record->abandonStatements();
@@ -276,8 +285,11 @@ extern "C" NEVER_INLINE void Bun__closeAllSQLiteDatabasesForTermination(JSC::JSG
 extern "C" void Bun__closeSQLiteDatabasesOfGraphContext(WebCore::ScriptExecutionContextIdentifier graphContext)
 {
     // A graph is disposed on its VM's thread. Its context's own vm() is null once the realm that made the graph is collected.
+    auto& vm = defaultGlobalObject()->vm();
+    // The backups that script of the graph started, of whichever databases.
+    WebCore::abortBackupsWithoutScript(vm, graphContext);
     Vector<Ref<VersionSqlite3>> owned;
-    for (auto* record : WebCore::clientData(defaultGlobalObject()->vm())->sqliteDatabases()) {
+    for (auto* record : WebCore::clientData(vm)->sqliteDatabases()) {
         // One that is calling the script that disposes the graph stays open until it is collected.
         if (record->graphContext == graphContext && record->db && !record->inCallback)
             owned.append(*record);
@@ -285,6 +297,13 @@ extern "C" void Bun__closeSQLiteDatabasesOfGraphContext(WebCore::ScriptExecution
     // The JSSQLDatabase and its callbacks may already be dead, so don't run JS here.
     for (auto& record : owned)
         record->close(true, false);
+}
+
+// `bun test --isolate` retires the realm of a test file on a VM that lives on. No script of the file runs after that,
+// and a copy that the file left would call its progress callback.
+extern "C" void Bun__abortSQLiteBackupsForTestIsolation(JSC::JSGlobalObject* globalObject)
+{
+    WebCore::abortBackupsWithoutScript(globalObject->vm());
 }
 
 namespace WebCore {
@@ -1251,6 +1270,595 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementSerialize, (JSC::JSGlobalObject * lexical
     }
 
     RELEASE_AND_RETURN(scope, JSBuffer__bufferFromPointerAndLengthAndDeinit(lexicalGlobalObject, reinterpret_cast<char*>(data), static_cast<unsigned int>(length), NULL, sqlite_free_typed_array));
+}
+
+// src/jsc/sqlite_backup.rs
+extern "C" bool Bun__SqliteBackup__createFile(const char* path);
+extern "C" void Bun__SqliteBackup__removeFile(const char* path, bool onlyIfEmpty);
+extern "C" bool Bun__SqliteBackup__isSameFile(const char* a, const char* b);
+extern "C" void Bun__SqliteBackup__syncDirectoryOf(const char* path);
+
+JSC_DECLARE_HOST_FUNCTION(jsSQLDatabaseBackupTimerFired);
+
+// A copy that db.backup() started, with the Online Backup API of SQLite.
+//
+// The thread of the connection copies some pages, lets the event loop run, and copies some more. A connection has no
+// mutex (Bun__initializeSQLite), so no other thread can copy from it. SQLite copies again the pages that the connection
+// writes meanwhile, and the file is the database as it is when the last page is copied.
+//
+// Nothing but SQLite opens the file of the destination while a connection has it: to close any descriptor of a file
+// gives up the locks that the process holds on it. A file that the copy made is written without a sync. When SQLite is
+// done with the source, the copy alone has the destination, and a thread of the work pool syncs and closes a large one
+// through that connection.
+//
+// A copy is in the list of its VM (JSVMClientData::sqliteBackups) from start() until it ends. What is queued for it
+// (a task, a timer, work on the pool) has its id and finds it there, so nothing that is queued holds a copy, and a
+// copy that has ended is not found.
+class DatabaseBackup final : public WTF::RefCounted<DatabaseBackup> {
+    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(DatabaseBackup);
+    WTF_MAKE_NONCOPYABLE(DatabaseBackup);
+
+public:
+    // Opens the file at `path` and starts to copy the database `schema` of `source` into it. The promise settles when
+    // the copy ends. Null with an exception pending: nothing is kept, and a file that this call made is removed.
+    static JSPromise* start(JSGlobalObject*, ThrowScope&, JSSQLDatabase* source, const UTF8CString& schema, const UTF8CString& path, JSValue progress);
+    // The timer that a copy armed calls this.
+    static void stepFromTimer(VM&, uint64_t id);
+
+private:
+    friend void abortBackupsOf(VersionSqlite3&);
+    friend void abortBackupsWithoutScript(VM&, ScriptExecutionContextIdentifier);
+
+    enum class State : uint8_t {
+        // A step is on the queue that runs after the event loop has polled.
+        Queued,
+        // A timer that repeats is armed: something holds a lock, or the progress callback has paused the copy.
+        Waiting,
+        // The copy is committed, and the work pool syncs and closes the file that the copy made.
+        Closing,
+        // Settled or aborted.
+        Ended,
+    };
+
+    // better-sqlite3 and node:sqlite copy as many in a step.
+    static constexpr int pagesOfAStep = 100;
+    // The thread of the connection syncs a file of fewer pages itself (4 MB at the default page size): that is short,
+    // and the work pool can be busy with something else.
+    static constexpr int pagesWorthAThread = 1024;
+    // A database that the copy replaces is synced each time it got as many pages.
+    static constexpr int pagesOfASync = 1024;
+    // A step that cannot take a lock is tried again after 1 ms, then after 2 ms more, and so on up to this.
+    static constexpr unsigned maximumDelayInMilliseconds = 256;
+
+    explicit DatabaseBackup(VersionSqlite3& connection)
+        : m_connection(connection)
+    {
+    }
+
+    static Vector<DatabaseBackup*>& all(VM& vm) { return WebCore::clientData(vm)->sqliteBackups(); }
+    static DatabaseBackup* find(VM&, uint64_t id, State);
+
+    JSGlobalObject* globalObject() const { return m_promise->globalObject(); }
+    void queueStep();
+    void step(JSGlobalObject*);
+    bool continuesAfter(JSGlobalObject*, TopExceptionScope&);
+    void waitOnTimer(JSGlobalObject*);
+    void clearTimer(JSGlobalObject*);
+    void finish(JSGlobalObject*);
+    void didFinish(JSGlobalObject*, int status);
+    // Gives up the destination. An existing database is as it was, and a file that the copy made is removed.
+    void discard();
+    // Ends a copy that is not complete. The promise is the caller's to settle.
+    void abort(VM&);
+    // Takes the copy out of the list. The promise is the caller's to settle.
+    void leave(VM&);
+    void reject(JSGlobalObject*, JSValue);
+
+    // Used while m_source holds its Database.
+    VersionSqlite3& m_connection;
+    // The backup is finished before its destination is closed: members are destroyed in reverse order.
+    SqlitePtr<sqlite3> m_destination;
+    SqlitePtr<sqlite3_backup> m_backup;
+    JSC::Strong<JSPromise> m_promise;
+    // The function, or the AsyncContextFrame that holds it with the async context of the caller.
+    JSC::Strong<JSC::Unknown> m_progress;
+    JSC::Strong<JSSQLDatabase> m_source;
+    // The timer of the runtime that calls step() while the copy waits, every m_delay milliseconds.
+    JSC::Strong<JSC::Unknown> m_timer;
+    // Where the steps are queued: the context of the realm of the promise.
+    RefPtr<ScriptExecutionContext> m_context;
+    // The file, as SQLite resolved the path when it opened it.
+    UTF8CString m_path;
+    uint64_t m_id { 0 };
+    // The Bun.ModuleGraph whose script started the copy (0: none). The promise and the progress callback are script of
+    // it, and script of a graph does not run after the graph is disposed.
+    ScriptExecutionContextIdentifier m_callerGraph { 0 };
+    // How many pages the next step copies. The first step copies none: it takes the locks, and the progress callback
+    // learns the size of the database before a page moves.
+    int m_pages { 0 };
+    // After SQLite started the copy again: no step is smaller than this.
+    int m_leastPages { 0 };
+    // How far the last step was into the database.
+    int m_copiedPages { 0 };
+    // What a database that the copy replaces got since its file was last synced.
+    int m_unsyncedPages { 0 };
+    unsigned m_delay { 0 };
+    State m_state { State::Ended };
+    // The copy made the file, so nothing of value was in it.
+    bool m_created { false };
+    // A step has taken the locks.
+    bool m_started { false };
+};
+
+// A library that was built without mutexes is used by one thread.
+static bool sqliteCanUseAnotherThread()
+{
+#if LAZY_LOAD_SQLITE
+    lazyLoadSQLiteForBackup();
+    return lazy_sqlite3_threadsafe && lazy_sqlite3_threadsafe();
+#else
+    return sqlite3_threadsafe();
+#endif
+}
+
+// What `PRAGMA busy_timeout` set for the connection, in milliseconds. The value is that of the time when SQLite compiles
+// the statement, so no statement is kept.
+static int busyTimeoutOf(sqlite3* db)
+{
+    SqlitePtr<sqlite3_stmt> statement;
+    int status = sqlite3_prepare_v2(db, "PRAGMA busy_timeout", -1, outPtr(statement), nullptr);
+    if (status != SQLITE_OK || sqlite3_step(statement.get()) != SQLITE_ROW)
+        return 0;
+    return static_cast<int>(sqlite3_column_int64(statement.get(), 0));
+}
+
+// What the connection has written to its file goes to the disk. It is SQLite's own descriptor that is synced. Returns a
+// result code of SQLite.
+static int syncFileOf(sqlite3* db)
+{
+    sqlite3_file* file = nullptr;
+    int status = sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &file);
+    if (status == SQLITE_OK && file && file->pMethods)
+        status = file->pMethods->xSync(file, SQLITE_SYNC_NORMAL);
+    return status;
+}
+
+// The end of a file that a copy made: what was written without a sync goes to the disk, and the connection closes. The
+// caller alone has the connection. Returns a result code of SQLite.
+static int syncAndCloseBackup(sqlite3* destination, const char* path)
+{
+    int status = syncFileOf(destination);
+    sqlite3_close_v2(destination);
+    if (status == SQLITE_OK)
+        Bun__SqliteBackup__syncDirectoryOf(path);
+    return status;
+}
+
+DatabaseBackup* DatabaseBackup::find(VM& vm, uint64_t id, State state)
+{
+    for (auto* backup : all(vm)) {
+        if (backup->m_id == id)
+            return backup->m_state == state ? backup : nullptr;
+    }
+    return nullptr;
+}
+
+JSPromise* DatabaseBackup::start(JSGlobalObject* lexicalGlobalObject, ThrowScope& scope, JSSQLDatabase* source, const UTF8CString& schema, const UTF8CString& path, JSValue progress)
+{
+    auto& vm = getVM(lexicalGlobalObject);
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+    VersionSqlite3& connection = source->record();
+    Ref backup = adoptRef(*new DatabaseBackup(connection));
+
+    // SQLite does not say whether an open made the file. So SQLite only opens, and the copy makes a file that is not
+    // there: that file alone is the copy's to remove.
+    int status = sqlite3_open_v2(path.legacyCStringPointer(), outPtr(backup->m_destination), SQLITE_OPEN_READWRITE, nullptr);
+    if (status == SQLITE_CANTOPEN && Bun__SqliteBackup__createFile(path.legacyCStringPointer())) {
+        backup->m_created = true;
+        backup->m_path = path;
+        status = sqlite3_open_v2(path.legacyCStringPointer(), outPtr(backup->m_destination), SQLITE_OPEN_READWRITE, nullptr);
+    }
+    sqlite3* destination = backup->m_destination.get();
+    if (status != SQLITE_OK) {
+        throwException(lexicalGlobalObject, scope, destination ? createSQLiteError(lexicalGlobalObject, destination) : createSQLiteError(lexicalGlobalObject, status, sqlite3_errstr(status), -1));
+        backup->discard();
+        return nullptr;
+    }
+    sqlite3_extended_result_codes(destination, 1);
+    if (const char* resolved = sqlite3_db_filename(destination, "main"))
+        backup->m_path = UTF8CString::unsafeFromUTF8(resolved);
+    const char* destinationPath = backup->m_path.legacyCStringPointer();
+
+    // The copy that ends first would remove or replace the file under the other one.
+    for (auto* other : all(vm)) {
+        if (!strcmp(other->m_path.legacyCStringPointer(), destinationPath)) {
+            throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Another backup to this file is in progress"_s));
+            backup->discard();
+            return nullptr;
+        }
+    }
+
+    if (backup->m_created) {
+        // Nothing is lost with a file that the copy made, so SQLite does not wait for the disk while it writes the
+        // file. finish() waits for the disk, once.
+        sqlite3_exec(destination, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr);
+    } else {
+        // A database and its own file wait for the locks of each other.
+        const char* sourcePath = sqlite3_db_filename(connection.db.get(), schema.legacyCStringPointer());
+        if (sourcePath && *sourcePath && (!strcmp(sourcePath, destinationPath) || Bun__SqliteBackup__isSameFile(sourcePath, destinationPath))) {
+            throwTypeError(lexicalGlobalObject, scope, "Cannot back up a database to its own file"_s);
+            backup->discard();
+            return nullptr;
+        }
+        // The pages of a destination in write-ahead mode go through its log. When the connection then writes a page
+        // that is copied already, the commit computes the checksum of every frame of the log again, in one step, and
+        // the close writes every page once more. So the database is replaced in rollback mode. It stays as it is
+        // where that fails: another connection has it open, or the file is no database.
+        int persistent = 0;
+        sqlite3_file_control(destination, "main", SQLITE_FCNTL_PERSIST_WAL, &persistent);
+        sqlite3_exec(destination, "PRAGMA journal_mode=DELETE", nullptr, nullptr, nullptr);
+    }
+
+    backup->m_backup.reset(sqlite3_backup_init(destination, "main", connection.db.get(), schema.legacyCStringPointer()));
+    if (!backup->m_backup) {
+        throwException(lexicalGlobalObject, scope, createSQLiteError(lexicalGlobalObject, destination));
+        backup->discard();
+        return nullptr;
+    }
+
+    static std::atomic<uint64_t> lastId { 0 };
+    auto* promise = JSPromise::create(vm, globalObject->promiseStructure());
+    backup->m_promise.set(vm, promise);
+    if (progress.isCallable())
+        backup->m_progress.set(vm, AsyncContextFrame::withAsyncContextIfNeeded(lexicalGlobalObject, progress));
+    backup->m_source.set(vm, source);
+    backup->m_context = globalObject->scriptExecutionContext();
+    backup->m_id = ++lastId;
+    backup->m_callerGraph = ScriptExecutionContext::ownerOfSQLiteDatabase(lexicalGlobalObject);
+
+    // The list has a reference until leave().
+    DatabaseBackup& kept = backup.leakRef();
+    all(vm).append(&kept);
+    kept.queueStep();
+    return promise;
+}
+
+void DatabaseBackup::queueStep()
+{
+    m_state = State::Queued;
+    m_context->postTaskAfterYield([id = m_id](ScriptExecutionContext& context) {
+        if (auto* backup = find(context.vm(), id, State::Queued))
+            backup->step(backup->globalObject());
+    });
+}
+
+// False if something was thrown. The copy ends, and its promise is rejected with what was thrown. A termination that
+// the VM outlives (the timeout of node:vm) leaves the copy for the next turn, and the end of the VM ends it.
+bool DatabaseBackup::continuesAfter(JSGlobalObject* globalObject, TopExceptionScope& scope)
+{
+    auto* exception = scope.exception();
+    if (!exception) [[likely]]
+        return true;
+    auto& vm = getVM(globalObject);
+    if (vm.hasPendingTerminationException()) {
+        if (m_state != State::Ended)
+            queueStep();
+        return false;
+    }
+    JSValue thrown = exception->value();
+    scope.clearException();
+    if (m_state != State::Ended) {
+        abort(vm);
+        reject(globalObject, thrown);
+    }
+    return false;
+}
+
+void DatabaseBackup::step(JSGlobalObject* globalObject)
+{
+    auto& vm = getVM(globalObject);
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    // The script that runs below can close the database, which ends the copy.
+    Ref protectedThis { *this };
+
+    // CHECK_NOT_BUSY, for a call that no script made. A statement of the connection is running below this frame when
+    // one of its callbacks waits on an event loop, and that loop has called the copy.
+    if (m_connection.inCallback) {
+        waitOnTimer(globalObject);
+        return;
+    }
+    if (!m_connection.orphans.isEmpty()) [[unlikely]] {
+        // A statement that the collector left for the next call on the connection holds the lock that the step needs.
+        m_connection.finalizeOrphans(globalObject);
+        if (!continuesAfter(globalObject, scope) || m_state == State::Ended)
+            return;
+    }
+
+    // A step reads the source, and SQLite waits for a lock of another connection as long as `PRAGMA busy_timeout` of
+    // the source says, on this thread. The copy waits on a timer, so the step does not wait.
+    sqlite3* source = m_connection.db.get();
+    int timeout = busyTimeoutOf(source);
+    if (timeout > 0)
+        sqlite3_busy_timeout(source, 0);
+    int pages = m_pages;
+    int status = sqlite3_backup_step(m_backup.get(), pages);
+    if (timeout > 0)
+        sqlite3_busy_timeout(source, timeout);
+    int totalPages = sqlite3_backup_pagecount(m_backup.get());
+    int remainingPages = sqlite3_backup_remaining(m_backup.get());
+
+    if (status == SQLITE_DONE) {
+        m_copiedPages = totalPages;
+        finish(globalObject);
+        return;
+    }
+
+    // Both connections give extended result codes, and each kind of SQLITE_BUSY goes away with time.
+    if ((status & 0xff) == SQLITE_BUSY || (status & 0xff) == SQLITE_LOCKED) {
+        waitOnTimer(globalObject);
+        return;
+    }
+
+    if (status != SQLITE_OK) {
+        abort(vm);
+        reject(globalObject, createSQLiteError(globalObject, status, sqlite3_errstr(status), -1));
+        return;
+    }
+
+    int copiedPages = totalPages - remainingPages;
+    // SQLite starts the copy again when the pages change in a way that it cannot follow: another connection wrote
+    // them, or the connection itself wrote a database in memory. A copy that starts again at every turn of the event
+    // loop never ends, so each time the steps get twice as large, until one step copies every page.
+    if (pages && copiedPages < static_cast<int64_t>(m_copiedPages) + pages)
+        m_leastPages = static_cast<int>(std::min<int64_t>(static_cast<int64_t>(pages) * 2, std::numeric_limits<int>::max()));
+    m_copiedPages = copiedPages;
+    if (!m_started) {
+        m_started = true;
+        m_pages = pagesOfAStep;
+    }
+    // SQLite syncs a database that it replaces when it commits, in the last step, and that sync would take as long as
+    // the disk needs for the whole copy. So the file is synced every few megabytes, and the last sync has little to do.
+    // A failure here is one of the commit too.
+    if (!m_created && pages && (m_unsyncedPages += std::min(pages, pagesOfASync)) >= pagesOfASync) {
+        m_unsyncedPages = 0;
+        syncFileOf(m_destination.get());
+    }
+
+    if (JSValue progress = m_progress.get()) {
+        JSObject* progressed = constructEmptyObject(globalObject, globalObject->objectPrototype(), 2);
+        Bun::putDirectNamed(vm, progressed, "totalPages"_s, jsNumber(totalPages));
+        Bun::putDirectNamed(vm, progressed, "remainingPages"_s, jsNumber(remainingPages));
+        MarkedArgumentBuffer arguments;
+        arguments.append(progressed);
+        JSValue returned = AsyncContextFrame::call(globalObject, progress, jsUndefined(), arguments);
+        if (!continuesAfter(globalObject, scope) || m_state == State::Ended)
+            return;
+        // As better-sqlite3: undefined keeps the size of the steps, and a number is the new size.
+        if (!returned.isUndefined()) {
+            if (!returned.isNumber() || std::isnan(returned.asNumber())) {
+                abort(vm);
+                reject(globalObject, createTypeError(globalObject, "Expected progress callback to return a number or undefined"_s));
+                return;
+            }
+            m_pages = static_cast<int>(std::clamp(std::round(returned.asNumber()), 0.0, static_cast<double>(std::numeric_limits<int>::max())));
+        }
+    }
+
+    if (!m_pages) {
+        // The callback is asked again later.
+        waitOnTimer(globalObject);
+        return;
+    }
+    // The callback has the last word on the size of a step, but not on whether the copy can end.
+    m_pages = std::max(m_pages, m_leastPages);
+    clearTimer(globalObject);
+    queueStep();
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsSQLDatabaseBackupTimerFired, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    JSValue id = callFrame->argument(0);
+    if (id.isNumber())
+        DatabaseBackup::stepFromTimer(getVM(globalObject), static_cast<uint64_t>(id.asNumber()));
+    return JSValue::encode(jsUndefined());
+}
+
+void DatabaseBackup::stepFromTimer(VM& vm, uint64_t id)
+{
+    if (auto* backup = find(vm, id, State::Waiting))
+        backup->step(backup->globalObject());
+}
+
+// The timer repeats: the runtime does not call a timer while a termination is pending, and the VM can outlive one (the
+// timeout of node:vm).
+void DatabaseBackup::waitOnTimer(JSGlobalObject* globalObject)
+{
+    auto& vm = getVM(globalObject);
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    m_state = State::Waiting;
+    unsigned delay = m_delay ? std::min(m_delay * 2, maximumDelayInMilliseconds) : 1;
+    if (delay == m_delay)
+        return;
+    clearTimer(globalObject);
+    // setInterval() of the runtime: the fake timers of a test do not replace it, and it keeps the process alive.
+    auto* callback = JSFunction::create(vm, globalObject, 1, String(), jsSQLDatabaseBackupTimerFired, ImplementationVisibility::Private);
+    JSValue timer = JSValue::decode(Bun__Timer__setInterval(globalObject, JSValue::encode(callback), JSValue::encode(jsNumber(static_cast<double>(m_id))), JSValue::encode(jsNumber(delay))));
+    // A termination can come with any call into the runtime. Then there is no timer, and a task needs no such call.
+    scope.assertNoExceptionExceptTermination();
+    if (!timer) [[unlikely]] {
+        queueStep();
+        return;
+    }
+    m_delay = delay;
+    m_timer.set(vm, timer);
+}
+
+void DatabaseBackup::clearTimer(JSGlobalObject* globalObject)
+{
+    m_delay = 0;
+    JSValue timer = m_timer.get();
+    if (!timer)
+        return;
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(getVM(globalObject));
+    Bun__Timer__clearInterval(globalObject, JSValue::encode(timer));
+    scope.assertNoExceptionExceptTermination();
+    m_timer.clear();
+}
+
+// The copy is committed. What is left is the end of the destination.
+void DatabaseBackup::finish(JSGlobalObject* globalObject)
+{
+    auto& vm = getVM(globalObject);
+    int status = sqlite3_backup_finish(m_backup.release());
+    if (status != SQLITE_OK || !m_created) {
+        // SQLite replaced an existing database with a sync at each point where the old one or the new one has to be
+        // on the disk.
+        m_destination = nullptr;
+        leave(vm);
+        didFinish(globalObject, status);
+        return;
+    }
+
+    if (m_copiedPages < pagesWorthAThread || !sqliteCanUseAnotherThread()) {
+        status = syncAndCloseBackup(m_destination.release(), m_path.legacyCStringPointer());
+        leave(vm);
+        didFinish(globalObject, status);
+        return;
+    }
+
+    // SQLite is done with the source, and the copy alone has the destination. A close() of the source does not end
+    // the copy anymore.
+    m_state = State::Closing;
+    clearTimer(globalObject);
+    m_progress.clear();
+    m_source.clear();
+    // The pool can destroy this function and the one that it posts, so they hold nothing of the VM.
+    Bun::PhonyWorkQueue::create("SQLite backup"_s)->dispatch(globalObject, [destination = m_destination.release(), path = std::string(m_path.legacyCStringPointer(), m_path.length()), context = m_context->identifier(), loop = m_context->currentLoopKind(), id = m_id]() {
+        int status = syncAndCloseBackup(destination, path.c_str());
+        ScriptExecutionContext::postTaskTo(context, loop, [id, status](ScriptExecutionContext& context) {
+            if (auto* backup = find(context.vm(), id, State::Closing)) {
+                Ref protectedBackup { *backup };
+                auto* globalObject = backup->globalObject();
+                backup->leave(context.vm());
+                backup->didFinish(globalObject, status);
+            }
+        });
+    });
+}
+
+// The destination is closed and the copy has left the list. `status` says whether the file is complete and on the disk.
+void DatabaseBackup::didFinish(JSGlobalObject* globalObject, int status)
+{
+    auto& vm = getVM(globalObject);
+    if (status != SQLITE_OK) {
+        if (m_created)
+            Bun__SqliteBackup__removeFile(m_path.legacyCStringPointer(), false);
+        reject(globalObject, createSQLiteError(globalObject, status, sqlite3_errstr(status), -1));
+        return;
+    }
+    JSObject* result = constructEmptyObject(globalObject, globalObject->objectPrototype(), 2);
+    Bun::putDirectNamed(vm, result, "totalPages"_s, jsNumber(m_copiedPages));
+    Bun::putDirectNamed(vm, result, "remainingPages"_s, jsNumber(0));
+    m_promise->fulfill(vm, result);
+    m_promise.clear();
+}
+
+void DatabaseBackup::discard()
+{
+    // SQLite rolls back what the copy wrote: an existing database has the pages that it had, and a new file has none.
+    m_backup = nullptr;
+    m_destination = nullptr;
+    // A file that is not empty anymore has the content of somebody else.
+    if (m_created)
+        Bun__SqliteBackup__removeFile(m_path.legacyCStringPointer(), true);
+}
+
+void DatabaseBackup::abort(VM& vm)
+{
+    ASSERT(m_state != State::Ended && m_state != State::Closing);
+    discard();
+    leave(vm);
+}
+
+void DatabaseBackup::leave(VM& vm)
+{
+    m_state = State::Ended;
+    clearTimer(globalObject());
+    m_progress.clear();
+    m_source.clear();
+    m_context = nullptr;
+
+    auto& backups = all(vm);
+    backups.removeAt(backups.find(this));
+    // The caller holds a reference of its own.
+    deref();
+}
+
+void DatabaseBackup::reject(JSGlobalObject* globalObject, JSValue reason)
+{
+    m_promise->reject(getVM(globalObject), reason);
+    m_promise.clear();
+}
+
+static JSValue databaseHasClosedError(JSGlobalObject* globalObject)
+{
+    return createError(globalObject, "Database has closed"_s);
+}
+
+static void abortBackupsOf(VersionSqlite3& connection)
+{
+    auto& vm = *connection.vm;
+    auto& backups = DatabaseBackup::all(vm);
+    // abort() takes a copy out of the list.
+    for (size_t i = backups.size(); i--;) {
+        Ref backup { *backups[i] };
+        // A copy that is closing has every page, and the source is not part of it anymore.
+        if (&backup->m_connection != &connection || backup->m_state == DatabaseBackup::State::Closing)
+            continue;
+        auto* globalObject = backup->globalObject();
+        backup->abort(vm);
+        backup->reject(globalObject, databaseHasClosedError(globalObject));
+    }
+}
+
+static void abortBackupsWithoutScript(VM& vm, ScriptExecutionContextIdentifier callerGraph)
+{
+    auto& backups = DatabaseBackup::all(vm);
+    for (size_t i = backups.size(); i--;) {
+        if (callerGraph && backups[i]->m_callerGraph != callerGraph)
+            continue;
+        Ref backup { *backups[i] };
+        // The pool goes on with the file of a copy that is closing. The file has every page.
+        if (backup->m_state == DatabaseBackup::State::Closing)
+            backup->leave(vm);
+        else
+            backup->abort(vm);
+        backup->m_promise.clear();
+    }
+}
+
+// db.backup(): (handle, destination, attached, progress). Answers the promise of the copy.
+JSC_DEFINE_HOST_FUNCTION(jsSQLStatementBackupFunction, (JSC::JSGlobalObject * lexicalGlobalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = JSC::getVM(lexicalGlobalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    VersionSqlite3* versionDB = databaseForHandle(lexicalGlobalObject, scope, callFrame->argument(0));
+    if (!versionDB) [[unlikely]]
+        return {};
+
+    auto destination = toCString(lexicalGlobalObject, scope, "destination"_s, callFrame->argument(1));
+    RETURN_IF_EXCEPTION(scope, {});
+    auto attached = toCString(lexicalGlobalObject, scope, "attached"_s, callFrame->argument(2));
+    RETURN_IF_EXCEPTION(scope, {});
+
+    // Read after toCString: a user toString() may have closed the database.
+    if (!versionDB->handle()) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, databaseHasClosedError(lexicalGlobalObject));
+        return {};
+    }
+
+    RELEASE_AND_RETURN(scope, JSValue::encode(DatabaseBackup::start(lexicalGlobalObject, scope, uncheckedDowncast<JSSQLDatabase>(callFrame->argument(0)), attached, destination, callFrame->argument(3))));
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsSQLStatementLoadExtensionFunction, (JSC::JSGlobalObject * lexicalGlobalObject, JSC::CallFrame* callFrame))
@@ -2651,6 +3259,9 @@ JSValue createJSSQLStatementConstructor(Zig::GlobalObject* globalObject)
 
 int VersionSqlite3::close(bool force, bool mayCallScript)
 {
+    // SQLite keeps a connection that a backup reads until the backup has finished.
+    if (!WebCore::clientData(*vm)->sqliteBackups().isEmpty()) [[unlikely]]
+        WebCore::abortBackupsOf(*this);
     // Finalizing can run JS, and a GC during that JS can remove entries from `statements`, so move the handles out first.
     for (auto* statement : statements) {
         if (!statement->stmt || !(force || statement->ownedByDatabase))

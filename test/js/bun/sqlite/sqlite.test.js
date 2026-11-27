@@ -1,9 +1,23 @@
+import { AsyncLocalStorage } from "async_hooks";
 import { spawnSync } from "bun";
 import * as internalForTesting from "bun:internal-for-testing";
 import { heapStats } from "bun:jsc";
 import { constants, Database, SQLiteError } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "fs";
+import { afterAll, beforeAll, describe, expect, it, jest } from "bun:test";
+import {
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import {
   bunEnv,
   bunExe,
@@ -6794,6 +6808,1310 @@ describe("an exception that is raised behind a step ends a statement that writes
       const stored = count(db, table);
       expect([1, 10001]).toContain(stored);
       expect(count(db, "ft WHERE ft MATCH 'hello'")).toBe(stored);
+    });
+  });
+});
+
+describe("db.backup()", () => {
+  const busy = "This database connection is busy executing a query";
+  const closed = new Error("Database has closed");
+
+  // One row fills most of a page, so the database has a little more than `rows` pages of 4096 bytes.
+  function fill(db, rows, table = "t") {
+    // What a test writes need not survive a power cut, and a sync of the file takes long on a busy disk.
+    db.run("PRAGMA synchronous = OFF");
+    db.run(`CREATE TABLE IF NOT EXISTS ${table} (id INTEGER PRIMARY KEY, a TEXT)`);
+    const insert = db.prepare(`INSERT INTO ${table} (a) VALUES (?)`);
+    const text = Buffer.alloc(3000, "x").toString();
+    db.transaction(() => {
+      for (let i = 0; i < rows; i++) insert.run(text + i);
+    })();
+    return db;
+  }
+  const pagesOf = (db, schema = "main") => db.query(`PRAGMA ${schema}.page_count`).get().page_count;
+  // What a reader of the file finds in it.
+  function read(file, table = "t") {
+    using db = new Database(file, { readonly: true });
+    return {
+      ...db.query(`SELECT count(*) AS rows, coalesce(sum(length(a)), 0) AS bytes FROM ${table}`).get(),
+      integrity: db.query("PRAGMA integrity_check").get().integrity_check,
+    };
+  }
+  const contentOf = rows => ({
+    rows,
+    bytes: Array.from({ length: rows }, (_, i) => 3000 + String(i).length).reduce((a, b) => a + b, 0),
+    integrity: "ok",
+  });
+  const turn = () => new Promise(resolve => setImmediate(resolve));
+  // Starts a copy and runs the event loop until it has copied some pages and not all.
+  async function underWay(db, file) {
+    const { promise: copiedSome, resolve } = Promise.withResolvers();
+    const copy = db.backup(file, {
+      progress({ totalPages, remainingPages }) {
+        if (remainingPages < totalPages) resolve();
+      },
+    });
+    await copiedSome;
+    // An async function would wait for a promise that it returns.
+    return { copy };
+  }
+
+  it("answers a promise that is pending, and the event loop runs while the pages are copied", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    const file = path.join(String(dir), "backup.sqlite");
+    using db = fill(new Database(":memory:"), 450);
+    const totalPages = pagesOf(db);
+
+    let settled = false;
+    let immediates = 0;
+    let queries = 0;
+    const promise = db.backup(file);
+    expect(promise).toBeInstanceOf(Promise);
+    expect(Bun.peek.status(promise)).toBe("pending");
+    (function tick() {
+      if (settled) return;
+      immediates++;
+      if (db.query("SELECT count(*) AS n FROM t").get().n === 450) queries++;
+      setImmediate(tick);
+    })();
+
+    expect(await promise).toEqual({ totalPages, remainingPages: 0 });
+    settled = true;
+    // One turn to count the pages and one for each 100 of them.
+    expect(immediates).toBeGreaterThanOrEqual(Math.floor(totalPages / 100));
+    expect(queries).toBe(immediates);
+    expect(read(file)).toEqual(contentOf(450));
+    expect(readdirSync(String(dir))).toEqual(["backup.sqlite"]);
+  });
+
+  it("tells the progress callback the pages before the first is copied and after each 100", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    using db = fill(new Database(":memory:"), 450);
+    const totalPages = pagesOf(db);
+    const calls = [];
+    const receivers = [];
+    const result = await db.backup(path.join(String(dir), "backup.sqlite"), {
+      progress(progress) {
+        receivers.push(this);
+        calls.push(progress);
+      },
+    });
+    const expected = [];
+    for (let remainingPages = totalPages; remainingPages > 0; remainingPages -= 100) {
+      expected.push({ totalPages, remainingPages });
+    }
+    expect(calls).toEqual(expected);
+    expect(new Set(calls).size).toBe(calls.length);
+    expect(receivers).toEqual(calls.map(() => undefined));
+    expect(result).toEqual({ totalPages, remainingPages: 0 });
+  });
+
+  it("copies in each step the number of pages that the progress callback returned", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    using db = fill(new Database(":memory:"), 450);
+    const totalPages = pagesOf(db);
+    const file = path.join(String(dir), "backup.sqlite");
+
+    const sizes = [10, undefined, 7.5, 7.4, "rest"];
+    const remaining = [];
+    await db.backup(file, {
+      progress({ remainingPages }) {
+        remaining.push(remainingPages);
+        const size = sizes[remaining.length - 1];
+        return size === "rest" ? Infinity : size;
+      },
+    });
+    // undefined keeps the size, and a fraction is rounded as Math.round() rounds it.
+    expect(remaining).toEqual([totalPages, totalPages - 10, totalPages - 20, totalPages - 28, totalPages - 35]);
+    expect(read(file)).toEqual(contentOf(450));
+  });
+
+  it("asks the progress callback again, without copying, after it returned 0 or less", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    using db = fill(new Database(":memory:"), 250);
+    const totalPages = pagesOf(db);
+    const file = path.join(String(dir), "backup.sqlite");
+
+    const answers = [200, 0, -3, 0, 200];
+    const remaining = [];
+    const result = await db.backup(file, {
+      progress({ remainingPages }) {
+        remaining.push(remainingPages);
+        return answers[remaining.length - 1];
+      },
+    });
+    expect(remaining).toEqual([totalPages, totalPages - 200, totalPages - 200, totalPages - 200, totalPages - 200]);
+    expect(result).toEqual({ totalPages, remainingPages: 0 });
+    expect(read(file)).toEqual(contentOf(250));
+  });
+
+  it.each([
+    ["a string", "100"],
+    ["NaN", NaN],
+    ["null", null],
+    ["a bigint", 100n],
+    ["an object", { valueOf: () => 100 }],
+  ])("is rejected when the progress callback returns %s, and the file that it made is removed", async (_, value) => {
+    using dir = tempDir("sqlite-backup", {});
+    using db = fill(new Database(":memory:"), 10);
+    const promise = db.backup(path.join(String(dir), "backup.sqlite"), { progress: () => value });
+    expect(promise).rejects.toEqual(new TypeError("Expected progress callback to return a number or undefined"));
+    await promise.catch(() => {});
+    expect(readdirSync(String(dir))).toEqual([]);
+    expect(db.query("SELECT count(*) AS n FROM t").get()).toEqual({ n: 10 });
+  });
+
+  it("is rejected with what the progress callback throws, and the file that it made is removed", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    using db = fill(new Database(":memory:"), 450);
+    const error = new RangeError("enough");
+    let calls = 0;
+    const promise = db.backup(path.join(String(dir), "backup.sqlite"), {
+      progress() {
+        if (++calls === 3) throw error;
+      },
+    });
+    expect(await promise.catch(thrown => thrown)).toBe(error);
+    expect(calls).toBe(3);
+    expect(readdirSync(String(dir))).toEqual([]);
+    // The database is not part of the failure.
+    expect(await db.backup(path.join(String(dir), "second.sqlite"))).toEqual({
+      totalPages: pagesOf(db),
+      remainingPages: 0,
+    });
+  });
+
+  it("leaves a database that was at the destination as it was when the copy does not end", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    const file = path.join(String(dir), "backup.sqlite");
+    fill(new Database(file), 150).close();
+    using db = fill(new Database(":memory:"), 450);
+
+    let calls = 0;
+    const promise = db.backup(file, {
+      progress() {
+        if (++calls === 4) throw new Error("enough");
+      },
+    });
+    expect(await promise.catch(thrown => thrown)).toEqual(new Error("enough"));
+    expect(read(file)).toEqual(contentOf(150));
+    expect(readdirSync(String(dir))).toEqual(["backup.sqlite"]);
+
+    // And it replaces the database when it ends.
+    await db.backup(file);
+    expect(read(file)).toEqual(contentOf(450));
+  });
+
+  it("replaces a database in write-ahead mode as one in rollback mode, and leaves no log", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    const file = path.join(String(dir), "backup.sqlite");
+    const journalModeOf = file => {
+      using db = new Database(file);
+      return db.query("PRAGMA journal_mode").get().journal_mode;
+    };
+    {
+      using old = new Database(file);
+      old.run("PRAGMA journal_mode = WAL");
+      fill(old, 150);
+    }
+    using db = fill(new Database(":memory:"), 450);
+    expect(await db.backup(file)).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+    expect(readdirSync(String(dir))).toEqual(["backup.sqlite"]);
+    // The file is what its source is, and a database in memory has no write-ahead mode.
+    expect(journalModeOf(file)).toBe("delete");
+    expect(read(file)).toEqual(contentOf(450));
+
+    // The copy of a database in write-ahead mode is in that mode, so the next copy replaces such a database again.
+    using source = new Database(path.join(String(dir), "source.sqlite"));
+    source.run("PRAGMA journal_mode = WAL");
+    fill(source, 300);
+    await source.backup(file);
+    const remaining = [];
+    await source.backup(file, {
+      progress({ remainingPages }) {
+        remaining.push(remainingPages);
+        // A page that the step before copied.
+        if (remaining.length === 3) source.run("UPDATE t SET a = 'changed' WHERE id = 1");
+      },
+    });
+    const totalPages = pagesOf(source);
+    expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 200, totalPages - 300]);
+    expect(readdirSync(String(dir)).filter(name => name.startsWith("backup"))).toEqual(["backup.sqlite"]);
+    {
+      using copy = new Database(file, { readonly: true });
+      expect(copy.query("SELECT count(*) AS n, sum(a = 'changed') AS changed FROM t").get()).toEqual({ n: 300, changed: 1 }); // prettier-ignore
+      expect(copy.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+    }
+    expect(journalModeOf(file)).toBe("wal");
+  });
+
+  it("replaces a database in write-ahead mode with one that has pages of another size", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    const file = path.join(String(dir), "backup.sqlite");
+    {
+      using old = new Database(file);
+      old.run("PRAGMA journal_mode = WAL");
+      fill(old, 20);
+    }
+    using db = new Database(":memory:");
+    db.run("PRAGMA page_size = 8192");
+    fill(db, 40);
+    expect(await db.backup(file)).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+    expect(read(file)).toEqual(contentOf(40));
+    using copy = new Database(file, { readonly: true });
+    expect(copy.query("PRAGMA page_size").get()).toEqual({ page_size: 8192 });
+  });
+
+  it("replaces a database whose log another process left behind", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    const file = path.join(String(dir), "backup.sqlite");
+    {
+      using old = new Database(path.join(String(dir), "old.sqlite"));
+      old.run("PRAGMA journal_mode = WAL");
+      old.run("PRAGMA wal_autocheckpoint = 0");
+      fill(old, 150);
+      // As after the end of a process that did not close its database: the pages are in the log.
+      copyFileSync(path.join(String(dir), "old.sqlite"), file);
+      copyFileSync(path.join(String(dir), "old.sqlite-wal"), file + "-wal");
+    }
+    expect(statSync(file + "-wal").size).toBeGreaterThan(150 * 4096);
+    using db = fill(new Database(":memory:"), 250);
+    expect(await db.backup(file)).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+    expect(readdirSync(String(dir)).filter(name => name.startsWith("backup"))).toEqual(["backup.sqlite"]);
+    expect(read(file)).toEqual(contentOf(250));
+  });
+
+  describe("what it copies", () => {
+    const sources = {
+      "a database in memory": () => fill(new Database(":memory:"), 120),
+      "a database in a file": dir => fill(new Database(path.join(dir, "source.sqlite")), 120),
+      "a database in write-ahead mode with pages that are only in the log": dir => {
+        const db = new Database(path.join(dir, "source.sqlite"));
+        db.run("PRAGMA journal_mode = WAL");
+        db.run("PRAGMA wal_autocheckpoint = 0");
+        return fill(db, 120);
+      },
+      "a database that was deserialized": () => {
+        using db = fill(new Database(":memory:"), 120);
+        return Database.deserialize(db.serialize());
+      },
+      "a database that is read-only": dir => {
+        const file = path.join(dir, "source.sqlite");
+        fill(new Database(file), 120).close();
+        return new Database(file, { readonly: true });
+      },
+    };
+    it.each(Object.keys(sources))("%s", async name => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = sources[name](String(dir));
+      expect(await db.backup(file)).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+      // The file is all of the backup.
+      expect(readdirSync(String(dir)).filter(name => name.startsWith("backup"))).toEqual(["backup.sqlite"]);
+      expect(read(file)).toEqual(contentOf(120));
+    });
+
+    it("a database without a table", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = new Database(":memory:");
+      const calls = [];
+      expect(await db.backup(file, { progress: progress => void calls.push(progress) })).toEqual({
+        totalPages: 0,
+        remainingPages: 0,
+      });
+      expect(calls).toEqual([]);
+      using copy = new Database(file);
+      expect(copy.query("SELECT count(*) AS n FROM sqlite_schema").get()).toEqual({ n: 0 });
+    });
+
+    it("the database that `attached` names", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(":memory:"), 20);
+      db.run(`ATTACH '${path.join(String(dir), "other.sqlite")}' AS other`);
+      fill(db, 130, "other.u");
+      db.run("CREATE TEMP TABLE v (a)");
+      db.run("INSERT INTO v VALUES ('temporary')");
+
+      expect(await db.backup(file, { attached: "other" })).toEqual({
+        totalPages: pagesOf(db, "other"),
+        remainingPages: 0,
+      });
+      expect(read(file, "u")).toEqual(contentOf(130));
+      expect(await db.backup(file, { attached: "main" })).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+      expect(read(file)).toEqual(contentOf(20));
+      await db.backup(file, { attached: "temp" });
+      using copy = new Database(file);
+      expect(copy.query("SELECT a FROM v").all()).toEqual([{ a: "temporary" }]);
+    });
+
+    it.each(["a file", "a file in write-ahead mode", "memory, deserialized"])(
+      "what its connection writes while it copies, for a database in %s",
+      async kind => {
+        using dir = tempDir("sqlite-backup", {});
+        const file = path.join(String(dir), "backup.sqlite");
+        using db =
+          kind === "memory, deserialized"
+            ? Database.deserialize(fill(new Database(":memory:"), 450).serialize())
+            : fill(new Database(path.join(String(dir), "source.sqlite")), 450);
+        if (kind === "a file in write-ahead mode") db.run("PRAGMA journal_mode = WAL");
+        db.run("CREATE TABLE written (at INTEGER)");
+        const totalPages = pagesOf(db);
+        const remaining = [];
+        await db.backup(file, {
+          progress({ remainingPages }) {
+            remaining.push(remainingPages);
+            // The page of this table is the last of the database, and the rows of `t` are on pages that are copied.
+            db.run("INSERT INTO written VALUES (?)", [remainingPages]);
+            if (remaining.length === 3) db.run("UPDATE t SET a = 'changed' WHERE id <= 50");
+          },
+        });
+        // SQLite copies a page again when the connection writes it, and the copy goes on from where it was.
+        expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 200, totalPages - 300, totalPages - 400]);
+        using copy = new Database(file, { readonly: true });
+        expect(copy.query("SELECT at FROM written ORDER BY rowid").values()).toEqual(remaining.map(at => [at]));
+        expect(copy.query("SELECT count(*) AS n FROM t WHERE a = 'changed'").get()).toEqual({ n: 50 });
+        expect(copy.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+      },
+    );
+
+    // SQLite starts the copy of a database in memory again at each write: only a step that copies every page ends it.
+    it.each([
+      ["", undefined],
+      [", also when the progress callback asks for 100 pages each time", 100],
+    ])(
+      "a database in memory that is written in every turn of the event loop, in steps that get larger%s",
+      async (_, pages) => {
+        using dir = tempDir("sqlite-backup", {});
+        const file = path.join(String(dir), "backup.sqlite");
+        using db = fill(new Database(":memory:"), 450);
+        db.run("CREATE TABLE written (at INTEGER)");
+        const totalPages = pagesOf(db);
+        const remaining = [];
+        await db.backup(file, {
+          progress({ remainingPages }) {
+            remaining.push(remainingPages);
+            db.run("INSERT INTO written VALUES (?)", [remainingPages]);
+            return pages;
+          },
+        });
+        // 100 pages, then 100 again from the start, then 200, 400 and all of them.
+        expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 100, totalPages - 200, totalPages - 400]);
+        using copy = new Database(file, { readonly: true });
+        expect(copy.query("SELECT at FROM written ORDER BY rowid").values()).toEqual(remaining.map(at => [at]));
+        expect(copy.query("SELECT count(*) AS n FROM t").get()).toEqual({ n: 450 });
+        expect(copy.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+      },
+    );
+
+    it.each(["rollback", "write-ahead"])(
+      "what another connection writes while it copies a file in %s mode, in a copy that starts again",
+      async mode => {
+        using dir = tempDir("sqlite-backup", {});
+        const file = path.join(String(dir), "backup.sqlite");
+        const source = path.join(String(dir), "source.sqlite");
+        using db = new Database(source);
+        if (mode === "write-ahead") db.run("PRAGMA journal_mode = WAL");
+        fill(db, 450);
+        db.run("CREATE TABLE written (at INTEGER)");
+        using other = new Database(source);
+        other.run("PRAGMA synchronous = OFF");
+        const totalPages = pagesOf(db);
+        const remaining = [];
+        await db.backup(file, {
+          progress({ remainingPages }) {
+            remaining.push(remainingPages);
+            if (remaining.length === 3) other.run("INSERT INTO written VALUES (?)", [remainingPages]);
+          },
+        });
+        // 200 pages, then 100 again from the start, and then steps of 200.
+        expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 200, totalPages - 100, totalPages - 300]);
+        using copy = new Database(file, { readonly: true });
+        expect(copy.query("SELECT at FROM written").values()).toEqual([[totalPages - 200]]);
+        expect(copy.query("SELECT count(*) AS n FROM t").get()).toEqual({ n: 450 });
+        expect(copy.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+      },
+    );
+
+    it.each([512, 65536])("a database with pages of %d bytes, 100 of them in a step", async pageSize => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = new Database(":memory:");
+      db.run(`PRAGMA page_size = ${pageSize}`);
+      const rows = pageSize === 512 ? 40 : 4500;
+      fill(db, rows);
+      const totalPages = pagesOf(db);
+      expect(totalPages).toBeWithin(201, 300);
+      const remaining = [];
+      await db.backup(file, { progress: ({ remainingPages }) => void remaining.push(remainingPages) });
+      expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 200]);
+      expect(read(file)).toEqual(contentOf(rows));
+      expect(statSync(file).size).toBe(totalPages * pageSize);
+    });
+
+    it("to a path with characters that are not ASCII, after the spaces around it are cut off", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "zálohování 備份 🗄.sqlite");
+      using db = fill(new Database(":memory:"), 5);
+      await db.backup(`  ${file}\n`);
+      expect(read(file)).toEqual(contentOf(5));
+    });
+  });
+
+  describe("close() of its database ends a copy", () => {
+    it.each([
+      ["close() in the turn of the call", false, false],
+      ["close(true) in the turn of the call", true, false],
+      ["close() after some pages", false, true],
+      ["close(true) after some pages", true, true],
+    ])("%s", async (_, force, afterPages) => {
+      using dir = tempDir("sqlite-backup", {});
+      const source = path.join(String(dir), "source.sqlite");
+      const db = fill(new Database(source), 450);
+      const { copy } = afterPages
+        ? await underWay(db, path.join(String(dir), "backup.sqlite"))
+        : { copy: db.backup(path.join(String(dir), "backup.sqlite")) };
+      db.close(force);
+      expect(await copy.catch(error => error)).toEqual(closed);
+      expect(readdirSync(String(dir))).toEqual(["source.sqlite"]);
+      expect(read(source)).toEqual(contentOf(450));
+      if (force) {
+        // On Windows rmSync throws EBUSY if the copy still held the connection, which holds the file.
+        rmSync(source);
+        expect(readdirSync(String(dir))).toEqual([]);
+      }
+    });
+
+    it("close() after the last page is copied does not end it", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      // A new file of this size is synced by the work pool, and the promise waits for that.
+      const db = fill(new Database(":memory:"), 1200);
+      const totalPages = pagesOf(db);
+      const copy = db.backup(file, {
+        progress({ remainingPages }) {
+          if (remainingPages > 100) return;
+          // The step of the next turn of the event loop copies the last page.
+          let turns = 3;
+          (function next() {
+            if (turns-- === 0) db.close();
+            else setImmediate(next);
+          })();
+        },
+      });
+      expect(await copy).toEqual({ totalPages, remainingPages: 0 });
+      expect(() => db.run("SELECT 1")).toThrow("Database has closed");
+      expect(readdirSync(String(dir))).toEqual(["backup.sqlite"]);
+      expect(read(file)).toEqual(contentOf(1200));
+    });
+
+    it.each([
+      ["waits for a lock of another connection on the destination", false],
+      ["is paused by its progress callback", true],
+    ])("close() while the copy %s, and the database at the destination is as it was", async (_, paused) => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using old = fill(new Database(file), 30);
+      const db = fill(new Database(":memory:"), 250);
+      if (!paused) old.run("BEGIN EXCLUSIVE");
+      let calls = 0;
+      const copy = db.backup(file, { progress: () => (calls++, paused ? 0 : undefined) });
+      for (let i = 0; i < 20; i++) await turn();
+      expect(Bun.peek.status(copy)).toBe("pending");
+      // Paused, the copy has the write lock of the destination and has written no page.
+      if (paused) expect(() => old.run("DELETE FROM t")).toThrow("database is locked");
+      const callsBefore = calls;
+      db.close();
+      expect(await copy.catch(error => error)).toEqual(closed);
+      if (!paused) old.run("COMMIT");
+      old.run("DELETE FROM t WHERE id > 20");
+      for (let i = 0; i < 20; i++) await turn();
+      expect(calls).toBe(callsBefore);
+      expect(callsBefore > 0).toBe(paused);
+      expect(readdirSync(String(dir))).toEqual(["backup.sqlite"]);
+      expect(read(file)).toEqual(contentOf(20));
+    });
+
+    it("close() in the progress callback", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const db = fill(new Database(":memory:"), 450);
+      let calls = 0;
+      const promise = db.backup(path.join(String(dir), "backup.sqlite"), {
+        progress() {
+          if (++calls === 2) db.close();
+          return 50;
+        },
+      });
+      expect(await promise.catch(error => error)).toEqual(closed);
+      expect(calls).toBe(2);
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+
+    it("and a database that is closed starts none", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const db = fill(new Database(":memory:"), 5);
+      db.close();
+      expect(await db.backup(path.join(String(dir), "backup.sqlite")).catch(error => error)).toEqual(closed);
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+
+    it("one of two copies ends as it would alone when the other fails", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      using db = fill(new Database(":memory:"), 450);
+      const first = db.backup(path.join(String(dir), "first.sqlite"), {
+        progress({ remainingPages }) {
+          if (remainingPages < 300) throw new Error("enough");
+        },
+      });
+      const second = db.backup(path.join(String(dir), "second.sqlite"));
+      expect(await first.catch(error => error)).toEqual(new Error("enough"));
+      expect(await second).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+      expect(readdirSync(String(dir))).toEqual(["second.sqlite"]);
+      expect(read(path.join(String(dir), "second.sqlite"))).toEqual(contentOf(450));
+    });
+  });
+
+  describe("while its connection is inside a write transaction it waits", () => {
+    it("for the COMMIT of a transaction that was open at the call, and copies what was committed", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(":memory:"), 20);
+      db.run("BEGIN");
+      db.run("DELETE FROM t WHERE id > 5");
+
+      const calls = [];
+      const promise = db.backup(file, { progress: progress => void calls.push(progress) });
+      for (let i = 0; i < 20; i++) await turn();
+      expect(Bun.peek.status(promise)).toBe("pending");
+      expect(calls).toEqual([]);
+
+      db.run("COMMIT");
+      expect(await promise).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+      expect(read(file)).toEqual(contentOf(5));
+    });
+
+    it("for the ROLLBACK, and copies what was there before the transaction", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(path.join(String(dir), "source.sqlite")), 20);
+      db.run("BEGIN IMMEDIATE");
+      db.run("DELETE FROM t");
+      const promise = db.backup(file);
+      for (let i = 0; i < 20; i++) await turn();
+      expect(Bun.peek.status(promise)).toBe("pending");
+      db.run("ROLLBACK");
+      await promise;
+      expect(read(file)).toEqual(contentOf(20));
+    });
+
+    it("for a transaction that begins after some pages, and copies the pages that it wrote again", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(":memory:"), 450);
+      const { copy } = await underWay(db, file);
+      db.run("BEGIN");
+      db.run("UPDATE t SET a = 'changed' WHERE id = 1");
+      for (let i = 0; i < 20; i++) await turn();
+      expect(Bun.peek.status(copy)).toBe("pending");
+      db.run("COMMIT");
+      await copy;
+      using copied = new Database(file, { readonly: true });
+      expect(copied.query("SELECT a FROM t WHERE id = 1").get()).toEqual({ a: "changed" });
+      expect(copied.query("SELECT count(*) AS n FROM t").get()).toEqual({ n: 450 });
+    });
+
+    // A step runs at the start of a turn of the event loop, and each of these turns finds a transaction open.
+    it("for a turn of the event loop that finds no transaction open, when they follow each other", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(path.join(String(dir), "source.sqlite")), 250);
+      db.run("CREATE TABLE counter (n INTEGER)");
+      db.run("INSERT INTO counter VALUES (0)");
+      const totalPages = pagesOf(db);
+
+      const remaining = [];
+      const copy = db.backup(file, { progress: ({ remainingPages }) => void remaining.push(remainingPages) });
+      for (let transactions = 0; transactions < 30; transactions++) {
+        db.run("BEGIN IMMEDIATE");
+        db.run("UPDATE counter SET n = n + 1");
+        await turn();
+        db.run("COMMIT");
+      }
+      expect(Bun.peek.status(copy)).toBe("pending");
+      expect(remaining).toEqual([]);
+
+      expect(await copy).toEqual({ totalPages, remainingPages: 0 });
+      expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 200]);
+      using copied = new Database(file, { readonly: true });
+      expect(copied.query("SELECT n FROM counter").get()).toEqual({ n: 30 });
+    });
+
+    it.each([
+      ["", false],
+      // The collector then leaves the statement for the next call on the connection, and a step is such a call.
+      [", on a database that has an update hook", true],
+    ])("for a statement that writes, stopped on a row and is collected%s", async (_, hook) => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(":memory:"), 20);
+      if (hook) db.onDelete = () => {};
+      // Nothing holds the statement or its iterator after the call.
+      (() => {
+        const rows = db.prepare("UPDATE t SET a = 'changed' WHERE id <= 3 RETURNING id").iterate();
+        expect(rows.next().value).toEqual({ id: 1 });
+      })();
+      const copy = db.backup(file);
+      for (let i = 0; i < 20; i++) await turn();
+      expect(Bun.peek.status(copy)).toBe("pending");
+      // The collector finalizes the statement, which commits what it wrote.
+      Bun.gc(true);
+      await copy;
+      using copied = new Database(file, { readonly: true });
+      expect(copied.query("SELECT count(*) AS n FROM t WHERE a = 'changed'").get()).toEqual({ n: 3 });
+    });
+
+    it("for a statement that writes and stopped on a row", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(":memory:"), 20);
+      const rows = db.prepare("UPDATE t SET a = 'changed' WHERE id <= 3 RETURNING id").iterate();
+      expect(rows.next().value).toEqual({ id: 1 });
+      const promise = db.backup(file);
+      for (let i = 0; i < 20; i++) await turn();
+      expect(Bun.peek.status(promise)).toBe("pending");
+      expect([...rows]).toEqual([{ id: 2 }, { id: 3 }]);
+      await promise;
+      using copy = new Database(file, { readonly: true });
+      expect(copy.query("SELECT count(*) AS n FROM t WHERE a = 'changed'").get()).toEqual({ n: 3 });
+    });
+  });
+
+  it("waits while another connection holds a lock on the destination, with the fake timers of a test too", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    const file = path.join(String(dir), "backup.sqlite");
+    using db = fill(new Database(":memory:"), 120);
+    using other = new Database(file);
+    other.run("CREATE TABLE old (a)");
+    other.run("BEGIN EXCLUSIVE");
+
+    jest.useFakeTimers();
+    try {
+      const promise = db.backup(file);
+      for (let i = 0; i < 50; i++) await turn();
+      expect(Bun.peek.status(promise)).toBe("pending");
+      other.run("COMMIT");
+      expect(await promise).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+    } finally {
+      jest.useRealTimers();
+    }
+    expect(read(file)).toEqual(contentOf(120));
+  });
+
+  it("does not wait inside SQLite for as long as the busy_timeout of its database", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    const file = path.join(String(dir), "backup.sqlite");
+    const source = path.join(String(dir), "source.sqlite");
+    using db = fill(new Database(source), 120);
+    db.run("PRAGMA busy_timeout = 10000");
+    using other = new Database(source);
+    other.run("BEGIN EXCLUSIVE");
+
+    const start = performance.now();
+    const promise = db.backup(file);
+    for (let i = 0; i < 20; i++) await turn();
+    // A step that waited for the lock of `other` held this thread for 10 seconds.
+    expect(performance.now() - start).toBeLessThan(5000);
+    expect(Bun.peek.status(promise)).toBe("pending");
+    other.run("COMMIT");
+    expect(await promise).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+    expect(db.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 10000 });
+    expect(read(file)).toEqual(contentOf(120));
+  });
+
+  it("goes on after a timeout of node:vm ended its progress callback, and no callback runs before the timeout has ended the script", async () => {
+    using dir = tempDir("sqlite-backup", { "entry.js": "export default 1;" });
+    using db = fill(new Database(":memory:"), 250);
+    using other = fill(new Database(":memory:"), 250);
+    const totalPages = pagesOf(db);
+    const remaining = [];
+    let inside = false;
+    let spinning = false;
+    let callsBehindTheTimeout = 0;
+    const copy = db.backup(path.join(String(dir), "backup.sqlite"), {
+      progress({ remainingPages }) {
+        remaining.push(remainingPages);
+        // The other copy waits on a timer by now. Only the timeout ends this.
+        if (inside && remaining.length === 2) for (spinning = true; ;);
+      },
+    });
+    // Paused, it asks its callback again each time its timer fires.
+    const copyOfOther = other.backup(path.join(String(dir), "other.sqlite"), {
+      progress() {
+        if (spinning) callsBehindTheTimeout++;
+        return inside ? 0 : 100;
+      },
+    });
+
+    let build;
+    const context = vm.createContext({
+      // Bun.build() runs the event loop until the setup() of a plugin has settled, and the copies take their steps there.
+      wait() {
+        build = Bun.build({
+          entrypoints: [path.join(String(dir), "entry.js")],
+          plugins: [
+            {
+              name: "ten turns",
+              async setup() {
+                for (let turns = 0; turns < 10; turns++) await turn();
+              },
+            },
+          ],
+        });
+      },
+    });
+    inside = true;
+    let code = "did not throw";
+    try {
+      vm.runInContext("wait()", context, { timeout: 100 });
+    } catch (error) {
+      code = error.code;
+    }
+    inside = false;
+    expect({ code, spinning, remaining, callsBehindTheTimeout }).toEqual({
+      code: "ERR_SCRIPT_EXECUTION_TIMEOUT",
+      spinning: true,
+      remaining: [totalPages, totalPages - 100],
+      callsBehindTheTimeout: 0,
+    });
+    spinning = false;
+
+    const copied = { totalPages, remainingPages: 0 };
+    expect(await Promise.all([copy, copyOfOther])).toEqual([copied, copied]);
+    expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 200]);
+    expect(read(path.join(String(dir), "backup.sqlite"))).toEqual(contentOf(250));
+    expect(read(path.join(String(dir), "other.sqlite"))).toEqual(contentOf(250));
+    await build?.catch(() => {});
+  });
+
+  it("goes on after a timeout of node:vm that came while it waited for a lock", async () => {
+    using dir = tempDir("sqlite-backup", { "entry.js": "export default 1;" });
+    const file = path.join(String(dir), "backup.sqlite");
+    using db = fill(new Database(":memory:"), 120);
+    using holder = new Database(file);
+    holder.run("CREATE TABLE old (a)");
+    holder.run("BEGIN EXCLUSIVE");
+    const copy = db.backup(file);
+
+    let build;
+    const context = vm.createContext({
+      // The event loop of Bun.build() runs the timer of the copy, and it runs no script when the timeout comes.
+      wait() {
+        build = Bun.build({
+          entrypoints: [path.join(String(dir), "entry.js")],
+          plugins: [{ name: "idle", setup: () => new Promise(resolve => setTimeout(resolve, 150)) }],
+        });
+      },
+    });
+    let code = "did not throw";
+    try {
+      vm.runInContext("wait()", context, { timeout: 30 });
+    } catch (error) {
+      code = error.code;
+    }
+    expect(code).toBe("ERR_SCRIPT_EXECUTION_TIMEOUT");
+    expect(Bun.peek.status(copy)).toBe("pending");
+
+    holder.run("COMMIT");
+    expect(await copy).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+    expect(read(file)).toEqual(contentOf(120));
+    await build?.catch(() => {});
+  });
+
+  describe("is rejected", () => {
+    it.each([
+      ["without a destination", [], new TypeError("Expected first argument to be a string")],
+      ["with a destination that is no string", [new URL("file:///tmp/a")], new TypeError("Expected first argument to be a string")], // prettier-ignore
+      ["with an empty destination", ["  \n"], new TypeError("Backup filename cannot be an empty string")],
+      ["with :memory: as the destination", [" :memory: "], new TypeError('Invalid backup filename ":memory:"')],
+      ["with options that are no object", ["a.sqlite", "main"], new TypeError("Expected second argument to be an options object")], // prettier-ignore
+      ["with an `attached` that is no string", ["a.sqlite", { attached: 1 }], new TypeError('Expected the "attached" option to be a string')], // prettier-ignore
+      ["with an empty `attached`", ["a.sqlite", { attached: "" }], new TypeError('The "attached" option cannot be an empty string')], // prettier-ignore
+      ["with a `progress` that is no function", ["a.sqlite", { progress: {} }], new TypeError('Expected the "progress" option to be a function')], // prettier-ignore
+    ])("%s", async (_, args, error) => {
+      using dir = tempDir("sqlite-backup", {});
+      using db = fill(new Database(":memory:"), 2);
+      if (typeof args[0] === "string" && args[0].includes("sqlite")) args = [path.join(String(dir), args[0]), args[1]];
+      const promise = db.backup(...args);
+      expect(promise).toBeInstanceOf(Promise);
+      expect(await promise.catch(thrown => thrown)).toEqual(error);
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+
+    it("with the options null and undefined as without options", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      using db = fill(new Database(":memory:"), 2);
+      const expected = { totalPages: pagesOf(db), remainingPages: 0 };
+      expect(await db.backup(path.join(String(dir), "a.sqlite"), null)).toEqual(expected);
+      expect(await db.backup(path.join(String(dir), "b.sqlite"), undefined)).toEqual(expected);
+      expect(await db.backup(path.join(String(dir), "c.sqlite"), { progress: null, attached: "main" })).toEqual(expected); // prettier-ignore
+      expect(await db.backup(path.join(String(dir), "d.sqlite"), { progress: undefined, attached: undefined })).toEqual(expected); // prettier-ignore
+    });
+
+    it("while another copy into the same file has not ended", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const file = path.join(String(dir), "backup.sqlite");
+      using db = fill(new Database(":memory:"), 120);
+      using other = fill(new Database(":memory:"), 5);
+      const first = db.backup(file);
+      const second = other.backup(`${String(dir)}${path.sep}.${path.sep}backup.sqlite`);
+      expect(await second.catch(thrown => thrown)).toEqual(new Error("Another backup to this file is in progress"));
+      expect(await first).toEqual({ totalPages: pagesOf(db), remainingPages: 0 });
+      expect(read(file)).toEqual(contentOf(120));
+      // And not after it has ended.
+      expect(await other.backup(file)).toEqual({ totalPages: pagesOf(other), remainingPages: 0 });
+      expect(read(file)).toEqual(contentOf(5));
+    });
+
+    it("with SQLite's error when the directory of the destination does not exist", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      using db = fill(new Database(":memory:"), 2);
+      const error = await db.backup(path.join(String(dir), "none", "backup.sqlite")).catch(thrown => thrown);
+      expect(error).toMatchObject({
+        name: "SQLiteError",
+        code: "SQLITE_CANTOPEN",
+        errno: 14,
+        message: "unable to open database file",
+      });
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+
+    it("with SQLite's error when the connection has no database of the name in `attached`", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      using db = fill(new Database(":memory:"), 2);
+      const error = await db.backup(path.join(String(dir), "backup.sqlite"), { attached: "other" }).catch(thrown => thrown); // prettier-ignore
+      expect(error).toMatchObject({ name: "SQLiteError", code: "SQLITE_ERROR", message: "unknown database other" });
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+
+    it("with SQLite's error when the file at the destination is not a database, and the file stays", async () => {
+      const notes = Buffer.alloc(8000, "These are not the pages of a database. ").toString();
+      using dir = tempDir("sqlite-backup", { "notes.txt": notes });
+      const file = path.join(String(dir), "notes.txt");
+      using db = fill(new Database(":memory:"), 2);
+      const error = await db.backup(file).catch(thrown => thrown);
+      expect(error).toMatchObject({ name: "SQLiteError", code: "SQLITE_NOTADB", message: "file is not a database" });
+      expect(readFileSync(file, "utf8")).toBe(notes);
+    });
+
+    it.each([
+      ["its path", (dir, source) => source],
+      ["another spelling of its path", dir => path.join(dir, "nowhere", "..", "source.sqlite")],
+      // A symbolic link needs a privilege on Windows.
+      ...(isWindows ? [] : [["a symbolic link to it", (dir, source) => (symlinkSync(source, path.join(dir, "link.sqlite")), path.join(dir, "link.sqlite"))]]), // prettier-ignore
+      ["a hard link to it", (dir, source) => (linkSync(source, path.join(dir, "link.sqlite")), path.join(dir, "link.sqlite"))], // prettier-ignore
+    ])("when the destination is the file of the database itself: %s", async (_, destinationOf) => {
+      using dir = tempDir("sqlite-backup", {});
+      const source = path.join(String(dir), "source.sqlite");
+      using db = fill(new Database(source), 30);
+      mkdirSync(path.join(String(dir), "nowhere"));
+      const promise = db.backup(destinationOf(String(dir), source));
+      expect(await promise.catch(thrown => thrown)).toEqual(new TypeError("Cannot back up a database to its own file")); // prettier-ignore
+      expect(db.query("SELECT count(*) AS n FROM t").get()).toEqual({ n: 30 });
+      db.close();
+      expect(read(source)).toEqual(contentOf(30));
+    });
+
+    it("inside a function that a statement of the connection calls", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      using db = fill(new Database(":memory:"), 2);
+      let promise;
+      db.function("copy", () => ((promise = db.backup(path.join(String(dir), "backup.sqlite"))), 1));
+      expect(db.query("SELECT copy() AS a").get()).toEqual({ a: 1 });
+      expect(await promise.catch(thrown => thrown)).toEqual(new TypeError(busy));
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+
+    it("with a null byte in the destination or in `attached`", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      using db = fill(new Database(":memory:"), 2);
+      const rejected = argument =>
+        expect.objectContaining({
+          code: "ERR_INVALID_ARG_VALUE",
+          message: expect.stringContaining(`The argument '${argument}' must be a string without null bytes.`),
+        });
+      expect(await db.backup(path.join(String(dir), "backup\0.sqlite")).catch(thrown => thrown)).toEqual(rejected("destination")); // prettier-ignore
+      expect(await db.backup(path.join(String(dir), "backup.sqlite"), { attached: "main\0x" }).catch(thrown => thrown)).toEqual(rejected("attached")); // prettier-ignore
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+  });
+
+  it("copies nothing while a function that a statement of its connection calls runs the event loop", async () => {
+    using dir = tempDir("sqlite-backup", { "entry.js": "export default 1;" });
+    using db = fill(new Database(":memory:"), 450);
+    const totalPages = pagesOf(db);
+    const remaining = [];
+    let inside;
+    let build;
+    db.function("wait", () => {
+      const before = remaining.length;
+      let turns = 0;
+      // Bun.build() runs the event loop until the setup() of a plugin has settled.
+      build = Bun.build({
+        entrypoints: [path.join(String(dir), "entry.js")],
+        plugins: [
+          {
+            name: "ten turns",
+            async setup() {
+              for (; turns < 10; turns++) await turn();
+            },
+          },
+        ],
+      });
+      inside = { turns, progressCalls: remaining.length - before };
+      return 1;
+    });
+
+    const copy = db.backup(path.join(String(dir), "backup.sqlite"), {
+      progress: ({ remainingPages }) => void remaining.push(remainingPages),
+    });
+    expect(db.query("SELECT wait() AS a").get()).toEqual({ a: 1 });
+    expect(inside).toEqual({ turns: 10, progressCalls: 0 });
+    await build;
+    expect(await copy).toEqual({ totalPages, remainingPages: 0 });
+    expect(remaining).toEqual([totalPages, totalPages - 100, totalPages - 200, totalPages - 300, totalPages - 400]);
+  });
+
+  describe("a Bun.ModuleGraph that is disposed ends a copy", () => {
+    it.each([
+      ["that its script started, of a database that its script opened: nothing settles", true, true],
+      ["that its script started, of a database of the host: nothing settles", false, true],
+      ["that the host started, of a database that its script opened: the promise is rejected", true, false],
+    ])("%s", async (_, opensInGraph, startsInGraph) => {
+      using dir = tempDir("sqlite-backup", {});
+      const open = () => fill(new Database(path.join(String(dir), "source.sqlite")), 450);
+      const graph = new Bun.ModuleGraph();
+      const db = opensInGraph ? graph.run(open) : open();
+
+      const calls = [];
+      const { promise: copiedSome, resolve } = Promise.withResolvers();
+      const start = () =>
+        db.backup(path.join(String(dir), "backup.sqlite"), {
+          progress({ totalPages, remainingPages }) {
+            calls.push(remainingPages);
+            if (remainingPages < totalPages) resolve();
+          },
+        });
+      const copy = startsInGraph ? graph.run(start) : start();
+      await copiedSome;
+      const callsBefore = calls.length;
+      graph.dispose();
+
+      if (startsInGraph) {
+        for (let i = 0; i < 20; i++) await turn();
+        expect(Bun.peek.status(copy)).toBe("pending");
+      } else {
+        // Script of the host waits for it.
+        expect(await copy.catch(error => error)).toEqual(closed);
+      }
+      expect(calls.length).toBe(callsBefore);
+      expect(readdirSync(String(dir))).toEqual(["source.sqlite"]);
+
+      if (opensInGraph) {
+        expect(() => db.run("SELECT 1")).toThrow("Database has closed");
+      } else {
+        // The database is the host's, and the host copies it.
+        expect(await db.backup(path.join(String(dir), "backup.sqlite"))).toEqual({
+          totalPages: pagesOf(db),
+          remainingPages: 0,
+        });
+        expect(read(path.join(String(dir), "backup.sqlite"))).toEqual(contentOf(450));
+        db.close(true);
+      }
+    });
+  });
+
+  it("calls the progress callback in the async context of the call", async () => {
+    using dir = tempDir("sqlite-backup", {});
+    using db = fill(new Database(":memory:"), 250);
+    const storage = new AsyncLocalStorage();
+    const stores = [];
+    const promise = storage.run("the caller", () =>
+      db.backup(path.join(String(dir), "backup.sqlite"), { progress: () => void stores.push(storage.getStore()) }),
+    );
+    expect(storage.getStore()).toBeUndefined();
+    await promise;
+    expect(stores).toEqual(["the caller", "the caller", "the caller"]);
+  });
+
+  // Each in a process of its own: the process ends, or the test counts what the collector keeps.
+  describe.concurrent("and the process", () => {
+    async function run(src, dir) {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", src],
+        env: bunEnv,
+        cwd: dir,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout: stdout.trim(), stderr, exitCode };
+    }
+    const prelude = /* js */ `
+      import { Database } from "bun:sqlite";
+      function fill(db, rows) {
+        db.run("PRAGMA synchronous = OFF");
+        db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)");
+        const insert = db.prepare("INSERT INTO t (a) VALUES (?)");
+        const text = Buffer.alloc(3000, "x").toString();
+        db.transaction(() => { for (let i = 0; i < rows; i++) insert.run(text + i); })();
+        return db;
+      }
+    `;
+
+    it("stays alive until a copy that nobody waits for has ended", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const { stdout, stderr, exitCode } = await run(
+        prelude +
+          /* js */ `
+          const db = fill(new Database(":memory:"), 450);
+          db.backup("backup.sqlite", { progress: ({ remainingPages }) => console.log(remainingPages) });
+          console.log("end of the script");
+        `,
+        String(dir),
+      );
+      expect(stderr).toBe("");
+      expect(stdout.split("\n")).toEqual(["end of the script", "452", "352", "252", "152", "52"]);
+      expect(exitCode).toBe(0);
+      expect(read(path.join(String(dir), "backup.sqlite"))).toEqual(contentOf(450));
+    });
+
+    it("copies to the end for a Database and a promise that nothing holds anymore", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const { stdout, stderr, exitCode } = await run(
+        prelude +
+          /* js */ `
+          import { heapStats } from "bun:jsc";
+          const handles = () => (Bun.gc(true), heapStats().objectTypeCounts.SQLDatabase ?? 0);
+          let collections = 0;
+          (() => {
+            fill(new Database(":memory:"), 450).backup("backup.sqlite", {
+              progress() {
+                collections++;
+                Bun.gc(true);
+              },
+            });
+          })();
+          Bun.gc(true);
+          process.on("exit", () => console.log(JSON.stringify({ collections, handles: handles() })));
+        `,
+        String(dir),
+      );
+      expect(stderr).toBe("");
+      // Its copy held the Database. Nothing holds it after the copy.
+      expect(JSON.parse(stdout)).toEqual({ collections: 5, handles: 0 });
+      expect(exitCode).toBe(0);
+      expect(read(path.join(String(dir), "backup.sqlite"))).toEqual(contentOf(450));
+    });
+
+    it("ends at process.exit() during a copy, which removes the file that the copy made", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const { stdout, stderr, exitCode } = await run(
+        prelude +
+          /* js */ `
+          const db = fill(new Database("source.sqlite"), 450);
+          db.backup("backup.sqlite", {
+            progress({ totalPages, remainingPages }) {
+              if (remainingPages < totalPages - 150) {
+                console.log("exit");
+                process.exit(7);
+              }
+            },
+          }).then(() => console.log("copied"), () => console.log("rejected"));
+        `,
+        String(dir),
+      );
+      expect(stderr).toBe("");
+      expect(stdout).toBe("exit");
+      expect(exitCode).toBe(7);
+      expect(readdirSync(String(dir))).toEqual(["source.sqlite"]);
+      expect(read(path.join(String(dir), "source.sqlite"))).toEqual(contentOf(450));
+    });
+
+    // The work pool syncs a new file of this size after the last page, and the promise waits for that.
+    const afterTheLastPage = then => /* js */ `
+      progress({ remainingPages }) {
+        if (remainingPages > 100) return;
+        // The step of the next turn of the event loop copies the last page.
+        let turns = 3;
+        (function next() {
+          if (turns-- === 0) ${then};
+          else setImmediate(next);
+        })();
+      },
+    `;
+
+    it("ends at process.exit() after the last page of a large copy, which leaves the whole file", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const { stderr, exitCode } = await run(
+        prelude +
+          /* js */ `
+          const db = fill(new Database(":memory:"), 1200);
+          db.backup("backup.sqlite", { ${afterTheLastPage("process.exit(7)")} });
+        `,
+        String(dir),
+      );
+      expect(stderr).toBe("");
+      expect(exitCode).toBe(7);
+      expect(readdirSync(String(dir))).toEqual(["backup.sqlite"]);
+      expect(read(path.join(String(dir), "backup.sqlite"))).toEqual(contentOf(1200));
+    });
+
+    it.each([
+      ["copies a large database to the end in a Worker", `.then(result => postMessage(result))`, ""],
+      ["leaves the whole file when its Worker is terminated after the last page", "", `postMessage("the last page")`],
+    ])("%s", async (_, then, afterLast) => {
+      using dir = tempDir("sqlite-backup", {
+        "worker.js":
+          prelude +
+          /* js */ `
+          const db = fill(new Database(":memory:"), 1200);
+          db.backup("backup.sqlite", { ${afterLast && afterTheLastPage(afterLast)} })${then};
+        `,
+      });
+      const { stdout, stderr, exitCode } = await run(
+        /* js */ `
+          const worker = new Worker("./worker.js");
+          const { promise, resolve } = Promise.withResolvers();
+          worker.onmessage = event => resolve(event.data);
+          console.log(JSON.stringify(await promise));
+          await worker.terminate();
+        `,
+        String(dir),
+      );
+      expect(stderr).toBe("");
+      expect(JSON.parse(stdout)).toEqual(
+        afterLast ? "the last page" : { totalPages: expect.any(Number), remainingPages: 0 },
+      );
+      expect(exitCode).toBe(0);
+      expect(readdirSync(String(dir)).sort()).toEqual(["backup.sqlite", "worker.js"]);
+      expect(read(path.join(String(dir), "backup.sqlite"))).toEqual(contentOf(1200));
+    });
+
+    it("holds nothing after copies that ended in each way", async () => {
+      using dir = tempDir("sqlite-backup", {});
+      const { stdout, stderr, exitCode } = await run(
+        prelude +
+          /* js */ `
+          import { heapStats } from "bun:jsc";
+          import { rmSync } from "node:fs";
+          const held = () => {
+            Bun.gc(true);
+            const stats = heapStats();
+            return { handles: stats.objectTypeCounts.SQLDatabase ?? 0, protected: stats.protectedObjectCount };
+          };
+          async function round() {
+            const db = fill(new Database(":memory:"), 3);
+            const paused = db.backup("paused.sqlite", { progress: () => 0 });
+            const ends = await Promise.allSettled([
+              db.backup("copied.sqlite"),
+              db.backup("thrown.sqlite", { progress() { throw new Error("enough"); } }),
+              db.backup("answer.sqlite", { progress: () => "all" }),
+              db.backup("attached.sqlite", { attached: "none" }),
+            ]);
+            db.close();
+            ends.push(...(await Promise.allSettled([paused])));
+            rmSync("copied.sqlite");
+            return ends.map(end => end.status).join();
+          }
+          const first = await round();
+          const before = held();
+          const ends = new Set([first]);
+          for (let i = 0; i < 100; i++) ends.add(await round());
+          console.log(JSON.stringify({ ends: [...ends], before, after: held() }));
+        `,
+        String(dir),
+      );
+      expect(stderr).toBe("");
+      const { ends, before, after } = JSON.parse(stdout);
+      expect(ends).toEqual(["fulfilled,rejected,rejected,rejected,rejected"]);
+      expect(after).toEqual(before);
+      expect(before.handles).toBe(0);
+      expect(exitCode).toBe(0);
+      expect(readdirSync(String(dir))).toEqual([]);
+    });
+
+    it("ends with the test file that left it, when `bun test --isolate` goes to the next file", async () => {
+      using dir = tempDir("sqlite-backup", {
+        "first.test.js": /* js */ `
+          import { Database } from "bun:sqlite";
+          import { expect, test } from "bun:test";
+          import { existsSync } from "node:fs";
+          test("leaves a copy that its progress callback paused", async () => {
+            const db = new Database(":memory:");
+            db.run("CREATE TABLE t (a)");
+            db.run("INSERT INTO t VALUES (1)");
+            const { promise: paused, resolve } = Promise.withResolvers();
+            globalThis.copy = db.backup("backup.sqlite", { progress: () => (resolve(), 0) });
+            await paused;
+            expect(existsSync("backup.sqlite")).toBe(true);
+          });
+        `,
+        "second.test.js": /* js */ `
+          import { expect, test } from "bun:test";
+          import { existsSync } from "node:fs";
+          test("finds that the copy has ended, which removed the file that it made", () => {
+            expect(existsSync("backup.sqlite")).toBe(false);
+          });
+        `,
+      });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "--isolate", "./first.test.js", "./second.test.js"],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+      expect(stderr).toContain(" 2 pass");
+      expect(stderr).toContain(" 0 fail");
+      expect(exitCode).toBe(0);
+    });
+
+    it("ends when its Worker is terminated during a copy, which removes the file that the copy made", async () => {
+      using dir = tempDir("sqlite-backup", {
+        "worker.js":
+          prelude +
+          /* js */ `
+          const db = fill(new Database("source.sqlite"), 450);
+          db.backup("backup.sqlite", {
+            progress({ totalPages, remainingPages }) {
+              if (remainingPages < totalPages - 150) postMessage("some pages");
+              // The copy does not go on until the worker is terminated.
+              return remainingPages < totalPages - 150 ? 0 : 100;
+            },
+          }).then(() => postMessage("copied"), () => postMessage("rejected"));
+        `,
+      });
+      const { stdout, stderr, exitCode } = await run(
+        /* js */ `
+          const worker = new Worker("./worker.js");
+          const messages = [];
+          const { promise, resolve } = Promise.withResolvers();
+          worker.onmessage = event => {
+            messages.push(event.data);
+            resolve();
+          };
+          await promise;
+          await worker.terminate();
+          console.log(JSON.stringify([...new Set(messages)]));
+        `,
+        String(dir),
+      );
+      expect(stderr).toBe("");
+      expect(stdout).toBe('["some pages"]');
+      expect(exitCode).toBe(0);
+      expect(readdirSync(String(dir)).sort()).toEqual(["source.sqlite", "worker.js"]);
     });
   });
 });

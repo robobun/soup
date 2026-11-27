@@ -568,6 +568,58 @@ declare module "bun:sqlite" {
     serialize(name?: string): Buffer;
 
     /**
+     * Copy the database into a file while the program goes on using it.
+     *
+     * The copy is made with SQLite's
+     * [Online Backup API](https://www.sqlite.org/backup.html): 100 pages are
+     * copied, the event loop runs, and the next 100 pages are copied. What this
+     * `Database` writes in the meantime is in the backup too.
+     *
+     * - A write by another connection, and every write to a database in
+     *   memory, makes SQLite start the copy again. Each time, the steps get
+     *   twice as large, so the last step of a database that is written all the
+     *   time copies every page.
+     * - While this `Database` is inside a write transaction, and while another
+     *   connection holds a lock that the copy needs, the copy waits and tries
+     *   again later.
+     * - A file that does not exist at `destination` is created, and it is
+     *   removed if the backup does not complete. A database that is already
+     *   there is replaced in place, in one transaction of SQLite. It is as it
+     *   was if the backup fails or is cancelled. During the copy, other
+     *   connections to it can get `SQLITE_BUSY`.
+     * - {@link Database.close} cancels a backup that has not copied its last
+     *   page.
+     * - A backup that is still copying keeps the process alive.
+     *
+     * The signature is that of `backup()` in `better-sqlite3`.
+     *
+     * @param destination Path of the file of the backup
+     * @param options An attached database to copy, and a callback to follow or pace the copy
+     * @returns A promise of the pages of the backup, with `remainingPages: 0`.
+     * It is rejected if the copy fails, if `progress` throws, if the
+     * `Database` is closed before the last page is copied, or if another
+     * backup to the same file is in progress.
+     *
+     * @example
+     * ```ts
+     * const db = new Database("app.sqlite");
+     * await db.backup(`backup-${Date.now()}.sqlite`);
+     * ```
+     *
+     * @example
+     * ```ts
+     * await db.backup("backup.sqlite", {
+     *   progress({ totalPages, remainingPages }) {
+     *     console.log(`${(((totalPages - remainingPages) / totalPages) * 100).toFixed(1)}%`);
+     *   },
+     * });
+     * ```
+     *
+     * @link https://www.sqlite.org/backup.html
+     */
+    backup(destination: string, options?: BackupOptions): Promise<BackupProgress>;
+
+    /**
      * Load a serialized SQLite3 database
      *
      * Internally, this calls `sqlite3_deserialize`.
@@ -1479,6 +1531,47 @@ declare module "bun:sqlite" {
    */
   export type SQLFunctionResult =
     string | bigint | NodeJS.TypedArray | ArrayBufferLike | number | boolean | null | undefined | void;
+
+  /**
+   * How far a {@link Database.backup} is.
+   */
+  export interface BackupProgress {
+    /**
+     * The number of pages of the database.
+     */
+    totalPages: number;
+
+    /**
+     * The number of pages that are not copied yet. `0` in what the promise of
+     * {@link Database.backup} resolves to.
+     */
+    remainingPages: number;
+  }
+
+  /**
+   * Options for {@link Database.backup}
+   */
+  export interface BackupOptions {
+    /**
+     * The name of the database to copy: `"main"`, `"temp"`, or the name that
+     * `ATTACH DATABASE` gave to an attached database.
+     *
+     * @default "main"
+     */
+    attached?: string | undefined;
+
+    /**
+     * Called before the first page is copied and after each step that leaves
+     * pages to copy.
+     *
+     * A number that it returns is the number of pages of the next steps: the
+     * default is `100`. `0` pauses the copy, and the callback is then asked
+     * again later. So a callback that only reports must return nothing. If it
+     * throws, the backup is cancelled and its promise is rejected with what
+     * was thrown.
+     */
+    progress?: ((progress: BackupProgress) => number | void) | null | undefined;
+  }
 
   /**
    * Options for {@link Database.function} and {@link Database.aggregate}

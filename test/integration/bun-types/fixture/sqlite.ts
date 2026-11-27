@@ -1,4 +1,11 @@
-import { type Changes, Database, type UpdateHook, constants } from "bun:sqlite";
+import {
+  type BackupOptions,
+  type BackupProgress,
+  type Changes,
+  Database,
+  type UpdateHook,
+  constants,
+} from "bun:sqlite";
 import { expectType } from "./utilities";
 
 expectType(constants.SQLITE_FCNTL_BEGIN_ATOMIC_WRITE).is<number>();
@@ -96,6 +103,22 @@ db.aggregate<string[]>("list", {
 });
 // @ts-expect-error - `step` is required
 db.aggregate("no_step", { start: 0 });
+
+expectType(db.backup("backup.sqlite")).is<Promise<BackupProgress>>();
+const backupOptions: BackupOptions = {
+  attached: "main",
+  progress(progress) {
+    expectType(progress).is<BackupProgress>();
+    expectType(progress.remainingPages).is<number>();
+    return progress.remainingPages > 1000 ? 500 : undefined;
+  },
+};
+db.backup("backup.sqlite", backupOptions);
+db.backup("backup.sqlite", { progress: () => {} });
+// @ts-expect-error - the destination is a path
+db.backup(db);
+// @ts-expect-error - a number of pages, or nothing
+db.backup("backup.sqlite", { progress: () => "fast" });
 
 expectType(db.onInsert).is<UpdateHook | null>();
 db.onInsert = function (database, tableName, rowid, schemaName) {

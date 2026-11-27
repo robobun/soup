@@ -47,6 +47,7 @@ inline bool Bun__VmHandle__scriptAllowedInline(const unsigned char* state)
 
 namespace WebCore {
 
+class DatabaseBackup;
 class ExtendedDOMClientIsoSubspaces;
 class ExtendedDOMIsoSubspaces;
 class JSBuiltinFunctions;
@@ -362,6 +363,7 @@ private:
 
     SentinelLinkedList<JSVMClientDataClient, BasicRawSentinelNode<JSVMClientDataClient>> m_clients;
     Vector<VersionSqlite3*> m_sqliteDatabases;
+    Vector<DatabaseBackup*> m_sqliteBackups;
     bool m_isWorkerVM { false };
     bool m_isNodeWorkerVM { false };
 
@@ -374,6 +376,8 @@ public:
     void addClient(JSVMClientDataClient& client) { m_clients.append(&client); }
     // VM thread. The bun:sqlite connections this VM has; each one removes itself in its destructor.
     Vector<VersionSqlite3*>& sqliteDatabases() { return m_sqliteDatabases; }
+    // VM thread. The copies that db.backup() of bun:sqlite started and that have not ended. The list has a reference to each.
+    Vector<DatabaseBackup*>& sqliteBackups() { return m_sqliteBackups; }
 };
 
 } // namespace WebCore

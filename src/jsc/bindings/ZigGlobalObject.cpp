@@ -5492,6 +5492,8 @@ extern "C" void Zig__GlobalObject__stopActiveDOMObjectsForTestIsolation(Zig::Glo
     stopActiveDOMObjectsOfDerivedRealms(globalObject);
 }
 
+extern "C" void Bun__abortSQLiteBackupsForTestIsolation(JSC::JSGlobalObject*);
+
 // `bun test --isolate`: JSC drops microtasks queued against the finished file's realm from here on
 // (as WebCore does for a stopped document), and the realm reports ScriptExecutionStatus::Stopped so
 // its deferred work (FinalizationRegistry cleanup, wasm completions) is dropped too. Work the file
@@ -5499,6 +5501,8 @@ extern "C" void Zig__GlobalObject__stopActiveDOMObjectsForTestIsolation(Zig::Glo
 extern "C" void Zig__GlobalObject__retireForTestIsolation(Zig::GlobalObject* globalObject)
 {
     globalObject->setMicrotaskRunnability(JSC::QueuedTaskResult::Discard);
+    // A step of db.backup() would call the progress callback of the file.
+    JSC::callRemovable<Bun::Feature::Sqlite, JSC::RemovedFeatureStub::ReturnDefault, Bun__abortSQLiteBackupsForTestIsolation>(globalObject);
     // Again, to catch realms that close handlers created since the first pass.
     stopActiveDOMObjectsOfDerivedRealms(globalObject);
     for (auto& derived : std::exchange(globalObject->m_derivedRealms, {})) {

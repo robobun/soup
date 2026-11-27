@@ -1,7 +1,7 @@
 // The native functions that Bun's own modules make with $newCppFunction, each from the code of the function.
 import * as b from "bun-builtins-table";
 import { framesOfModuleGraphsCell, linkAboveNativeEmitterCell, moduleGraphsCell } from "./native-cells.ts";
-import { answering, comparedDeeply, comparedDeeplyCalling, deepComparison } from "./native-code.ts";
+import { answering, comparedDeeply, comparedDeeplyCalling, deepComparison, promiseOf } from "./native-code.ts";
 
 const cpp = (file: string, symbol: string): b.BuiltinPath => `native:NewCppFunction:${file}:${symbol}`;
 
@@ -164,6 +164,8 @@ const answersOfNativeFunctions: readonly (readonly [b.BuiltinPath, b.TableType])
   [cpp("JSInspectorProfiler.cpp", "jsFunction_startPreciseCoverage"), b.undefined],
   [cpp("JSInspectorProfiler.cpp", "jsFunction_stopCPUProfiler"), b.string],
   [cpp("JSInspectorProfiler.cpp", "jsFunction_stopPreciseCoverage"), b.undefined],
+  // db.backup() of bun:sqlite: the pages that the copy has.
+  [cpp("JSSQLStatement.cpp", "jsSQLStatementBackupFunction"), promiseOf(b.plainData)],
   [cpp("Worker.cpp", "jsFunctionPostMessage"), b.undefined],
 ];
 
