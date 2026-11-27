@@ -3439,7 +3439,7 @@ export interface ClassOptions extends ClassTableColumns {
   memoryCost?: boolean;
   /** `fn estimated_size(&self) -> usize`: the same for the GC, whose marking threads call it. For a heap snapshot too, without `memoryCost`. */
   estimatedSize?: boolean;
-  /** Absent: JavaScript cannot construct one, and there is no constructor object. `"illegal"`: there is one, and `new` on it throws `Illegal constructor`. With `webIDL`, several are overloads. */
+  /** Absent: JavaScript cannot construct one, and there is no constructor object. `"illegal"`: there is one, and `new` on it throws `Illegal constructor`. Several are overloads. */
   construct?: ConstructOptions | readonly ConstructOptions[] | "illegal";
   /** `Name(..)` without `new`, which otherwise throws. The Rust function is `call`. */
   call?: Omit<SignatureOptions, "rustPath">;
@@ -3857,10 +3857,13 @@ export class ClassType extends NamedType {
         assert(options[key] === undefined, `${key}: a webIDL class does not have it yet`);
       assert(typeof options.construct === "object", "construct: a webIDL class is constructed by JavaScript");
     }
-    assert(this.webIDL || !Array.isArray(options.construct), "construct: overloads are for a webIDL class");
     assert(this.base || options.rustPath !== undefined, "a class has a rustPath");
     this.rustPath = this.base?.rustPath ?? options.rustPath!;
     this.refCounted = options.refCounted ?? false;
+    assert(
+      this.webIDL || !Array.isArray(options.construct) || !this.refCounted,
+      "construct: a refCounted class has overloads only if it is a webIDL class",
+    );
     this.finalize = options.finalize ?? false;
     assert(this.refCounted || !this.finalize, "finalize is only for a refCounted class: otherwise implement Drop");
     this.sharedThis = !Object.values(options.proto ?? {})
@@ -3891,6 +3894,10 @@ export class ClassType extends NamedType {
       .flat()
       .map(overload => new Construction(resolve(overload)));
     this.construct = options.construct ? new FunctionDefinition(constructions, {}, false, this.webIDL) : null;
+    assert(
+      this.webIDL || constructions.every(overload => overload.args.length === constructions[0].args.length),
+      "construct: without webIDL, every overload takes the same number of arguments",
+    );
     this.passStructure = constructions.some(overload => overload.passStructure);
     // The compiler may go by the first overload that has enough parameters.
     for (const key of ["passStructure", "isFresh", "capability", "throws"] as const)

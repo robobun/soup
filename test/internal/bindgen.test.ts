@@ -550,8 +550,11 @@ itAlways("mistakes in a schema are errors when it loads", () => {
   expect(() => b.class({ rustPath: "T", construct: { fresh: true } })).toThrow(
     "fresh: without passStructure the object always is",
   );
+  expect(() =>
+    b.class({ rustPath: "T", refCounted: true, construct: [{}, { rustName: "other", args: { x: b.i32 } }] }),
+  ).toThrow("construct: a refCounted class has overloads only if it is a webIDL class");
   expect(() => b.class({ rustPath: "T", construct: [{}, { rustName: "other", args: { x: b.i32 } }] })).toThrow(
-    "construct: overloads are for a webIDL class",
+    "construct: without webIDL, every overload takes the same number of arguments",
   );
   for (const construct of [undefined, "illegal"] as const)
     expect(() => b.class({ rustPath: "T", webIDL: true, construct })).toThrow(
@@ -596,6 +599,23 @@ itAlways("mistakes in a schema are errors when it loads", () => {
   expect("byKind" in dispatch && dispatch.byKind.get("undefined")).toBe(textOrBytes.signatures[1]);
   // What takes undefined can come before what does not.
   b.fn({ args: { encoding: b.string.nullable, callback: b.any, length: b.f64 } });
+});
+
+itAlways("the constructor of a class that is not webIDL is chosen by the kinds of its arguments", () => {
+  const { construct } = b.class({
+    rustPath: "T",
+    construct: [{ args: { pattern: b.string } }, { rustName: "from_list", args: { patterns: b.array(b.string) } }],
+  });
+  const { dispatch } = construct!;
+  const chosen = (kind: string) => "byKind" in dispatch && (dispatch.byKind.get(kind) as { rustName: string }).rustName;
+  // What is neither goes to the first, which reports its own error.
+  expect(["string", "array", "undefined", "other"].map(chosen)).toEqual([
+    "constructor",
+    "from_list",
+    "constructor",
+    "constructor",
+  ]);
+  expect(construct!.length).toBe(1);
 });
 
 itAlways("the constructor of a webIDL class is chosen by the number of arguments, then by the kind of the last", () => {

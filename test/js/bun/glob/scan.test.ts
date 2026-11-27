@@ -1588,3 +1588,562 @@ describe("ignore option", () => {
     expect(scanSync("*", { cwd, ignore: undefined })).toEqual(["a.ts"]);
   });
 });
+
+describe("a list of patterns", () => {
+  const norm = (a: string[]) => a.map(p => p.replaceAll("\\", "/")).sort();
+  const tree = {
+    "package.json": "{}",
+    "README.md": "",
+    "src/index.ts": "",
+    "src/index.test.ts": "",
+    "src/util/helpers.ts": "",
+    "src/util/data.json": "{}",
+    "test/setup.ts": "",
+    "node_modules/dep/index.ts": "",
+    "node_modules/dep/package.json": "{}",
+  };
+  const scanSync = (patterns: string | string[], opts: GlobScanOptions) =>
+    norm(Array.from(new Glob(patterns).scanSync(opts)));
+  const scan = async (patterns: string | string[], opts: GlobScanOptions) =>
+    norm(await Array.fromAsync(new Glob(patterns).scan(opts)));
+
+  test("finds what any of its patterns finds, each path once", async () => {
+    using dir = tempDir("glob-list", tree);
+    const cwd = String(dir);
+    // The list of https://github.com/oven-sh/bun/issues/9470.
+    const expected = [
+      "node_modules/dep/index.ts",
+      "package.json",
+      "src/index.test.ts",
+      "src/index.ts",
+      "src/util/helpers.ts",
+      "test/setup.ts",
+    ];
+    expect(scanSync(["**/*.ts", "package.json"], { cwd })).toEqual(expected);
+    expect(await scan(["**/*.ts", "package.json"], { cwd })).toEqual(expected);
+    expect(scanSync(["package.json", "**/*.ts"], { cwd })).toEqual(expected);
+
+    // Four patterns find src/index.ts.
+    const overlapping = ["src/**", "**/*.ts", "src/index.ts", "src/*.ts", "**/index.ts"];
+    const found = Array.from(new Glob(overlapping).scanSync({ cwd }));
+    expect(new Set(found).size).toBe(found.length);
+    expect(norm(found)).toEqual([
+      "node_modules/dep/index.ts",
+      "src/index.test.ts",
+      "src/index.ts",
+      "src/util/data.json",
+      "src/util/helpers.ts",
+      "test/setup.ts",
+    ]);
+    expect(await scan(overlapping, { cwd })).toEqual(norm(found));
+
+    // A list of one pattern is that pattern.
+    expect(scanSync(["src/*.ts"], { cwd })).toEqual(scanSync("src/*.ts", { cwd }));
+    expect(scanSync(["src/*.ts", "src/*.ts"], { cwd })).toEqual(scanSync("src/*.ts", { cwd }));
+  });
+
+  test("takes the options of a scan", async () => {
+    using dir = tempDir("glob-list-options", { ...tree, ".env": "", "src/.cache/tmp.ts": "" });
+    const cwd = String(dir);
+    const list = ["src/**/*.ts", "*", "node_modules/*"];
+
+    expect(scanSync(list, { cwd })).toEqual([
+      "README.md",
+      "package.json",
+      "src/index.test.ts",
+      "src/index.ts",
+      "src/util/helpers.ts",
+    ]);
+    // The folder as a string.
+    expect(norm(Array.from(new Glob(list).scanSync(cwd)))).toEqual(scanSync(list, { cwd }));
+    expect(norm(await Array.fromAsync(new Glob(list).scan(cwd)))).toEqual(scanSync(list, { cwd }));
+
+    expect(scanSync(list, { cwd, dot: true })).toEqual([
+      ".env",
+      "README.md",
+      "package.json",
+      "src/.cache/tmp.ts",
+      "src/index.test.ts",
+      "src/index.ts",
+      "src/util/helpers.ts",
+    ]);
+    expect(scanSync(list, { cwd, onlyFiles: false })).toEqual([
+      "README.md",
+      "node_modules",
+      "node_modules/dep",
+      "package.json",
+      "src",
+      "src/index.test.ts",
+      "src/index.ts",
+      "src/util/helpers.ts",
+      "test",
+    ]);
+    const absolute = ["README.md", "package.json", "src/index.test.ts", "src/index.ts", "src/util/helpers.ts"];
+    expect(scanSync(list, { cwd, absolute: true })).toEqual(norm(absolute.map(it => path.join(cwd, it))));
+    expect(await scan(list, { cwd, absolute: true })).toEqual(norm(absolute.map(it => path.join(cwd, it))));
+    expect(scanSync(list, { cwd, ignore: ["**/*.test.ts", "README.md"] })).toEqual([
+      "package.json",
+      "src/index.ts",
+      "src/util/helpers.ts",
+    ]);
+  });
+
+  test.skipIf(!canCreateDirSymlink)("follows links as a scan for one pattern does", () => {
+    using dir = tempDir("glob-list-links", tree);
+    const cwd = String(dir);
+    fs.symlinkSync("src", path.join(cwd, "linked"), "dir");
+    const list = ["**/*.json", "linked/*.ts", "*"];
+    // `linked` is named by one pattern, which goes through it. `*` finds the link, which is no file.
+    expect(scanSync(list, { cwd })).toEqual([
+      "README.md",
+      "linked/index.test.ts",
+      "linked/index.ts",
+      "node_modules/dep/package.json",
+      "package.json",
+      "src/util/data.json",
+    ]);
+    expect(scanSync(list, { cwd, onlyFiles: false })).toEqual([
+      "README.md",
+      "linked",
+      "linked/index.test.ts",
+      "linked/index.ts",
+      "node_modules",
+      "node_modules/dep/package.json",
+      "package.json",
+      "src",
+      "src/util/data.json",
+      "test",
+    ]);
+    expect(scanSync(list, { cwd, followSymlinks: true })).toEqual([
+      "README.md",
+      "linked/index.test.ts",
+      "linked/index.ts",
+      "linked/util/data.json",
+      "node_modules/dep/package.json",
+      "package.json",
+      "src/util/data.json",
+    ]);
+  });
+
+  test("an entry that starts with ! leaves out what it matches", async () => {
+    using dir = tempDir("glob-list-negated", tree);
+    const cwd = String(dir);
+    const expected = ["src/index.ts", "src/util/helpers.ts", "test/setup.ts"];
+    const list = ["**/*.ts", "!**/node_modules/**", "!**/*.test.ts"];
+    expect(scanSync(list, { cwd })).toEqual(expected);
+    expect(await scan(list, { cwd })).toEqual(expected);
+    // It is the `ignore` option, written in the list.
+    expect(scanSync("**/*.ts", { cwd, ignore: ["**/node_modules/**", "**/*.test.ts"] })).toEqual(expected);
+    // Where it stands in the list does not matter: it also leaves out what a later entry names.
+    expect(scanSync(["!**/*.test.ts", "!**/node_modules/**", "**/*.ts"], { cwd })).toEqual(expected);
+    expect(scanSync(["**/*.ts", "!src/**", "src/index.ts"], { cwd })).toEqual([
+      "node_modules/dep/index.ts",
+      "test/setup.ts",
+    ]);
+    // With several patterns that match, and with the option as well.
+    expect(scanSync(["**/*.ts", "**/*.json", "!**/node_modules/**"], { cwd, ignore: "src/util" })).toEqual([
+      "package.json",
+      "src/index.test.ts",
+      "src/index.ts",
+      "test/setup.ts",
+    ]);
+    // An odd number of `!` leaves out, an even number does not.
+    expect(scanSync(["src/*.ts", "!!!src/*.test.ts"], { cwd })).toEqual(["src/index.ts"]);
+    expect(scanSync(["test/*", "!!src/*.test.ts"], { cwd })).toEqual(["src/index.test.ts", "test/setup.ts"]);
+    // An even number is no part of the pattern: the `**` finds what it finds without it.
+    expect(scanSync(["!!**/*.test.ts", "test/*"], { cwd })).toEqual(scanSync(["**/*.test.ts", "test/*"], { cwd }));
+    expect(scanSync(["!!**/*.json", "!node_modules"], { cwd })).toEqual(["package.json", "src/util/data.json"]);
+    expect(scanSync([`!!../${path.basename(cwd)}/src/*.ts`], { cwd }).length).toBe(2);
+    // `!(` starts a group.
+    expect(scanSync(["src/!(index).ts", "test/*"], { cwd })).toEqual(["src/index.test.ts", "test/setup.ts"]);
+  });
+
+  // A broken link in a directory that is entered makes this walk throw.
+  test.skipIf(isWindows)("a directory that an entry with ! matches is not entered", async () => {
+    using dir = tempDir("glob-list-negated", tree);
+    const cwd = String(dir);
+    fs.symlinkSync("missing", path.join(cwd, "node_modules", "broken"));
+    const opts = { cwd, followSymlinks: true, throwErrorOnBrokenSymlink: true } satisfies GlobScanOptions;
+    expect(() => scanSync(["**/*.ts", "**/*.json"], opts)).toThrow(expect.objectContaining({ code: "ENOENT" }));
+
+    const expected = ["package.json", "src/index.test.ts", "src/index.ts", "src/util/data.json", "test/setup.ts"];
+    expect(scanSync(["**/*.ts", "**/*.json", "!node_modules"], opts)).toEqual(
+      expected.concat("src/util/helpers.ts").sort(),
+    );
+    expect(await scan(["**/*.ts", "**/*.json", "!**/node_modules/**", "!**/helpers.*"], opts)).toEqual(expected);
+  });
+
+  test("a list without a pattern that matches finds nothing and reads nothing", async () => {
+    using dir = tempDir("glob-list-empty", tree);
+    const cwd = String(dir);
+    const missing = path.join(cwd, "does-not-exist");
+    for (const list of [[], ["!**/*.ts"], ["!a", "!b"]]) {
+      expect(scanSync(list, { cwd })).toEqual([]);
+      expect(await scan(list, { cwd })).toEqual([]);
+      // A scan that opened `cwd` would throw.
+      expect(scanSync(list, { cwd: missing })).toEqual([]);
+      expect(await scan(list, { cwd: missing })).toEqual([]);
+    }
+    // As a string, `!` in front is not an entry of a list.
+    expect(scanSync(["!src/**"], { cwd })).not.toEqual(scanSync("!src/**", { cwd }));
+    expect(scanSync([""], { cwd })).toEqual([]);
+    expect(scanSync(["", "package.json", ""], { cwd })).toEqual(["package.json"]);
+  });
+
+  test("a ./ in front of an entry does not count", async () => {
+    using dir = tempDir("glob-list-dot-slash", tree);
+    const cwd = String(dir);
+    const sources = ["src/index.test.ts", "src/index.ts"];
+
+    // One file is one path, however its entries spell it.
+    expect(scanSync(["./src/*.ts", "src/*.ts", "././src/*.ts"], { cwd })).toEqual(sources);
+    expect(await scan(["./src/*.ts", "src/*.ts"], { cwd })).toEqual(sources);
+    expect(scanSync(["./src/*.ts", "./*.json", "./**/*.md"], { cwd })).toEqual([
+      "README.md",
+      "package.json",
+      ...sources,
+    ]);
+    // Also in a list of one entry. As a string, the pattern is spelled in the paths.
+    expect(scanSync(["./src/*.ts"], { cwd })).toEqual(sources);
+    expect(scanSync("./src/*.ts", { cwd })).toEqual(sources.map(it => "./" + it));
+
+    // An entry with `!` leaves out the same paths with `./` and without it, on either side.
+    for (const list of [
+      ["**/*.ts", "!src/**", "!node_modules"],
+      ["./**/*.ts", "!src/**", "!node_modules"],
+      ["**/*.ts", "!./src/**", "!./node_modules"],
+      ["./**/*.ts", "!./src/**", "!././node_modules/"],
+    ]) {
+      expect(scanSync(list, { cwd })).toEqual(["test/setup.ts"]);
+      expect(scanSync(list, { cwd, absolute: true })).toEqual([path.join(cwd, "test/setup.ts").replaceAll("\\", "/")]);
+    }
+    // The same with the `ignore` option beside the list, also an empty one.
+    expect(scanSync(["./**/*.ts", "!node_modules"], { cwd, ignore: ["./src/util", "**/*.test.ts"] })).toEqual([
+      "src/index.ts",
+      "test/setup.ts",
+    ]);
+    expect(scanSync(["./**/*.ts", "!node_modules", "!src"], { cwd, ignore: [] })).toEqual(["test/setup.ts"]);
+
+    // What follows the `./` starts in the same directory: `.//src` is not `/src`.
+    expect(scanSync([".//src/*.ts"], { cwd })).toEqual(sources);
+    expect(scanSync([".//src/*.ts", "src/*.ts", "!.//src/*.test.ts"], { cwd })).toEqual(["src/index.ts"]);
+    // `./` alone is the directory, as the string is.
+    expect(scanSync(["./"], { cwd, onlyFiles: false })).toEqual(scanSync("./", { cwd, onlyFiles: false }));
+  });
+
+  test("a ! behind a ./ is a character of a name", () => {
+    using dir = tempDir("glob-list-bang", { "!keep.ts": "", "other.ts": "" });
+    const cwd = String(dir);
+    expect(scanSync(["./!*.ts"], { cwd })).toEqual(["!keep.ts"]);
+    expect(scanSync(["*.ts", "!./!*.ts"], { cwd })).toEqual(["other.ts"]);
+  });
+
+  test("a pattern starts where it says", async () => {
+    using dir = tempDir("glob-list-starts", tree);
+    const cwd = String(dir);
+    const name = path.basename(cwd);
+    const root = cwd.replaceAll("\\", "/");
+
+    // `..` is another directory, and stays in the path.
+    expect(scanSync([`../${name}/test/*`, `../${name}/*.json`, "test/*"], { cwd })).toEqual([
+      `../${name}/package.json`,
+      `../${name}/test/setup.ts`,
+      "test/setup.ts",
+    ]);
+    expect(scanSync(["src/util/../*.ts", "src/util/*.json"], { cwd })).toEqual([
+      "src/util/../index.test.ts",
+      "src/util/../index.ts",
+      "src/util/data.json",
+    ]);
+    // An absolute pattern does not look at `cwd`.
+    expect(scanSync([`${root}/src/*.ts`, `${root}/*.json`, "test/*"], { cwd })).toEqual(
+      norm([`${root}/src/index.test.ts`, `${root}/src/index.ts`, `${root}/package.json`, "test/setup.ts"]),
+    );
+    expect(await scan([`${root}/src/*.ts`, "src/*.ts"], { cwd })).toEqual(
+      norm([`${root}/src/index.test.ts`, `${root}/src/index.ts`, "src/index.test.ts", "src/index.ts"]),
+    );
+    // With `absolute` the two spell a path the same way, and it is there once.
+    expect(scanSync([`${root}/src/*.ts`, "src/*.ts"], { cwd, absolute: true })).toEqual(
+      scanSync("src/*.ts", { cwd, absolute: true }),
+    );
+    // An entry with `!` is asked about the full path for an absolute pattern, and about the normalized path from
+    // `cwd` for another one.
+    expect(scanSync([`${root}/src/*.ts`, "src/*.ts", "!src/**"], { cwd })).toEqual(
+      norm([`${root}/src/index.test.ts`, `${root}/src/index.ts`]),
+    );
+    expect(scanSync([`../${name}/src/*.ts`, "src/*.ts", "!src/*.test.ts"], { cwd })).toEqual([
+      `../${name}/src/index.ts`,
+      "src/index.ts",
+    ]);
+  });
+
+  test("absolute does not change what a list leaves out", () => {
+    using dir = tempDir("glob-list-absolute", tree);
+    const cwd = String(dir);
+    const name = path.basename(cwd);
+    const root = cwd.replaceAll("\\", "/");
+    const resolved = (found: string[]) => norm(found.map(it => path.resolve(cwd, it)));
+    for (const list of [
+      ["**/*.ts", "!src/**", "!node_modules"],
+      [`../${name}/src/*.ts`, "test/*", "!src/*.test.ts"],
+      ["src/./*.ts", "src/util/../*.ts", "!src/*.test.ts"],
+      [`${root}/src/*.ts`, "test/*", `!${root}/src/*.test.ts`],
+      [`${root}/src/*.ts`, "src/*.ts", "!src/*.test.ts"],
+    ]) {
+      const found = scanSync(list, { cwd });
+      expect(found.length).toBeGreaterThan(0);
+      expect([list, [...new Set(resolved(scanSync(list, { cwd, absolute: true })))]]).toEqual([
+        list,
+        [...new Set(resolved(found))],
+      ]);
+    }
+  });
+
+  test.each([
+    [["**/*.ts", "package.json"]],
+    [["**/*.ts", "**/*.json", "**/*.md"]],
+    [["src/**", "test/**", "*.md"]],
+    [["**/*.ts", "!**/*.test.ts"]],
+    [["**/*", "!**/node_modules/**", "!src/util/**"]],
+    [["src/**/*.ts", "!**/util/**", "**/*.json", "!node_modules"]],
+    [["{src,test}/**/*.ts", "node_modules/*/package.json", "!**/index.*"]],
+    [["./**/*.ts", "!src/**"]],
+    [["**/*.ts", "!./src/**"]],
+    [["./**/*.ts", "./**/*.json", "!./node_modules/**", "!**/*.test.ts"]],
+  ])("agrees with fast-glob: %j", list => {
+    using dir = tempDir("glob-list-fg", tree);
+    const cwd = String(dir);
+    // fast-glob keeps the `./` of a pattern in the paths.
+    const expected = fg
+      .globSync(list, { cwd })
+      .map(it => it.replace(/^\.\//, ""))
+      .sort();
+    expect(expected.length).toBeGreaterThan(0);
+    expect(scanSync(list, { cwd })).toEqual(expected);
+  });
+
+  test("a scan that cannot start throws", async () => {
+    using dir = tempDir("glob-list-throws", tree);
+    const cwd = String(dir);
+    const nullByteError = expect.objectContaining({
+      code: "ERR_INVALID_ARG_VALUE",
+      message: expect.stringContaining("'pattern' must be a string without null bytes"),
+    });
+    for (const list of [["*.ts", "a\0b"], ["a\0b", "*.ts"], ["*.ts", "!a\0b"], ["!a\0b"]]) {
+      expect(() => new Glob(list).scanSync({ cwd })).toThrow(nullByteError);
+      // Also for `scan`, at the call and not as a rejection.
+      expect(() => new Glob(list).scan({ cwd })).toThrow(nullByteError);
+    }
+
+    const missing = path.join(cwd, "does-not-exist");
+    const list = ["*.ts", "**/*.json"];
+    expect(() => Array.from(new Glob(list).scanSync({ cwd: missing }))).toThrow(
+      expect.objectContaining({ code: "ENOENT" }),
+    );
+    expect(Array.fromAsync(new Glob(list).scan({ cwd: missing }))).rejects.toMatchObject({ code: "ENOENT" });
+    // @ts-expect-error
+    expect(() => new Glob(list).scanSync(5)).toThrow("GlobScanOptions must be an object");
+
+    // One pattern that cannot start fails the scan, also where the others find something.
+    const gone = `${missing.replaceAll("\\", "/")}/*.ts`;
+    expect(() => Array.from(new Glob(gone).scanSync({ cwd }))).toThrow(expect.objectContaining({ code: "ENOENT" }));
+    expect(() => Array.from(new Glob(["*.json", gone]).scanSync({ cwd }))).toThrow(
+      expect.objectContaining({ code: "ENOENT" }),
+    );
+    expect(Array.fromAsync(new Glob([gone, "*.json"]).scan({ cwd }))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // https://github.com/oven-sh/bun/issues/32596: the walker cuts a pattern at every separator, also inside a group.
+  // `match()` knows the group, so an entry with `!` that has one works.
+  test.failing("a group with a separator in it scans what it matches", () => {
+    using dir = tempDir("glob-list-group", tree);
+    const cwd = String(dir);
+    const glob = new Glob(["{src/*.ts,package.json}", "README.md"]);
+    expect(glob.match("src/index.ts")).toBe(true);
+    expect(norm(Array.from(glob.scanSync({ cwd })))).toEqual([
+      "README.md",
+      "package.json",
+      "src/index.test.ts",
+      "src/index.ts",
+    ]);
+  });
+
+  test("a group with a separator in it leaves out what it matches", () => {
+    using dir = tempDir("glob-list-group", tree);
+    const cwd = String(dir);
+    expect(
+      scanSync(["**/*.ts", "**/*.json", "!{src/util/**,node_modules}", "!@(src|test)/*.test.ts"], { cwd }),
+    ).toEqual(["package.json", "src/index.ts", "test/setup.ts"]);
+  });
+
+  test("scans at the same time, with a collection in between", async () => {
+    using dir = tempDir("glob-list-concurrent", tree);
+    const cwd = String(dir);
+    const lists = [
+      ["**/*.ts", "package.json"],
+      ["**/*.json", "**/*.md", "!**/node_modules/**"],
+      ["src/**", "./test/*"],
+    ];
+    const expected = lists.map(list => scanSync(list, { cwd }));
+    const running = Array.from({ length: 12 }, (_, i) => scan(lists[i % lists.length], { cwd }));
+    Bun.gc(true);
+    const found = await Promise.all(running);
+    Bun.gc(true);
+    for (let i = 0; i < found.length; i++) expect(found[i]).toEqual(expected[i % lists.length]);
+  });
+
+  // A scan of a list has to find what the scans for its patterns find one by one, whatever a pattern does on its
+  // own: answer without a listing, follow a link that another one only names, or change the directory.
+  describe("finds what the scans for each of its patterns find", () => {
+    let dir: ReturnType<typeof tempDir>;
+    let cwd: string;
+    let socket: { stop(): void } | undefined;
+    let patterns: string[];
+    beforeAll(() => {
+      dir = tempDir("glob-list-union", {
+        ...tree,
+        "a.ts": "",
+        ".hidden.ts": "",
+        ".dot/f.ts": "",
+        ".dot/inner/g.ts": "",
+        "src/util/.secret.ts": "",
+        "src/util/deep/x.ts": "",
+        "links/keep.ts": "",
+      });
+      cwd = String(dir);
+      if (canCreateDirSymlink) {
+        fs.symlinkSync(path.join("..", "a.ts"), path.join(cwd, "links", "file"), "file");
+        fs.symlinkSync(path.join("..", "src"), path.join(cwd, "links", "dir"), "dir");
+        fs.symlinkSync("missing", path.join(cwd, "links", "broken"), "file");
+        fs.symlinkSync("..", path.join(cwd, "links", "loop"), "dir");
+        // Nothing follows it unless `dot` is set.
+        fs.symlinkSync("missing", path.join(cwd, "src", "util", ".gone"), "file");
+      }
+      // A socket is neither a file nor a directory: a pattern that names it finds it, a listing does not.
+      if (!isWindows) socket = Bun.listen({ unix: path.join(cwd, "sock"), socket: { data() {} } });
+
+      const name = path.basename(cwd);
+      const root = cwd.replaceAll("\\", "/");
+      patterns = [
+        "**/*.ts",
+        "**/*.json",
+        "*",
+        "src/**",
+        "src/*.ts",
+        "**/util/**",
+        "**/util",
+        "package.json",
+        "src/index.ts",
+        "sock",
+        "nope",
+        "links/file",
+        "links/dir",
+        "links/broken",
+        "links/*",
+        "links/**",
+        "links/dir/*.ts",
+        "links/loop/src/*.ts",
+        "*/dir/*.ts",
+        "src/util/../*.ts",
+        "src/./index.ts",
+        "./**/*.ts",
+        "./src/*.ts",
+        "./package.json",
+        "././src/*.ts",
+        `../${name}/src/*.ts`,
+        `./../${name}/*.json`,
+        ".dot/**",
+        ".*",
+        "{src,test}/**/*.ts",
+        "**/",
+        "!(a).ts",
+        `${root}/src/*.ts`,
+        `${root}/**/*.json`,
+        `${root}/package.json`,
+        `${root}/src/../a.ts`,
+        "",
+        ".",
+        "src/..",
+        "./",
+        ".//src/*.ts",
+      ];
+    });
+    afterAll(() => {
+      socket?.stop();
+      dir?.[Symbol.dispose]();
+    });
+
+    type Found = string[] | { code: string };
+    const run = (pattern: string | string[], options: GlobScanOptions): Found => {
+      try {
+        return Array.from(new Glob(pattern).scanSync({ cwd, ...options })).sort();
+      } catch (error: any) {
+        return { code: error.code };
+      }
+    };
+    // The lists whose scan differs from what their patterns find one by one. In a list, `negated` are entries with
+    // `!`. For a pattern alone they are the `ignore` option. A pattern alone is scanned as it is written, and the
+    // `./` in front of what it finds is dropped.
+    const differing = (lists: number[][], options: GlobScanOptions, negated: string[] = []) => {
+      const ignore = [options.ignore ?? [], negated].flat();
+      const alone = new Map<number, Found>();
+      return lists.flatMap(list => {
+        const union = new Set<string>();
+        let expected: Found | undefined;
+        for (const index of list) {
+          if (!alone.has(index)) {
+            const found = run(patterns[index], { ...options, ignore });
+            alone.set(index, Array.isArray(found) ? found.map(it => it.replace(/^(\.[\\/]+)+(?=.)/, "")) : found);
+          }
+          const found = alone.get(index)!;
+          // What one pattern throws, the list throws.
+          if (!Array.isArray(found)) expected ??= found;
+          else for (const it of found) union.add(it);
+        }
+        expected ??= [...union].sort();
+        const entries = [...list.map(index => patterns[index]), ...negated.map(it => "!" + it)];
+        const found = run(entries, options);
+        return Bun.deepEquals(found, expected) ? [] : [{ list: entries, found, expected }];
+      });
+    };
+
+    test.each<[GlobScanOptions, string[]]>([
+      [{}, []],
+      [{ onlyFiles: false }, []],
+      [{ followSymlinks: true }, []],
+      [{ onlyFiles: false, followSymlinks: true, dot: true, absolute: true }, []],
+      [{ followSymlinks: true, throwErrorOnBrokenSymlink: true }, []],
+      [{}, ["**/util/**", "./links/loop", "**/*.test.ts"]],
+      [{ onlyFiles: false, absolute: true, ignore: ["links/loop"] }, ["src/**", "package.json", "links/dir/"]],
+    ])("two patterns, with %j and without %j", (options, negated) => {
+      // In both orders: a later pattern does not repeat what an earlier one found.
+      const pairs: number[][] = [];
+      for (let i = 0; i < patterns.length; i++) {
+        for (let j = 0; j < patterns.length; j++) if (i !== j) pairs.push([i, j]);
+      }
+      expect(pairs.length).toBe(41 * 40);
+      expect(differing(pairs, options, negated).slice(0, 5)).toEqual([]);
+      // The patterns alone find something in this tree.
+      expect(run("src/*.ts", options)).toContainEqual(expect.stringContaining("index.ts"));
+    });
+
+    test("longer lists", () => {
+      let seed = 9470;
+      const random = (below: number) => {
+        seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+        return seed % below;
+      };
+      for (const [options, negated] of [
+        [{}, []],
+        [{ onlyFiles: false }, ["**/deep", "links/**"]],
+        [{ followSymlinks: true, dot: true }, []],
+        [{ absolute: true }, ["**/*.json", "./src/util/"]],
+      ] as [GlobScanOptions, string[]][]) {
+        const lists = Array.from({ length: 100 }, (_, round) =>
+          Array.from({ length: round % 10 === 0 ? 60 + random(60) : 3 + random(6) }, () => random(patterns.length)),
+        );
+        expect(differing(lists, options, negated).slice(0, 5)).toEqual([]);
+      }
+    });
+  });
+});

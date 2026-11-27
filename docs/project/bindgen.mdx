@@ -236,6 +236,11 @@ arguments from left to right:
 Choosing converts nothing and runs no JavaScript. A signature that no call can reach is
 an error when the schema is loaded. The constructors of a [`webIDL`](#webidl) class are chosen differently.
 
+The `construct` of a class can be a list of signatures too, each with the `rustName` of its
+function. They take the same number of arguments, and the class is not `refCounted`.
+`new Bun.Glob()` has one for a string and one for an array, so that the call with a string is
+what it was before there were arrays.
+
 ## Types
 
 Conversions are strict unless the schema says otherwise: `b.i32` takes a number

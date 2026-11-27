@@ -13933,6 +13933,292 @@ two help texts), `docs/pm/bunx.mdx`, `docs/snippets/cli/bunx.mdx`,
 `docs/runtime/templating/create.mdx`, `completions/bun.bash`, `completions/bun.fish`,
 `completions/bun.zsh`, `completions/bun-cli.json`, `test/cli/install/bunx.test.ts`.
 
+### 2026-11-26: `new Bun.Glob([...])`, one glob for a list of patterns
+
+A `Glob` took one pattern. Code with a list of patterns (the `files` of a package, the `include`
+of a tool, the arguments of a command) had two ways. It made a `Glob` for each pattern and put
+the results in a `Set`. Or it joined the list into `{a,b}`, which scans nothing when a pattern
+has a `/` in it (oven-sh/bun#32596) and needs an escape for each `,` and `}`. The server in
+Bun's guide for TanStack Start, which is TanStack's template, does the second.
+oven-sh/bun#9470 asks for a list since March 2024 (14 thumbs up). fast-glob, tinyglobby and
+`fs.glob` of Node.js take one. Now the constructor takes an array.
+
+```ts
+import { Glob } from "bun";
+
+const glob = new Glob(["src/**/*.ts", "package.json", "!**/*.test.ts"]);
+
+glob.match("src/index.ts"); // true
+glob.match("package.json"); // true
+glob.match("src/index.test.ts"); // false
+
+for await (const file of glob.scan(".")) console.log(file);
+```
+
+- `match()` is true for a path that one of the patterns matches.
+- A scan returns what the scan of each pattern returns: every path once, in no specified order.
+  It takes the options of a scan of one pattern. It works under `/$bunfs/` in a compiled
+  executable.
+- An entry that starts with an odd number of `!` excludes what it matches, as the `ignore`
+  option of a scan does (2026-08-22). It applies to every other entry, wherever it is in the
+  array. A scan does not enter a directory that it matches, and `match()` is false for every
+  path below that directory. `!(` starts a group and does not count. `\!` is the character. An
+  even number of `!` excludes nothing and is dropped: `!!x` is `x`.
+- An array without an entry that says what to match matches nothing, and a scan of it opens no
+  directory.
+- A `./` in front of an entry does not count. `["./src/*.ts", "src/*.ts"]` returns
+  `src/index.ts` once, and `!./src/**` excludes what `!src/**` excludes. `match()` of an array
+  drops the `./` of the path too, also when the array has one entry. What follows the `./`
+  starts in the same directory: `.//src` is `src`, and `./!x` is the file `!x`.
+- A string is what it was. `new Glob("!*.ts")` still negates the pattern, and a scan for
+  `"./src/*.ts"` still returns `./src/index.ts`.
+- Bun reads the array in the constructor, once. A later change to the array changes nothing. An
+  element that is not a string is a `TypeError` with `ERR_INVALID_ARG_TYPE`
+  (`element of patterns must be a string`). A Proxy of an array and an iterable are not arrays.
+  What is neither a string nor an array gets `pattern must be a string or an array of strings`.
+
+How it is built.
+
+- `Glob.bind.ts` gives `construct` two signatures: a string (`Glob::constructor`) and an array
+  of strings (`Glob::from_list`). bindgen wrote several constructors only for a `webIDL` class.
+  `cppOverloadedConstructor` in `src/codegen/bindgen-emit.ts` now writes them for a class that
+  is not `refCounted`, if they take the same number of arguments, with the dispatch that a
+  function with overloads has. For `Glob` the dispatch is one test: an array goes to the second
+  signature, and everything else goes to the first, which reports the error.
+- The struct is `enum Glob { One { pattern, shape }, Many(Box<PatternList>) }` in
+  `src/runtime/api/glob.rs`. A const assert keeps it at 56 bytes, so the object is 80 bytes as
+  before. Every array is `Many`, also one with one entry.
+- `src/glob/ignore.rs` has the two types that own the rules. `IgnoreList` is what a scan leaves
+  out. It is in the `ignore` commit of 2026-08-22 since today (see the rebase of the day). This
+  commit adds `PatternList`, the list of a `Glob`. It finds the entries with an odd number of
+  `!` (through `matcher::negations`, so the list and the matcher count alike), drops the `./`
+  and an even number of `!`, and answers `matches(path)`.
+- `match()` of a list takes time that is linear in the length of the path. `PatternList` keeps
+  each `!` entry in two forms: as it is, and as the pattern for what is below a directory that
+  the entry matches (`dist` and `dist/` give `dist/**`, `**/` gives `*/**`). An entry that
+  matches all of that itself, such as `dist/**`, has no second form.
+- A scan has one plain `GlobWalker` for each entry that says what to match
+  (`AnyGlobWalker::Each`). The walkers walk one after the other, and each is dropped when it
+  has walked. The map of found paths goes from one walker to the next, and a walker does not
+  report a path that is in the map. `Glob.scan()` runs the whole list as one job of the work
+  pool.
+- The walkers share the `IgnoreList` of the `Glob` through an `Arc`. If the scan has an
+  `ignore` option too, the list of the option holds the list of the `Glob` as its parent, and
+  no pattern is copied.
+- A walk asks a pattern as it is, and `match()` of a list asks the prepared form. A prepared
+  pattern builds a program once it was asked about 33 paths. A first version prepared the
+  patterns of every scan, and a scan with three `ignore` patterns on a tree of 43 entries took
+  28% more instructions.
+- A list tells the garbage collector what it holds when it is made
+  (`vm.report_extra_memory()` in `from_list`, the report without an owner, as 12 other places
+  in `src` make it). The collector counts that until its next full collection. A string `Glob`
+  has nothing to tell and calls nothing.
+- `GlobWalker.rs` gets no code for lists. This commit changes one comment in it.
+
+What the design review decided, before the code. It compared six designs: a list mode in the
+shared walker that reads each directory once, the same for entries below `cwd` only, one walker
+for each pattern, a cache of directory listings, a crossing component in the matcher, and no
+change.
+
+- It picked the list mode in the walker, with a confidence of 0.6, and left one question for a
+  maintainer: can a feature commit edit the shared walker at all? One of its three answers was
+  no: put the API on one walker for each pattern, and land the list mode after it.
+- The cache lost because it replays listings and merges nothing (16.6 MB of peak memory against
+  7.6 MB in its measurement). The crossing component lost because a list scan would no longer
+  be the union of its entries.
+- I built the pick first: `GlobWalker<A, SENTINEL, const LIST: bool>`, about 550 more lines in
+  `GlobWalker.rs`. For three `**` patterns on a tree of four directories it made 4 `openat` and
+  8 `getdents64`, as one pattern does. It agreed with the union of the single scans on 59,640
+  generated lists, and each of nine mutations of it failed a test.
+
+What the reviews of the diff found. There were two. The first read the build with the list mode
+and said: cut the work in three. Repair the `ignore` commit, where a `./` decided what a scan
+left out. Put the API on plain walkers. Land the list mode later, as a commit of its own with
+numbers from a release build. Nothing in soup is published, so a day costs no user anything.
+The second read the commit that was cut so, which was pushed for some hours as 144a6ff874f. It
+found these faults in it, and each has a test now:
+
+- An array with one entry was stored as a string pattern. So
+  `new Glob(["./src/*.ts"]).match("./src/index.ts")` was false, and true with the entry twice.
+- The `./` was cut off as text. `[".//src/*.ts"]` scanned `/src` at the root of the file
+  system, `["./!*.ts"]` negated, and `!.//src/**` excluded nothing.
+- An even number of `!` stayed on the pattern. The matcher toggles it, and the walker read
+  `!!**` as a name: `["!!**/*.ts"]` scanned one level.
+- The collector got one call of the two that its protocol has: the report when the memory is
+  taken, and not the one when the object is marked. With 50 lists of 300 entries held at a
+  time, 8,000 lists grew the process by 255 MiB. With the report
+  without an owner they grow it by 13 MiB (22 MiB without `--smol`), and 200,000 lists with
+  1,000 held by 66 MiB. `estimatedSize` on the class is the other way. It costs every
+  `new Glob(string)` 15 instructions more, so it is not taken.
+- Every scan with `ignore` prepared its patterns, as said above: 19% more instructions with one
+  pattern and 28% with three on 43 entries. My table had 9 and 855 entries and did not show it.
+- `match()` and a scan gave two answers for `!**/`, for a `\` at the end of an entry and for
+  `!dist/*`, which left out the directory `dist` too. They give one now.
+- A scan with `ignore: []` on a list copied the `!` entries of the `Glob` into a new list. It
+  shares the list of the `Glob` now.
+- A walker that had walked stayed alive until the scan ended: 432 MiB more for 100 `**`
+  patterns over 20,000 directories, in the review's measurement.
+- What is neither a string nor an array was told `pattern must be a string`.
+- The test that compares a list with the scans of its patterns took the `./` off the pattern
+  with the rule that it tests. It scans each pattern as it is written now, and takes the `./`
+  off the paths.
+
+The second review also asked for three things that this commit does otherwise:
+
+- The change to bindgen as a commit of its own, because the rule that it relaxes is five days
+  old upstream (oven-sh/bun#49372). Here one feature is one commit. The rule is as narrow as
+  `Glob` needs it: no `refCounted` class, and the same number of arguments. For upstream the
+  part is `cppOverloadedConstructor`, the two asserts, the paragraph in `bindgen.mdx` and the
+  cases in `bindgen.test.ts`. Without it the constructor takes a union, which costs
+  `new Glob(string)` 44 instructions (24.0 to 24.8 ns became 27.4 to 28.5 ns in the first
+  review).
+- One path that every `!` entry and `ignore` pattern is asked about, for every walker. The
+  `ignore` commit has that for a relative pattern now: the normalized path from `cwd`, with
+  `absolute` and without it. An absolute pattern is still asked about the full path.
+- Rows in `bench/glob`. The bench needs `fast-glob` from `bench/node_modules`, which this
+  machine does not have and cannot install.
+
+Known, and not solved here.
+
+- A `{a,b}` or `@(a|b)` group with a `/` in it scans nothing in an entry, as in a string
+  (oven-sh/bun#32596). `match()` knows such a group, so it works in a `!` entry. The docs say
+  it, and a `test.failing` row pins it.
+- For a `!` entry with a `/` at the end of an alternative, as `!{dist/,build/}`, a scan skips
+  the directories and `match()` is still true for what is below them. A `test.failing` row
+  pins it.
+- `match()` asks every `!` entry about all the directories above a path. A walk does not ask
+  about the directories that an absolute pattern names before its first wildcard, or about a
+  `..` that a pattern starts with. For `["/app/node_modules/zod/*.js", "!**/node_modules"]` a
+  scan returns the files and `match()` is false for them. A `test.failing` row pins it.
+- `match()` does not know whether a path is a directory. `["**", "!build/"]` matches `build`,
+  and a scan with `onlyFiles: false` leaves `build` out.
+- Only the `./` in front is dropped. `["src/./*.ts", "src/*.ts"]` returns `src/./index.ts` and
+  `src/index.ts`.
+- A `!` entry that is relative does nothing against an absolute entry, and the other way
+  round.
+- If one pattern cannot start, the scan throws, as the scan of that pattern does. An absolute
+  pattern in a directory that does not exist is `ENOENT` for the whole list.
+- The tree has other lists with `!`, and they count differently. In fast-glob every entry that
+  starts with `!` excludes. `Bun.Archive`, `import.meta.glob` and the lint globs take exactly
+  one `!`, and an array of only `!` entries includes everything else in `Bun.Archive`, where it
+  matches nothing here. The `workspaces` of a package and `--watch-exclude` count every `!`,
+  also the one of `!(`. `fs.glob` of Node.js has no `!` entries: it takes `exclude`.
+- A pattern that is matched often builds a program of some kilobytes. The collector does not
+  know of it, for a list and for a string alike.
+- `test/js/bun/glob/leak.test.ts` has a case from upstream, `leaks > scan`, that reads 408 MB
+  against its bound of 400 MB on the debug build with ASAN, with and without this commit. It
+  was handed off to upstream's queue.
+
+What was checked.
+
+- Tests, on the debug build: `scan.test.ts` (32 new cases in `a list of patterns`, among them
+  ten rows that are compared with fast-glob 3.3.1, and a comparison of 1,640 lists of two
+  patterns, under seven sets of options, with the union of the single scans), `match.test.ts`
+  (20 new, among them 784 lists whose `match()` is asked about every file that their scan
+  finds, and a row for each shape of a `!` entry), `proto.test.ts` (2 new),
+  `path-length.test.ts` and `matches-glob.test.ts`: 903 pass and 4 are skipped, as before. Five
+  new cases in `leak.test.ts` pass, and so does `compile-asset-bunfs.test.ts` (11), where one
+  case scans lists under `/$bunfs/` now.
+- On the release build of the stack without this commit, 58 cases fail: 31, 18, 3, 5 and 1.
+  The three new cases that do not are the `test.failing` rows.
+- Four mutations, in one build. Without the report to the collector, the three leak cases that
+  make lists read 365 MiB against a bound of 100. Without the form for what is below a
+  directory, 14 of the 20 list cases of `match.test.ts` fail. With every pattern asked with a
+  `/` at its end, the `dist/*` case of the `ignore` option fails. With an even number of `!`
+  left on the pattern, the `!!**` rows and the `./` row of `scan.test.ts` fail.
+- bindgen: `test/internal/bindgen.test.ts` has the two rules and a case for the dispatch. It,
+  `bindgen-declared-results.test.ts`, `aot-schema-generator.test.ts`,
+  `test/internal/builtins-table/` and `test/aot/builtins/proven-returns.test.ts` pass on the
+  debug build (414, and 7 skipped).
+- AOT: a new program, `what-a-glob-scans/a-list-of-patterns-is-read-when-the-glob-is-made.js`,
+  and the 11 other programs under `test/aot/parallel` that name `Bun.Glob` print under
+  `--compile --aot` what plain Bun prints, in all four ways. One of them does so only after
+  the repair that the rebase of the day names.
+- `cargo check` of `bun_glob` and `bun_runtime` for the 12 targets of CI, `cargo clippy` of
+  both, `cargo fmt --all --check`, prettier on the changed files, the source lints (224) and
+  `test/integration/bun-types` (30) pass.
+- Not run: Windows and macOS, beyond `cargo check`. The docs say that an entry is written with
+  `/` on every platform, and one row of `match.test.ts` is for `\` in a path on Windows. The
+  whole workspace was not checked for the 12 targets, because the disk has no room for it.
+  `bun_runtime` is the only crate that calls what changed in `bun_glob`.
+
+What it costs. Instructions are counted with `qemu-x86_64 -one-insn-per-tb` on release builds,
+with `BUN_JSC_useJIT=0`, as the difference between two loop lengths. "Before" is the stack with
+the repaired `ignore` commit and without this commit (b935a5697f4), and "after" is this commit.
+
+- `new Bun.Glob("**/*.ts")`: 413 before, 422 after: the test for an array, and the `heap`
+  argument that both signatures have.
+- `glob.match()` of a string `Glob`: 1,043 and 1,045.
+- `scanSync()` of `**/*.ts` without `ignore`: 36,842 and 36,838 on a tree of 9 entries, 239,847
+  and 240,237 on 43, 1,241,767 and 1,239,331 on 855.
+- `scanSync()` with three `ignore` patterns: 43,866 and 44,185 on 9 entries, 284,664 and
+  286,565 on 43, 1,577,192 and 1,587,952 on 855. That is 0.7% each, for the prepared form that
+  an `IgnoreList` keeps beside each pattern and for the test for a parent.
+- The text of the binary grows by 4,864 bytes.
+- The repair of the `ignore` commit has a cost of its own, against the stack of 2026-11-25.
+  With three `ignore` patterns: 43,058 became 43,866 on 9 entries (1.9%), 282,970 became
+  284,664 on 43 (0.6%), and 1,567,829 became 1,577,192 on 855 (0.6%). A scan without `ignore`
+  differs by up to 0.7% between two builds. The text grows by 8,448 bytes.
+- A list: `new Glob()` of three entries is 4,220 instructions, and `match()` with two entries
+  and one `!` entry is 1,595. A scan of three `**` patterns on the 9 entries is 65,158, against
+  36,951 for one pattern, 51,762 for `**/*.{ts,json,md}` and 82,015 for three `Glob`s and a
+  `Set`. It makes 12 `openat` and 24 `getdents64`, three times what one pattern makes.
+- `match()` of a list with two `!` entries takes 0.06 ms for a path of 16 KB and 2.6 ms for
+  800 KB. The first build took 179 ms for 16 KB, because it asked every `!` entry about every
+  directory above the path.
+- `Glob.scan()` of a list is one job on one thread. For patterns in different directories,
+  a `Glob` for each and `Promise.all` can take less wall time. The docs say so.
+
+Not in this commit.
+
+- The list mode of the walker, which reads a directory once for all the patterns that reach
+  it. It is built and kept out of the stack. Before it lands it needs: numbers from a release
+  build against one brace pattern and against scans in parallel, a count of directory reads in
+  a test that every platform runs, no restart of the walk at 127 components, the branch for
+  file systems that do not tell the type of an entry under a test, a list scan that fails a
+  `stat`, entries that start at the root on Windows, and a clean `cargo clippy`.
+- The other places that run one walker for each pattern of a list: `import.meta.glob([...])`,
+  the `workspaces` globs, the project globs of `bun lint`, the entry globs of `--aot`, and
+  `bun ./a/*.html ./b/*.html`.
+- The guide for TanStack Start. Its server is TanStack's file, and an array throws on every
+  released Bun.
+- A cherry-pick of this commit onto upstream needs the `ignore` commit of 2026-08-22 under it.
+
+The rebase of the day.
+
+- Upstream moved by 1 commit, to e13b16bc7ed (oven-sh/bun#49578). 85 patches went onto it. None
+  stopped the rebase, and none was dropped.
+- Three older patches were repaired. Each repair is in the commit of its patch.
+  - `redis.multi()` (2026-10-20): the release build of the stack did not compile. The patch
+    asserted that a client is at most 512 bytes. Upstream's client is 512 bytes now, and the
+    two fields of the patch make it 520. The assert is gone.
+  - The `ignore` option (2026-08-22) has five repairs, and each has a test. A `./` in front of
+    the scanned pattern made a scan ignore nothing. `absolute` changed what a pattern was asked
+    about when the scanned pattern had a `..` or a `.` in it. `dist/*` left out the directory
+    `dist` with what is in it. `.//src` was read as `/src`, and `./!x` as a negation. The
+    patterns and the question about a path moved out of the walker into `bun_glob::IgnoreList`
+    (`src/glob/ignore.rs`). The commit with these repairs was built and tested without the
+    commit of today too: the glob tests pass on both builds of it, and its release build is
+    the "before" of the numbers above.
+  - `Bun.JWT` (2026-09-14), `Bun.Queue` (2026-10-06) and `Bun.SMTPClient` (2026-11-10): the
+    AOT program `closed-world/library-code-from-evaluated-text-refused.js` lists the members of
+    `Bun` that a closed executable refuses when the program never uses them. It failed,
+    because the three are such members and the list did not have them. Each patch adds its
+    name now.
+- The fork's three workflows were green for the push of 2026-11-25.
+- Only the tip of the stack and the commit under it were built, each as a debug build and as a
+  release build.
+
+Files: `src/runtime/api/Glob.bind.ts`, `src/runtime/api/glob.rs`, `src/glob/ignore.rs`,
+`src/glob/GlobWalker.rs` (a comment), `src/glob/lib.rs`, `src/codegen/bindgen-emit.ts`,
+`src/codegen/bindgen-lib-internal.ts`, `packages/bun-types/bun.d.ts`, `docs/runtime/glob.mdx`,
+`docs/project/bindgen.mdx`, `test/js/bun/glob/scan.test.ts`, `test/js/bun/glob/match.test.ts`,
+`test/js/bun/glob/proto.test.ts`, `test/js/bun/glob/leak.test.ts`,
+`test/js/node/path/matches-glob.test.ts`, `test/bundler/compile-asset-bunfs.test.ts`,
+`test/internal/bindgen.test.ts`, `test/integration/bun-types/bun-types.test.ts`,
+`test/integration/bun-types/fixture/bun.ts`,
+`test/aot/parallel/what-a-glob-scans/a-list-of-patterns-is-read-when-the-glob-is-made.js`.
+
 ## Dropped
 
 - 2026-08-31, user-defined functions for `bun:sqlite` (`db.function()`): dropped on 2026-10-17.

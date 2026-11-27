@@ -25,6 +25,8 @@ describe("path.matchesGlob(path, glob)", () => {
     123,
     stringLikeObject,
     Symbol("hi"),
+    // `new Bun.Glob()` takes an array of patterns. This does not. (A row that is an array is the arguments.)
+    [["hi"]],
   ])("throws if `glob` is not a string", (notAString: any) => {
     expect(() => path.matchesGlob("hi", notAString)).toThrow(TypeError);
   });

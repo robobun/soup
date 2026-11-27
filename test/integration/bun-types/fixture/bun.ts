@@ -121,6 +121,16 @@ new Bun.Glob("**/*.ts").scan({ ignore: "node_modules/**" }) satisfies AsyncItera
 new Bun.Glob("**/*.ts").scanSync({ ignore: ["node_modules/**", "dist/**"] }) satisfies IterableIterator<string>;
 // @ts-expect-error ignore takes glob pattern strings
 new Bun.Glob("**/*.ts").scanSync({ ignore: /node_modules/ });
+new Bun.Glob(["**/*.ts", "package.json", "!**/*.test.ts"]).match("src/index.ts") satisfies boolean;
+new Bun.Glob(["**/*.ts", "package.json"]).scan(".") satisfies AsyncIterableIterator<string>;
+new Bun.Glob([] as string[]).scanSync({ cwd: "." }) satisfies IterableIterator<string>;
+new Bun.Glob(["**/*.ts", "package.json"] as const) satisfies Bun.Glob;
+declare const oneOrSeveralPatterns: string | readonly string[];
+new Bun.Glob(oneOrSeveralPatterns) satisfies Bun.Glob;
+// @ts-expect-error every pattern of the list is a string
+new Bun.Glob(["**/*.ts", 1]);
+// @ts-expect-error the patterns are an array, not any iterable
+new Bun.Glob(new Set(["**/*.ts"]));
 
 tsd.expectType(Bun.unescapeHTML("&lt;b&gt;")).is<string>();
 tsd.expectType(Bun.unescapeHTML("/search?q=1&copy=2", { attribute: true })).is<string>();

@@ -1578,12 +1578,14 @@ ${type.nativeFunctions.map(fn => cppMethod(type, fn)).join("")}${type.methods
 ${
   type.webIDL
     ? cppWebIDLConstructor(type, classGuard)
-    : construct && !type.illegalConstructor
-      ? `${
-          type.refCounted && !type.passStructure
-            ? cppExtern(constructSymbolName(type, construction), construction, [], "void*")
-            : cppExtern(constructSymbolName(type, construction), construction, ["JSC::Structure*"])
-        }
+    : construct && !type.illegalConstructor && type.constructions.length > 1
+      ? cppOverloadedConstructor(type)
+      : construct && !type.illegalConstructor
+        ? `${
+            type.refCounted && !type.passStructure
+              ? cppExtern(constructSymbolName(type, construction), construction, [], "void*")
+              : cppExtern(constructSymbolName(type, construction), construction, ["JSC::Structure*"])
+          }
 static JSC_DECLARE_HOST_FUNCTION(construct${name});
 JSC_DEFINE_HOST_FUNCTION(construct${name}, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
@@ -1605,7 +1607,7 @@ ${
 }
 }
 `
-      : ""
+        : ""
 }
 ${table(`JS${name}PrototypeTableValues`, prototypeRows)}${table(`JS${name}ConstructorTableValues`, constructorRows)}
 ${
@@ -1710,6 +1712,26 @@ ${cppConstructorSignature(type)}
 `
     : ""
 }`;
+}
+
+/** The constructor of a class with several signatures. The kinds of the arguments choose one, as for a function with overloads. */
+function cppOverloadedConstructor(type: ClassType): string {
+  const { name } = type;
+  const construct = type.construct!;
+  const takeStructure = `    JSC::Structure* structure = Bun::Bindgen::structureForNewTarget(globalObject, callFrame, ${type.classIndex});
+${indent(cppReturnIfFailed("!!structure", "{}"), 4)}
+`;
+  return `${construct.signatures.map(signature => cppExtern(constructSymbolName(type, signature), signature, ["JSC::Structure*"])).join("\n")}
+static JSC_DECLARE_HOST_FUNCTION(construct${name});
+${cppHostFunctionBody(
+  `JSC_DEFINE_HOST_FUNCTION(construct${name}, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))`,
+  `construct${name}`,
+  construct,
+  signature => `${takeStructure}${cppCallBody(signature, constructSymbolName(type, signature), ["structure"])}`,
+  "",
+  "",
+)}
+`;
 }
 
 /** What WebCore's templates leave to each class, but for what fills the prototype. */

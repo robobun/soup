@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use bun_glob::BunGlobWalker as GlobWalker;
-use bun_glob::IgnoreList;
 use bun_glob::walk;
+use bun_glob::{IgnoreList, PatternList};
 use bun_jsc::bindgen::{self, IntoError, JsHeap, JsLocal, JsScope};
 use bun_jsc::bun_string_jsc;
 use bun_jsc::{
@@ -14,11 +14,19 @@ use bun_sys as syscall;
 use crate::generated_bindgen::glob::{GlobScanArgument, GlobScanIgnore, GlobScanOptions};
 
 /// `Bun.Glob`, declared in `Glob.bind.ts`.
-pub(crate) struct Glob {
-    /// An ASCII pattern is the JavaScript string's own buffer, not a copy.
-    pattern: bun_core::Utf8Bytes<'static>,
-    shape: bun_glob::matcher::Shape,
+pub(crate) enum Glob {
+    One {
+        /// An ASCII pattern is the JavaScript string's own buffer, not a copy.
+        pattern: bun_core::Utf8Bytes<'static>,
+        shape: bun_glob::matcher::Shape,
+    },
+    /// An array of patterns.
+    Many(Box<PatternList>),
 }
+
+// With it, the object of a `Glob` is 80 bytes. A list is behind a pointer so that it stays so.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<Glob>() == 56);
 
 pub(crate) enum ScanError<'a> {
     Sys(syscall::Error),
@@ -55,6 +63,7 @@ struct ScanOpts {
     only_files: bool,
     follow_symlinks: bool,
     error_on_broken_symlinks: bool,
+    /// The `ignore` option. With a list of patterns, also the entries that leave out.
     ignore: Option<Arc<IgnoreList>>,
 }
 
@@ -94,6 +103,7 @@ impl ScanOpts {
     fn new<'a>(
         argument: Option<GlobScanArgument<'a>>,
         fn_name: &'static str,
+        list: Option<&Arc<IgnoreList>>,
     ) -> Result<ScanOpts, ScanError<'a>> {
         let options = match argument {
             Some(GlobScanArgument::Options(options)) => options,
@@ -114,14 +124,21 @@ impl ScanOpts {
             only_files: options.only_files,
             follow_symlinks: options.follow_symlinks,
             error_on_broken_symlinks: options.throw_error_on_broken_symlink,
-            ignore: match &options.ignore {
-                Some(GlobScanIgnore::Pattern(pattern)) => Some(IgnoreList::new([*pattern])),
-                Some(GlobScanIgnore::Patterns(patterns)) if !patterns.is_empty() => Some(
-                    IgnoreList::new(patterns.iter().map(|pattern| pattern.slice())),
-                ),
-                _ => None,
-            }
-            .map(Arc::new),
+            ignore: {
+                let own = match &options.ignore {
+                    Some(GlobScanIgnore::Pattern(pattern)) => Some(IgnoreList::new([*pattern])),
+                    Some(GlobScanIgnore::Patterns(patterns)) if !patterns.is_empty() => Some(
+                        IgnoreList::new(patterns.iter().map(|pattern| pattern.slice())),
+                    ),
+                    _ => None,
+                };
+                match (own, list) {
+                    (Some(own), Some(list)) => Some(Arc::new(own.under(Arc::clone(list)))),
+                    (Some(own), None) => Some(Arc::new(own)),
+                    // The walkers share the list of the `Glob`.
+                    (None, list) => list.map(Arc::clone),
+                }
+            },
         })
     }
 }
@@ -239,11 +256,21 @@ use standalone_accessor::StandaloneAccessor;
 
 type StandaloneGlobWalker = walk::GlobWalker<StandaloneAccessor, false>;
 
+type MatchedPaths = bun_collections::StringArrayHashMap<()>;
+
 /// The accessor is picked at init time: embedded-graph walks for a cwd or
 /// pattern under the standalone virtual path, syscalls for everything else.
 pub(crate) enum AnyGlobWalker {
     Fs(Box<GlobWalker>),
     Standalone(Box<StandaloneGlobWalker>),
+    Each(Box<EachWalker>),
+}
+
+/// A walker for each pattern of a list. They walk one after the other, and a walker does not
+/// report a path that one before it has found.
+pub(crate) struct EachWalker {
+    walkers: Vec<AnyGlobWalker>,
+    found: MatchedPaths,
 }
 
 impl AnyGlobWalker {
@@ -251,20 +278,40 @@ impl AnyGlobWalker {
         match self {
             AnyGlobWalker::Fs(walker) => walker.walk(),
             AnyGlobWalker::Standalone(walker) => walker.walk(),
+            AnyGlobWalker::Each(each) => {
+                let EachWalker { walkers, found } = &mut **each;
+                // A walker that has walked is dropped: it holds what it has read.
+                for mut walker in core::mem::take(walkers) {
+                    core::mem::swap(walker.matched_paths_mut(), found);
+                    let result = walker.walk()?;
+                    core::mem::swap(walker.matched_paths_mut(), found);
+                    if result.is_err() {
+                        return Ok(result);
+                    }
+                }
+                Ok(Ok(()))
+            }
+        }
+    }
+
+    fn matched_paths(&self) -> &MatchedPaths {
+        match self {
+            AnyGlobWalker::Fs(walker) => &walker.matched_paths,
+            AnyGlobWalker::Standalone(walker) => &walker.matched_paths,
+            AnyGlobWalker::Each(each) => &each.found,
+        }
+    }
+
+    fn matched_paths_mut(&mut self) -> &mut MatchedPaths {
+        match self {
+            AnyGlobWalker::Fs(walker) => &mut walker.matched_paths,
+            AnyGlobWalker::Standalone(walker) => &mut walker.matched_paths,
+            AnyGlobWalker::Each(each) => &mut each.found,
         }
     }
 
     fn matched_paths_to_js<'a>(&self, heap: &JsHeap<'a>) -> bindgen::Result<'a, JsLocal<'a>> {
-        fn to_js<'a, A: walk::Accessor>(
-            walker: &walk::GlobWalker<A, false>,
-            heap: &JsHeap<'a>,
-        ) -> bindgen::Result<'a, JsLocal<'a>> {
-            bindgen::to_js::array(heap, walker.matched_paths.keys(), bindgen::to_js::utf8)
-        }
-        match self {
-            AnyGlobWalker::Fs(walker) => to_js(walker, heap),
-            AnyGlobWalker::Standalone(walker) => to_js(walker, heap),
-        }
+        bindgen::to_js::array(heap, self.matched_paths().keys(), bindgen::to_js::utf8)
     }
 }
 
@@ -331,22 +378,61 @@ impl JobContext for WalkTask {
 }
 
 impl Glob {
+    /// `None` for a list without an entry that says what matches: a scan of it finds nothing,
+    /// and looks at nothing.
     fn make_glob_walker<'a>(
         &self,
         argument: Option<GlobScanArgument<'a>>,
         fn_name: &'static str,
-    ) -> Result<AnyGlobWalker, ScanError<'a>> {
-        if bun_core::strings::contains_char(self.pattern.slice(), 0) {
-            return Err(ScanError::NullBytes(
-                "pattern",
-                Box::from(self.pattern.slice()),
-            ));
+    ) -> Result<Option<AnyGlobWalker>, ScanError<'a>> {
+        let null_bytes = |pattern: &[u8]| {
+            bun_core::strings::contains_char(pattern, 0)
+                .then(|| ScanError::NullBytes("pattern", Box::from(pattern)))
+        };
+        let list = match self {
+            Glob::One { pattern, .. } => {
+                if let Some(error) = null_bytes(pattern.slice()) {
+                    return Err(error);
+                }
+                let mut match_opts = ScanOpts::new(argument, fn_name, None)?;
+                let ignore = match_opts.ignore.take();
+                return Self::walker_of(pattern.slice(), &match_opts, ignore).map(Some);
+            }
+            Glob::Many(list) => list,
+        };
+        // Every entry is looked at before a walker exists, as the one pattern is.
+        let positive = list.positive().iter().map(|it| it.pattern());
+        if let Some(error) = positive
+            .clone()
+            .chain(list.ignore().patterns())
+            .find_map(null_bytes)
+        {
+            return Err(error);
         }
-        let match_opts = ScanOpts::new(argument, fn_name)?;
+        let match_opts = ScanOpts::new(argument, fn_name, Some(list.ignore()))?;
+        // The walkers share what the scan leaves out.
+        let ignore = match_opts.ignore.as_ref();
+        let walkers = positive
+            .map(|pattern| Self::walker_of(pattern, &match_opts, ignore.map(Arc::clone)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((!walkers.is_empty()).then(|| {
+            AnyGlobWalker::Each(Box::new(EachWalker {
+                walkers,
+                found: MatchedPaths::default(),
+            }))
+        }))
+    }
 
+    /// The walker of one pattern.
+    fn walker_of<'a>(
+        pattern: &[u8],
+        match_opts: &ScanOpts,
+        ignore: Option<Arc<IgnoreList>>,
+    ) -> Result<AnyGlobWalker, ScanError<'a>> {
         fn init_walker<'a, A: walk::Accessor>(
             pattern: &[u8],
-            opts: ScanOpts,
+            opts: &ScanOpts,
+            ignore: Option<Arc<IgnoreList>>,
         ) -> Result<Box<walk::GlobWalker<A, false>>, ScanError<'a>> {
             let result = match &opts.cwd {
                 Some(cwd) => walk::GlobWalker::<A, false>::init_with_cwd(
@@ -372,7 +458,7 @@ impl Glob {
             let mut walker = result
                 .map_err(|err| ScanError::Runtime(err.into()))?
                 .map_err(ScanError::Sys)?;
-            if let Some(ignore) = opts.ignore {
+            if let Some(ignore) = ignore {
                 walker.set_ignore(ignore);
             }
             Ok(Box::new(walker))
@@ -381,10 +467,9 @@ impl Glob {
         // Match the walker's root choice (`Iterator::init`): an absolute
         // pattern roots at its literal prefix and ignores the cwd, a relative
         // pattern roots at the cwd. A `/$bunfs/` root walks the graph, as does an embedded directory that is not on disk.
-        let pattern_is_absolute = bun_paths::is_absolute(self.pattern.slice());
+        let pattern_is_absolute = bun_paths::is_absolute(pattern);
         let in_standalone_graph = bun_standalone_graph::Graph::get_ref().is_some_and(|graph| {
             if pattern_is_absolute {
-                let pattern = self.pattern.slice();
                 let literal = pattern
                     .iter()
                     .position(|c| b"*?[{".contains(c))
@@ -405,32 +490,49 @@ impl Glob {
 
         if in_standalone_graph {
             return Ok(AnyGlobWalker::Standalone(
-                init_walker::<StandaloneAccessor>(self.pattern.slice(), match_opts)?,
+                init_walker::<StandaloneAccessor>(pattern, match_opts, ignore)?,
             ));
         }
         Ok(AnyGlobWalker::Fs(init_walker::<walk::SyscallAccessor>(
-            self.pattern.slice(),
-            match_opts,
+            pattern, match_opts, ignore,
         )?))
     }
 }
 
 impl Glob {
-    pub(crate) fn constructor(pattern: bun_core::Utf8Bytes<'static>) -> Self {
-        Glob {
+    pub(crate) fn constructor(_: &JsHeap<'_>, pattern: bun_core::Utf8Bytes<'static>) -> Self {
+        Glob::One {
             shape: bun_glob::matcher::Shape::of(pattern.slice()),
             pattern,
         }
     }
 
+    /// `new Glob([..])`. `PatternList` says what an entry with `!` or `./` in front is.
+    pub(crate) fn from_list(
+        heap: &JsHeap<'_>,
+        patterns: Vec<bun_core::Utf8Bytes<'static>>,
+    ) -> Self {
+        let patterns = PatternList::new(patterns);
+        // The collector counts 80 bytes for the object. It is told what the list holds now, and
+        // not again when it marks the object: that is `estimatedSize`, which a `Glob` of one
+        // pattern would pay for.
+        // SAFETY: the collector runs no JavaScript.
+        let vm = unsafe { heap.global() }.vm();
+        vm.report_extra_memory(patterns.memory_cost());
+        Glob::Many(Box::new(patterns))
+    }
+
     pub(crate) fn r#match<'a>(&self, str: &'a [u8]) -> bool {
-        bun_glob::matcher::match_prepared::<{ cfg!(windows) }>(
-            self.pattern.slice(),
-            &self.shape,
-            str,
-            bun_glob::Dots::Match,
-        )
-        .matches()
+        match self {
+            Glob::One { pattern, shape } => bun_glob::matcher::match_prepared::<{ cfg!(windows) }>(
+                pattern.slice(),
+                shape,
+                str,
+                bun_glob::Dots::Match,
+            )
+            .matches(),
+            Glob::Many(list) => list.matches(str),
+        }
     }
 
     pub(crate) fn scan<'a>(
@@ -438,7 +540,9 @@ impl Glob {
         cx: &mut JsScope<'a>,
         options: Option<GlobScanArgument<'a>>,
     ) -> Result<JsLocal<'a>, ScanError<'a>> {
-        let walker = self.make_glob_walker(options, "scan")?;
+        let Some(walker) = self.make_glob_walker(options, "scan")? else {
+            return Ok(JsLocal::UNDEFINED);
+        };
         let promise = JSPromiseStrong::init(cx.global());
         let value = promise.value();
         Job::<WalkTask>::schedule(
@@ -454,7 +558,9 @@ impl Glob {
         heap: &JsHeap<'a>,
         options: Option<GlobScanArgument<'a>>,
     ) -> Result<JsLocal<'a>, ScanError<'a>> {
-        let mut walker = self.make_glob_walker(options, "scanSync")?;
+        let Some(mut walker) = self.make_glob_walker(options, "scanSync")? else {
+            return Ok(JsLocal::UNDEFINED);
+        };
         walker
             .walk()
             .map_err(|err| ScanError::Runtime(err.into()))?

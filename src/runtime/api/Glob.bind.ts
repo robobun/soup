@@ -23,11 +23,18 @@ export const GlobScanArgument = b.union({
   options: GlobScanOptions,
 });
 
+// Two signatures and not one with a union, so that `new Glob(string)` is the call that it was.
 export const Glob = b.class({
   rustPath: "crate::api::glob::Glob",
-  construct: {
-    args: { pattern: b.string.utf8.owned },
-  },
+  construct: [
+    {
+      args: { pattern: b.string.utf8.owned },
+      capability: "heap",
+      // What is neither a string nor an array comes here.
+      expected: { pattern: "pattern must be a string or an array of strings" },
+    },
+    { args: { patterns: b.array(b.string.utf8.owned) }, capability: "heap", rustName: "from_list" },
+  ],
   proto: {
     match: {
       args: { str: b.string.utf8 },

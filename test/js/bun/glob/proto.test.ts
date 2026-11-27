@@ -49,8 +49,8 @@ test("arguments of the wrong type throw a TypeError", () => {
   const invalid = (message: string) =>
     expect.objectContaining({ name: "TypeError", code: "ERR_INVALID_ARG_TYPE", message });
   const glob = new Bun.Glob("*");
-  expect(() => new (Bun.Glob as any)()).toThrow(invalid("pattern must be a string"));
-  expect(() => new Bun.Glob(5 as any)).toThrow(invalid("pattern must be a string"));
+  expect(() => new (Bun.Glob as any)()).toThrow(invalid("pattern must be a string or an array of strings"));
+  expect(() => new Bun.Glob(5 as any)).toThrow(invalid("pattern must be a string or an array of strings"));
   expect(() => (glob.match as any)()).toThrow(invalid("str must be a string"));
   expect(() => glob.match(5 as any)).toThrow(invalid("str must be a string"));
   expect(() => glob.scanSync(5 as any)).toThrow(invalid("GlobScanOptions must be an object"));
@@ -116,4 +116,90 @@ test.skipIf(isDebug)("the native half of scan and scanSync is not in a stack tra
   expect(frames(thrown!)).toEqual([]);
   expect(thrown!.stack).toContain("at scanSync");
   expect(frames(await scan().catch(error => error))).toEqual([]);
+});
+
+test("the constructor takes one pattern or an array of patterns", () => {
+  const invalid = (message: string) =>
+    expect.objectContaining({ name: "TypeError", code: "ERR_INVALID_ARG_TYPE", message });
+  const notPatterns = invalid("pattern must be a string or an array of strings");
+  const notAPattern = invalid("element of patterns must be a string");
+
+  expect(new Bun.Glob(["*.ts", "*.json"]).match("a.json")).toBe(true);
+  expect(Bun.Glob.length).toBe(1);
+
+  // What is not an array is not read as one.
+  for (const value of [
+    new Proxy(["*.ts"], {}),
+    new Set(["*.ts"]),
+    { 0: "*.ts", length: 1 },
+    new Uint8Array(1),
+    null,
+    true,
+    Symbol("*.ts"),
+    () => "*.ts",
+  ]) {
+    expect(() => new Bun.Glob(value as any)).toThrow(notPatterns);
+  }
+  // Every element is a string.
+  for (const value of [
+    [5],
+    ["*.ts", null],
+    ["*.ts", undefined],
+    [["*.ts"]],
+    [Symbol("*.ts")],
+    [{ toString: () => "*.ts" }],
+  ]) {
+    expect(() => new Bun.Glob(value as any)).toThrow(notAPattern);
+  }
+  const sparse = new Array(2);
+  sparse[1] = "*.ts";
+  expect(() => new Bun.Glob(sparse)).toThrow(notAPattern);
+
+  // A `String` object is one pattern, alone and in an array.
+  expect(new Bun.Glob(new String("*.ts") as any).match("a.ts")).toBe(true);
+  expect(new Bun.Glob([new String("*.ts"), "*.json"] as any).match("a.ts")).toBe(true);
+
+  class Patterns extends Array<string> {}
+  expect(new Bun.Glob(Patterns.from(["*.ts", "*.json"])).match("a.json")).toBe(true);
+  expect(new Bun.Glob(Object.freeze(["*.ts", "*.json"]) as string[]).match("a.json")).toBe(true);
+
+  class Files extends Bun.Glob {
+    first(cwd: string) {
+      return this.scanSync({ cwd }).next().value;
+    }
+  }
+  const files = new Files(["*.nothing", "!*.ts"]);
+  expect(files).toBeInstanceOf(Files);
+  expect(files.match("a.nothing")).toBe(true);
+  expect(files.first(import.meta.dir)).toBeUndefined();
+});
+
+test("an array of patterns is read once, when the Glob is made", () => {
+  const patterns = ["*.ts", "*.json"];
+  const glob = new Bun.Glob(patterns);
+  patterns.length = 0;
+  patterns.push("*.md");
+  expect([glob.match("a.ts"), glob.match("a.json"), glob.match("a.md")]).toEqual([true, true, false]);
+
+  let reads = 0;
+  const accessor = ["*.ts", ""];
+  Object.defineProperty(accessor, 1, {
+    get() {
+      reads++;
+      return "*.json";
+    },
+  });
+  const fromAccessor = new Bun.Glob(accessor);
+  expect(fromAccessor.match("a.json")).toBe(true);
+  expect(fromAccessor.match("b.json")).toBe(true);
+  expect(Array.from(fromAccessor.scanSync({ cwd: import.meta.dir, ignore: "**" }))).toEqual([]);
+  expect(reads).toBe(1);
+
+  // A getter that throws: nothing is made.
+  Object.defineProperty(accessor, 1, {
+    get() {
+      throw new RangeError("no pattern here");
+    },
+  });
+  expect(() => new Bun.Glob(accessor)).toThrow(new RangeError("no pattern here"));
 });

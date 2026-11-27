@@ -35,6 +35,8 @@ The `Glob` class implements the following interface:
 
 ```ts
 class Glob {
+  constructor(pattern: string | string[]);
+
   scan(root: string | ScanOptions): AsyncIterable<string>;
   scanSync(root: string | ScanOptions): Iterable<string>;
 
@@ -90,6 +92,69 @@ interface ScanOptions {
   ignore?: string | string[];
 }
 ```
+
+## Several patterns
+
+Pass an array to match any of several patterns with one `Glob`:
+
+```ts
+import { Glob } from "bun";
+
+const glob = new Glob(["**/*.ts", "**/*.tsx", "package.json"]);
+
+glob.match("src/index.ts"); // => true
+glob.match("package.json"); // => true
+glob.match("README.md"); // => false
+
+for await (const file of glob.scan(".")) {
+  console.log(file); // every .ts and .tsx file, and package.json
+}
+```
+
+`match()` returns `true` for a path that one of the patterns matches. A scan returns what the scan of each pattern returns. It returns every path once, also when several patterns match it, and in no specified order. It takes the same options as the scan of one pattern.
+
+An entry that starts with `!` excludes what it matches:
+
+```ts
+import { Glob } from "bun";
+
+const glob = new Glob(["**/*.ts", "!**/node_modules/**", "!**/*.test.ts"]);
+
+glob.match("src/index.ts"); // => true
+glob.match("src/index.test.ts"); // => false
+glob.match("node_modules/zod/index.ts"); // => false
+
+await Array.fromAsync(glob.scan(".")); // no test file, and nothing under node_modules
+```
+
+Such an entry is the [`ignore` option](#ignoring-paths) written in the list:
+
+- It applies to all the other entries, wherever it is in the array.
+- A scan does not enter a directory that it matches, and `match()` returns `false` for every path below that directory.
+- A scan matches it against the same path as an `ignore` pattern: the normalized path relative to `cwd`, or the full path if the entry that found the path is absolute.
+- An odd number of `!` in front of an entry excludes. An even number does not. `!(` starts an extended glob pattern and does not count, and `\!` matches a literal `!`.
+- An array without an entry that says what to match matches nothing, and a scan of it reads nothing. This is different from the `glob` option of `Bun.Archive`, where such a list includes everything else.
+
+This is different from a single pattern that starts with `!`, which negates the pattern:
+
+```ts
+new Glob("!*.ts").match("index.js"); // => true: the pattern does not match
+new Glob(["!*.ts"]).match("index.js"); // => false: nothing says what to match
+```
+
+A `./` in front of an entry makes no difference. `new Glob(["./src/*.ts", "src/*.ts"])` returns `src/index.ts` once, and `!./src/**` excludes what `!src/**` excludes. `match()` of an array ignores a `./` in front of the path too. Only the `./` in front counts for nothing: `src/./*.ts` returns `src/./index.ts`. A `../` or an absolute path stays in the paths that a scan returns: `["src/*.ts", "../lib/*.ts"]` returns `src/index.ts` and `../lib/index.ts`.
+
+Write the entries with `/` on every platform. A `\` escapes the character after it.
+
+Keep these limits in mind:
+
+- A scan walks the patterns of an array one after the other, on one thread. Directories that several patterns reach are read once for each of them. When the patterns are in different directories and you scan asynchronously, a `Glob` for each pattern and `Promise.all` can be faster.
+- If one pattern cannot start, the scan throws. An example is an absolute pattern in a directory that does not exist.
+- A `{a,b}` or `@(a|b)` group that contains a `/` matches with `match()`, but a scan finds nothing for it. This is the same for a single pattern. Write such a group as separate entries: `["src/*.ts", "package.json"]` instead of `"{src/*.ts,package.json}"`. In an entry that starts with `!`, such a group works. There is one exception: for a `/` at the end of an alternative, as in `!{dist/,build/}`, a scan skips the directories, and `match()` still returns `true` for what is below them.
+- `match()` does not know whether a path is a directory. `new Glob(["**", "!build/"]).match("build")` returns `true`, and a scan with `onlyFiles: false` does not return `build`.
+- `match()` asks every `!` entry about all the directories above a path. A scan does not ask about the directories that an absolute pattern names before its first wildcard, or about a `..` at the start of a pattern. With `["/app/node_modules/zod/*.js", "!**/node_modules"]` a scan returns the files of `zod`, and `match()` returns `false` for them.
+
+Bun reads the array when it creates the `Glob`. Changing the array later does not change the `Glob`.
 
 ## Ignoring paths
 
@@ -217,6 +282,8 @@ const glob = new Glob("!index.ts");
 glob.match("index.ts"); // => false
 glob.match("foo.ts"); // => true
 ```
+
+In an [array of patterns](#several-patterns), an entry that starts with `!` does not negate. It leaves out what it matches.
 
 ### `\` - Escapes any of the special characters above
 

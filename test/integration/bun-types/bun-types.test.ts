@@ -663,6 +663,8 @@ describe("@types/bun integration test", () => {
       "DiffObject.bind.ts: arrays<T>(oldArray: readonly T[], newArray: readonly T[], options?: Options | undefined): Change<T[]>[] | undefined: oldArray takes any[], not readonly T[]",
       "DiffObject.bind.ts: hunks() is Hunk[] | undefined, not Hunk[]",
       "DiffObject.bind.ts: createPatch() is string | undefined, not string",
+      // One signature for both constructors of the schema, so that `new Glob(stringOrList)` checks.
+      "Glob.bind.ts: new Glob(pattern: string | readonly string[]): Glob: pattern takes string, not string | readonly string[], or patterns takes string[], not string | readonly string[]",
       // An S3File is a Blob with more members, which C++ adds and no schema describes.
       "S3Client.bind.ts: new S3Client().file() has no readable, bucket, presign, presignPost, copyTo",
       "S3Client.bind.ts: new S3Client().file().stat() is Promise<unknown> | undefined, not Promise<S3Stats>",

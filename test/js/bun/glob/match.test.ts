@@ -3045,6 +3045,244 @@ test.concurrent.each([
   expect(await matchedLikeMinimatch(pattern, dot, paths)).toEqual(expected);
 });
 
+describe("a list of patterns", () => {
+  test("matches what any of its patterns matches", () => {
+    const glob = new Glob(["*.ts", "src/**/*.json", "README.md"]);
+    expect(glob.match("index.ts")).toBe(true);
+    expect(glob.match("src/a/b.json")).toBe(true);
+    expect(glob.match("README.md")).toBe(true);
+    expect(glob.match("src/index.ts")).toBe(false);
+    expect(glob.match("package.json")).toBe(false);
+    expect(glob.match("")).toBe(false);
+
+    // A list of one pattern is that pattern.
+    for (const pattern of ["*.ts", "**/*.{ts,json}", "!(a).ts", "!!*.ts", "", "a\0b"]) {
+      for (const path of ["a.ts", "b.ts", "src/a.ts", "a.json", "", "a\0b"]) {
+        expect(new Glob([pattern]).match(path)).toBe(new Glob(pattern).match(path));
+        expect(new Glob([pattern, pattern]).match(path)).toBe(new Glob(pattern).match(path));
+      }
+    }
+    expect(new Glob(["a\0b", "*.ts"]).match("a\0b")).toBe(true);
+    expect(new Glob(["", "*.ts"]).match("")).toBe(true);
+  });
+
+  test("an entry that starts with ! leaves out what it matches", () => {
+    const glob = new Glob(["**/*.ts", "!**/*.test.ts", "!dist", "!**/node_modules"]);
+    expect(glob.match("src/index.ts")).toBe(true);
+    expect(glob.match("src/index.test.ts")).toBe(false);
+    // A scan does not enter a directory that an entry leaves out, so what is below it does not match either.
+    expect(glob.match("dist/index.ts")).toBe(false);
+    expect(glob.match("dist/a/b/index.ts")).toBe(false);
+    expect(glob.match("node_modules/dep/index.ts")).toBe(false);
+    expect(glob.match("packages/app/node_modules/dep/index.ts")).toBe(false);
+    // `dist` is the directory at the start of the path only.
+    expect(glob.match("src/dist/index.ts")).toBe(true);
+    expect(glob.match("/dist/index.ts")).toBe(true);
+
+    // Where the entry stands does not matter.
+    expect(new Glob(["!*.test.ts", "*.ts"]).match("a.test.ts")).toBe(false);
+    expect(new Glob(["!*.test.ts", "*.ts"]).match("a.ts")).toBe(true);
+    // A directory with its separator, as `ignore: "build/"` leaves it out.
+    expect(new Glob(["**", "!build/"]).match("build/a.js")).toBe(false);
+    expect(new Glob(["**", "!**/build/**"]).match("a/build/b.js")).toBe(false);
+    // `match()` does not know that `build` is a directory. A scan does, and does not report it.
+    expect(new Glob(["**", "!build/"]).match("build")).toBe(true);
+    if (isWindows) expect(new Glob(["**/*.ts", "!dist"]).match("dist\\index.ts")).toBe(false);
+  });
+
+  test("an odd number of ! leaves out, and !( starts a group", () => {
+    expect(new Glob(["*.ts", "!a.ts"]).match("a.ts")).toBe(false);
+    expect(new Glob(["*.ts", "!!!a.ts"]).match("a.ts")).toBe(false);
+    // An even number says what matches: what the pattern of one `!` less does not match.
+    expect(new Glob(["*.json", "!!a.ts"]).match("a.ts")).toBe(true);
+    expect(new Glob(["*.json", "!!a.ts"]).match("b.ts")).toBe(false);
+    expect(new Glob(["!(a).ts", "*.json"]).match("b.ts")).toBe(true);
+    expect(new Glob(["!(a).ts", "*.json"]).match("a.ts")).toBe(false);
+    expect(new Glob(["*.ts", "!!(a).ts"]).match("a.ts")).toBe(true);
+    expect(new Glob(["*.ts", "!!(a).ts"]).match("b.ts")).toBe(false);
+    // `\!` is the character.
+    expect(new Glob(["\\!a.ts", "b.ts"]).match("!a.ts")).toBe(true);
+    expect(new Glob(["*.ts", "\\!a.ts"]).match("a.ts")).toBe(true);
+  });
+
+  test("a ./ in front of an entry or of the path does not count", () => {
+    const glob = new Glob(["./src/*.ts", "lib/*.ts", "!./src/*.test.ts", "!lib/internal.ts"]);
+    for (const [path, matches] of [
+      ["src/index.ts", true],
+      ["lib/index.ts", true],
+      ["src/index.test.ts", false],
+      ["lib/internal.ts", false],
+      ["test/index.ts", false],
+    ] as const) {
+      expect(glob.match(path)).toBe(matches);
+      expect(glob.match("./" + path)).toBe(matches);
+      expect(glob.match("././" + path)).toBe(matches);
+    }
+    // Also in a list of one entry. As a string, the pattern is matched as it is written.
+    expect(new Glob(["./src/*.ts"]).match("src/index.ts")).toBe(true);
+    expect(new Glob(["./src/*.ts"]).match("./src/index.ts")).toBe(true);
+    expect(new Glob(["*.ts"]).match("./a.ts")).toBe(true);
+    expect(new Glob("./src/*.ts").match("src/index.ts")).toBe(false);
+    // A list of one entry answers as the list that has the entry twice.
+    for (const pattern of ["./src/*.ts", "src/*.ts", "*.ts", "././*.ts", "./", ".//src/*.ts", "./!*.ts"]) {
+      for (const path of [
+        "src/index.ts",
+        "./src/index.ts",
+        "././src/index.ts",
+        "a.ts",
+        "./a.ts",
+        "./",
+        ".//",
+        "",
+        "!a.ts",
+      ]) {
+        expect([pattern, path, new Glob([pattern]).match(path)]).toEqual([
+          pattern,
+          path,
+          new Glob([pattern, pattern]).match(path),
+        ]);
+      }
+    }
+    // `./` alone is the directory, as an entry and as a path.
+    expect(new Glob(["./"]).match("./")).toBe(true);
+    expect(new Glob(["./", "x"]).match("./")).toBe(true);
+    expect(new Glob(["./"]).match("src")).toBe(false);
+    // What follows the `./` starts in the same directory: `.//src` is not `/src`.
+    expect(new Glob([".//src/*.ts"]).match("src/index.ts")).toBe(true);
+    expect(new Glob([".//src/*.ts"]).match("/src/index.ts")).toBe(false);
+    expect(new Glob(["**/*.ts", "!.//src/**"]).match("src/index.ts")).toBe(false);
+    // A `!` behind the `./` is a character of a name.
+    expect(new Glob(["./!*.ts"]).match("!a.ts")).toBe(true);
+    expect(new Glob(["./!*.ts"]).match("index.js")).toBe(false);
+    expect(new Glob(["*", "!./!*.ts"]).match("!a.ts")).toBe(false);
+    expect(new Glob(["*", "!./!*.ts"]).match("a.ts")).toBe(true);
+    // In a path, `\` separates on Windows only.
+    expect(new Glob(["src/*.ts", "x"]).match(".\\src\\a.ts")).toBe(isWindows);
+    // `../` is not dropped.
+    expect(new Glob(["../src/*.ts", "a.ts"]).match("src/index.ts")).toBe(false);
+    expect(new Glob(["../src/*.ts", "a.ts"]).match("../src/index.ts")).toBe(true);
+  });
+
+  test.each([
+    // An entry, a path that it leaves out, and a path that it does not.
+    ["!dist", "dist/a/b.js", "src/dist.js"],
+    ["!dist/", "dist/a.js", "dist"],
+    ["!dist/**", "dist/a/b.js", "dist"],
+    // `dist` stays, and `dist/a` is a directory that the entry matches.
+    ["!dist/*", "dist/a/b.js", "dist"],
+    ["!**/node_modules", "a/node_modules/b/c.js", "a/node_modules.js"],
+    ["!**/node_modules/", "a/node_modules/b/c.js", "a/node_modules"],
+    // Every directory: what is below one has a `/` in it.
+    ["!**/", "src/index.ts", "README.md"],
+    ["!src/**/", "src/a/index.ts", "index.ts"],
+    ["!{dist,build}/", "build/a.js", "src/build.js"],
+    ["!@(dist|build)", "dist/a/b.js", "distribution/a.js"],
+  ])("%s leaves out what is below a directory that it matches", (entry, below, other) => {
+    const glob = new Glob(["**", entry]);
+    expect(glob.match(below)).toBe(false);
+    expect(glob.match(other)).toBe(true);
+  });
+
+  test("an entry with ! that names no directory leaves out nothing below one", () => {
+    // A `\` at the end escapes nothing, and an escaped `/` is not the end of a name.
+    expect(new Glob(["**", "!dist\\"]).match("dist/index.js")).toBe(true);
+    expect(new Glob(["**", "!src\\/"]).match("src/index.ts")).toBe(true);
+    // Nothing is left of these.
+    for (const entry of ["!", "!/", "!./", "!//"]) {
+      expect([entry, new Glob(["**", entry]).match("/usr/lib/a.ts")]).toEqual([entry, true]);
+      expect([entry, new Glob(["**", entry]).match("usr/lib/a.ts")]).toEqual([entry, true]);
+    }
+  });
+
+  // A scan asks such an entry about `dist/`, and does not enter `dist`.
+  test.failing("a / at the end of an alternative leaves out what is below the directory", () => {
+    expect(new Glob(["**", "!{node_modules/,dist/}"]).match("dist/index.js")).toBe(false);
+  });
+
+  test("a list without a pattern that matches matches nothing", () => {
+    for (const path of ["", "a", "a.ts", "src/a.ts"]) {
+      expect(new Glob([]).match(path)).toBe(false);
+      expect(new Glob(["!a"]).match(path)).toBe(false);
+      expect(new Glob(["!a", "!*.ts"]).match(path)).toBe(false);
+    }
+    // As a string, the `!` in front negates the pattern.
+    expect(new Glob("!a").match("b")).toBe(true);
+    expect(new Glob(["!a"]).match("b")).toBe(false);
+  });
+
+  test("takes time that grows with the length of the path, not with its square", () => {
+    // An entry with `!` is asked about the path and about every directory above it. Asked one directory at a time,
+    // this path takes minutes. The budget is far above what the two questions per entry take.
+    const glob = new Glob(["**/*.ts", "!**/node_modules", "!dist/", "!**/*.test.ts", "!**/build/**"]);
+    const path = Buffer.alloc(400_000, "a/").toString() + "index.ts";
+    const started = performance.now();
+    expect(glob.match(path)).toBe(true);
+    expect(glob.match(path.replace("a/a/index.ts", "a/node_modules/index.ts"))).toBe(false);
+    const elapsed = performance.now() - started;
+    if (elapsed >= 2000) throw new Error(`match() took ${elapsed.toFixed(0)} ms for a path of ${path.length} bytes`);
+  });
+
+  test("matches the files that a scan finds", () => {
+    using dir = tempDir("glob-match-list", {
+      "package.json": "{}",
+      "src/index.ts": "",
+      "src/index.test.ts": "",
+      "src/util/helpers.ts": "",
+      "src/util/data.json": "{}",
+      "dist/index.js": "",
+      "dist/chunks/a.js": "",
+      "node_modules/dep/index.ts": "",
+      "packages/app/package.json": "{}",
+      "packages/app/src/main.ts": "",
+      "packages/app/dist/main.js": "",
+      "packages/app/node_modules/dep/index.ts": "",
+    });
+    const cwd = String(dir);
+    const all = Array.from(new Glob("**").scanSync({ cwd })).map(it => it.replaceAll("\\", "/"));
+    expect(all.length).toBe(12);
+
+    const matching = ["**/*.ts", "src/**", "*.json", "packages/*/src/**", "./src/*.ts", "**/index.*", "**/*.js"];
+    const leavingOut = [
+      "**/node_modules/**",
+      "dist",
+      "**/dist/",
+      "**/*.test.ts",
+      "./src/util",
+      "{dist,packages/app}/**",
+    ];
+    let lists = 0;
+    for (let i = 0; i < matching.length; i++) {
+      for (let j = i; j < matching.length; j++) {
+        for (let k = -1; k < leavingOut.length; k++) {
+          for (let l = k; l < leavingOut.length; l++) {
+            const list = [...new Set([matching[i], matching[j]])];
+            for (const it of new Set([leavingOut[k], leavingOut[l]])) if (it) list.push("!" + it);
+            const glob = new Glob(list);
+            const scanned = Array.from(glob.scanSync({ cwd })).map(it => it.replaceAll("\\", "/"));
+            expect({ list, matched: all.filter(it => glob.match(it)).sort() }).toEqual({
+              list,
+              matched: scanned.sort(),
+            });
+            lists++;
+          }
+        }
+      }
+    }
+    expect(lists).toBe(28 * 28);
+  });
+
+  // A walk does not ask an entry with `!` about the directories that an absolute pattern names before its first
+  // wildcard, or about a `..` that a pattern starts with. `match()` asks about every directory above the path.
+  test.failing("matches a file that a scan finds below a directory that the pattern names", () => {
+    using dir = tempDir("glob-match-list-named", { "node_modules/dep/index.ts": "", "src/index.ts": "" });
+    const cwd = String(dir).replaceAll("\\", "/");
+    const glob = new Glob([`${cwd}/node_modules/dep/*.ts`, "!**/node_modules"]);
+    const scanned = Array.from(glob.scanSync({ cwd })).map(it => it.replaceAll("\\", "/"));
+    expect(scanned).toEqual([`${cwd}/node_modules/dep/index.ts`]);
+    expect(scanned.filter(it => glob.match(it))).toEqual(scanned);
+  });
+});
+
 function returnError(cb: () => any): Error | undefined {
   try {
     cb();

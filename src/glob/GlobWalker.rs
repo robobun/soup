@@ -253,10 +253,12 @@ pub struct GlobWalker<A: Accessor, const SENTINEL: bool> {
 ///
 /// All matched paths are UTF-8 (DirIterator converts them on windows)
 ///
-/// Multiple patterns are not supported so right now this is
-/// only possible when running a pattern like:
+/// A walker has one pattern, and finds a path twice with a pattern like:
 ///
 /// `foo/**/*`
+///
+/// A scan for several patterns has a walker for each. It gives the map of one walker
+/// to the next, which then does not report a path that is in it.
 ///
 /// Use `.keys()` to get the matched paths
 // `to_js_array` lives in a `*_jsc` crate

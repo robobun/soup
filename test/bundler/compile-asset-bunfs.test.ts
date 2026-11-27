@@ -141,6 +141,13 @@ describe.concurrent("compile --asset and /$bunfs/ directory semantics", () => {
           absoluteLiteralFile: [...new Bun.Glob(rootPosix + "/index.html").scanSync({})],
           enoentCode: errcode(() => [...new Bun.Glob("*").scanSync(missing)]),
           enotdirCode: errcode(() => [...new Bun.Glob("*").scanSync(indexHtml)]),
+          // A list of patterns walks the embedded tree too.
+          list: [...new Bun.Glob(["*.html", "_app/**/*.css", "*.svg", "!empty.*"]).scanSync(root)].sort(),
+          listAsync: (await Array.fromAsync(new Bun.Glob(["**/*.js", "*.html", "index.html"]).scan(root))).sort(),
+          // Patterns in the embedded tree and patterns on disk, in one list.
+          listMixed: [...new Bun.Glob([rootPosix + "/*.html", realDirPosix + "/*", "*.svg", realDirPosix + "/*.txt"]).scanSync(root)].sort(),
+          listMixedAsync: (await Array.fromAsync(new Bun.Glob([realDirPosix + "/*", "_app/immutable/*.css"]).scan(root))).sort(),
+          listEnoentCode: errcode(() => [...new Bun.Glob(["*", "*.html"]).scanSync(missing)]),
         };
         fs.rmSync(realDir, { recursive: true, force: true });
 
@@ -235,6 +242,15 @@ describe.concurrent("compile --asset and /$bunfs/ directory semantics", () => {
           absoluteLiteralFile: [],
           enoentCode: "ENOENT",
           enotdirCode: "ENOTDIR",
+          list: [join("_app", "immutable", "app.css"), "favicon.svg", "index.html"].sort(),
+          listAsync: [join("_app", "immutable", "chunks", "entry.js"), "index.html"].sort(),
+          listMixed: [
+            r.client.root.replaceAll(sep, "/") + "/index.html",
+            r.realDirPosix + "/real.txt",
+            "favicon.svg",
+          ].sort(),
+          listMixedAsync: [r.realDirPosix + "/real.txt", join("_app", "immutable", "app.css")].sort(),
+          listEnoentCode: "ENOENT",
         },
         realDirPosix: expect.any(String),
       });

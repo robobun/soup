@@ -12212,7 +12212,44 @@ declare module "bun" {
    * ```
    */
   export class Glob {
-    constructor(pattern: string);
+    /**
+     * Create a `Glob` from one pattern, or from an array of patterns.
+     *
+     * With an array, `match()` is true for a path that one of the patterns
+     * matches, and a scan returns what the scan of each pattern returns,
+     * every path once and in no specified order.
+     *
+     * In an array, an entry that starts with an odd number of `!` excludes
+     * what it matches, as the `ignore` option of a scan does. `match()` is
+     * false for a path that such an entry matches and for everything below a
+     * directory that it matches, and a scan does not enter that directory.
+     * `!(` starts a group and is not such an entry, and `\!` is a literal
+     * `!`. An array in which no entry says what to match matches nothing
+     * (the `glob` option of `Bun.Archive` includes everything for such a
+     * list). A `./` in front of an entry has no effect, and `match()` of an
+     * array ignores a `./` in front of the path.
+     *
+     * A string that starts with `!` is not an array entry. It matches what
+     * the pattern after the `!` does not match.
+     *
+     * `match()` does not know whether a path is a directory. It can be true
+     * for a directory that a scan with `onlyFiles: false` leaves out.
+     *
+     * Bun reads the array when it creates the `Glob`. Later changes to the
+     * array do not change the `Glob`.
+     *
+     * @param pattern One pattern, or an array of patterns
+     *
+     * @example
+     * ```js
+     * const glob = new Glob(["src/*.ts", "package.json", "!src/*.test.ts"]);
+     * glob.match("src/index.ts"); // true
+     * glob.match("package.json"); // true
+     * glob.match("src/index.test.ts"); // false
+     * const files = await Array.fromAsync(glob.scan("."));
+     * ```
+     */
+    constructor(pattern: string | readonly string[]);
 
     /**
      * Scan a root directory recursively for files that match this glob pattern. Returns an async iterator.
